@@ -46,7 +46,57 @@
 
 // standard library
 #include <memory>
+#include <variant>
 #include <vector>
+
+namespace sirius::experimental {
+
+class gpu_expression_executor {
+ public:
+  using data_batch              = cucascade::data_batch;
+  using data_repository_manager = cucascade::data_repository_manager<std::shared_ptr<data_batch>>;
+  using execute_result          = std::variant<cudf::column_view, std::unique_ptr<cudf::column>>;
+
+  static cudf::column_view get_result_view(execute_result const& result)
+  {
+    if (std::holds_alternative<cudf::column_view>(result)) {
+      return std::get<cudf::column_view>(result);
+    } else {
+      return std::get<std::unique_ptr<cudf::column>>(result)->view();
+    }
+  }
+
+  static std::unique_ptr<cudf::column> materialize_result(execute_result& result)
+  {
+    if (std::holds_alternative<cudf::column_view>(result)) {
+      return std::make_unique<cudf::column>(std::get<cudf::column_view>(result));
+    } else {
+      return std::move(std::get<std::unique_ptr<cudf::column>>(result));
+    }
+  }
+
+  gpu_expression_executor(
+    duckdb::Expression const& expr,
+    rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref());
+
+  std::vector<std::unique_ptr<cudf::column>> _output_columns;
+  cudf::table_view _input_table;
+
+  std::shared_ptr<data_batch> execute(std::shared_ptr<data_batch> input_batch,
+                                      rmm::cuda_stream_view stream);
+  execute_result execute_expression(duckdb::Expression const& expr);
+  execute_result execute_expression(duckdb::BoundBetweenExpression const& expr);
+  execute_result execute_expression(duckdb::BoundCaseExpression const& expr);
+  execute_result execute_expression(duckdb::BoundCastExpression const& expr);
+  execute_result execute_expression(duckdb::BoundComparisonExpression const& expr);
+  execute_result execute_expression(duckdb::BoundConjunctionExpression const& expr);
+  execute_result execute_expression(duckdb::BoundConstantExpression const& expr);
+  execute_result execute_expression(duckdb::BoundFunctionExpression const& expr);
+  execute_result execute_expression(duckdb::BoundOperatorExpression const& expr);
+  execute_result execute_expression(duckdb::BoundReferenceExpression const& expr);
+};
+
+}  // namespace sirius::experimental
 
 namespace duckdb {
 namespace sirius {

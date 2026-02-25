@@ -114,6 +114,23 @@ class gpu_expression_translator {
   std::optional<translated_expression> translate_join_condition(
     duckdb::JoinCondition const& condition);
 
+  ///==========NEW STUFF==========///
+  struct translate_node;
+  struct fallback_expression {
+    duckdb::Expression const* expr;
+    std::vector<std::unique_ptr<translate_node>> children;
+  };
+  struct translate_node {
+    std::variant<translated_expression, fallback_expression> node;
+  };
+
+  using translate_result = std::variant<translated_expression, duckdb::Expression>;
+  translate_result translate_expression_with_fallback(
+    duckdb::Expression const& expr,
+    cudf::ast::table_reference const table_src = cudf::ast::table_reference::LEFT)
+  {
+  }
+
  private:
   // std::optional cannot wrap a real reference, so we use reference_wrapper instead
   using expr_ref = std::reference_wrapper<cudf::ast::expression const>;
