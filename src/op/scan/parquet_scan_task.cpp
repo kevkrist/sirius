@@ -55,7 +55,7 @@ namespace sirius::op::scan {
 // Define CUDF_NIGHTLY tp 1 if we're on a cuDF version new enough to support filter pushdown with
 // the hybrid_scan_reader. This is not currently released in a cuDF version, so a CUDF_VERSION_NUM
 // guard is not sufficient.
-#define CUDF_NIGHTLY 1
+#define CUDF_NIGHTLY 0
 
 #if CUDF_VERSION_NUM < 2604
 namespace {
@@ -425,13 +425,20 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       for (size_t selected_pos = 0; selected_pos < selected_column_indices.size(); ++selected_pos) {
         auto const col_idx          = selected_column_indices[selected_pos];
         auto const& column_metadata = row_group.columns[col_idx].meta_data;
-        // To reflect the fact that pure filter columns are not part of the decompression result,
-        // we omit them from the uncompressed byte count.
+// To reflect the fact that pure filter columns are not part of the decompression result,
+// we omit them from the uncompressed byte count.
+#if CUDF_NIGHTLY
         if (column_metadata.total_uncompressed_size > 0 &&
             !pure_filter_pos_set.contains(selected_pos)) {
           partition_uncompressed_bytes +=
             static_cast<size_t>(column_metadata.total_uncompressed_size);
         }
+#else
+        if (column_metadata.total_uncompressed_size > 0) {
+          partition_uncompressed_bytes +=
+            static_cast<size_t>(column_metadata.total_uncompressed_size);
+        }
+#endif
         if (column_metadata.total_compressed_size > 0) {
           partition_compressed_bytes += static_cast<size_t>(column_metadata.total_compressed_size);
         }

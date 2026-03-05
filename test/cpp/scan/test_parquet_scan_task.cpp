@@ -30,6 +30,7 @@
 
 // rmm
 #include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 // cudf
 #include <cudf/logger.hpp>
@@ -49,6 +50,10 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+
+// Toggle this on or off to test filter pushdown with the hybrid_scan_reader. This is currently only
+// working for decimal columns with cuDF nightly. See parquet_scan_task.cpp.
+#define CUDF_NIGHTLY 0
 
 using namespace sirius;
 using namespace sirius::scan_test_utils;
@@ -517,7 +522,7 @@ static void run_parquet_scan_test_with_filter(
   };
 
   auto batches = run_scan();
-  validator(batches, expected_rows, mem_mgr);
+  validator(batches, expected_rows, mem_mgr, rmm::cuda_stream_default);
 
   auto commit_result = con.Query("COMMIT");
   REQUIRE(commit_result);
@@ -628,6 +633,7 @@ TEST_CASE("parquet_scan_task - multi file full scan five files mixed sizes",
     "parquet_multi_file_five", {1400, 2600, 0, 3100, 900}, 6, 150000, 300);
 }
 
+#if CUDF_NIGHTLY
 TEST_CASE("parquet_scan_task - filter prunes all rows", "[parquet_scan_task][filter]")
 {
   auto table_filters = make_id_constant_filter(duckdb::ExpressionType::COMPARE_LESSTHAN, 0);
@@ -954,3 +960,4 @@ TEST_CASE("parquet_scan_task - filter prunes row groups with multi-column compar
   REQUIRE(!drop_result->HasError());
   std::filesystem::remove(parquet_path);
 }
+#endif
