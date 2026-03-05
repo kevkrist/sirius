@@ -156,7 +156,7 @@ std::tuple<std::vector<size_t>, std::vector<size_t>> make_selected_column_indice
 
   std::vector<size_t> pure_filter_output_positions;
   for (duckdb::idx_t i = 0; i < scan_op.column_ids.size(); i++) {
-    bool const in_projection = projected_set.contains(i);
+    bool const in_projection  = projected_set.contains(i);
     bool const is_pure_filter = pure_filter_set.contains(i);
     if (in_projection || is_pure_filter) {
       auto const output_pos = selected_column_indices.size();
@@ -340,8 +340,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   auto [selected_column_indices, pure_filter_positions] =
     detail::make_selected_column_indices(*scan_op, filter_idxs);
   _pure_filter_ids = std::move(pure_filter_positions);
-  std::unordered_set<size_t> pure_filter_pos_set(_pure_filter_ids.begin(),
-                                                 _pure_filter_ids.end());
+  std::unordered_set<size_t> pure_filter_pos_set(_pure_filter_ids.begin(), _pure_filter_ids.end());
 #else
   auto selected_column_indices = detail::make_selected_column_indices(*scan_op);
 #endif
@@ -497,7 +496,6 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   // Get the byte ranges for the range of row groups assigned to this task.
   auto byte_ranges =
     reader->all_column_chunks_byte_ranges(l_state.get_rg_indices(), g_state.get_options());
-  std::cout << "\n\tBYTE RANGES READ\n" << std::endl;
 
   // Read each byte range into the allocation asynchronously
   std::vector<cudf::io::text::byte_range_info> new_byte_ranges;

@@ -54,7 +54,8 @@ namespace sirius {
 
 namespace detail {
 
-#define MULTISTAGE_DECOMPRESSION 0
+/// [KEVIN] We should experiment with using the multistage decompression provided by the
+/// hybrid_scan_reader.
 
 /**
  * @brief Convert host_parquet_representation to gpu_table_representation
@@ -128,16 +129,12 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
       dst_ptrs[i], src_ptrs[i], counts[i], cudaMemcpyHostToDevice, stream.value()));
   }
 #endif
-
-// Invoke the Parquet reader to materialize the table on GPU
-#if MULTISTAGE_DECOMPRESSION
-#else
+  // Invoke the Parquet reader to materialize the table on GPU
   auto [table, meta] = reader->materialize_all_columns(host_src.get_row_group_indices(),
                                                        column_chunk_spans_d,
                                                        host_src.get_reader_options(),
                                                        stream,
                                                        mr_ref);
-#endif
 #else
   // cudf 26.02 takes std::vector<rmm::device_buffer>&& instead of spans
   std::vector<rmm::device_buffer> column_chunk_buffers;
