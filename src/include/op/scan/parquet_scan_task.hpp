@@ -214,7 +214,7 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
   cudf::io::parquet_reader_options _reader_options;              ///< Parquet reader options
   std::shared_ptr<gpu_expression_translator::translated_expression>
-    _translated_filter;                  ///< The translated filter expression, if any
+    _translated_filter;  ///< The translated filter expression, if any
   std::vector<size_t>
     _pure_filter_ids;  ///< Output positions of pure filter columns in the selected column set
 
