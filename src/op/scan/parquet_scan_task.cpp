@@ -34,13 +34,13 @@
 #include <duckdb/main/config.hpp>
 
 // cudf
-#include "cudf/cudf_utils.hpp"
-
 #include <cudf/ast/expressions.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
+#include <cudf/io/text/byte_range_info.hpp>
 #if CUDF_VERSION_NUM >= 2604
 #include <cudf/io/parquet_io_utils.hpp>
 #endif
@@ -49,10 +49,16 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
 namespace sirius::op::scan {
+
+// Define CUDF_NIGHTLY tp 1 if we're on a cuDF version new enough to support filter pushdown with
+// the hybrid_scan_reader. This is not currently released in a cuDF version, so a CUDF_VERSION_NUM
+// guard is not sufficient.
+#define CUDF_NIGHTLY 1
 
 #if CUDF_VERSION_NUM < 2604
 namespace {
@@ -102,8 +108,69 @@ bool projected_columns_are_flat(cudf::io::parquet::FileMetaData const& meta,
     });
 }
 
-std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan const& scan_op,
-                                                 std::vector<duckdb::idx_t> const& filter_ids)
+#if CUDF_NIGHTLY
+// For filter pushdown with hybrid_scan_reader, we need to add pure filter columns to the column set
+// in the reader options.
+std::tuple<std::vector<size_t>, std::vector<size_t>> make_selected_column_indices(
+  sirius_physical_parquet_scan const& scan_op, std::vector<duckdb::idx_t> const& filter_ids)
+{
+  // Deduplication set
+  std::unordered_set<size_t> seen;
+  std::vector<size_t> selected_column_indices;
+
+  // In case there are duplicate columns in the projection list, we deduplicate, in order
+  auto push_unique = [&selected_column_indices, &seen](auto col_idx) {
+    if (duckdb::IsVirtualColumn(col_idx)) { return; }
+    if (seen.insert(col_idx).second) {
+      // Insert successful (not yet seen)
+      selected_column_indices.push_back(col_idx);
+    }
+  };
+
+  if (scan_op.projection_ids.empty()) {
+    //===----------No Projection: Select All Columns----------===//
+    std::for_each(scan_op.column_ids.begin(),
+                  scan_op.column_ids.end(),
+                  [&push_unique](duckdb::ColumnIndex const& column_id) {
+                    push_unique(column_id.GetPrimaryIndex());
+                  });
+    return {selected_column_indices, {}};
+  }
+
+  //===----------Projection Applied: Select Projected Columns Only----------===//
+  // Collect the set of column_ids positions that are referenced by projection_ids,
+  // then iterate in column_ids order (not projection_ids order).
+  // This ensures the parquet reader produces columns in the same order that
+  // the TABLE_SCAN filter expects (column_ids order), since the filter's
+  // BoundReferenceExpression indices are offsets into column_ids.
+  //
+  // filter_ids contains positions in column_ids (same as projection_ids).
+  // Pure filter columns are those referenced by the filter but absent from the projection.
+  // We track their output positions in selected_column_indices so the converter can prune them.
+  std::unordered_set<duckdb::idx_t> projected_set(scan_op.projection_ids.begin(),
+                                                  scan_op.projection_ids.end());
+  std::unordered_set<duckdb::idx_t> pure_filter_set;
+  for (auto filter_pos : filter_ids) {
+    if (!projected_set.contains(filter_pos)) { pure_filter_set.insert(filter_pos); }
+  }
+
+  std::vector<size_t> pure_filter_output_positions;
+  for (duckdb::idx_t i = 0; i < scan_op.column_ids.size(); i++) {
+    bool const in_projection = projected_set.contains(i);
+    bool const is_pure_filter = pure_filter_set.contains(i);
+    if (in_projection || is_pure_filter) {
+      auto const output_pos = selected_column_indices.size();
+      push_unique(scan_op.column_ids[i].GetPrimaryIndex());
+      // Record the output position only if the column was actually inserted (not a duplicate)
+      if (is_pure_filter && selected_column_indices.size() > output_pos) {
+        pure_filter_output_positions.push_back(output_pos);
+      }
+    }
+  }
+  return {selected_column_indices, pure_filter_output_positions};
+}
+#else
+std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan const& scan_op)
 {
   // Deduplication set
   std::unordered_set<size_t> seen;
@@ -136,13 +203,41 @@ std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan co
   // BoundReferenceExpression indices are offsets into column_ids.
   std::unordered_set<duckdb::idx_t> projected_set(scan_op.projection_ids.begin(),
                                                   scan_op.projection_ids.end());
-  std::unordered_set<duckdb::idx_t> filter_set(filter_ids.begin(), filter_ids.end());
   for (duckdb::idx_t i = 0; i < scan_op.column_ids.size(); i++) {
-    if (projected_set.count(i) || filter_set.count(i)) {
-      push_unique(scan_op.column_ids[i].GetPrimaryIndex());
-    }
+    if (projected_set.count(i)) { push_unique(scan_op.column_ids[i].GetPrimaryIndex()); }
   }
   return selected_column_indices;
+}
+#endif
+
+std::vector<byte_range_info> merge_byte_ranges(std::vector<byte_range_info> const& byte_ranges)
+{
+  if (byte_ranges.empty()) { return {}; }
+
+  std::vector<byte_range_info> merged;
+  merged.reserve(byte_ranges.size());
+
+  auto current_start = byte_ranges[0].offset();
+  auto current_end   = current_start + byte_ranges[0].size();
+
+  for (auto const& range : byte_ranges) {
+    auto const range_start = range.offset();
+    auto const range_end   = range_start + range.size();
+
+    if (range_start <= current_end) {
+      // Ranges overlap or are contiguous, extend the current range
+      current_end = std::max(current_end, range_end);
+    } else {
+      // No overlap, push the current range and start a new one
+      merged.emplace_back(current_start, current_end - current_start);
+      current_start = range_start;
+      current_end   = range_end;
+    }
+  }
+  // Push the final range
+  merged.emplace_back(current_start, current_end - current_start);
+
+  return merged;
 }
 
 }  // namespace detail
@@ -201,7 +296,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   _reader_options = cudf::io::parquet_reader_options::builder().build();
 
 // If filtering or projecting with hybrid_scan_reader, we need column names
-#if CUDF_VERSION_NUM >= 2604
+#if CUDF_NIGHTLY
   bool const try_filter = scan_op->table_filters && !scan_op->table_filters->filters.empty();
 #else
   // cuDF has a bug in filter pushdown with decimal columns. Fixed by this PR:
@@ -217,16 +312,17 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     }
   }
 
+#if CUDF_NIGHTLY
   // Try to apply table filter
-  std::vector<duckdb::idx_t> filter_ids; /// We need filter_ids for projections that omit filter columns
+  std::vector<duckdb::idx_t> filter_idxs;  // Positions in column_ids referenced by the filter
   if (try_filter) {
     auto duckdb_expr = _scan_op->get_table_filter_expression();
     if (duckdb_expr) {
-      // Name resolver: BoundReferenceExpression::index is a position in column_ids,
-      // and the primary index is the table column ordinal, which indexes into names.
-      auto name_resolver = [&scan_op, &filter_ids](duckdb::idx_t ref_index) -> std::string {
-        filter_ids.push_back(ref_index);
+      // Name resolver: BoundReferenceExpression::index is a position in column_ids.
+      // We collect ref_index (not primary_idx) to match with domain of projection_ids.
+      auto name_resolver = [&scan_op, &filter_idxs](duckdb::idx_t ref_index) -> std::string {
         auto const primary_idx = scan_op->column_ids[ref_index].GetPrimaryIndex();
+        filter_idxs.push_back(ref_index);
         return scan_op->names[primary_idx];
       };
       gpu_expression_translator translator(rmm::cuda_stream_default,
@@ -241,7 +337,14 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   }
 
   // Get the selected column indices for projection
-  auto selected_column_indices = detail::make_selected_column_indices(*scan_op, filter_ids);
+  auto [selected_column_indices, pure_filter_positions] =
+    detail::make_selected_column_indices(*scan_op, filter_idxs);
+  _pure_filter_ids = std::move(pure_filter_positions);
+  std::unordered_set<size_t> pure_filter_pos_set(_pure_filter_ids.begin(),
+                                                 _pure_filter_ids.end());
+#else
+  auto selected_column_indices = detail::make_selected_column_indices(*scan_op);
+#endif
 
   // Apply projections by column name using DuckDB's bound column names.
   if (is_projected) {
@@ -323,9 +426,13 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
       auto const& row_group = file_metadata.row_groups[rg_idx];
       partition_rg_indices.push_back(rg_idx);
 
-      for (auto const col_idx : selected_column_indices) {
+      for (size_t selected_pos = 0; selected_pos < selected_column_indices.size(); ++selected_pos) {
+        auto const col_idx          = selected_column_indices[selected_pos];
         auto const& column_metadata = row_group.columns[col_idx].meta_data;
-        if (column_metadata.total_uncompressed_size > 0) {
+        // To reflect the fact that pure filter columns are not part of the decompression result,
+        // we omit them from the uncompressed byte count.
+        if (column_metadata.total_uncompressed_size > 0 &&
+            !pure_filter_pos_set.contains(selected_pos)) {
           partition_uncompressed_bytes +=
             static_cast<size_t>(column_metadata.total_uncompressed_size);
         }
@@ -387,10 +494,10 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
   memory::multiple_blocks_allocation_accessor<uint8_t> data_accessor;
   data_accessor.initialize(0, allocation);
 
-  // Get the byte ranges for the range of row groups assigned to this task
-  // [KEVIN] I want to merge contiguous byte ranges, but the hybrid_scan_reader chokes
+  // Get the byte ranges for the range of row groups assigned to this task.
   auto byte_ranges =
     reader->all_column_chunks_byte_ranges(l_state.get_rg_indices(), g_state.get_options());
+  std::cout << "\n\tBYTE RANGES READ\n" << std::endl;
 
   // Read each byte range into the allocation asynchronously
   std::vector<cudf::io::text::byte_range_info> new_byte_ranges;
@@ -422,7 +529,8 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   std::move(new_byte_ranges),
                                                   l_state.get_reserved_compressed_bytes(),
                                                   l_state.get_reserved_uncompressed_bytes(),
-                                                  g_state.get_filter_expression_pin());
+                                                  g_state.get_filter_expression_pin(),
+                                                  g_state.get_pure_filter_ids());
   auto data_batch =
     std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(parquet_representation));
   return std::make_unique<op::operator_data>(

@@ -101,8 +101,9 @@ std::string expression_to_string(cudf::ast::expression const& expr)
     return op_str + "(?)";
   }
   if (auto const* col_ref = dynamic_cast<cudf::ast::column_reference const*>(&expr)) {
-    auto table_str = (col_ref->get_table_source() == cudf::ast::table_reference::LEFT) ? "L" : "R";
-    return std::string(table_str) + "[" + std::to_string(col_ref->get_column_index()) + "]";
+    std::string table_str =
+      (col_ref->get_table_source() == cudf::ast::table_reference::LEFT) ? "L" : "R";
+    return table_str + "[" + std::to_string(col_ref->get_column_index()) + "]";
   }
   if (auto const* col_name_ref = dynamic_cast<cudf::ast::column_name_reference const*>(&expr)) {
     return col_name_ref->get_column_name();

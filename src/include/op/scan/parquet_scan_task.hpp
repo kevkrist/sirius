@@ -195,6 +195,16 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
     return _translated_filter;
   }
 
+  /**
+   * @brief Get output positions for pure filter columns.
+   *
+   * These positions refer to the column order produced by the parquet reader for the
+   * selected/projection column set.
+   *
+   * @return A const reference to the vector of pure filter column positions.
+   */
+  [[nodiscard]] std::vector<size_t> const& get_pure_filter_ids() const { return _pure_filter_ids; }
+
  private:
   //===----------Fields----------===//
   size_t _approximate_batch_size;          ///< Target approximate batch size for scan tasks
@@ -204,7 +214,9 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
   cudf::io::parquet_reader_options _reader_options;              ///< Parquet reader options
   std::shared_ptr<gpu_expression_translator::translated_expression>
-    _translated_filter;  ///< The translated filter expression, if any
+    _translated_filter;                  ///< The translated filter expression, if any
+  std::vector<size_t>
+    _pure_filter_ids;  ///< Output positions of pure filter columns in the selected column set
 
   std::vector<row_group_range> _row_group_partitions;  ///< Row-group partitions for tasks
   std::atomic<size_t> _next_rg_partition{0};           ///< Number of local states created

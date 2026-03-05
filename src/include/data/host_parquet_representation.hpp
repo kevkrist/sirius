@@ -77,7 +77,8 @@ class host_parquet_representation : public cucascade::idata_representation {
     std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
     std::size_t size_in_bytes,
     std::size_t uncompressed_size_in_bytes,
-    std::shared_ptr<translated_expression> filter_expression_pin = nullptr)
+    std::shared_ptr<translated_expression> filter_expression_pin = nullptr,
+    std::vector<size_t> pure_filter_ids                          = {})
     : idata_representation(*memory_space),
       _column_chunks(std::move(column_chunks)),
       _parquet_reader(std::move(parquet_reader)),
@@ -86,7 +87,8 @@ class host_parquet_representation : public cucascade::idata_representation {
       _column_chunk_byte_ranges(std::move(column_chunk_byte_ranges)),
       _size_in_bytes(size_in_bytes),
       _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
-      _filter_expression_pin(filter_expression_pin)
+      _filter_expression_pin(std::move(filter_expression_pin)),
+      _pure_filter_ids(std::move(pure_filter_ids))
   {
   }
 
@@ -211,6 +213,15 @@ class host_parquet_representation : public cucascade::idata_representation {
     return _filter_expression_pin;
   }
 
+  /**
+   * @brief Gets the vector of pure filter column positions.
+   *
+   * Positions are relative to the column order of the materialized GPU table before pruning.
+   *
+   * @return A const reference to the vector of pure filter column positions.
+   */
+  [[nodiscard]] std::vector<size_t> const& get_pure_filter_ids() const { return _pure_filter_ids; }
+
  private:
   cucascade::memory::fixed_multiple_blocks_allocation _column_chunks;
   std::unique_ptr<hybrid_scan_reader> _parquet_reader;
@@ -221,5 +232,7 @@ class host_parquet_representation : public cucascade::idata_representation {
   std::size_t _uncompressed_size_in_bytes;
   std::shared_ptr<translated_expression>
     _filter_expression_pin;  ///< Pins the AST filter expression to keep device scalars alive
+  std::vector<size_t> _pure_filter_ids;  ///< Output positions of pure filter columns prior to
+                                         ///< pruning from the materialized table
 };
 }  // namespace sirius

@@ -54,7 +54,8 @@ std::unique_ptr<cucascade::idata_representation> host_parquet_representation::cl
                                                        _column_chunk_byte_ranges,
                                                        _size_in_bytes,
                                                        _uncompressed_size_in_bytes,
-                                                       _filter_expression_pin);
+                                                       _filter_expression_pin,
+                                                       _pure_filter_ids);
 }
 
 }  // namespace sirius

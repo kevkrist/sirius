@@ -54,6 +54,8 @@ namespace sirius {
 
 namespace detail {
 
+#define MULTISTAGE_DECOMPRESSION 0
+
 /**
  * @brief Convert host_parquet_representation to gpu_table_representation
  */
@@ -127,12 +129,15 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
   }
 #endif
 
-  // Invoke the Parquet reader to materialize the table on GPU
+// Invoke the Parquet reader to materialize the table on GPU
+#if MULTISTAGE_DECOMPRESSION
+#else
   auto [table, meta] = reader->materialize_all_columns(host_src.get_row_group_indices(),
                                                        column_chunk_spans_d,
                                                        host_src.get_reader_options(),
                                                        stream,
                                                        mr_ref);
+#endif
 #else
   // cudf 26.02 takes std::vector<rmm::device_buffer>&& instead of spans
   std::vector<rmm::device_buffer> column_chunk_buffers;
@@ -166,6 +171,18 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
                                                        stream);
 #endif
   stream.synchronize();
+
+  // Now we need to prune the pure filter columns from the table, if there are any.
+  auto const& pure_filter_ids = host_src.get_pure_filter_ids();
+  if (!pure_filter_ids.empty()) {
+    auto columns = table->release();
+    std::vector<size_t> sorted_ids(pure_filter_ids.begin(), pure_filter_ids.end());
+    std::sort(sorted_ids.rbegin(), sorted_ids.rend());
+    for (auto id : sorted_ids) {
+      columns.erase(columns.begin() + static_cast<ptrdiff_t>(id));
+    }
+    table = std::make_unique<cudf::table>(std::move(columns));
+  }
 
   return std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
@@ -231,7 +248,8 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
     host_src.get_column_chunk_byte_ranges(),
     data_size,
     host_src.get_uncompressed_size_in_bytes(),
-    host_src.get_filter_expression_pin());
+    host_src.get_filter_expression_pin(),
+    host_src.get_pure_filter_ids());
 }
 
 }  // namespace detail
