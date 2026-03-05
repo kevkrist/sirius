@@ -16,6 +16,9 @@
 
 #pragma once
 
+// sirius
+#include <expression_executor/gpu_expression_translator.hpp>
+
 // cucascade
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -41,13 +44,14 @@ namespace sirius {
  * The APIs for this reader are still marked experimental and are likely volatile.
  */
 class host_parquet_representation : public cucascade::idata_representation {
-  using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
+  using hybrid_scan_reader    = cudf::io::parquet::experimental::hybrid_scan_reader;
+  using translated_expression = gpu_expression_translator::translated_expression;
 
  public:
   /**
    * @brief Constructs a host_parquet_representation.
    *
-   * @param[in] memory_space The memory space to which the representation beloongs.
+   * @param[in] memory_space The memory space to which the representation belongs.
    * @param[in] column_chunks The fixed multiple blocks allocation containing the Parquet column
    * chunks.
    * @param[in] parquet_reader An instance hybrid scan Parquet reader for a given Parquet file.
@@ -60,15 +64,20 @@ class host_parquet_representation : public cucascade::idata_representation {
    * @param[in] size_in_bytes The size of the representation in bytes (compressed).
    * @param[in] uncompressed_size_in_bytes The uncompressed size of the data represented by this
    * representation.
+   * @param[in] filter_expression_pin An optional shared_ptr that co-owns the AST filter expression
+   * referenced by reader_options. This keeps the AST (and its device scalars) alive for the
+   * lifetime of this representation, since parquet_reader_options stores the filter as a reference.
    */
-  host_parquet_representation(cucascade::memory::memory_space* memory_space,
-                              cucascade::memory::fixed_multiple_blocks_allocation column_chunks,
-                              std::unique_ptr<hybrid_scan_reader> parquet_reader,
-                              cudf::io::parquet_reader_options reader_options,
-                              std::vector<cudf::size_type> row_group_indices,
-                              std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
-                              std::size_t size_in_bytes,
-                              std::size_t uncompressed_size_in_bytes)
+  host_parquet_representation(
+    cucascade::memory::memory_space* memory_space,
+    cucascade::memory::fixed_multiple_blocks_allocation column_chunks,
+    std::unique_ptr<hybrid_scan_reader> parquet_reader,
+    cudf::io::parquet_reader_options reader_options,
+    std::vector<cudf::size_type> row_group_indices,
+    std::vector<cudf::io::text::byte_range_info> column_chunk_byte_ranges,
+    std::size_t size_in_bytes,
+    std::size_t uncompressed_size_in_bytes,
+    std::shared_ptr<translated_expression> filter_expression_pin = nullptr)
     : idata_representation(*memory_space),
       _column_chunks(std::move(column_chunks)),
       _parquet_reader(std::move(parquet_reader)),
@@ -76,7 +85,8 @@ class host_parquet_representation : public cucascade::idata_representation {
       _row_group_indices(std::move(row_group_indices)),
       _column_chunk_byte_ranges(std::move(column_chunk_byte_ranges)),
       _size_in_bytes(size_in_bytes),
-      _uncompressed_size_in_bytes(uncompressed_size_in_bytes)
+      _uncompressed_size_in_bytes(uncompressed_size_in_bytes),
+      _filter_expression_pin(filter_expression_pin)
   {
   }
 
@@ -101,16 +111,19 @@ class host_parquet_representation : public cucascade::idata_representation {
   /**
    * @brief Gets the hybrid scan Parquet reader as needed for materializing column data.
    *
-   * @return A const reference to the hybrid scan Parquet reader.
+   * @return A const pointer to the hybrid scan Parquet reader.
    */
-  [[nodiscard]] hybrid_scan_reader const& get_parquet_reader() const { return *_parquet_reader; };
+  [[nodiscard]] std::unique_ptr<hybrid_scan_reader> const& get_parquet_reader() const
+  {
+    return _parquet_reader;
+  };
 
   /**
    * @brief Moves the hybrid scan Parquet reader out of the representation.
    *
    * @return A unique pointer to the hybrid scan Parquet reader.
    */
-  [[nodiscard]] std::unique_ptr<hybrid_scan_reader> move_parquet_reader()
+  [[nodiscard]] std::unique_ptr<hybrid_scan_reader> take_parquet_reader()
   {
     return std::move(_parquet_reader);
   };
@@ -145,18 +158,6 @@ class host_parquet_representation : public cucascade::idata_representation {
   [[nodiscard]] std::vector<cudf::size_type>& get_row_group_indices()
   {
     return _row_group_indices;
-  };
-
-  /**
-   * @brief Gets a host span of the row group indices of the row groups represented in the multiple
-   * blocks allocation.
-   *
-   * @return A host span of the row group indices.
-   */
-  [[nodiscard]] cudf::host_span<cudf::size_type const> get_rg_span() const
-  {
-    return cudf::host_span<cudf::size_type const>(_row_group_indices.data(),
-                                                  _row_group_indices.size());
   };
 
   /**
@@ -200,6 +201,16 @@ class host_parquet_representation : public cucascade::idata_representation {
     return _uncompressed_size_in_bytes;
   }
 
+  /**
+   * @brief Gets the shared pointer that pins the AST filter expression alive.
+   *
+   * @return The shared_ptr pin (may be null if no filter was set).
+   */
+  [[nodiscard]] std::shared_ptr<translated_expression> const& get_filter_expression_pin() const
+  {
+    return _filter_expression_pin;
+  }
+
  private:
   cucascade::memory::fixed_multiple_blocks_allocation _column_chunks;
   std::unique_ptr<hybrid_scan_reader> _parquet_reader;
@@ -208,5 +219,7 @@ class host_parquet_representation : public cucascade::idata_representation {
   std::vector<cudf::io::text::byte_range_info> _column_chunk_byte_ranges;
   std::size_t _size_in_bytes;
   std::size_t _uncompressed_size_in_bytes;
+  std::shared_ptr<translated_expression>
+    _filter_expression_pin;  ///< Pins the AST filter expression to keep device scalars alive
 };
 }  // namespace sirius

@@ -74,9 +74,7 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
 
   auto const& allocation = host_src.get_column_chunks();
 
-  // The following pattern follows the example here:
-  // https://github.com/rapidsai/cudf/blob/main/cpp/examples/hybrid_scan_io/common_utils.cpp#L160
-
+#if CUDF_VERSION_NUM >= 2604
   // Allocate a single device buffer and partition it according to the byte ranges
   std::vector<cudf::device_span<uint8_t const>> column_chunk_spans_d;
   rmm::device_buffer device_buffer(host_src.get_size_in_bytes(), stream, mr_ref);
@@ -130,25 +128,47 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
 #endif
 
   // Invoke the Parquet reader to materialize the table on GPU
-#if CUDF_VERSION_NUM >= 2604
-  auto column_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
-    column_chunk_spans_d.data(), column_chunk_spans_d.size());
-  auto result = reader.materialize_all_columns(
-    host_src.get_rg_span(), column_chunk_spans_h, host_src.get_reader_options(), stream, mr_ref);
+  auto [table, meta] = reader->materialize_all_columns(host_src.get_row_group_indices(),
+                                                       column_chunk_spans_d,
+                                                       host_src.get_reader_options(),
+                                                       stream,
+                                                       mr_ref);
 #else
   // cudf 26.02 takes std::vector<rmm::device_buffer>&& instead of spans
   std::vector<rmm::device_buffer> column_chunk_buffers;
-  for (auto const& span : column_chunk_spans_d) {
-    column_chunk_buffers.emplace_back(span.data(), span.size(), stream, mr_ref);
+  column_chunk_buffers.reserve(byte_ranges.size());
+  size_t src_block_index  = 0;
+  size_t src_block_offset = 0;
+  for (auto const& byte_range : byte_ranges) {
+    rmm::device_buffer dev_buf(byte_range.size(), stream, mr_ref);
+    auto* dst           = static_cast<uint8_t*>(dev_buf.data());
+    size_t chunk_copied = 0;
+    while (chunk_copied < byte_range.size()) {
+      auto const bytes_to_copy =
+        std::min(byte_range.size() - chunk_copied, allocation->block_size() - src_block_offset);
+      RMM_CUDA_TRY(::cudaMemcpyAsync(dst + chunk_copied,
+                                     allocation->at(src_block_index).data() + src_block_offset,
+                                     bytes_to_copy,
+                                     cudaMemcpyHostToDevice,
+                                     stream.value()));
+      chunk_copied += bytes_to_copy;
+      src_block_offset += bytes_to_copy;
+      if (src_block_offset == allocation->block_size()) {
+        src_block_index++;
+        src_block_offset = 0;
+      }
+    }
+    column_chunk_buffers.push_back(std::move(dev_buf));
   }
-  auto result = reader.materialize_all_columns(
-    host_src.get_rg_span(), std::move(column_chunk_buffers), host_src.get_reader_options(), stream);
+  auto [table, meta] = reader->materialize_all_columns(host_src.get_row_group_indices(),
+                                                       std::move(column_chunk_buffers),
+                                                       host_src.get_reader_options(),
+                                                       stream);
 #endif
-  auto new_table = std::move(result.tbl);  // Discard metadata
   stream.synchronize();
 
   return std::make_unique<cucascade::gpu_table_representation>(
-    std::move(new_table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
+    std::move(table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
 }
 
 /**
@@ -199,15 +219,19 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_host_pa
       dst_block_offset = 0;
     }
   }
+
+  auto cloned_reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(
+    host_src.get_parquet_reader()->parquet_metadata(), host_src.get_reader_options());
   return std::make_unique<host_parquet_representation>(
     const_cast<cucascade::memory::memory_space*>(target_memory_space),
     std::move(dst_allocation),
-    std::move(host_src.move_parquet_reader()),
+    std::move(cloned_reader),
     host_src.get_reader_options(),
-    std::move(host_src.get_row_group_indices()),
-    std::move(host_src.get_column_chunk_byte_ranges()),
+    host_src.get_row_group_indices(),
+    host_src.get_column_chunk_byte_ranges(),
     data_size,
-    host_src.get_uncompressed_size_in_bytes());
+    host_src.get_uncompressed_size_in_bytes(),
+    host_src.get_filter_expression_pin());
 }
 
 }  // namespace detail
