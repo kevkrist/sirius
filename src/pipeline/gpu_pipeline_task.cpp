@@ -18,19 +18,17 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
+#include "pipeline/oom_reschedule_exception.hpp"
 
 #include <absl/cleanup/cleanup.h>
-#include <absl/functional/any_invocable.h>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
-#include <iostream>
 #include <optional>
 
 namespace sirius {
@@ -65,8 +63,13 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
             cancel_task_if_needed();
             return std::nullopt;
           }
-          batch->convert_to<cucascade::gpu_table_representation>(
-            registry, requested_memory_space, stream);
+          try {
+            batch->convert_to<cucascade::gpu_table_representation>(
+              registry, requested_memory_space, stream);
+          } catch (...) {
+            batch->try_to_release_in_transit();
+            throw;
+          }
           batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
           break;
         }
@@ -76,8 +79,13 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
             cancel_task_if_needed();
             return std::nullopt;
           }
-          batch->convert_to<cucascade::host_data_packed_representation>(
-            registry, requested_memory_space, stream);
+          try {
+            batch->convert_to<cucascade::host_data_representation>(
+              registry, requested_memory_space, stream);
+          } catch (...) {
+            batch->try_to_release_in_transit();
+            throw;
+          }
           batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
           break;
         }
@@ -110,6 +118,8 @@ void validate_operator_output_types(const op::operator_data* data,
     if (!batch) { continue; }
     cudf::table_view tbl = get_cudf_table_view(*batch);
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
+      // bobbi (todo): delim join will return this warning for now, but there is no bug here, so we
+      // can ignore it. we can do something about this after gtc
       SIRIUS_LOG_WARN(
         "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
         "{}, expected {}",
@@ -139,6 +149,37 @@ void validate_operator_output_types(const op::operator_data* data,
   }
 }
 
+std::unique_ptr<op::operator_data> run_one_operator(op::sirius_physical_operator& op,
+                                                    const op::operator_data& operator_input_data,
+                                                    rmm::cuda_stream_view stream,
+                                                    const sirius_pipeline* pipeline,
+                                                    size_t op_index,
+                                                    size_t num_operators,
+                                                    std::string& batch_sizes)
+{
+  auto start                = std::chrono::high_resolution_clock::now();
+  auto operator_output_data = op.execute(operator_input_data, stream);
+  stream.synchronize();
+  auto end      = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  batch_sizes   = "";
+  for (auto& batch : operator_output_data->get_data_batches()) {
+    auto view = get_cudf_table_view(*batch);
+    batch_sizes += std::to_string(view.num_rows()) + "  ";
+  }
+  SIRIUS_LOG_TRACE(
+    "Pipeline {}: operator {} (id={}) produced {} batches with num rows: {}, execution time: "
+    "{:.2f} ms",
+    pipeline->get_pipeline_id(),
+    op.get_name(),
+    op.get_operator_id(),
+    operator_output_data ? operator_output_data->get_data_batches().size() : 0u,
+    batch_sizes,
+    duration.count() / 1000.0);
+  validate_operator_output_types(operator_output_data.get(), op);
+  return operator_output_data;
+}
+
 }  // namespace
 
 gpu_pipeline_task::gpu_pipeline_task(
@@ -154,6 +195,7 @@ gpu_pipeline_task::gpu_pipeline_task(
 
 gpu_pipeline_task::~gpu_pipeline_task()
 {
+  if (_oom_rescheduled) { return; }
   if (_global_state == nullptr ||
       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
     return;
@@ -173,39 +215,74 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto operator_input_output_data = std::move(local_state._input_data);
-  std::string batch_sizes         = "";
+  auto operators                  = pipeline->get_operators();
+  auto start_index                = local_state._start_operator_index;
+
+  if (start_index > 0) {
+    SIRIUS_LOG_INFO("Pipeline {}: resuming task {} from operator index {} (of {})",
+                    pipeline->get_pipeline_id(),
+                    _task_id,
+                    start_index,
+                    operators.size());
+  }
+
+  std::string batch_sizes = "";
   for (auto& batch : operator_input_output_data->get_data_batches()) {
     auto view = get_cudf_table_view(*batch);
     batch_sizes += std::to_string(view.num_rows()) + "  ";
   }
-  for (auto& op : pipeline->get_operators()) {
+  for (size_t i = start_index; i < operators.size(); i++) {
+    auto& op = operators[i].get();
     SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) executing on {} batches with num row: {}",
                      pipeline->get_pipeline_id(),
-                     op.get().get_name(),
-                     op.get().get_operator_id(),
+                     op.get_name(),
+                     op.get_operator_id(),
                      operator_input_output_data->get_data_batches().size(),
                      batch_sizes);
-    auto start            = std::chrono::high_resolution_clock::now();
-    auto temp_output_data = op.get().execute(*operator_input_output_data, stream);
-    stream.synchronize();
-    operator_input_output_data = std::move(temp_output_data);
-    auto end                   = std::chrono::high_resolution_clock::now();
-    auto duration              = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    batch_sizes                = "";
-    for (auto& batch : operator_input_output_data->get_data_batches()) {
-      auto view = get_cudf_table_view(*batch);
-      batch_sizes += std::to_string(view.num_rows()) + "  ";
+    try {
+      operator_input_output_data = run_one_operator(
+        op, *operator_input_output_data, stream, pipeline, i, operators.size(), batch_sizes);
+    } catch (const rmm::out_of_memory&) {
+      SIRIUS_LOG_WARN("Pipeline {}: OOM at operator {} (id={}, index {}/{}), retrying once",
+                      pipeline->get_pipeline_id(),
+                      op.get_name(),
+                      op.get_operator_id(),
+                      i,
+                      operators.size());
+      try {
+        SIRIUS_LOG_WARN(
+          "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), trimming memory pool and "
+          "retrying operator)",
+          pipeline->get_pipeline_id(),
+          op.get_name(),
+          op.get_operator_id(),
+          i,
+          operators.size());
+        cudaMemPool_t pool{};
+        if (cudaDeviceGetDefaultMemPool(&pool,
+                                        operator_input_output_data->get_data_batches()[0]
+                                          ->get_memory_space()
+                                          ->get_device_id()) == cudaSuccess) {
+          cudaMemPoolTrimTo(pool, 0);
+          cudaDeviceSynchronize();
+        }
+        operator_input_output_data = run_one_operator(
+          op, *operator_input_output_data, stream, pipeline, i, operators.size(), batch_sizes);
+      } catch (const rmm::out_of_memory&) {
+        SIRIUS_LOG_WARN(
+          "Pipeline {}: OOM again at operator {} (id={}, index {}/{}), rescheduling task {}",
+          pipeline->get_pipeline_id(),
+          op.get_name(),
+          op.get_operator_id(),
+          i,
+          operators.size(),
+          _task_id);
+        throw oom_reschedule_exception(
+          std::move(operator_input_output_data),
+          i,
+          "OOM at operator " + op.get_name() + " (index " + std::to_string(i) + ")");
+      }
     }
-    SIRIUS_LOG_TRACE(
-      "Pipeline {}: operator {} (id={}) produced {} batches with num rows: {}, execution time: "
-      "{:.2f} ms",
-      pipeline->get_pipeline_id(),
-      op.get().get_name(),
-      op.get().get_operator_id(),
-      operator_input_output_data ? operator_input_output_data->get_data_batches().size() : 0u,
-      batch_sizes,
-      duration.count() / 1000.0);
-    validate_operator_output_types(operator_input_output_data.get(), op.get());
   }
   return operator_input_output_data;
 }
@@ -255,7 +332,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
   auto output_data = compute_task(stream);
-  stream.synchronize();
+
   if (output_data) { publish_output(*output_data, stream); }
   // 4. After each cudf operator, get peak total bytes to collect statistics
   // 5. Push output batches to the data repository
@@ -291,6 +368,13 @@ std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consume
   return _global_state->cast<gpu_pipeline_task_global_state>()
     .get_pipeline()
     ->get_output_consumers();
+}
+
+std::unique_ptr<gpu_pipeline_task> gpu_pipeline_task::create_rescheduled_task(
+  uint64_t task_id, std::unique_ptr<sirius_pipeline_task_local_state> local_state)
+{
+  return std::make_unique<gpu_pipeline_task>(
+    task_id, _data_repos, std::move(local_state), get_shared_global_state());
 }
 
 }  // namespace pipeline
