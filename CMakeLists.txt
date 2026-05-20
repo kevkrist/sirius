@@ -444,6 +444,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_partition_inject.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
+    test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)

@@ -16,8 +16,11 @@
 
 #pragma once
 
+#include <duckdb/execution/operator/join/join_filter_pushdown.hpp>
 #include <duckdb/optimizer/optimizer_extension.hpp>
 #include <duckdb/planner/logical_operator.hpp>
+
+#include <cstddef>
 
 namespace sirius::transparent {
 
@@ -36,5 +39,32 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 /// we silently fall back to CPU.
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
+
+namespace detail {
+
+/// @brief Count of nodes that received metadata during preserve_dynamic_filter_metadata.
+/// Surfaced for diagnostic logging and unit-test assertions.
+struct preserved_counts {
+  std::size_t joins{0};
+  std::size_t gets{0};
+};
+
+/// @brief Deep-copy a @c JoinFilterPushdownInfo, sharing the @c DynamicTableFilterSet shared_ptrs
+/// (preserving the route-key pointer identity that pairs joins with their downstream scans).
+/// Omits @c min_max_aggregates — Sirius does not consume them and cloning @c Expression trees
+/// is non-trivial.
+[[nodiscard]] duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> clone_filter_pushdown_info(
+  duckdb::JoinFilterPushdownInfo const& src);
+
+/// @brief Walk @p original and @p copy in parallel and re-attach
+/// @c LogicalComparisonJoin::filter_pushdown / @c LogicalGet::dynamic_filters from original onto
+/// copy. @c LogicalOperator::Copy round-trips through serialize/deserialize, and these fields
+/// are absent from both operators' serialization schemas — without this fixup the copy has them
+/// null. Bails defensively at any structural mismatch.
+void preserve_dynamic_filter_metadata(duckdb::LogicalOperator& original,
+                                      duckdb::LogicalOperator& copy,
+                                      preserved_counts& counts);
+
+}  // namespace detail
 
 }  // namespace sirius::transparent
