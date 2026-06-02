@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <op/scan/post_convert_fn.hpp>
+
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table.hpp>
 
@@ -31,14 +33,11 @@
 
 namespace sirius::op::scan {
 
-// Forward-declare the post_convert_fn_t so we don't pull in the full
-// host_parquet_representation header in every translation unit.
-// The actual definition lives in data/host_parquet_representation.hpp.
-using post_convert_fn_t =
-  std::function<std::unique_ptr<cudf::table>(std::unique_ptr<cudf::table>,
-                                             std::string const& data_file_path,
-                                             int64_t first_row_offset,
-                                             rmm::cuda_stream_view)>;
+/// Legacy alias.  Kept during Phase 1 of the scan-executor removal so legacy
+/// callers (parquet_scan_task, iceberg_scan_task) keep compiling while the new
+/// GPU scan path adopts the new name.  Phase 2 deletes the legacy callers and
+/// this alias goes with them.
+using post_convert_fn_t = scan_post_decode_hook_t;
 
 //===----------------------------------------------------------------------===//
 // Abstract delete filter interface

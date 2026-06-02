@@ -21,6 +21,7 @@
 #include <expression_executor/gpu_expression_translator_internal.hpp>
 #include <io/io_context.hpp>
 #include <io/types.hpp>
+#include <op/scan/post_convert_fn.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/sirius_physical_operator.hpp>
 
@@ -191,6 +192,11 @@ class parquet_scan_data : public op::operator_data {
   /// order. Empty when the table has no hive partitions. assemble_scan_output consumes this
   /// directly instead of re-parsing a file path at execute time.
   std::vector<std::string> partition_values;
+  /// Optional post-decode hook applied to the freshly read cudf::table before
+  /// assemble_scan_output reshapes it.  Iceberg's split provider installs a
+  /// delete-filter pipeline here; parquet/S3 leave it null and the operator
+  /// skips the call.
+  scan_post_decode_hook_t post_decode_hook;
   /// GPU memory space for allocating output tables produced by execute().
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
 };

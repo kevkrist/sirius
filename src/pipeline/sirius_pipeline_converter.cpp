@@ -24,6 +24,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_scan_info.hpp"
+#include "op/scan/iceberg_scan_info.hpp"
 #include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/sirius_gpu_duckdb_native_scan_operator.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
@@ -368,43 +369,103 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   inserted_operators_.push_back(std::move(gpu_scan_op));
 }
 
+namespace {
+
+/// Resolve the Iceberg table path from a scan operator.  Mirrors
+/// @c sirius_engine::resolve_iceberg_table_path (which is the writer for
+/// @c sirius_engine::iceberg_delete_data_cache_): file-based scans put the
+/// path in @c parameters[0]; REST catalog scans leave @c parameters empty
+/// and the table root is derived from the first data file by stripping
+/// @c /data/<filename>.
+std::string resolve_iceberg_table_path(op::sirius_physical_table_scan const& scan_op)
+{
+  if (!scan_op.parameters.empty()) { return scan_op.parameters[0].ToString(); }
+  if (scan_op.bind_data) {
+    auto& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+    if (bind_data.file_list && !bind_data.file_list->IsEmpty()) {
+      auto files = bind_data.file_list->GetAllFiles();
+      if (!files.empty()) {
+        auto const& first_path = files[0].path;
+        auto data_pos          = first_path.rfind("/data/");
+        if (data_pos != std::string::npos) { return first_path.substr(0, data_pos); }
+      }
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
+void sirius_pipeline_converter::insert_iceberg_scan_operator(
+  duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
+{
+  auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
+  if (!scan_op.bind_data) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::insert_iceberg_scan_operator] iceberg_scan has no bind_data");
+  }
+  auto const& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
+  if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::insert_iceberg_scan_operator] iceberg_scan has no input files");
+  }
+
+  auto scan_info            = std::make_unique<op::scan::iceberg_scan_info>();
+  scan_info->returned_types = scan_op.returned_types;
+  scan_info->column_ids     = scan_op.column_ids;
+  scan_info->projection_ids = scan_op.projection_ids;
+  scan_info->names          = scan_op.names;
+  scan_info->table_filters  = std::move(scan_op.table_filters);
+
+  std::vector<std::string> file_paths;
+  for (auto const& file : bind_data.file_list->GetAllFiles()) {
+    file_paths.push_back(file.path);
+  }
+  scan_info->file_paths        = std::move(file_paths);
+  scan_info->partition_indices = bind_data.reader_bind.hive_partitioning_indexes;
+  scan_info->scan_output_arity      = scan_op.types.size();
+  scan_info->approximate_batch_size = op_params_.scan_task_batch_size;
+
+  // Pull delete metadata from the engine-level cache (populated once by
+  // sirius_engine::prefetch_iceberg_delete_data).  When the cache lookup
+  // misses (no cache wired, or table is V1), delete_data stays null and the
+  // iceberg_split_provider behaves as a plain parquet scan.
+  if (iceberg_cache_ != nullptr) {
+    auto const table_path = resolve_iceberg_table_path(scan_op);
+    if (!table_path.empty()) {
+      auto it = iceberg_cache_->find(table_path);
+      if (it != iceberg_cache_->end()) { scan_info->delete_data = it->second; }
+    }
+  }
+
+  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_parquet_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
+  auto* gpu_scan_ptr = gpu_scan_op.get();
+  current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
+  inserted_operators_.push_back(std::move(gpu_scan_op));
+}
+
 void sirius_pipeline_converter::split_table_scan_source(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
 {
   if (current_pipeline->source->type != op::SiriusPhysicalOperatorType::TABLE_SCAN) { return; }
 
-  auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
-  // If parquet scan, route to metadata scan + gpu scan operator pipeline
-  if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet" ||
-      scan_op.function.name == "sirius_read_parquet") {
+  auto& scan_op    = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
+  auto const& name = scan_op.function.name;
+
+  if (name == "parquet_scan" || name == "read_parquet" || name == "sirius_read_parquet") {
     insert_parquet_scan_operator(current_pipeline);
     return;
   }
-
-  if (scan_op.function.name == "seq_scan" && op_params_.enable_gpu_duckdb_native_scan) {
+  if (name == "seq_scan") {
     insert_duckdb_native_scan_operator(current_pipeline);
     return;
   }
-
-  if (scan_op.function.name == "seq_scan" || scan_op.function.name == "iceberg_scan") {
-    auto new_pipeline = duckdb::make_shared_ptr<sirius_pipeline>(build_ctx_);
-
-    auto new_scan_op = construct_sirius_specific_operator(scan_op, iceberg_cache_);
-    // todo(bobbi) currently this can be set to any operator since it's never used, and now we
-    // set it to scan_op
-    new_pipeline->source = nullptr;
-    new_pipeline->sink   = new_scan_op.get();
-
-    current_pipeline->source = new_scan_op.get();
-    // move scan_op to current_pipeline.operator[0], current_pipeline.operator[0] to
-    // current_pipeline.operator[1], ...
-    current_pipeline->operators.insert(current_pipeline->operators.begin(), scan_op);
-
-    scheduled_.push_back(new_pipeline);
-    inserted_operators_.push_back(std::move(new_scan_op));
-  } else {
-    throw std::runtime_error("Unsupported scan function: " + scan_op.function.name);
+  if (name == "iceberg_scan") {
+    insert_iceberg_scan_operator(current_pipeline);
+    return;
   }
+  throw std::runtime_error("Unsupported scan function: " + name);
 }
 
 void sirius_pipeline_converter::split_cpu_source(

@@ -244,6 +244,38 @@ std::unique_ptr<cudf::table> sirius_gpu_parquet_scan_operator::read_table_from_m
       "[sirius_gpu_parquet_scan_operator] Applied duckdb filter expression post parquet scan.");
   }
 
+  // Optional post-decode hook (iceberg delete-filter pipeline).  Runs against
+  // the reader's pre-assembly layout so the hook's column indices (e.g.
+  // equality-delete keys force-projected as trailing columns) line up with the
+  // cudf table.  Hooks deliver rows in the same layout they received;
+  // assemble_scan_output below then drops trailing pure-filter / extra
+  // columns.  The data file path and the row offset of this batch within that
+  // file come from the first slice; iceberg's split provider forces one file
+  // per parquet_scan_data so the first slice's file_path is the data file
+  // every row in this batch came from.
+  if (scan_data.post_decode_hook) {
+    std::string data_path;
+    int64_t first_row = 0;
+    if (!scan_data.rg_slices.empty()) {
+      auto const& slice = scan_data.rg_slices.front();
+      data_path         = slice.file_path;
+      if (slice.file_metadata && !slice.row_group_indices.empty()) {
+        auto const rg_first = static_cast<std::size_t>(slice.row_group_indices.front());
+        for (std::size_t i = 0; i < rg_first; ++i) {
+          first_row += slice.file_metadata->row_groups[i].num_rows;
+        }
+      }
+    }
+    auto input_table = std::move(table);
+    table =
+      scan_data.post_decode_hook(std::move(input_table), data_path, first_row, stream);
+    SIRIUS_LOG_DEBUG(
+      "[sirius_gpu_parquet_scan_operator] Applied post-decode hook: file='{}' first_row={} -> {} rows",
+      data_path,
+      first_row,
+      table->num_rows());
+  }
+
   // Reshape the reader's output to the scan_plan's D-order layout: reorder data
   // columns, drop pure-filter columns, inject hive-partition columns. Skipped
   // when the scan is a trivial identity (no partitions, 1:1 data layout) or a

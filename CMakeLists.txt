@@ -204,6 +204,7 @@ set(EXTENSION_SOURCES
     src/op/scan/positional_delete_filter.cpp
     src/op/scan/puffin_reader.cpp
     src/op/scan/duckdb_native_scan_info.cpp
+    src/op/scan/iceberg_scan_info.cpp
     src/op/scan/parquet_scan_info.cpp
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/parquet_schema_mapping.cpp
@@ -272,6 +273,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_top_n.cpp
     src/scan_manager/cached_split_provider.cpp
     src/scan_manager/duckdb_native_split_provider.cpp
+    src/scan_manager/iceberg_split_provider.cpp
     src/pin_table.cpp
     src/scan_manager/parquet_split_provider.cpp
     src/scan_manager/sirius_scan_manager.cpp
