@@ -240,8 +240,6 @@ parquet_split_provider::next_split_provider()
 void parquet_split_provider::run_batch(file_batch const& batch,
                                        std::vector<std::unique_ptr<op::operator_data>>& out)
 {
-  auto stream = cudf::get_default_stream();
-
   //===----------Build reader options----------===//
   auto const data_column_names = _plan->data_column_names();
   auto reader_options          = std::make_shared<cudf::io::parquet_reader_options>(
@@ -272,94 +270,69 @@ void parquet_split_provider::run_batch(file_batch const& batch,
   }
   auto const planning_ioctx_it = _gpu_ioctxs.begin();
 
-  // Translate the filter to a cudf AST for reader-side pushdown, falling back to a post-read
-  // DuckDB-expression evaluation when translation isn't possible. Partition-column filters
-  // have already been dropped at construction; anything remaining references data columns.
+  // FLBA-decimal guard for the OPERATOR's read-time filter. cudf's reader filter (applied per task
+  // in sirius_gpu_parquet_scan_operator) throws "Invalid type and stats combination" on decimal
+  // statistics stored in physical type FIXED_LEN_BYTE_ARRAY / BYTE_ARRAY — which TPC-H generators
+  // like tpchgen-rs emit at SF1000. When a file in this batch has such a column, the operator must
+  // skip its set_filter and evaluate the predicate post-decode; this flag is propagated to each
+  // parquet_scan_data so it does.
   //
-  // Pushdown safety guard: cudf's row-group stats filter (stats_filter_helpers.hpp:132)
-  // throws "Invalid type and stats combination" when comparing a `fixed_point_scalar` AST
-  // literal against parquet stats stored in physical type FIXED_LEN_BYTE_ARRAY (or
-  // BYTE_ARRAY) — which TPC-H generators like tpchgen-rs emit at SF1000. INT32/INT64
-  // decimal stats compare fine. If any file in this batch stores a decimal column with
-  // FLBA/BYTE_ARRAY, we skip pushdown for row-group pruning; the filter still applies
-  // post-decode in the operator's scan path (sirius_gpu_parquet_scan_operator.cpp:197).
-  std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
-  // Propagated to each parquet_scan_data so the operator also skips its own set_filter
-  // call (otherwise the same cudf crash happens at scan time instead of pruning time).
+  // Row-group pruning no longer needs a cudf AST at this planning stage: it runs on the host from
+  // parquet footer statistics (prune_row_groups_by_stats below), which decodes or conservatively
+  // skips such decimals on the host. The predicate is therefore translated to a cudf AST only
+  // per-task inside the operator — never pushed into this metadata scan stage.
   bool skip_pushdown_due_to_flba = false;
   if (_duckdb_filter_expression) {
-    // Resolver maps the BoundReferenceExpression's batch position (D) to the corresponding
-    // parquet column name. scan_plan::batch_column_name is the single source of truth for
-    // this D→name mapping.
-    auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
-      return _plan->batch_column_name(ref_index);
-    };
-    gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
-    ast_expression = sirius::op::translate_duckdb_expression_with_names(
-      translator, *_duckdb_filter_expression, name_resolver);
-    if (ast_expression) {
-      // Probe the first file's schema before committing to filter pushdown. The probe
-      // result is reused below by the main file loop via the prefetch cache.
-      //
-      // The probe requires a gpu_ioctx (planning_ioctx_it). When gpu_ioctxs is empty
-      // (scan_manager-only path) we cannot probe cheaply, so we default to skipping
-      // pushdown — correctness over the row-group-pruning perf win.
-      if (planning_ioctx_it == _gpu_ioctxs.end()) {
-        skip_pushdown_due_to_flba = true;
-      } else if (!batch.file_paths.empty()) {
-        auto const& probe_path = batch.file_paths.front();
-        try {
-          auto probe_io_object = planning_ioctx_it->second->create_io_object(probe_path);
-          auto probe_ds        = planning_ioctx_it->second->make_datasource(probe_io_object);
-          std::shared_ptr<cudf::io::parquet::FileMetaData const> probe_meta;
-          if (planning_ioctx_it->second->cache() != nullptr) {
-            if (auto cached = planning_ioctx_it->second->cache()->get_metadata(*probe_io_object)) {
-              if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(cached)) {
-                probe_meta = pm->file_metadata();
-              }
+    // Probe the first file's schema for FLBA/BYTE_ARRAY decimal columns. The probe requires a
+    // gpu_ioctx (planning_ioctx_it); when gpu_ioctxs is empty (scan_manager-only path) we cannot
+    // probe cheaply, so we default to skipping reader-side pushdown — correctness over the perf win.
+    if (planning_ioctx_it == _gpu_ioctxs.end()) {
+      skip_pushdown_due_to_flba = true;
+    } else if (!batch.file_paths.empty()) {
+      auto const& probe_path = batch.file_paths.front();
+      try {
+        auto probe_io_object = planning_ioctx_it->second->create_io_object(probe_path);
+        auto probe_ds        = planning_ioctx_it->second->make_datasource(probe_io_object);
+        std::shared_ptr<cudf::io::parquet::FileMetaData const> probe_meta;
+        if (planning_ioctx_it->second->cache() != nullptr) {
+          if (auto cached = planning_ioctx_it->second->cache()->get_metadata(*probe_io_object)) {
+            if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(cached)) {
+              probe_meta = pm->file_metadata();
             }
           }
-          if (!probe_meta) {
-            auto footer = cudf::io::parquet::fetch_footer_to_host(*probe_ds);
-            op::scan::hybrid_scan_reader probe_reader(
-              cudf::host_span<uint8_t const>(footer->data(), footer->size()), *reader_options);
-            probe_meta = std::make_shared<cudf::io::parquet::FileMetaData const>(
-              probe_reader.parquet_metadata());
-          }
-          for (auto const& elem : probe_meta->schema) {
-            bool const is_decimal =
-              (elem.converted_type.has_value() &&
-               *elem.converted_type == cudf::io::parquet::ConvertedType::DECIMAL) ||
-              (elem.logical_type.has_value() &&
-               elem.logical_type->type == cudf::io::parquet::LogicalType::DECIMAL);
-            if (!is_decimal) { continue; }
-            if (elem.type == cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY ||
-                elem.type == cudf::io::parquet::Type::BYTE_ARRAY) {
-              skip_pushdown_due_to_flba = true;
-              break;
-            }
-          }
-        } catch (std::exception const& e) {
-          SIRIUS_LOG_DEBUG(
-            "[parquet_split_provider] FLBA-decimal probe failed ({}); proceeding without "
-            "pushdown",
-            e.what());
-          skip_pushdown_due_to_flba = true;
         }
-      }
-
-      if (!skip_pushdown_due_to_flba) {
-        reader_options->set_filter(ast_expression->back());
+        if (!probe_meta) {
+          auto footer = cudf::io::parquet::fetch_footer_to_host(*probe_ds);
+          op::scan::hybrid_scan_reader probe_reader(
+            cudf::host_span<uint8_t const>(footer->data(), footer->size()), *reader_options);
+          probe_meta = std::make_shared<cudf::io::parquet::FileMetaData const>(
+            probe_reader.parquet_metadata());
+        }
+        for (auto const& elem : probe_meta->schema) {
+          bool const is_decimal =
+            (elem.converted_type.has_value() &&
+             *elem.converted_type == cudf::io::parquet::ConvertedType::DECIMAL) ||
+            (elem.logical_type.has_value() &&
+             elem.logical_type->type == cudf::io::parquet::LogicalType::DECIMAL);
+          if (!is_decimal) { continue; }
+          if (elem.type == cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY ||
+              elem.type == cudf::io::parquet::Type::BYTE_ARRAY) {
+            skip_pushdown_due_to_flba = true;
+            break;
+          }
+        }
+      } catch (std::exception const& e) {
         SIRIUS_LOG_DEBUG(
-          "[parquet_split_provider] Translated filter expression for row group pruning.");
-      } else {
-        SIRIUS_LOG_DEBUG(
-          "[parquet_split_provider] Skipping row-group pruning pushdown: file has "
-          "FIXED_LEN_BYTE_ARRAY/BYTE_ARRAY decimal column(s) which cudf's stats filter does "
-          "not support. Filter will still apply post-decode in the scan operator.");
+          "[parquet_split_provider] FLBA-decimal probe failed ({}); operator will apply the "
+          "filter post-decode",
+          e.what());
+        skip_pushdown_due_to_flba = true;
       }
-    } else {
-      SIRIUS_LOG_DEBUG("[parquet_split_provider] AST translation failed for row group pruning.");
+    }
+    if (skip_pushdown_due_to_flba) {
+      SIRIUS_LOG_DEBUG(
+        "[parquet_split_provider] FIXED_LEN_BYTE_ARRAY/BYTE_ARRAY decimal column(s) present; the "
+        "scan operator will apply the filter post-decode instead of via cudf reader pushdown.");
     }
   }
 
