@@ -213,6 +213,7 @@ set(EXTENSION_SOURCES
     src/op/scan/parquet_scan_task.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/prefetched_data_source.cpp
+    src/op/scan/row_group_stats_pruner.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_utils.cpp
     src/op/scan/sirius_gpu_duckdb_native_scan_operator.cpp
@@ -532,6 +533,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_split_provider.cpp
     test/cpp/scan/test_parquet_split_provider_s3.cpp
     test/cpp/scan/test_partition_inject.cpp
+    test/cpp/scan/test_row_group_stats_pruner.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
     test/cpp/scan_manager/test_sirius_scan_manager_s3.cpp

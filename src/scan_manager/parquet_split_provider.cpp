@@ -20,8 +20,10 @@
 #include "io/io_context.hpp"
 #include "io/prefetching_cache.hpp"
 #include "log/logging.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/scan/parquet_scan_operator_data.hpp"
 #include "op/scan/parquet_schema_mapping.hpp"
+#include "op/scan/row_group_stats_pruner.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "scan_manager/parquet_metadata.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -176,6 +178,27 @@ parquet_split_provider::parquet_split_provider(
                                               _plan->batch_position_by_column_id,
                                               _plan->partition_primary_indices);
     if (duckdb_expression) { _duckdb_filter_expression = std::move(duckdb_expression); }
+
+    // Pre-compute the per-column conjuncts used for host-side row-group pruning, mirroring exactly
+    // the column set that convert_table_filters_to_expression() pushes down (same OPTIONAL /
+    // IS_NOT_NULL / hive-partition / non-projected skips). Building this here — where column_ids,
+    // returned_types and _plan are all in scope — keeps run_batch's pruning a pure host operation
+    // over parquet footer stats with no cuDF AST. The borrowed TableFilter pointers stay valid
+    // because the owning TableFilterSet is retained in _table_filter_set below.
+    for (auto const& [column_index, filter] : table_filter_set->filters) {
+      if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
+          filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
+        continue;
+      }
+      auto const primary_idx = column_ids.at(column_index).GetPrimaryIndex();
+      if (_plan->partition_primary_indices.count(primary_idx)) { continue; }
+      auto const& batch_pos = _plan->batch_position_by_column_id[column_index];
+      if (!batch_pos.has_value()) { continue; }
+      _prune_filters.push_back({_plan->batch_column_name(*batch_pos),
+                                sirius::to_duckdb(returned_types.at(primary_idx)),
+                                filter.get()});
+    }
+    _table_filter_set = std::move(table_filter_set);
   }
 
   // Pre-decompose the file list into per-task batches once; next_split_provider() iterates this
@@ -506,27 +529,23 @@ void parquet_split_provider::run_batch(file_batch const& batch,
 
     //===----------Row Group Partitioning----------===//
     auto row_group_indices = reader.all_row_groups(*reader_options);
-    // Row group pruning with filter pushdown using metadata statistics.
-    // Also skipped when the FLBA-decimal probe disabled pushdown — in that case
-    // reader_options has no filter set and filter_row_groups_with_stats would
-    // throw "Empty input filter expression encountered" (hybrid_scan_impl.cpp:217).
-    if (ast_expression && !skip_pushdown_due_to_flba) {
+    // Host-side row-group pruning by parquet column-chunk min/max statistics, evaluated with
+    // DuckDB's TableFilter::CheckStatistics (see op::scan::prune_row_groups_by_stats). Replaces
+    // cuDF's GPU filter_row_groups_with_stats: no cuDF AST is needed at this metadata/planning
+    // stage and no GPU kernel is launched, and it safely prunes decimal columns the GPU stats
+    // filter rejected (so the FLBA workaround no longer gates pruning — it now only governs the
+    // operator's read-time set_filter). Conservative: never drops a row group that could match.
+    if (!_prune_filters.empty()) {
       auto const row_groups_before_pruning = row_group_indices.size();
-      // clang-format off
-      SIRIUS_LOG_DEBUG("[parquet_split_provider] Row group pruning: file: {}\n" \
-                       "                                                  before: {}",
-                       file_path,
-                       row_groups_before_pruning);
-      // clang-format on
-      // Prune row groups with filter pushdown using metadata statistics.
       row_group_indices =
-        reader.filter_row_groups_with_stats(row_group_indices, *reader_options, stream);
-      auto const row_groups_after_pruning = row_group_indices.size();
-      auto const pruned_row_groups        = row_groups_before_pruning - row_groups_after_pruning;
+        op::scan::prune_row_groups_by_stats(metadata, row_group_indices, _prune_filters);
       // clang-format off
-      SIRIUS_LOG_DEBUG("[parquet_split_provider]                     after: {} (pruned {})",
-                       row_groups_after_pruning,
-                       pruned_row_groups);
+      SIRIUS_LOG_DEBUG("[parquet_split_provider] Row group pruning (host stats): file: {}\n" \
+                       "                                                  before: {} after: {} (pruned {})",
+                       file_path,
+                       row_groups_before_pruning,
+                       row_group_indices.size(),
+                       row_groups_before_pruning - row_group_indices.size());
       // clang-format on
     }
 

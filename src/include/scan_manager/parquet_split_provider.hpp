@@ -17,6 +17,7 @@
 #pragma once
 
 #include "helper/logical_type.hpp"
+#include "op/scan/row_group_stats_pruner.hpp"
 #include "op/scan/scan_plan.hpp"
 #include "scan_manager/split_provider.hpp"
 #include "sirius_config.hpp"
@@ -212,6 +213,13 @@ class parquet_split_provider : public split_provider {
   /// The coalesced DuckDB filter expression (AST translation attempted in run_batch()).
   /// Empty when no filters were translatable (after skipping partition-column filters).
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
+  /// Original DuckDB filters, retained for the lifetime of the provider so the borrowed
+  /// @c TableFilter pointers inside @c _prune_filters stay valid. Empty when the scan is unfiltered.
+  duckdb::unique_ptr<duckdb::TableFilterSet> _table_filter_set;
+  /// Per-column conjuncts for host-side row-group pruning by min/max statistics
+  /// (see @c op::scan::prune_row_groups_by_stats). Built once at construction from
+  /// @c _table_filter_set, mirroring the column set of @c _duckdb_filter_expression.
+  std::vector<op::scan::stats_prune_filter> _prune_filters;
 
   std::size_t _approximate_batch_size;
   std::size_t _max_file_processed;
