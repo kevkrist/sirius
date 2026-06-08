@@ -43,17 +43,20 @@ using cudf::io::parquet::FileMetaData;
 using cudf::io::parquet::Type;
 using stat_bytes = std::vector<uint8_t>;
 
-// Parquet fixed-width statistics are stored little-endian; Sirius targets little-endian hosts
-// (x86_64), so a raw copy reproduces the value. (Mirrors DuckDB's `Load<T>` in
-// extension/parquet/parquet_statistics.cpp.)
-static_assert(std::endian::native == std::endian::little,
-              "row_group_stats_pruner assumes a little-endian host for parquet stat decoding");
-
+// Decode a fixed-width parquet statistic, which is stored little-endian regardless of host. On a
+// little-endian host (x86_64 and aarch64 — Sirius's build targets) the memcpy reproduces the value
+// directly and the byte-reverse compiles away; on a big-endian host the bytes are reversed so the
+// value is still correct. (Mirrors DuckDB's `Load<T>` in extension/parquet/parquet_statistics.cpp,
+// made endianness-explicit.)
 template <typename T>
 [[nodiscard]] T load_le(stat_bytes const& bytes)
 {
   T value{};
   std::memcpy(&value, bytes.data(), sizeof(T));
+  if constexpr (std::endian::native != std::endian::little) {
+    auto* const first = reinterpret_cast<std::byte*>(&value);
+    std::reverse(first, first + sizeof(T));
+  }
   return value;
 }
 
