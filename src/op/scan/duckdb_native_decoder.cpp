@@ -994,8 +994,11 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
     auto compacted_cols                 = compacted->release();
     auto const num_selected             = static_cast<uint32_t>(compacted_cols[0]->size());
     auto const* d_sel                   = compacted_cols[0]->view().data<std::int32_t>();
+    // d_sel is null when num_selected == 0 (zero-row compacted index column);
+    // `active=true` still applies the (empty) selection so the varchar columns
+    // come out empty instead of decoding every row.
     ::sirius::cuda::scan::string_decode_selection selection{
-      reinterpret_cast<uint32_t const*>(d_sel), num_selected};
+      reinterpret_cast<uint32_t const*>(d_sel), num_selected, /*active=*/true};
 
     std::vector<std::unique_ptr<cudf::column>> final_cols(num_cols);
     // compacted_cols layout: [0] = selection vector (dropped), then fixed-width

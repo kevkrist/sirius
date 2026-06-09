@@ -194,6 +194,10 @@ class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
   /// `late_materialize_native_strings` config, a translatable filter touching
   /// only fixed-width columns, and at least one projected varchar column.
   bool _late_materialize_active = false;
+  /// Minimum split row count for late-mat to engage (operator_params
+  /// late_materialize_min_rows, snapshotted at construction). Splits below this
+  /// fall back to eager decode-then-filter even when _late_materialize_active.
+  std::size_t _late_materialize_min_rows = 0;
 
   std::vector<row_group_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};

@@ -1487,6 +1487,15 @@ static void SetLateMaterializeNativeStrings(ClientContext& context, SetScope sco
                    params->late_materialize_native_strings);
 }
 
+static void SetLateMaterializeMinRows(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->late_materialize_min_rows = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config LATE_MATERIALIZE_MIN_ROWS to {}",
+                   params->late_materialize_min_rows);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1678,6 +1687,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.late_materialize_native_strings),
     SetLateMaterializeNativeStrings);
+
+  config.AddExtensionOption(
+    "late_materialize_min_rows",
+    "Minimum scan-split row count for late materialization to engage; smaller splits fall back "
+    "to eager decode-then-filter (late-mat's fixed per-split overhead does not pay off on small "
+    "splits). Only consulted when late_materialize_native_strings is on.",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(sirius::operator_params{}.late_materialize_min_rows),
+    SetLateMaterializeMinRows);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

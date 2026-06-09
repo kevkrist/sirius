@@ -39,6 +39,12 @@ constexpr uint64_t DEFAULT_CONCAT_BATCH_BYTES         = 512ULL * 1024 * 1024;  /
 constexpr uint64_t DEFAULT_SORT_SAMPLE_BYTES          = 512ULL * 1024 * 1024;  // 512 MB
 constexpr uint64_t DEFAULT_MAX_BUILD_HASH_TABLE_BYTES = 500ULL * 1024 * 1024;  // 500 MB
 
+/// Below this many rows in a scan split, late materialization is skipped (eager
+/// decode-then-filter): its fixed per-split overhead (filter mask + boolean
+/// compaction + the mid-decode size sync) outweighs the avoided varchar decode
+/// when the split is small. ~8 default DuckDB row groups.
+constexpr uint64_t DEFAULT_LATE_MATERIALIZE_MIN_ROWS = 1024ULL * 1024;  // 1,048,576 rows
+
 /// Fraction of available GPU memory used per sort partition when max_sort_partition_bytes is 0.
 constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 
@@ -87,6 +93,12 @@ struct operator_params {
   /// is not referenced by the filter. On by default; SET to false for the
   /// eager-decode-then-filter baseline. See docs/super-sirius/scan.md.
   bool late_materialize_native_strings = true;
+
+  /// Minimum scan-split row count for late materialization to engage. Splits
+  /// smaller than this fall back to eager decode-then-filter: late-mat's fixed
+  /// per-split overhead does not pay off when the avoided varchar decode is
+  /// small. Only consulted when late_materialize_native_strings is on.
+  uint64_t late_materialize_min_rows = config::DEFAULT_LATE_MATERIALIZE_MIN_ROWS;
 };
 
 struct telemetry_config {

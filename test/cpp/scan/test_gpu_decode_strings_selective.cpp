@@ -117,7 +117,8 @@ void check_codec(CompressionType codec, uint8_t dict_fsst_mode = 1, bool unique_
                   << " stride=" << stride << " selected=" << sel.size());
     auto d_sel = upload(sel, stream.view());
     string_decode_selection selection{static_cast<uint32_t const*>(d_sel.data()),
-                                       static_cast<uint32_t>(sel.size())};
+                                       static_cast<uint32_t>(sel.size()),
+                                       /*active=*/true};
     auto sel_col  = gpu_decode_strings_column(built.col, stream.view(), mr, selection);
     auto sel_host = to_host_strings(*sel_col, stream.view());
 
@@ -127,13 +128,13 @@ void check_codec(CompressionType codec, uint8_t dict_fsst_mode = 1, bool unique_
     }
   }
 
-  // Empty selection (0 survivors) => empty column. The buffer has capacity (as
-  // it would in the scan path, where d_sel is sized from the row count) so the
-  // pointer is non-null; num_selected == 0 drives the empty result.
+  // Empty selection (0 survivors) => empty column. This mirrors the scan path
+  // exactly: when nothing survives the filter, the compacted index column has
+  // zero rows and its device pointer is NULL, so d_sel is null while the
+  // selection is still active. `active=true` (not the pointer) must drive the
+  // empty result without dereferencing d_sel.
   {
-    std::vector<uint32_t> cap_buf(1, 0u);  // capacity-only, no rows selected
-    auto d_sel = upload(cap_buf, stream.view());
-    string_decode_selection selection{static_cast<uint32_t const*>(d_sel.data()), 0u};
+    string_decode_selection selection{/*d_sel=*/nullptr, /*num_selected=*/0u, /*active=*/true};
     auto sel_col = gpu_decode_strings_column(built.col, stream.view(), mr, selection);
     REQUIRE(sel_col->size() == 0);
   }

@@ -130,6 +130,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("max_build_hash_table_bytes", yaml::bytes(opt.max_build_hash_table_bytes));
   r.optional("enable_gpu_duckdb_native_scan", opt.enable_gpu_duckdb_native_scan);
   r.optional("late_materialize_native_strings", opt.late_materialize_native_strings);
+  r.optional("late_materialize_min_rows", opt.late_materialize_min_rows);
   r.reject_unknown();
 }
 

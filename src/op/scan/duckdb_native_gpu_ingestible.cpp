@@ -292,7 +292,10 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
     bool lm_enabled = false;
     if (auto sirius_ctx =
           bind.context->registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
-      lm_enabled = sirius_ctx->get_config().get_operator_params().late_materialize_native_strings;
+      auto const& op_params = sirius_ctx->get_config().get_operator_params();
+      lm_enabled            = op_params.late_materialize_native_strings;
+      _late_materialize_min_rows =
+        static_cast<std::size_t>(op_params.late_materialize_min_rows);
     }
     if (lm_enabled && _filter_expression) {
       _fw_filter_ast           = build_fixed_width_filter_ast(bind, source_ids, emission_order_map);
@@ -336,14 +339,10 @@ duckdb_native_gpu_ingestible::next_split_provider()
   if (idx >= _batches.size()) { return {}; }
   row_group_batch claimed = _batches[idx];
 
-  // When late materialization is active the decoder applies the row filter
-  // inline during decode, so the post-decode step only projects (if needed).
-  bool const apply_filter        = static_cast<bool>(_filter_expression) && !_late_materialize_active;
-  bool const has_post_processing = apply_filter || _projection_required;
   std::size_t const output_arity = _output_arity;
   bool const projection_required = _projection_required;
 
-  return [this, claimed, apply_filter, projection_required, output_arity, has_post_processing]()
+  return [this, claimed, projection_required, output_arity]()
            -> std::vector<std::unique_ptr<op::operator_data>> {
     auto split_info = std::make_unique<duckdb_native_split_info>();
     split_info->payload.table_info =
@@ -351,9 +350,25 @@ duckdb_native_gpu_ingestible::next_split_provider()
     split_info->payload.io_ctx       = _io_ctx;
     split_info->payload.db_io_object = _db_io_object;
     split_info->payload.row_groups.reserve(claimed.count);
+    std::size_t split_rows = 0;
     for (std::size_t i = claimed.first_idx; i < claimed.first_idx + claimed.count; ++i) {
+      split_rows += _metadata.row_groups[i].row_count;
       split_info->payload.row_groups.push_back(std::move(_metadata.row_groups[i]));
     }
+
+    // Per-split late-mat gate: engage only when the query is viable AND this
+    // split is large enough to amortize late-mat's fixed per-split overhead
+    // (filter mask + boolean compaction + the mid-decode size sync). Small
+    // splits fall back to eager decode-then-filter. Decided here so filter_state
+    // (materialize_table) and apply_filter (below) stay in lockstep per split.
+    bool const split_late_mat =
+      _late_materialize_active && split_rows >= _late_materialize_min_rows;
+    split_info->payload.late_materialize = split_late_mat;
+
+    // When late materialization is active the decoder applies the row filter
+    // inline during decode, so the post-decode step only projects (if needed).
+    bool const apply_filter        = static_cast<bool>(_filter_expression) && !split_late_mat;
+    bool const has_post_processing = apply_filter || projection_required;
 
     std::unique_ptr<io::post_filter_and_projection_info> filter_info;
     if (has_post_processing) {
@@ -392,7 +407,7 @@ io::filtered_table duckdb_native_gpu_ingestible::materialize_table(
   // _fw_filter_ast is read-only and shared; each call builds its own executor.
   late_materialization_plan lm;
   late_materialization_plan const* lm_ptr = nullptr;
-  if (_late_materialize_active) {
+  if (split.payload.late_materialize) {
     rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
     lm.evaluate_mask =
       [this, mr_ref, stream](cudf::table_view fw_view) -> std::unique_ptr<cudf::column> {
@@ -410,12 +425,12 @@ io::filtered_table duckdb_native_gpu_ingestible::materialize_table(
     split.payload.row_groups.size(),
     table->num_rows(),
     table->num_columns(),
-    _late_materialize_active);
+    split.payload.late_materialize);
   // Eager path leaves both filter + projection to post_filter_and_project
   // (UNFILTERED). Late-mat applies the row filter inline but not the projection,
   // so the post step still runs to drop trailing filter-only columns.
   auto const state =
-    _late_materialize_active ? io::filter_state::ROW_FILTERED : io::filter_state::UNFILTERED;
+    split.payload.late_materialize ? io::filter_state::ROW_FILTERED : io::filter_state::UNFILTERED;
   return io::filtered_table{std::move(table), state};
 }
 

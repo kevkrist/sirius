@@ -80,11 +80,19 @@ struct gpu_string_column_decode_input {
 /// the (non-filter) string columns straight into compacted form, skipping the
 /// decode + gather work for filtered-out rows.
 ///
-/// When `d_sel == nullptr` the call decodes all `col.total_rows` rows exactly
+/// When `active == false` the call decodes all `col.total_rows` rows exactly
 /// as before (identity selection); this is the default.
+///
+/// `active` — not `d_sel != nullptr` — gates the selection, because an empty
+/// selection (num_selected == 0, nothing survived the filter) legitimately
+/// carries a null `d_sel`: the scan derives `d_sel` from a compacted index
+/// column whose device pointer is null when it has zero rows. Inferring
+/// activeness from the pointer would alias that empty-but-active case onto the
+/// decode-all default and wrongly materialize every row.
 struct string_decode_selection {
   uint32_t const* d_sel  = nullptr;  ///< device: sorted selected global row indices
   uint32_t num_selected  = 0;        ///< length of d_sel == output row count
+  bool active            = false;    ///< true => apply the selection (even if empty)
 };
 
 /// Decode one varchar column to a cudf strings column. Async modulo at most

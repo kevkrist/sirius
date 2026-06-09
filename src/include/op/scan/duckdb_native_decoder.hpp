@@ -65,6 +65,12 @@ struct duckdb_native_split_payload {
   /// BufferManager).
   std::shared_ptr<sirius::io::sirius_ioctx> io_ctx;
   std::shared_ptr<sirius::io::sirius_io_object> db_io_object;
+  /// Per-split late-materialization decision (query-level viability AND the
+  /// split clears late_materialize_min_rows). Set by next_split_provider;
+  /// materialize_table builds the selection plan and reports
+  /// filter_state::ROW_FILTERED iff this is true, keeping the post-decode filter
+  /// (apply_filter) in lockstep.
+  bool late_materialize = false;
 };
 
 //===----------------------------------------------------------------------===//

@@ -2108,9 +2108,12 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   // of `selection.d_sel` (sorted global row indices), so the output row count,
   // the lengths/offsets arrays, and the chars buffer are all sized to the
   // selected rows only. `out_rows == 0` (nothing survived) is an empty column.
-  bool const sel_active     = selection.d_sel != nullptr;
+  bool const sel_active     = selection.active;
   uint32_t const out_rows   = sel_active ? selection.num_selected : total_rows;
   if (sel_active && out_rows == 0) {
+    // Nothing survived the filter: empty column. d_sel is allowed to be null
+    // here (a zero-row compacted index column), so this must return before any
+    // kernel dereferences it.
     return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
   }
   vector_select const vec_sel{selection.d_sel, selection.num_selected};
@@ -2123,6 +2126,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   prep_dict_fsst.total_predecode_bytes = 0;
   size_t cum_chars_upper               = 0;
   bool needs_exact_total               = false;
+  uint32_t max_seg_max_len             = 0;  // max per-segment string length (selection bound)
   for (auto const& run : col.data) {
     switch (run.codec) {
       case duckdb::CompressionType::COMPRESSION_DICTIONARY: {
@@ -2194,13 +2198,22 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
         continue;
       }
       cum_chars_upper += size_t{seg.row_count} * seg.max_string_length;
+      max_seg_max_len = std::max(max_seg_max_len, seg.max_string_length);
     }
   }
 
-  // The host upper bound is computed over ALL rows; under a selection it would
-  // over-allocate the chars buffer by 1/selectivity, so force the exact-total
-  // read-back (one sync) to size chars to the selected rows.
-  if (sel_active) { needs_exact_total = true; }
+  // The all-rows host upper bound over-allocates the chars buffer by 1/selectivity
+  // under a selection. Rather than force an exact-total read-back (one sync per
+  // varchar column — the dominant per-split overhead on small/low-selectivity
+  // scans), re-bound to the selection: each of the out_rows selected rows is at
+  // most max_seg_max_len chars (its segment's stat, itself <= the column max), so
+  // out_rows * max_seg_max_len bounds the selected total without a sync. This
+  // mirrors the non-selection path's sync-free upper-bound sizing and keeps the
+  // same HOST_UPPER_BOUND_LIMIT guard below. When a segment's length stat is
+  // unknown (needs_exact_total already set), keep the exact-total read-back.
+  if (sel_active && !needs_exact_total) {
+    cum_chars_upper = size_t{out_rows} * max_seg_max_len;
+  }
 
   // Allocate output and intermediate buffers. Lengths/offsets are in OUTPUT
   // (post-selection) row space; comp_offsets stays in full segment-row space

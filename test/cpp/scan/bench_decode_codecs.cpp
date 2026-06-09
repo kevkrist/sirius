@@ -1479,7 +1479,7 @@ void run_selective_bench(char const* label,
     auto d_sel = sirius::test::decode::upload(sel, stream.view());
     cudaStreamSynchronize(stream.value());
     sirius::cuda::scan::string_decode_selection selection{
-      static_cast<uint32_t const*>(d_sel.data()), static_cast<uint32_t>(sel.size())};
+      static_cast<uint32_t const*>(d_sel.data()), static_cast<uint32_t>(sel.size()), /*active=*/true};
     double sel_sec = bench_strings_selective_seconds(stream, built.col, selection, mr);
     std::printf(
       "[bench]   selective keep=%5.1f%% (%8zu rows): %.6fs  %.2fx vs full  "
