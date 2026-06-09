@@ -16,6 +16,7 @@
 
 // sirius
 #include <expression/ast/from_duckdb.hpp>
+#include <expression/ast/node.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <io/io_context.hpp>
 #include <log/logging.hpp>
@@ -24,6 +25,7 @@
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <sirius_context.hpp>
 
 // cudf
 #include <cudf/table/table.hpp>
@@ -35,6 +37,7 @@
 // standard library
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -112,6 +115,100 @@ std::vector<row_group_batch_local> partition_row_groups_into_batches(
   return batches;
 }
 
+//===----------------------------------------------------------------------===//
+// build_fixed_width_filter_ast
+//===----------------------------------------------------------------------===//
+/// Build the late-materialization filter AST, or nullptr when late
+/// materialization is not viable for this query.
+///
+/// The returned AST's bound references are in DENSE FIXED-WIDTH index space:
+/// the projected non-rowid, non-varchar columns, numbered 0,1,2,... in
+/// projected order — exactly the table_view layout the decoder hands to
+/// @ref late_materialization_plan::evaluate_mask. This differs from
+/// @ref _filter_expression, whose references are in full emission order (which
+/// includes the varchar and rowid columns the decoder has not yet built when
+/// the mask is evaluated).
+///
+/// Viability requires: at least one projected varchar column (something to
+/// late-materialize), at least one fixed-width column (a filter to evaluate),
+/// and every pushed-down filter referencing a fixed-width column. The last is
+/// essential for correctness — a filter on a varchar or rowid column has no
+/// fixed-width index, so it would be silently dropped from the fixed-width
+/// expression and the mask would admit rows the query must reject. When any of
+/// these fails (or the translation throws), we return nullptr and the caller
+/// falls back to the eager decode-then-filter path. Late materialization is
+/// strictly an optimization; it never changes results or failure modes.
+///
+/// @p source_ids          column_ids indices in emission order (== decoder
+///                        column order); source_ids[k] is the column emitted at
+///                        position k.
+/// @p emission_order_map  column_ids index -> emission position, parallel to
+///                        the map @ref _filter_expression was built with.
+std::unique_ptr<sirius::ast::node> build_fixed_width_filter_ast(
+  duckdb_native_ingestible_table_info const& bind,
+  duckdb::vector<duckdb::idx_t> const& source_ids,
+  std::vector<std::optional<std::size_t>> const& emission_order_map)
+{
+  if (bind.table_filters == nullptr) { return nullptr; }
+  std::size_t const num_cols = bind.projected_cols.size();
+  // The emission/decoder column order must line up with source_ids for the
+  // dense-fixed-width remap below to be sound; bail if the invariant the eager
+  // filter path relies on does not hold here.
+  if (source_ids.size() != num_cols) { return nullptr; }
+
+  // Dense fixed-width index per emission position (== decoder column index):
+  // the count of non-rowid, non-varchar columns appearing before this one in
+  // projected order, mirroring the decoder's fw_to_final_idx assignment.
+  std::vector<std::optional<std::size_t>> fw_dense_by_emission(num_cols);
+  std::size_t fw_dense = 0;
+  bool any_varchar     = false;
+  for (std::size_t ci = 0; ci < num_cols; ++ci) {
+    bool const is_rowid = bind.projected_cols[ci].is_rowid;
+    bool const is_vc    = bind.projected_types[ci].is_varchar();
+    any_varchar         = any_varchar || is_vc;
+    if (!is_rowid && !is_vc) { fw_dense_by_emission[ci] = fw_dense++; }
+  }
+  bool const any_fixed_width = fw_dense > 0;
+  if (!any_varchar || !any_fixed_width) { return nullptr; }
+
+  // Every translatable filter must reference a fixed-width column. (Mirror the
+  // skip set convert_table_filters_to_expression applies so the two views of
+  // the filter set agree on which filters are live.)
+  for (auto const& [column_index, filter] : bind.table_filters->filters) {
+    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
+        filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
+      continue;
+    }
+    if (column_index >= emission_order_map.size()) { return nullptr; }
+    auto const emission_pos = emission_order_map[column_index];
+    if (!emission_pos.has_value() || !fw_dense_by_emission[*emission_pos].has_value()) {
+      return nullptr;
+    }
+  }
+
+  // Fixed-width-space batch map: column_ids index -> dense fixed-width index.
+  // Filter columns are guaranteed Some by the check above; non-filter columns'
+  // entries are never read by convert_table_filters_to_expression.
+  std::vector<std::optional<std::size_t>> fw_batch_map(bind.column_ids.size());
+  for (std::size_t k = 0; k < source_ids.size(); ++k) {
+    fw_batch_map[source_ids[k]] = fw_dense_by_emission[k];
+  }
+
+  // Translation failures disable late materialization rather than fail the
+  // query: the eager path will surface the same error at filter-eval time.
+  try {
+    auto fw_expr = sirius::op::convert_table_filters_to_expression(
+      *bind.table_filters, bind.column_ids, bind.returned_types, fw_batch_map);
+    if (!fw_expr) { return nullptr; }
+    return sirius::ast::from_duckdb(*fw_expr);
+  } catch (std::exception const& e) {
+    SPDLOG_DEBUG("[duckdb_native_gpu_ingestible] late-mat filter build failed, "
+                 "falling back to eager decode: {}",
+                 e.what());
+    return nullptr;
+  }
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -186,6 +283,25 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
     if (filter_expr_duckdb) {
       _filter_expression = std::shared_ptr<duckdb::Expression>(filter_expr_duckdb.release());
     }
+
+    // Late materialization: when enabled and every filter touches only
+    // fixed-width columns, decode the filter columns first, build the row mask,
+    // and materialize the varchar columns straight into compacted form (see
+    // late_materialization_plan). Decided once here because it is a function of
+    // the (query-constant) projected columns and filter set, not the split.
+    bool lm_enabled = false;
+    if (auto sirius_ctx =
+          bind.context->registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+      lm_enabled = sirius_ctx->get_config().get_operator_params().late_materialize_native_strings;
+    }
+    if (lm_enabled && _filter_expression) {
+      _fw_filter_ast           = build_fixed_width_filter_ast(bind, source_ids, emission_order_map);
+      _late_materialize_active = static_cast<bool>(_fw_filter_ast);
+      if (_late_materialize_active) {
+        SPDLOG_DEBUG("[duckdb_native_gpu_ingestible] late-materializing varchar columns "
+                     "(fixed-width filter pushed into decode)");
+      }
+    }
   }
 
   // Decoder emits one column per source_id; projection-down is needed when
@@ -220,7 +336,9 @@ duckdb_native_gpu_ingestible::next_split_provider()
   if (idx >= _batches.size()) { return {}; }
   row_group_batch claimed = _batches[idx];
 
-  bool const apply_filter        = static_cast<bool>(_filter_expression);
+  // When late materialization is active the decoder applies the row filter
+  // inline during decode, so the post-decode step only projects (if needed).
+  bool const apply_filter        = static_cast<bool>(_filter_expression) && !_late_materialize_active;
   bool const has_post_processing = apply_filter || _projection_required;
   std::size_t const output_arity = _output_arity;
   bool const projection_required = _projection_required;
@@ -267,16 +385,38 @@ io::filtered_table duckdb_native_gpu_ingestible::materialize_table(
   // formality (the ingestible interface preserves immutability conceptually,
   // but the decoder mutates the allocator state on the space).
   auto& mem_space_mut = const_cast<::cucascade::memory::memory_space&>(mem_space);
-  auto table          = decode_duckdb_native_split(split.payload, mem_space_mut, stream);
+
+  // Late-materialization plan: evaluate the fixed-width-space filter against the
+  // decoded fixed-width columns to a BOOL8 keep-mask. The decoder applies this
+  // mask, then decodes the varchar columns straight into compacted form.
+  // _fw_filter_ast is read-only and shared; each call builds its own executor.
+  late_materialization_plan lm;
+  late_materialization_plan const* lm_ptr = nullptr;
+  if (_late_materialize_active) {
+    rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+    lm.evaluate_mask =
+      [this, mr_ref, stream](cudf::table_view fw_view) -> std::unique_ptr<cudf::column> {
+      sirius::gpu_expression_executor exec(_fw_filter_ast.get(), mr_ref, stream);
+      auto mask = exec.execute(fw_view);  // single boolean column, one row per input row
+      return std::move(mask->release()[0]);
+    };
+    lm_ptr = &lm;
+  }
+
+  auto table = decode_duckdb_native_split(split.payload, mem_space_mut, stream, lm_ptr);
   SIRIUS_LOG_DEBUG(
     "[duckdb_native_gpu_ingestible::materialize_table] decoded split: row_groups={} rows={} "
-    "cols={}",
+    "cols={} late_mat={}",
     split.payload.row_groups.size(),
     table->num_rows(),
-    table->num_columns());
-  // duckdb-native applies filter + projection inside post_filter_and_project,
-  // never during materialization — always UNFILTERED here.
-  return io::filtered_table{std::move(table), io::filter_state::UNFILTERED};
+    table->num_columns(),
+    _late_materialize_active);
+  // Eager path leaves both filter + projection to post_filter_and_project
+  // (UNFILTERED). Late-mat applies the row filter inline but not the projection,
+  // so the post step still runs to drop trailing filter-only columns.
+  auto const state =
+    _late_materialize_active ? io::filter_state::ROW_FILTERED : io::filter_state::UNFILTERED;
+  return io::filtered_table{std::move(table), state};
 }
 
 //===----------------------------------------------------------------------===//

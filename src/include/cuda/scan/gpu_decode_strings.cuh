@@ -64,12 +64,41 @@ struct gpu_string_column_decode_input {
   bool has_nulls;
 };
 
+/// Optional late-materialization selection for @ref gpu_decode_strings_column.
+///
+/// When `d_sel != nullptr`, the decoder emits ONLY the `num_selected` rows
+/// whose column-relative global indices appear in `d_sel` (which must be
+/// sorted ascending and in-range `[0, col.total_rows)`), producing a
+/// compacted strings column of exactly `num_selected` rows. The selection is
+/// applied inside the decode kernels at the Pass-1 length computation — the
+/// earliest point in the pipeline — so the chars buffer is sized to and only
+/// ever holds the selected rows' bytes. Unselected rows are never decoded,
+/// gathered, or counted.
+///
+/// This is the kernel-level half of scan late materialization: decode the
+/// filter columns, build `d_sel` from the surviving rows, then materialize
+/// the (non-filter) string columns straight into compacted form, skipping the
+/// decode + gather work for filtered-out rows.
+///
+/// When `d_sel == nullptr` the call decodes all `col.total_rows` rows exactly
+/// as before (identity selection); this is the default.
+struct string_decode_selection {
+  uint32_t const* d_sel  = nullptr;  ///< device: sorted selected global row indices
+  uint32_t num_selected  = 0;        ///< length of d_sel == output row count
+};
+
 /// Decode one varchar column to a cudf strings column. Async modulo at most
 /// one host sync (the chars-buffer sizing read-back, which only fires when
-/// the per-segment length upper bound is unknown or pathological). Throws
-/// on malformed segment metadata or unsupported codecs.
-std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
-                                                        rmm::cuda_stream_view stream,
-                                                        rmm::device_async_resource_ref mr);
+/// the per-segment length upper bound is unknown or pathological — or always,
+/// for the selection path, which sizes chars to the exact selected total).
+/// Throws on malformed segment metadata or unsupported codecs.
+///
+/// @param selection  Optional late-materialization selection (see
+///                   @ref string_decode_selection). Default = decode all rows.
+std::unique_ptr<cudf::column> gpu_decode_strings_column(
+  gpu_string_column_decode_input const& col,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  string_decode_selection const& selection = {});
 
 }  // namespace sirius::cuda::scan

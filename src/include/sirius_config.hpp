@@ -77,6 +77,16 @@ struct operator_params {
   /// (sirius_gpu_duckdb_native_scan_operator) instead of the CPU fallback
   /// (sirius_physical_duckdb_scan). Off by default.
   bool enable_gpu_duckdb_native_scan = false;
+
+  /// Late-materialize string columns in the GPU-native scan: decode the
+  /// fixed-width filter columns first, build a selection vector from the
+  /// surviving rows, and materialize the (non-filter) varchar columns straight
+  /// into compacted form inside the decode kernels — skipping the decode +
+  /// chars-write work for filtered-out rows. Only engages when all pushed-down
+  /// filter columns are fixed-width and at least one projected varchar column
+  /// is not referenced by the filter. On by default; SET to false for the
+  /// eager-decode-then-filter baseline. See docs/super-sirius/scan.md.
+  bool late_materialize_native_strings = true;
 };
 
 struct telemetry_config {

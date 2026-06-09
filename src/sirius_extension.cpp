@@ -1478,6 +1478,15 @@ static void SetEnableGpuDuckdbNativeScan(ClientContext& context, SetScope scope,
                    params->enable_gpu_duckdb_native_scan);
 }
 
+static void SetLateMaterializeNativeStrings(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  params->late_materialize_native_strings = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config LATE_MATERIALIZE_NATIVE_STRINGS to {}",
+                   params->late_materialize_native_strings);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1660,6 +1669,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_gpu_duckdb_native_scan),
     SetEnableGpuDuckdbNativeScan);
+
+  config.AddExtensionOption(
+    "late_materialize_native_strings",
+    "Late-materialize varchar columns in the GPU-native scan: decode filter columns first, "
+    "build a selection vector, and materialize non-filter strings compacted inside the decode "
+    "kernels (on by default; set false for the eager-decode baseline)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(sirius::operator_params{}.late_materialize_native_strings),
+    SetLateMaterializeNativeStrings);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

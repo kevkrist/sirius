@@ -47,6 +47,10 @@ namespace sirius::scan_manager {
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
 
+namespace sirius::ast {
+struct node;
+}  // namespace sirius::ast
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -174,6 +178,22 @@ class duckdb_native_gpu_ingestible : public io::gpu_ingestible {
   std::shared_ptr<duckdb::Expression> _filter_expression;
   bool _projection_required = false;
   std::size_t _output_arity = 0;
+
+  /// Late-materialization filter, in DENSE FIXED-WIDTH column-index space —
+  /// the order the decoder hands to @ref late_materialization_plan::evaluate_mask
+  /// (projected non-rowid, non-varchar columns, in projected order). Non-null
+  /// exactly when @ref _late_materialize_active. Built once at construction
+  /// (see build_fixed_width_filter_ast); read-only and shared across all
+  /// concurrent @ref materialize_table calls, which each build their own
+  /// executor over it.
+  std::unique_ptr<sirius::ast::node> _fw_filter_ast;
+  /// When true, the decoder evaluates @ref _fw_filter_ast against the decoded
+  /// fixed-width columns and late-materializes the varchar columns straight
+  /// into compacted form; @ref post_filter_and_project then skips the (now
+  /// redundant) row filter and only projects. Gated on the
+  /// `late_materialize_native_strings` config, a translatable filter touching
+  /// only fixed-width columns, and at least one projected varchar column.
+  bool _late_materialize_active = false;
 
   std::vector<row_group_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};

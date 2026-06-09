@@ -31,7 +31,9 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/span.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -796,7 +798,8 @@ std::unique_ptr<cudf::column> build_rowid_column(
 
 std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payload const& split,
                                                         cucascade::memory::memory_space& mem_space,
-                                                        rmm::cuda_stream_view stream)
+                                                        rmm::cuda_stream_view stream,
+                                                        late_materialization_plan const* lm)
 {
   if (split.row_groups.empty()) {
     return std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
@@ -937,6 +940,80 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payl
     fw_cols       = fw_table->release();
   }
 
+  // Rowid emission positions, in projected order (parallel to a rowid_cols vec).
+  std::vector<std::size_t> rowid_to_final_idx;
+  for (std::size_t ci = 0; ci < num_cols; ++ci) {
+    if (is_rowid_col[ci]) rowid_to_final_idx.push_back(ci);
+  }
+
+  // Late-materialization path: decode filter columns (done above), evaluate the
+  // filter to a row mask, compact the fixed-width + rowid columns and a row-index
+  // selection vector in one apply_boolean_mask, then decode the varchar columns
+  // straight into compacted form via the in-kernel selection. Only taken when
+  // there is something to gain: a filter to evaluate (fw columns) and varchar
+  // columns to late-materialize.
+  bool const late_materialize = lm != nullptr && !vc_inputs.empty() && !fw_cols.empty();
+  if (late_materialize) {
+    std::vector<cudf::column_view> fw_views;
+    fw_views.reserve(fw_cols.size());
+    for (auto const& c : fw_cols) {
+      fw_views.push_back(c->view());
+    }
+    auto mask = lm->evaluate_mask(cudf::table_view{fw_views});
+    if (!mask || mask->size() != static_cast<cudf::size_type>(total_rows)) {
+      throw std::runtime_error(std::string(kTag) +
+                               " late-materialization mask has wrong size or is null");
+    }
+
+    // Build the rowid columns (full) so they compact alongside the fixed-width
+    // columns under the same mask.
+    std::vector<std::unique_ptr<cudf::column>> rowid_cols;
+    rowid_cols.reserve(rowid_to_final_idx.size());
+    for (std::size_t r = 0; r < rowid_to_final_idx.size(); ++r) {
+      rowid_cols.push_back(build_rowid_column(
+        split.row_groups, static_cast<cudf::size_type>(total_rows), stream, mr_ref));
+    }
+
+    // One apply_boolean_mask compacts everything at once: a row-index sequence
+    // (-> selection vector) followed by the fixed-width and rowid columns.
+    auto index_seq = cudf::sequence(static_cast<cudf::size_type>(total_rows),
+                                    cudf::numeric_scalar<std::int32_t>(0, true, stream, mr_ref),
+                                    stream,
+                                    mr_ref);
+    std::vector<cudf::column_view> filter_in_views;
+    filter_in_views.reserve(1 + fw_cols.size() + rowid_cols.size());
+    filter_in_views.push_back(index_seq->view());
+    for (auto const& c : fw_cols) {
+      filter_in_views.push_back(c->view());
+    }
+    for (auto const& c : rowid_cols) {
+      filter_in_views.push_back(c->view());
+    }
+    auto compacted =
+      cudf::apply_boolean_mask(cudf::table_view{filter_in_views}, mask->view(), stream, mr_ref);
+    auto compacted_cols                 = compacted->release();
+    auto const num_selected             = static_cast<uint32_t>(compacted_cols[0]->size());
+    auto const* d_sel                   = compacted_cols[0]->view().data<std::int32_t>();
+    ::sirius::cuda::scan::string_decode_selection selection{
+      reinterpret_cast<uint32_t const*>(d_sel), num_selected};
+
+    std::vector<std::unique_ptr<cudf::column>> final_cols(num_cols);
+    // compacted_cols layout: [0] = selection vector (dropped), then fixed-width
+    // columns in fw order, then rowid columns in rowid order.
+    for (std::size_t fi = 0; fi < fw_cols.size(); ++fi) {
+      final_cols[fw_to_final_idx[fi]] = std::move(compacted_cols[1 + fi]);
+    }
+    for (std::size_t r = 0; r < rowid_to_final_idx.size(); ++r) {
+      final_cols[rowid_to_final_idx[r]] = std::move(compacted_cols[1 + fw_cols.size() + r]);
+    }
+    for (std::size_t vi = 0; vi < vc_inputs.size(); ++vi) {
+      final_cols[vc_to_final_idx[vi]] =
+        ::sirius::cuda::scan::gpu_decode_strings_column(vc_inputs[vi], stream, mr_ref, selection);
+    }
+    return std::make_unique<cudf::table>(std::move(final_cols));
+  }
+
+  // Eager path: decode every row of every column.
   std::vector<std::unique_ptr<cudf::column>> vc_cols;
   vc_cols.reserve(vc_inputs.size());
   for (auto const& vc : vc_inputs) {

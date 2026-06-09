@@ -23,6 +23,7 @@
 #include "scan/bitpacking_synth.hpp"
 #include "scan/decode_test_utils.hpp"
 #include "scan/rle_synth.hpp"
+#include "scan/strings_multiseg_synth.hpp"
 #include "scan/strings_synth.hpp"
 
 #include <cudf/column/column.hpp>
@@ -1374,4 +1375,159 @@ TEST_CASE("bench DICT_FSST realistic multi-segment mode 1", "[!benchmark][scan][
     double(rows) / sec / 1e6,
     out_gbs,
     pct_peak);
+}
+
+//===----------------------------------------------------------------------===//
+// Late-materialization (selective decode) microbench.
+//
+// Models the scan late-mat path: a filter on OTHER columns has already produced
+// a selection vector, and only the surviving rows of this string column need
+// materializing. Compares full decode (what the pipeline does today, before a
+// separate cudf gather) against selective decode at a range of selectivities.
+// The win is the decode + chars-materialization work skipped for filtered rows.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+double bench_strings_selective_seconds(rmm::cuda_stream& stream,
+                                       sirius::cuda::scan::gpu_string_column_decode_input const& col,
+                                       sirius::cuda::scan::string_decode_selection const& sel,
+                                       rmm::mr::cuda_async_memory_resource& mr,
+                                       int iters  = 10,
+                                       int warmup = 3)
+{
+  for (int i = 0; i < warmup; ++i)
+    (void)sirius::cuda::scan::gpu_decode_strings_column(col, stream.view(), mr, sel);
+  cudaStreamSynchronize(stream.value());
+
+  cudaEvent_t s, e;
+  cudaEventCreate(&s);
+  cudaEventCreate(&e);
+  cudaEventRecord(s, stream.value());
+  for (int i = 0; i < iters; ++i)
+    (void)sirius::cuda::scan::gpu_decode_strings_column(col, stream.view(), mr, sel);
+  cudaEventRecord(e, stream.value());
+  cudaEventSynchronize(e);
+  float ms = 0.0f;
+  cudaEventElapsedTime(&ms, s, e);
+  cudaEventDestroy(s);
+  cudaEventDestroy(e);
+  return (ms / 1000.0) / iters;
+}
+
+/// Sorted selection vector keeping ~`keep_pct`% of rows (deterministic).
+std::vector<uint32_t> selection_at(uint32_t total_rows, double keep_pct)
+{
+  std::vector<uint32_t> sel;
+  sel.reserve(static_cast<size_t>(total_rows * keep_pct / 100.0) + 1);
+  uint64_t const thresh = static_cast<uint64_t>(keep_pct / 100.0 * double(1ull << 32));
+  for (uint32_t i = 0; i < total_rows; ++i) {
+    uint64_t h = (static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ull) >> 32;  // 32-bit hash
+    if (h < thresh) sel.push_back(i);
+  }
+  return sel;
+}
+
+void run_selective_bench(char const* label,
+                         duckdb::CompressionType codec,
+                         uint8_t dict_fsst_mode = 1,
+                         uint32_t num_distinct  = 0)  // 0 = all rows distinct (high cardinality)
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  uint32_t const rows = 4u << 20;  // 4 M rows of TPC-H-like comments
+  // For low-cardinality runs (num_distinct > 0), draw rows from a fixed pool of
+  // distinct comments — the regime where DuckDB picks DICT_FSST mode-1 (dict
+  // FSST-compressed, dict_count << row_count) and the dict predecode is cheap.
+  std::vector<std::string> pool;
+  if (num_distinct > 0) {
+    pool.resize(num_distinct);
+    for (uint32_t k = 0; k < num_distinct; ++k) {
+      pool[k] = sirius::test::decode::strings::make_tpch_like_comment(
+        static_cast<uint64_t>(k) * 0x9E3779B97F4A7C15ull + 11u, 5u, 150u);
+    }
+  }
+  // DICT_FSST FSST_ONLY (mode 2) requires every row distinct within a segment.
+  bool const force_unique =
+    (codec == duckdb::CompressionType::COMPRESSION_DICT_FSST && dict_fsst_mode == 2);
+  std::vector<std::string> synth(rows);
+  size_t total_input_bytes = 0;
+  for (uint32_t i = 0; i < rows; ++i) {
+    synth[i] = (num_distinct > 0)
+                 ? pool[(static_cast<uint64_t>(i) * 2654435761ull) % num_distinct]
+                 : sirius::test::decode::strings::make_tpch_like_comment(
+                     static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ull, 5u, 150u);
+    if (force_unique) { synth[i] += " #" + std::to_string(i); }
+    total_input_bytes += synth[i].size();
+  }
+  auto built =
+    sirius::test::decode::strings::build_string_column(synth, codec, stream.view(), dict_fsst_mode);
+  double const avg_len = double(total_input_bytes) / rows;
+
+  // Baseline: full decode (no selection).
+  double full_sec = bench_strings_seconds(stream, built.col, mr);
+  std::printf("[bench] %-22s full decode (%u rows, %.0fB avg): %.6fs  %.1f Mr/s\n",
+              label,
+              rows,
+              avg_len,
+              full_sec,
+              double(rows) / full_sec / 1e6);
+
+  for (double keep_pct : {100.0, 50.0, 10.0, 1.0}) {
+    auto sel   = selection_at(rows, keep_pct);
+    auto d_sel = sirius::test::decode::upload(sel, stream.view());
+    cudaStreamSynchronize(stream.value());
+    sirius::cuda::scan::string_decode_selection selection{
+      static_cast<uint32_t const*>(d_sel.data()), static_cast<uint32_t>(sel.size())};
+    double sel_sec = bench_strings_selective_seconds(stream, built.col, selection, mr);
+    std::printf(
+      "[bench]   selective keep=%5.1f%% (%8zu rows): %.6fs  %.2fx vs full  "
+      "(%.1f Mr/s selected)\n",
+      keep_pct,
+      sel.size(),
+      sel_sec,
+      full_sec / sel_sec,
+      double(sel.size()) / sel_sec / 1e6);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("bench late-mat selective DICT_FSST mode-1 high-card / TPC-H comments",
+          "[!benchmark][scan][decode][strings][selective]")
+{
+  // High-cardinality (dict ~= rows): the dict predecode dominates and is
+  // selectivity-independent, so late-mat cannot help. DuckDB would pick mode-2
+  // for this data; included to document the boundary.
+  run_selective_bench("DICT_FSST m1 hi-card", duckdb::CompressionType::COMPRESSION_DICT_FSST, 1);
+}
+
+TEST_CASE("bench late-mat selective DICT_FSST mode-1 low-card / TPC-H comments",
+          "[!benchmark][scan][decode][strings][selective]")
+{
+  // Realistic mode-1: dict_count << row_count, so the per-row gather (memcpy
+  // from the predecoded dict) dominates and late-mat skips it for filtered rows.
+  run_selective_bench(
+    "DICT_FSST m1 lo-card", duckdb::CompressionType::COMPRESSION_DICT_FSST, 1, /*num_distinct=*/256);
+}
+
+TEST_CASE("bench late-mat selective DICT_FSST mode-2 / TPC-H comments",
+          "[!benchmark][scan][decode][strings][selective]")
+{
+  // FSST_ONLY (all-distinct, no dict): per-row inline FSST decompress => the
+  // realistic high-cardinality codec for columns like l_comment.
+  run_selective_bench("DICT_FSST m2", duckdb::CompressionType::COMPRESSION_DICT_FSST, 2);
+}
+
+TEST_CASE("bench late-mat selective FSST / TPC-H comments",
+          "[!benchmark][scan][decode][strings][selective]")
+{
+  run_selective_bench("FSST", duckdb::CompressionType::COMPRESSION_FSST);
+}
+
+TEST_CASE("bench late-mat selective DICTIONARY / TPC-H comments",
+          "[!benchmark][scan][decode][strings][selective]")
+{
+  run_selective_bench("DICTIONARY", duckdb::CompressionType::COMPRESSION_DICTIONARY);
 }

@@ -21,7 +21,9 @@
 #include <op/scan/duckdb_native_metadata.hpp>
 
 // cudf
+#include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 
 // rmm
 #include <rmm/cuda_stream_view.hpp>
@@ -30,6 +32,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 // standard library
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -65,6 +68,36 @@ struct duckdb_native_split_payload {
 };
 
 //===----------------------------------------------------------------------===//
+// late_materialization_plan
+//===----------------------------------------------------------------------===//
+/**
+ * @brief Drives the decoder's late-materialization path.
+ *
+ * When a non-null plan is passed to @ref decode_duckdb_native_split, the
+ * decoder: (1) decodes the fixed-width columns, (2) calls @ref evaluate_mask to
+ * obtain a boolean row filter, (3) compacts the surviving rows into a selection
+ * vector and gathers the fixed-width (+ rowid) columns, and (4) decodes the
+ * varchar columns straight into compacted form via the in-kernel selection
+ * path (@ref sirius::cuda::scan::gpu_decode_strings_column with a selection) —
+ * so the decode + chars-write work for filtered-out rows is never done.
+ *
+ * The returned table holds only the surviving rows, in projected-column order
+ * (no projection-down; the caller drops any trailing filter-only columns).
+ */
+struct late_materialization_plan {
+  /**
+   * @brief Evaluate the pushed-down filter and return a BOOL8 keep-mask.
+   *
+   * The argument is the decoded fixed-width columns as a table_view, in decode
+   * order: the fixed-width projected columns in projected order, excluding
+   * varchar and rowid columns. The closure's filter references columns by that
+   * dense fixed-width index (the caller builds the filter to match). The
+   * result must be a BOOL8 column with one row per input row (true == keep).
+   */
+  std::function<std::unique_ptr<cudf::column>(cudf::table_view)> evaluate_mask;
+};
+
+//===----------------------------------------------------------------------===//
 // decode_duckdb_native_split
 //===----------------------------------------------------------------------===//
 /// Decode a single split (contiguous run of row-group metadata from the
@@ -73,8 +106,15 @@ struct duckdb_native_split_payload {
 /// FSST / DICT_FSST), validity (UNCOMPRESSED / EMPTY / CONSTANT / ROARING),
 /// rowid synthesis. Throws std::runtime_error on any codec the walker
 /// accepted but this decoder does not implement.
-std::unique_ptr<cudf::table> decode_duckdb_native_split(duckdb_native_split_payload const& split,
-                                                        cucascade::memory::memory_space& mem_space,
-                                                        rmm::cuda_stream_view stream);
+///
+/// When @p lm is non-null, the varchar columns are late-materialized against
+/// the filter it carries (see @ref late_materialization_plan); the returned
+/// table then contains only the surviving rows. When null, every row of every
+/// projected column is decoded (the default eager path).
+std::unique_ptr<cudf::table> decode_duckdb_native_split(
+  duckdb_native_split_payload const& split,
+  cucascade::memory::memory_space& mem_space,
+  rmm::cuda_stream_view stream,
+  late_materialization_plan const* lm = nullptr);
 
 }  // namespace sirius::op::scan
