@@ -1,10 +1,187 @@
 # Late materialization for the DuckDB-native string decode — handoff
 
 **Branch:** `kk/late-mat-native-strings`  ·  **Base:** `dev` @ `f1eb9e02`  ·  **Status:** prototype
-complete + kernel-level validated; end-to-end validation and SF100 profiling not yet run.
+complete + validated + **evaluated end-to-end → net-zero on TPC-H, PARKED (see FINAL EVALUATION below).**
 
 This note is the pick-up-where-I-left-off for the late-materialization prototype. It records what is
 done, what is proven, what is *not* yet done, and the exact commands to resume on another machine.
+
+---
+
+## FINAL EVALUATION — net-zero on TPC-H (2026-06-09; supersedes the "1.4–1.8× win" headline below)
+
+**Bottom line: the kernels are correct and the optimization works, but it yields ~no end-to-end
+benefit on TPC-H, so the work is parked here.** The 1.4–1.8× numbers in the session updates below are
+real, but they were measured on **synthetic single-table probes** —
+`SELECT <wide FSST col> FROM <big table> WHERE <fixed-width col> = <very low selectivity>` — hand-built
+to be late-mat's ideal case. TPC-H does not contain that shape.
+
+### The full 22-query sweep
+Only **3 of 22** canonical TPC-H queries engage late-mat at all; every other query runs 100% eager
+(reconstructed via `run_tpch_latemat.sh`, counting `late_mat=true/false` splits per query):
+
+| query | LM splits | projects | encoding | regime → why ~0 |
+|-------|-----------|----------|----------|------------------|
+| q1  | 26 | `l_returnflag`, `l_linestatus` | DICTIONARY (1-char, 2–3 distinct) | **~98% keep** — selection machinery is pure overhead |
+| q4  | 5  | `o_orderpriority` | DICTIONARY (5 distinct) | grouped → 5 output rows; trivial payload |
+| q12 | 18 | `l_shipmode` | DICTIONARY (7 distinct) | grouped → 2 output rows; trivial payload |
+
+All three project **short, low-cardinality DICTIONARY** strings that get grouped/aggregated away — there
+is essentially no decode work to skip. The A/B (`timeab_tpch.py`, q1/q4/q12) measured no end-to-end win.
+
+### Why it nets to zero — three compounding reasons
+1. **Triggers rarely, and only where the payload is trivial.** The 3 engaging queries project tiny
+   low-card DICTIONARY strings (often under high keep%) → nothing to save.
+2. **Where it WOULD help, the query shape blocks it.** Wide high-card FSST `*_comment` columns
+   (Q10 `c_comment`, Q2/Q20/Q21 `s_comment`, Q13 `o_comment`) are exactly late-mat's sweet spot, but
+   none engage: either the string is *itself* a filter (Q13 `NOT LIKE` → correctly declines), or the
+   table's row reduction is **join-driven** — downstream of the scan — rather than from a scan-local
+   fixed-width filter. Late-mat can only ride **scan-local fixed-width** selectivity; TPC-H prunes the
+   string-bearing tables via joins/aggregations, which land after the decode already happened.
+3. **The one big-table trigger has the wrong selectivity.** Q1 fires on all 26 lineitem splits, but its
+   filter (`l_shipdate <= …`) keeps ~98% of rows → the selection cost (two binary searches/chunk,
+   `apply_boolean_mask`, `index_seq` over all rows) dominates the ~2% of decode it avoids → break-even
+   (the microbench's 100%-keep regression regime).
+
+Even the synthetic wins were diluted: nsys showed **6× less kernel work → only 1.4–1.8× end-to-end**,
+because IO + filter-eval + `apply_boolean_mask` + aggregation crowd out decode's share of wall-clock.
+In a multi-join query decode is a single-digit-% slice, so any decode win rounds to nothing.
+
+### Would other column types help? (forward note — FSST is not special)
+benefit ≈ (per-row materialization cost) × (rows eliminated) − selection overhead − selection-independent prep.
+- **Within strings, DICTIONARY beats FSST** (13× vs 6× at 1% keep, microbench). Width × selectivity
+  drives it, not the codec.
+- **Biggest theoretical win: wide variable-width / nested** (LIST/ARRAY/STRUCT/JSON/embeddings — KB/row).
+  But the native decoder has **no nested support today** (it dispatches varchar vs fixed-width only), so
+  this is "would be the prize if the scan supported it," not reachable now.
+- **Wide fixed-width** (decimal128, UUID): modest, bandwidth-only — and fixed-width projected columns are
+  already post-filter-compacted via `apply_boolean_mask`, so little extra to gain.
+- **Narrow fixed-width** (int32, dates): ~zero (gather cost ≈ decode saved; and they're usually the
+  *filter* column, which can never be late-materialized).
+- **Sequential / cumulative codecs** (DELTA, DELTA_FOR, and FSST's compressed-offset *addressing*) have an
+  irreducible all-rows prep floor → can't fully skip dead rows (this is why DICT_FSST stayed ~1.0×).
+
+To make late-mat earn its keep you'd need a workload with (a) a wide var-width/nested column in the output
+projection, (b) a selective **scan-local fixed-width** filter on the *same table*, and (c) little join/agg
+dilution — i.e. log/event analytics (`SELECT payload FROM events WHERE ts BETWEEN … AND host=…`), not
+TPC-H. Widening column-type support raises the *ceiling*; it does nothing about the *trigger rate* that
+makes TPC-H net zero. **Decision: park the branch; revisit only if such a workload becomes a target.**
+
+The optimization is correct and on by default (`late_materialize_native_strings`, default true) with a
+small-split gate — it is never a correctness risk, only a no-op on TPC-H. The detailed build record and
+the (synthetic) win numbers are preserved verbatim below for the record.
+
+---
+
+## Session update — 2026-06-09 (e2e validation + SF50 profiling, on the GB10 box)
+
+Resumed sections A + B. Headline: **late-mat is correct end-to-end and is a real 1.4–1.8× win on
+big-table low-selectivity FSST scans.** Two bugs found+fixed, one config requirement uncovered.
+
+**Setup requirement (not a code bug, but blocks the native scan):** the GPU-native DuckDB scan needs
+`scan_manager.use_sirius_datasource: true` in the sirius yaml. It defaults to **false**, and when
+false `SiriusContext::initialize()` omits the local io_uring backend, so the scan_manager has no
+backend for local `.duckdb` paths and `decode_duckdb_native_split` throws
+`"missing io_ctx, io_obj, or SingleFileBlockManager"`. (Parquet falls back to
+`cudf::io::datasource`; the native scan has no fallback.) Added it to `~/.sirius/sirius.yaml` under
+`sirius.executor.scan_manager`.
+
+**Bug #1 (FIXED) — empty selection crashes late-mat.** A query whose fixed-width filter selects **zero
+rows** (e.g. `WHERE l_shipdate = DATE '1850-01-01'`) threw `cudf Column size mismatch: N != 0`. Cause:
+`gpu_decode_strings_column` inferred `sel_active = (d_sel != nullptr)`, but the decoder derives `d_sel`
+from a **zero-row** compacted index column whose device pointer is **null** → `sel_active` went false →
+it decoded all `total_rows` instead of 0, mismatching the 0-row fixed-width columns. `{nullptr, 0}` was
+ambiguous between "decode all" (eager default) and "empty selection". Fix: added an explicit
+`bool active` to `string_decode_selection`; the kernel now gates on `selection.active`, not the
+pointer. The selective test's empty case now passes a genuinely **null** d_sel (it used to pass a
+non-null capacity buffer, which is exactly why it never caught this). Touched:
+`gpu_decode_strings.{cuh,cu}`, `duckdb_native_decoder.cpp`, `test_gpu_decode_strings_selective.cpp`,
+`bench_decode_codecs.cpp`.
+
+**Correctness (section A) — DONE, all green.** Per-row diff (unique key + full string content, sorted)
+vs pure-DuckDB CPU ground truth across 9 cases: FSST single/multi-varchar (PA/PD), FSST+Uncompressed
+3-varchar + decimal filter (PE), DICTIONARY+FSST mixed + range filter (PF), compound 2-col fw filter
+(PH), empty selection (PG), decline-on-varchar-filter (PI, late-mat correctly refuses), Q1 (DICTIONARY
+~98% keep + aggregation), Q10 (multi-join, correctly declines). cpu==eager==latemat exact everywhere;
+Q1's only CPU diff is a 1-ULP `avg_disc` float-summation-order artifact (present in eager too).
+Harness lives in `test/tpch_performance/latemat_eval/` (`run_query.sh`, `compare.sh`, `timeab.py`).
+
+**Performance (section B) — DONE.** Warm, interleaved A/B in one process (cold = process-init-dominated
+on GB10). End-to-end query speedups at SF50:
+
+| probe (single-table)                        | keep%  | late-mat speedup |
+|---------------------------------------------|--------|------------------|
+| PB lineitem FSST `l_comment` (1 month)      | ~1.5%  | **1.8×**         |
+| PA lineitem FSST `l_comment` (1 day)        | ~0.04% | **1.7×**         |
+| PD orders 2×FSST                            | ~0.04% | **1.4×**         |
+| PF orders DICTIONARY+FSST                   | ~0.04% | **1.1×**         |
+| Q1 DICTIONARY `l_returnflag/linestatus`     | ~98%   | **1.0×** (break-even) |
+| PE customer 3×FSST (small 7.5M-row table)   | ~0.9%  | 0.9×             |
+
+nsys attribution (PE): late-mat does **6× less GPU kernel work** (the `kernel_gather_fsst_chunked`
+chars-gather collapses 32.3 M→0.78 M ns), exactly as the microbench predicted. The end-to-end wins are
+smaller than the kernel 6× because IO (reading the compressed FSST bytes is unchanged) + filter-eval +
+`apply_boolean_mask` + aggregation dilute the decode share.
+
+**Codec reality at SF50 (matters for section C below):** DuckDB stores **every** wide-text column
+(`l/o/c/p/s_comment`, `c_address/c_name/c_phone`, …) as plain **FSST**, and low-card columns as
+**DICTIONARY**. **There is no DICT_FSST anywhere in the dataset.** So the "flat DICT_FSST ceiling" (old
+section C) is *not reachable* with real TPC-H storage — the live codecs are precisely the two late-mat
+accelerates well.
+
+**The small-table regression is RMM pool pressure, not a late-mat flaw.** Under the conservative GB10
+default (`gpu.usage_limit_fraction: 0.30`), PE was **0.19× (5× slower)** and bimodal. Warm nsys showed
+late-mat's *non-kernel* time was dominated by `cudaMallocFromPoolAsync` (7.6 s vs 1.6 s over 6 iters) +
+`cudaStreamSynchronize` (5.1 s vs 0.5 s, one sync stalling 339 ms) — its extra allocations (per-split
+`index_seq` over all rows, `apply_boolean_mask` outputs, per-varchar selective buffers) + the **forced
+per-column exact-total chars-sizing sync** thrash a tight pool. Raising `usage_limit_fraction` to 0.70
+(via `SIRIUS_CONFIG_FILE=/tmp/sirius_highmem.yaml`) lifted PE to **0.90×** (min ON 0.070 s < OFF
+0.091 s) and nudged every other probe up (PB 1.8×, PA 1.7×). So: late-mat wins scale with the avoided
+eager-decode size; on small/cheap scans the fixed per-split + per-column overhead dominates, and a
+tight pool turns that overhead catastrophic.
+
+**Revised next-work priorities (supersedes old C/D):**
+1. **[DONE — same session] Remove the forced per-varchar chars-sizing sync.**
+   `gpu_decode_strings_column` used to force an exact-total D2H read-back (one `cudaStreamSynchronize`
+   + `cudaMemcpy` per varchar column per split) under any selection, to size the chars buffer to the
+   selected rows. Replaced with a **selection-aware sync-free upper bound** `out_rows *
+   max(seg.max_string_length)` — the same over-allocation strategy the non-selection path already uses
+   (guarded by the same `HOST_UPPER_BOUND_LIMIT`; falls back to the exact read-back only when a
+   segment's length stat is unknown). One-line conceptual change in `gpu_decode_strings.cu` (track
+   `max_seg_max_len`, re-bound `cum_chars_upper` under selection instead of `needs_exact_total=true`).
+   Result (warm A/B, SF50): with an adequately-sized pool, **every firing probe improved** — PD
+   1.36→1.88×, PA 1.71→1.85×, PF 1.12→1.61×, and **PE flipped from 0.90× (regression) to 1.28× (win)**;
+   Q1 stays ~1.0×. Correctness unchanged (kernel `[selective]` + the full section-A matrix still green;
+   the over-allocation is invisible because cudf strings bound on the offsets, exactly as the
+   non-selection path already relied on). Sync time in the warm PE nsys dropped ~2×.
+2. **[DONE — same session] Gate late-mat off for small splits.** New config
+   `late_materialize_min_rows` (default **1,048,576** ≈ 8 row groups; yaml
+   `executor.operator_params` + `SET late_materialize_min_rows`). Decided **per split** in
+   `next_split_provider` (threads a `late_materialize` bool through `duckdb_native_split_payload`);
+   `materialize_table` keys `filter_state` + the decoder's `lm_ptr` off it, and `apply_filter` flips in
+   lockstep — so a gated-off split falls back to the eager decode-then-(post)filter path with no
+   double/zero filtering. Validated: forcing the threshold above the split size puts every split on the
+   eager path (`late_mat=false`) with **results still == CPU**; small tables (supplier, 500 K) and the
+   partial tail split of multi-split scans (orders) gate off correctly while the big splits late-mat,
+   all correct. At the default, **every firing probe is unaffected** (lineitem/orders/customer splits
+   are all ≥ 1M), so the post-P1 win numbers stand. The knob is a tunable escape hatch: the only
+   residual regression is the *deliberately-starved* GB10 0.30 pool (dominated by the inherent
+   mid-pipeline `apply_boolean_mask` selection sync + cold pool-init, not removable churn — the pool is
+   ~35 GB, the extra `index_seq` ~10 MB); raise `late_materialize_min_rows` above the offending split
+   size on a memory-starved box to force eager there. Absolute starved-pool times are pool-warmup-order
+   dependent, so don't tune off a single run.
+3. **Selection-gate `kernel_compute_compressed_offsets_fsst`** — it still runs over *all* rows
+   (selection-independent) and is now ~50% of late-mat GPU time for plain FSST (not just DICT_FSST as
+   the old note assumed). Lower priority since GPU time isn't the e2e bottleneck.
+
+Note on the `index_seq` over `total_rows`: not worth removing. The only sync-free alternative
+(`thrust::copy_if` over a counting iterator) still needs a `total_rows`-capacity output, and the
+`apply_boolean_mask` it feeds already produces `num_selected` via an unavoidable size sync — so it
+saves neither a sync nor meaningful peak memory against a 35 GB pool.
+
+The original design notes below are unchanged (the record of how the prototype was built).
+
+---
 
 ---
 
