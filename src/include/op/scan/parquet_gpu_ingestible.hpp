@@ -38,8 +38,11 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -76,6 +79,49 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   [[nodiscard]] std::span<std::string const> file_paths() const override
   {
     return std::span<std::string const>(resolved_file_paths.data(), resolved_file_paths.size());
+  }
+
+  ///@brief Returns true iff every file here is also in @p other AND every projected column here is
+  ///in @p other.
+  [[nodiscard]] bool is_subset_of(const ingestible_table_info& other) const override
+  {
+    auto const* o = dynamic_cast<parquet_ingestible_table_info const*>(&other);
+    if (o == nullptr) { return false; }
+
+    std::unordered_set<std::string> other_files(o->resolved_file_paths.begin(),
+                                                o->resolved_file_paths.end());
+    for (auto const& f : resolved_file_paths) {
+      if (!other_files.contains(f)) { return false; }
+    }
+    std::unordered_set<duckdb::idx_t> other_cols;
+    for (auto const& c : o->column_ids) {
+      other_cols.insert(c.GetPrimaryIndex());
+    }
+    for (auto const& c : column_ids) {
+      if (!other_cols.contains(c.GetPrimaryIndex())) { return false; }
+    }
+    return true;
+  }
+
+  /// @brief Map each of this scan's column positions to the position of the same column in @p other
+  /// (e.g. this [C,B] over [A,B,C] -> [2,1]). Empty when @p other is not a superset.
+  [[nodiscard]] std::vector<std::size_t> column_projections(
+    const ingestible_table_info& other) const override
+  {
+    auto const* o = dynamic_cast<parquet_ingestible_table_info const*>(&other);
+    if (o == nullptr) { return {}; }
+    std::unordered_map<duckdb::idx_t, std::size_t> other_pos;
+    for (std::size_t j = 0; j < o->column_ids.size(); ++j) {
+      other_pos.emplace(o->column_ids[j].GetPrimaryIndex(), j);
+    }
+    std::vector<std::size_t> projection;
+    projection.reserve(column_ids.size());
+    for (auto const& c : column_ids) {
+      auto it = other_pos.find(c.GetPrimaryIndex());
+      if (it == other_pos.end()) { return {}; }
+      projection.push_back(it->second);
+    }
+    return projection;
   }
 };
 
@@ -118,6 +164,24 @@ class parquet_split_info : public scan_info {
   /// Whether the scan plan needs post-decode assembly (hive partition
   /// injection or column reordering). Mirrors @c needs_output_assembly(*plan).
   bool needs_assembly = false;
+
+  /// @brief Get the on-disk column-chunk byte ranges for each slice's selected row groups, paired
+  /// with that file's datasource.
+  [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override
+  {
+    std::vector<fadvise_entry> hints;
+    if (!reader_options) { return hints; }
+    hints.reserve(rg_slices.size());
+    for (auto const& slice : rg_slices) {
+      if (!slice.datasource || !slice.file_metadata || slice.row_group_indices.empty()) {
+        continue;
+      }
+      hybrid_scan_reader reader(*slice.file_metadata, *reader_options);
+      auto ranges = reader.all_column_chunks_byte_ranges(slice.row_group_indices, *reader_options);
+      if (!ranges.empty()) { hints.push_back(fadvise_entry{slice.datasource, std::move(ranges)}); }
+    }
+    return hints;
+  }
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {
@@ -175,7 +239,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
 
   ~parquet_gpu_ingestible() override;
 
-  std::unique_ptr<batch_coalecer> create_batch_coalecer() const override { return nullptr; }
+  std::unique_ptr<batch_coalecer> create_batch_coalecer() const override;
 
   std::shared_ptr<post_filter_and_projection_info> create_post_filter_and_projection_info()
     const final
@@ -202,32 +266,30 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
  private:
-  /// One per-task batch of files. The footer-read loop in @ref run_batch
-  /// walks these files sequentially, building up a single output vector
-  /// of @c scan_operator_input splits.
-  struct file_batch {
-    std::vector<std::string> file_paths;
-  };
+  /// Builds the shared reader options (column projection + filter pushdown) on the first split
+  /// claim. @note FLBA-decimal probe needs an io_ctx. Thread-safe.
+  void ensure_reader_options(std::shared_ptr<io::sirius_ioctx> const& io_ctx);
 
-  void run_batch(const file_batch& batch,
-                 std::vector<std::unique_ptr<op::operator_data>>& out,
-                 std::shared_ptr<io::sirius_ioctx> io_ctx);
+  /// Footer-walk + row-group pruning for a single file -> one parquet_split_info holding all
+  /// surviving row groups. The batch_coalecer imposes the byte cap + hive-partition boundaries
+  /// downstream.
+  std::unique_ptr<scan_info> parse_file(std::string const& file_path,
+                                        std::shared_ptr<io::sirius_ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
-
-  // Canonical scan plan — built once in the constructor, shared by every
-  // emitted split via its parquet_split_info::plan member.
   std::shared_ptr<scan_plan const> _plan;
-  // Coalesced DuckDB filter expression. Empty when no filters survived the
-  // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
   std::vector<std::string> _file_paths;
   std::size_t _approximate_batch_size{};
-  std::size_t _max_file_processed{};
   std::size_t _total_files{};
 
-  std::vector<file_batch> _batches;
-  std::atomic<std::size_t> _next_batch_idx{0};
+  /// Shared reader options, built once (see ensure_reader_options).
+  std::once_flag _reader_init_flag;
+  std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
+  bool _disable_filter_pushdown = false;  ///< FLBA-decimal probe tripped -- no row-group pushdown.
+  bool _pushdown_active         = false;  ///< filter translated AND pushdown enabled.
+
+  std::atomic<std::size_t> _next_file_idx{0};  ///< one metadata-scan task per file.
 };
 
 std::shared_ptr<parquet_gpu_ingestible> make_ingestible(
