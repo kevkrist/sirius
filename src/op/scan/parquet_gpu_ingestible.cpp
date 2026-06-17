@@ -502,13 +502,12 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   // here so the scan operator can skip post_filter_and_project entirely.
   // (post-decode fallback keeps assembly external because re-allocating after
   // exec.select is the same shape either way.)
-  if (state == op::scan::filter_state::ROW_FILTERED && ast_expression && split.needs_assembly) {
+  if (split.needs_assembly) {
     table = assemble_scan_output(*_plan, std::move(table), split.partition_values, stream);
-    state = op::scan::filter_state::ROW_FILTERED_AND_PROJECTED;
-    SIRIUS_LOG_DEBUG(
-      "[parquet_gpu_ingestible::materialize_table] Assembled inline on reader-side pushdown path.");
+    if (state == op::scan::filter_state::ROW_FILTERED) {
+      state = op::scan::filter_state::ROW_FILTERED_AND_PROJECTED;
+    }
   }
-
   return op::scan::filtered_table{std::move(table), state};
 }
 
