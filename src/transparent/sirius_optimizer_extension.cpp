@@ -17,6 +17,7 @@
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include "sirius_context.hpp"
+#include "transparent/sirius_date_dip.hpp"
 
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/common/types/value.hpp>
@@ -33,6 +34,32 @@ bool gpu_execution_enabled(const duckdb::ClientContext& context)
   duckdb::Value setting;
   auto lookup_result = context.TryGetCurrentSetting("gpu_execution", setting);
   return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
+}
+
+bool date_dips_enabled(const duckdb::ClientContext& context)
+{
+  duckdb::Value setting;
+  auto lookup_result = context.TryGetCurrentSetting("enable_date_dips", setting);
+  return lookup_result && !setting.IsNull() && setting.GetValue<bool>();
+}
+
+/// Inject date DIPs into the live optimized plan, using the correlations measured by
+/// `CALL sirius_measure_date_correlation(...)` and cached on @p ctx. No-op when the
+/// feature is disabled or no correlation has been measured. A failure must never block
+/// GPU execution, so the pass is wrapped — the worst case is the un-injected plan.
+void maybe_apply_date_dips(const duckdb::ClientContext& context,
+                           duckdb::SiriusContext& ctx,
+                           duckdb::LogicalOperator& plan)
+{
+  if (!date_dips_enabled(context)) { return; }
+  auto correlations = ctx.all_date_correlations();
+  if (correlations.empty()) { return; }
+  try {
+    auto num_dips = apply_date_dips(plan, correlations);
+    if (num_dips > 0) { SIRIUS_LOG_DEBUG("[date_dip] injected {} derived predicate(s)", num_dips); }
+  } catch (std::exception& e) {
+    spdlog::debug("date_dip pass failed (ignored): {}", e.what());
+  }
 }
 
 }  // namespace
@@ -84,6 +111,10 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // Restore the original connection setting so transparent execution does not
   // leak optimizer changes into later CPU queries.
   ctx->restore_transparent_disabled_optimizers(context);
+
+  // Inject date DIPs into the LIVE plan before the Copy below, so the captured plan
+  // carries the derived prune-only predicates onto its clustered fact-table scans.
+  maybe_apply_date_dips(context, *ctx, *plan);
 
   // Copy the optimized plan. OnFinalizePrepare will attempt create_plan() on this
   // copy — that's the single source of truth for GPU support. If the plan contains

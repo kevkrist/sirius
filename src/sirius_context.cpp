@@ -842,6 +842,34 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
   };
 }
 
+namespace {
+// Identifies a correlation by its dimension/fact date-column pair, so a re-measurement
+// of the same pair overwrites the prior entry. (Distinct join keys over the same date
+// pair are not modeled separately — one correlation per date-column pair.)
+std::string date_correlation_key(const sirius::transparent::date_correlation& c)
+{
+  return c.dim_table + "." + c.dim_date_col + "->" + c.fact_table + "." + c.fact_date_col;
+}
+}  // namespace
+
+void SiriusContext::upsert_date_correlation(
+  const sirius::transparent::date_correlation& correlation)
+{
+  std::lock_guard lock(mutex_);
+  date_correlation_cache_[date_correlation_key(correlation)] = correlation;
+}
+
+std::vector<sirius::transparent::date_correlation> SiriusContext::all_date_correlations() const
+{
+  std::lock_guard lock(mutex_);
+  std::vector<sirius::transparent::date_correlation> out;
+  out.reserve(date_correlation_cache_.size());
+  for (const auto& [key, corr] : date_correlation_cache_) {
+    out.push_back(corr);
+  }
+  return out;
+}
+
 void SiriusContext::record_transparent_rebind_success() noexcept
 {
   transparent_rebind_success_count_.fetch_add(1, std::memory_order_relaxed);

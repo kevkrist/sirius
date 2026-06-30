@@ -15,6 +15,8 @@
  */
 
 #include "duckdb/main/database.hpp"
+
+#include <array>
 #define DUCKDB_EXTENSION_MAIN
 
 #include "config.hpp"
@@ -39,6 +41,7 @@
 extern "C" int cudaProfilerStart();
 extern "C" int cudaProfilerStop();
 #include "data/sirius_converter_registry.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -51,11 +54,18 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "transparent/date_correlation.hpp"
+#include "transparent/sirius_date_dip.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
+
+#include <algorithm>
+#include <optional>
+#include <utility>
 // #include "from_substrait.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_buffer_manager.hpp"
@@ -1175,6 +1185,207 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+// ---------------------------------------------------------------------------
+// CALL sirius_measure_date_correlation(dim_table, dim_date_col, dim_key_col,
+//                                      fact_table, fact_date_col, fact_key_col)
+//
+// Measures min/max(fact_date - dim_date) over the FK equi-join `fact.fact_key =
+// dim.dim_key` and caches the [lag_lo_days, lag_hi_days] day bound on SiriusContext. The
+// date-DIP optimizer pass reads the cache to derive a prune-only predicate on the
+// clustered fact date column, so the lag comes from the data rather than an assumption.
+// ---------------------------------------------------------------------------
+struct MeasureDateCorrelationData : public TableFunctionData {
+  sirius::transparent::date_correlation correlation;  // 6 columns from args; lags measured
+  int64_t bucket_days = 0;  // 0 => one global lag; >0 => a lag histogram of this bucket width
+  bool finished       = false;
+};
+
+static unique_ptr<FunctionData> MeasureDateCorrelationBind(ClientContext& context,
+                                                           TableFunctionBindInput& input,
+                                                           vector<LogicalType>& return_types,
+                                                           vector<string>& names)
+{
+  auto result                                 = make_uniq<MeasureDateCorrelationData>();
+  auto& c                                     = result->correlation;
+  std::array<std::string*, 6> fields          = {&c.dim_table,
+                                                 &c.dim_date_col,
+                                                 &c.dim_key_col,
+                                                 &c.fact_table,
+                                                 &c.fact_date_col,
+                                                 &c.fact_key_col};
+  static std::array<const char*, 6> kArgNames = {
+    "dim_table", "dim_date_col", "dim_key_col", "fact_table", "fact_date_col", "fact_key_col"};
+  if (input.inputs.size() < 6) {
+    throw BinderException(
+      "sirius_measure_date_correlation requires 6 VARCHAR arguments: "
+      "(dim_table, dim_date_col, dim_key_col, fact_table, fact_date_col, fact_key_col)");
+  }
+  for (int i = 0; i < 6; ++i) {
+    if (input.inputs[i].IsNull()) {
+      throw BinderException(std::string("sirius_measure_date_correlation: '") + kArgNames[i] +
+                            "' must be a non-null VARCHAR");
+    }
+    *fields[i] = input.inputs[i].ToString();
+  }
+
+  // Optional: bucket the dimension date into `bucket_days`-wide buckets and measure a lag
+  // per bucket (a lag histogram), so the derived predicate stays tight when the lag drifts
+  // over time. Default 0 => a single global lag (optimal for a stationary correlation).
+  auto bucket_it = input.named_parameters.find("bucket_days");
+  if (bucket_it != input.named_parameters.end() && !bucket_it->second.IsNull()) {
+    result->bucket_days = bucket_it->second.GetValue<int64_t>();
+    if (result->bucket_days < 0) {
+      throw BinderException("sirius_measure_date_correlation: 'bucket_days' must be >= 0");
+    }
+  }
+
+  return_types.emplace_back(LogicalType::BIGINT);
+  names.emplace_back("lag_lo_days");
+  return_types.emplace_back(LogicalType::BIGINT);
+  names.emplace_back("lag_hi_days");
+  return_types.emplace_back(LogicalType::BIGINT);
+  names.emplace_back("num_buckets");
+  return_types.emplace_back(LogicalType::VARCHAR);
+  names.emplace_back("status");
+  return std::move(result);
+}
+
+struct MeasurementResult {
+  int32_t lag_lo_days;                                   // global lag (min over buckets)
+  int32_t lag_hi_days;                                   // global lag (max over buckets)
+  std::vector<sirius::transparent::lag_bucket> buckets;  // empty when bucket_days == 0
+};
+
+// Measures the per-bucket lag over the FK join on a fresh internal connection: one row per
+// `bucket_days`-wide dimension-date bucket (or a single global row when bucket_days == 0),
+// each carrying the bucket's dim-day range and lag [min, max]. Returns nullopt with `status`
+// set on an empty join / SQL error. Bracketed by InternalQueryGuard so the sub-query runs on
+// plain DuckDB (the optimizer hooks skip internal queries) and cannot corrupt the outer
+// CALL's lifecycle.
+static std::optional<MeasurementResult> RunDateCorrelationMeasurement(
+  ClientContext& context,
+  SiriusContext& sirius_ctx,
+  const sirius::transparent::date_correlation& c,
+  int64_t bucket_days,
+  std::string& status)
+{
+  using duckdb::KeywordHelper;
+  const auto fd = KeywordHelper::WriteOptionallyQuoted(c.fact_date_col);
+  const auto dd = KeywordHelper::WriteOptionallyQuoted(c.dim_date_col);
+  // lag in days = fact_date - dim_date (DATE - DATE -> BIGINT); dim day number = days since
+  // the date_t epoch (1970-01-01), matching lag_bucket's dim_lo_day/dim_hi_day.
+  const std::string lag    = "(f." + fd + " - d." + dd + ")";
+  const std::string dimday = "date_diff('day', DATE '1970-01-01', d." + dd + ")";
+  const std::string from   = " FROM " + KeywordHelper::WriteOptionallyQuoted(c.fact_table) +
+                           " f JOIN " + KeywordHelper::WriteOptionallyQuoted(c.dim_table) +
+                           " d ON f." + KeywordHelper::WriteOptionallyQuoted(c.fact_key_col) +
+                           " = d." + KeywordHelper::WriteOptionallyQuoted(c.dim_key_col);
+
+  std::string sql;
+  if (bucket_days > 0) {
+    sql = "SELECT CAST(min(" + dimday + ") AS INTEGER), CAST(max(" + dimday +
+          ") AS INTEGER), CAST(min(" + lag + ") AS INTEGER), CAST(max(" + lag + ") AS INTEGER)" +
+          from + " GROUP BY (" + dimday + " // " + std::to_string(bucket_days) + ") ORDER BY 1";
+  } else {
+    sql = "SELECT NULL::INTEGER, NULL::INTEGER, CAST(min(" + lag + ") AS INTEGER), CAST(max(" +
+          lag + ") AS INTEGER)" + from;
+  }
+
+  SiriusContext::InternalQueryGuard guard(sirius_ctx);
+  duckdb::Connection conn(*context.db);
+  auto result = conn.Query(sql);
+  if (result->HasError()) {
+    status = "error: " + result->GetError();
+    return std::nullopt;
+  }
+
+  MeasurementResult out{};
+  bool have_global = false;
+  for (idx_t r = 0; r < result->RowCount(); ++r) {
+    auto lag_lo_v = result->GetValue(2, r);
+    auto lag_hi_v = result->GetValue(3, r);
+    if (lag_lo_v.IsNull() || lag_hi_v.IsNull()) { continue; }  // empty bucket / empty join
+    const auto lag_lo = static_cast<int32_t>(lag_lo_v.GetValue<int64_t>());
+    const auto lag_hi = static_cast<int32_t>(lag_hi_v.GetValue<int64_t>());
+    if (bucket_days > 0) {
+      out.buckets.push_back(sirius::transparent::lag_bucket{
+        static_cast<int32_t>(result->GetValue(0, r).GetValue<int64_t>()),
+        static_cast<int32_t>(result->GetValue(1, r).GetValue<int64_t>()),
+        lag_lo,
+        lag_hi});
+    }
+    out.lag_lo_days = have_global ? std::min(out.lag_lo_days, lag_lo) : lag_lo;
+    out.lag_hi_days = have_global ? std::max(out.lag_hi_days, lag_hi) : lag_hi;
+    have_global     = true;
+  }
+  if (!have_global) {
+    status = "empty join — no correlation registered";
+    return std::nullopt;
+  }
+  status = "measured";
+  return out;
+}
+
+static void MeasureDateCorrelationFunction(ClientContext& context,
+                                           TableFunctionInput& data_p,
+                                           DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<MeasureDateCorrelationData>();
+  if (data.finished) { return; }  // run-once guard (the scan calls until an empty chunk)
+  data.finished = true;
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException(
+      "sirius_measure_date_correlation requires the Sirius context to be initialized");
+  }
+
+  std::string status;
+  auto measured =
+    RunDateCorrelationMeasurement(context, *sirius_ctx, data.correlation, data.bucket_days, status);
+
+  output.SetCardinality(1);
+  if (measured.has_value()) {
+    auto correlation        = data.correlation;
+    correlation.lag_lo_days = measured->lag_lo_days;
+    correlation.lag_hi_days = measured->lag_hi_days;
+    correlation.buckets     = std::move(measured->buckets);
+    const auto num_buckets  = static_cast<int64_t>(correlation.buckets.size());
+    SIRIUS_LOG_DEBUG("[date_dip] measured {}.{}->{}.{} = [{}, {}] days, {} bucket(s)",
+                     correlation.dim_table,
+                     correlation.dim_date_col,
+                     correlation.fact_table,
+                     correlation.fact_date_col,
+                     correlation.lag_lo_days,
+                     correlation.lag_hi_days,
+                     num_buckets);
+    output.SetValue(0, 0, Value::BIGINT(correlation.lag_lo_days));
+    output.SetValue(1, 0, Value::BIGINT(correlation.lag_hi_days));
+    output.SetValue(2, 0, Value::BIGINT(num_buckets));
+
+    // Stamp the DB write-activity token so the date-DIP pass can detect a stale correlation
+    // (data changed since measurement) and skip the DIP. Left 0/0 (gate fails closed) if the
+    // table can't be resolved or its database isn't file-backed.
+    try {
+      auto& fact_entry = Catalog::GetEntry<TableCatalogEntry>(
+        context, INVALID_CATALOG, INVALID_SCHEMA, correlation.fact_table);
+      if (auto tok = sirius::transparent::read_db_write_token(fact_entry)) {
+        correlation.snapshot_checkpoint_iteration = tok->checkpoint_iteration;
+        correlation.snapshot_wal_size             = tok->wal_size;
+      }
+    } catch (const std::exception&) {
+      // leave 0/0 -> gate fails closed; this correlation just won't fire a DIP
+    }
+
+    sirius_ctx->upsert_date_correlation(std::move(correlation));
+  } else {
+    output.SetValue(0, 0, Value());
+    output.SetValue(1, 0, Value());
+    output.SetValue(2, 0, Value::BIGINT(0));
+  }
+  output.SetValue(3, 0, Value(status));
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -1244,6 +1455,19 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
   CreateTableFunctionInfo unpin_table_info(unpin_table);
   catalog.CreateTableFunction(transaction, unpin_table_info);
+
+  TableFunction measure_date_correlation("sirius_measure_date_correlation",
+                                         {LogicalType::VARCHAR,
+                                          LogicalType::VARCHAR,
+                                          LogicalType::VARCHAR,
+                                          LogicalType::VARCHAR,
+                                          LogicalType::VARCHAR,
+                                          LogicalType::VARCHAR},
+                                         MeasureDateCorrelationFunction,
+                                         MeasureDateCorrelationBind);
+  measure_date_correlation.named_parameters["bucket_days"] = LogicalType::BIGINT;
+  CreateTableFunctionInfo measure_date_correlation_info(measure_date_correlation);
+  catalog.CreateTableFunction(transaction, measure_date_correlation_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
@@ -1548,6 +1772,17 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK),
                             SetEnableFallbackCheck);
+
+  // Phase-1 prototype: inject derived date-correlation predicates ("date DIPs")
+  // onto clustered fact-table scans so native row-group pruning can skip them
+  // across FK joins. Off by default; sound ONLY for known-correlated (TPC-H/dbgen)
+  // schemas because the correlation lag is hardcoded, not derived from stats.
+  config.AddExtensionOption(
+    "enable_date_dips",
+    "Inject derived date-correlation predicates to prune clustered "
+    "fact-table row groups across FK joins (TPC-H prototype; off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(false));
 
   config.AddExtensionOption(
     "enable_duckdb_fallback",

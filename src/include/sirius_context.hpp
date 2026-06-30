@@ -26,6 +26,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/telemetry_context.hpp"
+#include "transparent/date_correlation.hpp"
 
 #include <rmm/resource_ref.hpp>
 
@@ -41,7 +42,9 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -262,6 +265,17 @@ class SiriusContext : public ClientContextState {
   /// \brief Record that a transparently rebound query actually executed through Sirius.
   void record_transparent_execution() noexcept;
 
+  /// \brief Insert or overwrite a measured date correlation (see
+  /// sirius::transparent::date_correlation), keyed by its dimension/fact date-column
+  /// pair. Populated by `CALL sirius_measure_date_correlation(...)`; consumed by the
+  /// date-DIP optimizer pass. Thread-safe; persists across queries for the life of the
+  /// (process-lifetime, shared) SiriusContext.
+  void upsert_date_correlation(const sirius::transparent::date_correlation& correlation);
+
+  /// \brief Snapshot of all registered date correlations. Empty => date DIPs are
+  /// disabled (no measurement has been taken this session).
+  [[nodiscard]] std::vector<sirius::transparent::date_correlation> all_date_correlations() const;
+
  private:
   void throw_if_not_initialized() const;
   void acquire_query_lifecycle_slot();
@@ -330,6 +344,13 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
+
+  /// In-memory, session-lifetime cache of measured date correlations, keyed by
+  /// date_correlation_key() (see sirius_context.cpp). Guarded by mutex_. Persists across
+  /// queries (the owning SiriusContext is a process-lifetime singleton shared by all
+  /// connections); dropped at teardown. Intentionally NOT reset in QueryBegin/QueryEnd —
+  /// persistence across queries is the whole point.
+  std::unordered_map<std::string, sirius::transparent::date_correlation> date_correlation_cache_;
 };
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius

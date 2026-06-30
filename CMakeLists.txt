@@ -312,6 +312,7 @@ set(EXTENSION_SOURCES
     src/sirius_sql_rewrite.cpp
     src/telemetry/telemetry_context.cpp
     src/transparent/physical_sirius_execution.cpp
+    src/transparent/sirius_date_dip.cpp
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp)
@@ -336,6 +337,15 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
        ${SIRIUS_LEGACY_CONDITIONAL_SOURCES})
   list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
 endif()
+
+# sirius_extension.cpp ODR-uses duckdb's LogicalType::{VARCHAR,BIGINT,BOOLEAN}
+# statistics in table-function registration; GCC emits them as STB_GNU_UNIQUE,
+# which mold rejects as duplicates of duckdb_static's strong definitions when
+# linking the shell / loadable extension. -fno-gnu-unique emits them as weak
+# symbols that fold instead. Scoped to this one TU to keep the rebuild minimal
+# (it does not affect the CUDA sources).
+set_source_files_properties(src/sirius_extension.cpp
+                            PROPERTIES COMPILE_OPTIONS "-fno-gnu-unique")
 
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
@@ -571,6 +581,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
+    test/cpp/transparent/test_date_dip.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)
