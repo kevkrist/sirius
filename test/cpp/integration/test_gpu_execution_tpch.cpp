@@ -15,6 +15,8 @@
  */
 
 #include "op/sirius_physical_partition.hpp"
+#include "pipeline/task_scheduler.hpp"
+#include "sirius_context.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -395,6 +397,41 @@ class GPUExecutionParquetFixture : public GPUExecutionFixtureBase {
     REQUIRE_FALSE(result->HasError());
   }
 };
+
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "dynamic-filter feeder discovery remains active when priority is disabled",
+                 "[integration][dynamic_filter][priority]")
+{
+  static constexpr auto query =
+    "SELECT count(*) FROM lineitem l JOIN orders o ON l.l_orderkey=o.o_orderkey "
+    "WHERE o.o_orderdate>=DATE '1997-01-01' AND o.o_orderdate<DATE '1997-02-01'";
+  auto state = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(state);
+
+  auto invalid = con->Query("SET dynamic_filter_build_priority='invalid'");
+  REQUIRE(invalid);
+  CHECK(invalid->HasError());
+
+  for (auto const* mode : {"legacy", "off"}) {
+    auto result = con->Query(std::string{"SET dynamic_filter_build_priority='"} + mode + "'");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    CHECK(state->get_config().get_operator_params().dynamic_filter_build_priority ==
+          (std::string_view{mode} == "legacy" ? sirius::dynamic_filter_build_priority_mode::LEGACY
+                                              : sirius::dynamic_filter_build_priority_mode::OFF));
+    result = con->Query("SET gpu_execution=true");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    result = con->Query(query);
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+
+    auto const& scheduler = state->get_task_scheduler();
+    CHECK(scheduler.filter_build_pipeline_count_for_testing() > 0);
+    CHECK(scheduler.priority_dispatch_enabled_for_testing() ==
+          (std::string_view{mode} == "legacy"));
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // Scan tests

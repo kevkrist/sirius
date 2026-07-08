@@ -176,6 +176,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("dynamic_filter_domain_coverage_threshold",
              opt.dynamic_filter_domain_coverage_threshold);
   r.optional("dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold);
+  r.optional("dynamic_filter_build_priority", opt.dynamic_filter_build_priority);
   r.reject_unknown();
 }
 

@@ -26,6 +26,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "planner/query.hpp"
+#include "sirius_config.hpp"
 #include "telemetry/dynamic_filter_telemetry.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -44,14 +45,23 @@
 namespace sirius {
 namespace pipeline {
 
+bool filter_build_priority_enabled(const sirius::operator_params* params) noexcept
+{
+  return params == nullptr || params->dynamic_filter_build_priority ==
+                                sirius::dynamic_filter_build_priority_mode::LEGACY;
+}
+
 task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
   sirius::memory::sirius_memory_reservation_manager& mem_mgr,
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   exec::queue_ordering task_queue_ordering,
   const cucascade::memory::system_topology_info* sys_topology,
-  const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
-  : _task_queue(task_queue_ordering), _telemetry_context(std::move(telemetry_context))
+  const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors,
+  const sirius::operator_params* op_params)
+  : _op_params(op_params),
+    _task_queue(task_queue_ordering),
+    _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue");
@@ -244,7 +254,8 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   // tasks would assign to a different GPU and miss the cache entries).
   _no_pref_rr_counter.store(0, std::memory_order_relaxed);
 
-  _filter_build_pipelines = collect_filter_build_pipelines(*_query);
+  _priority_dispatch_enabled = filter_build_priority_enabled(_op_params);
+  _filter_build_pipelines    = collect_filter_build_pipelines(*_query);
   std::unordered_set<const void*> feeder_pipelines;
   feeder_pipelines.reserve(_filter_build_pipelines.size());
   for (auto const* pipeline : _filter_build_pipelines) {
@@ -410,7 +421,7 @@ void task_scheduler::management_eventloop()
       // the filter available to later splits of a transitive scan target; an immediate probe is
       // already ordered after publication by the join hint. Fall through to normal dispatch when
       // no compatible build task is queued, so the preference never starves other work.
-      if (!_filter_build_pipelines.empty()) {
+      if (_priority_dispatch_enabled && !_filter_build_pipelines.empty()) {
         task = _task_queue.pop_if(
           [this, device_id](const sirius::parallel::itask& t) -> bool {
             const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&t);

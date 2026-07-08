@@ -22,6 +22,7 @@
  */
 
 #include "op/sirius_dynamic_filter.hpp"
+#include "pipeline/task_scheduler.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
@@ -61,6 +62,16 @@ struct router_fixture {
 };
 
 }  // namespace
+
+TEST_CASE("dynamic-filter build priority gate follows operator params",
+          "[dynamic_filter][scheduler][priority]")
+{
+  CHECK(sirius::pipeline::filter_build_priority_enabled(nullptr));
+  sirius::operator_params params;
+  CHECK(sirius::pipeline::filter_build_priority_enabled(&params));
+  params.dynamic_filter_build_priority = sirius::dynamic_filter_build_priority_mode::OFF;
+  CHECK_FALSE(sirius::pipeline::filter_build_priority_enabled(&params));
+}
 
 TEST_CASE_METHOD(router_fixture,
                  "get_or_create_dynamic_filter_channel returns nullptr for a null key",

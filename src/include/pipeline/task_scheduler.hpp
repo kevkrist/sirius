@@ -45,6 +45,8 @@ struct TaskQueueHandleWrapper;
 
 namespace sirius {
 
+struct operator_params;
+
 namespace creator {
 class task_creator;
 }
@@ -52,6 +54,8 @@ class task_creator;
 namespace pipeline {
 
 class gpu_pipeline_executor;
+
+[[nodiscard]] bool filter_build_priority_enabled(const sirius::operator_params* params) noexcept;
 
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
@@ -79,7 +83,8 @@ class task_scheduler {
                           exec::queue_ordering task_queue_ordering = exec::queue_ordering::FIFO,
                           const cucascade::memory::system_topology_info* sys_topology = nullptr,
                           const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>*
-                            downgrade_executors = nullptr);
+                            downgrade_executors                    = nullptr,
+                          const sirius::operator_params* op_params = nullptr);
 
   /**
    * @brief Destructor for the task_scheduler.
@@ -203,6 +208,16 @@ class task_scheduler {
     _no_pref_rr_counter.store(value, std::memory_order_relaxed);
   }
 
+  [[nodiscard]] size_t filter_build_pipeline_count_for_testing() const noexcept
+  {
+    return _filter_build_pipelines.size();
+  }
+
+  [[nodiscard]] bool priority_dispatch_enabled_for_testing() const noexcept
+  {
+    return _priority_dispatch_enabled;
+  }
+
  private:
   void management_eventloop();
 
@@ -214,6 +229,8 @@ class task_scheduler {
   /// splits of a transitive scan target are more likely to observe the filter. Immediate probes are
   /// ordered independently by the join hint. Set once in prepare_for_query; read-only thereafter.
   std::unordered_set<const sirius_pipeline*> _filter_build_pipelines;
+  const sirius::operator_params* _op_params{nullptr};
+  bool _priority_dispatch_enabled{true};
 
   exec::inspectable_mpsc<sirius::parallel::itask> _task_queue;  ///< Queue for GPU pipeline tasks
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;

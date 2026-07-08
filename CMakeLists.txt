@@ -563,6 +563,7 @@ endif()
 set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
+    test/cpp/config/test_dynamic_filter_priority_config.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp

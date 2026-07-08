@@ -357,6 +357,7 @@ The cutover is **hardware-adaptive** — it replaced an earlier fixed `2M`-row-c
 - `enable_dynamic_zone_map_filter` (bool, default **false**, requires the master) — additionally emit a read-time zone map for row-group pruning. Off by default: static pushdown already handles range-derivable builds and scattered keys prune nothing, so it is reserved for clustered-keyset workloads whose narrow range is runtime-determined. The publication range-coverage gate skips obviously non-pruning numeric ranges.
 - `dynamic_filter_domain_coverage_threshold` (double, default **0.9**) — skip publishing a key's filters when the build covers at least this fraction of the key's domain (rows gate and zone-map range gate); ≥ 1.0 effectively disables the gate.
 - `dynamic_filter_keep_threshold` (double, default **0.9**) — consumer-side scan gate: disable a scan's post-decode filtering once a measured split keeps more than this fraction of its rows; in [0, 1], 1.0 keeps filtering always on.
+- `dynamic_filter_build_priority` (`legacy` or `off`, default **legacy**) — controls the scheduler's soft preference for queued tasks that feed dynamic-filter builds. `off` preserves normal queue order without disabling filter construction, publication, application, or telemetry. The value is snapshotted when each query is prepared, so a `SET` applies to subsequent queries.
 
 #### Ready replicas and per-split snapshots
 

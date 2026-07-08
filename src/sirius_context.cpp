@@ -499,7 +499,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                        telemetry_context_,
                                                        config_.get_task_queue_ordering(),
                                                        &config_.get_hw_topology(),
-                                                       &downgrade_executors_);
+                                                       &downgrade_executors_,
+                                                       &config_.get_operator_params());
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(
     config_.get_task_creator_config(), *memory_manager_, &config_.get_hw_topology());

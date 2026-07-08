@@ -26,6 +26,7 @@
 
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 namespace sirius {
 
@@ -57,6 +58,30 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 
 }  // namespace config
+
+enum class dynamic_filter_build_priority_mode : uint8_t { LEGACY, OFF };
+
+inline bool string_to_enum(std::string_view sv, dynamic_filter_build_priority_mode& out)
+{
+  if (sv == "legacy") {
+    out = dynamic_filter_build_priority_mode::LEGACY;
+    return true;
+  }
+  if (sv == "off") {
+    out = dynamic_filter_build_priority_mode::OFF;
+    return true;
+  }
+  return false;
+}
+
+inline bool enum_to_string(dynamic_filter_build_priority_mode mode, std::string& out)
+{
+  switch (mode) {
+    case dynamic_filter_build_priority_mode::LEGACY: out = "legacy"; return true;
+    case dynamic_filter_build_priority_mode::OFF: out = "off"; return true;
+  }
+  return false;
+}
 
 /// Parameters controlling operator-level resource sizing.
 /// These can be set via the .yaml file under the sirius.operator_params section
@@ -116,6 +141,11 @@ struct operator_params {
   /// keeps more than this fraction of its rows (too unselective to repay the mask kernel). In
   /// [0, 1]; 1.0 keeps filtering always on.
   double dynamic_filter_keep_threshold = 0.9;
+
+  /// Scheduler policy for queued tasks that feed dynamic-filter builds. LEGACY gives those tasks
+  /// soft dispatch priority; OFF preserves normal queue order while retaining instrumentation.
+  dynamic_filter_build_priority_mode dynamic_filter_build_priority =
+    dynamic_filter_build_priority_mode::LEGACY;
 };
 
 struct telemetry_config {

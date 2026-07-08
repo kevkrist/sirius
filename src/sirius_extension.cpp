@@ -1649,6 +1649,18 @@ static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope
                    params->dynamic_filter_keep_threshold);
 }
 
+static void SetDynamicFilterBuildPriority(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto value = StringValue::Get(parameter);
+  if (!sirius::string_to_enum(value, params->dynamic_filter_build_priority)) {
+    throw InvalidInputException("dynamic_filter_build_priority must be 'legacy' or 'off', got '%s'",
+                                value);
+  }
+  SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_BUILD_PRIORITY to {}", value);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -1872,6 +1884,19 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::DOUBLE,
     Value::DOUBLE(sirius::operator_params{}.dynamic_filter_keep_threshold),
     SetDynamicFilterKeepThreshold);
+
+  std::string dynamic_filter_build_priority_default;
+  if (!sirius::enum_to_string(sirius::operator_params{}.dynamic_filter_build_priority,
+                              dynamic_filter_build_priority_default)) {
+    throw InternalException("Invalid default dynamic_filter_build_priority");
+  }
+  config.AddExtensionOption(
+    "dynamic_filter_build_priority",
+    "Scheduler policy for dynamic-filter build feeders: 'legacy' gives them soft dispatch "
+    "priority; 'off' preserves normal queue order",
+    LogicalType::VARCHAR,
+    Value(dynamic_filter_build_priority_default),
+    SetDynamicFilterBuildPriority);
 }
 
 static void LoadInternal(ExtensionLoader& loader)
