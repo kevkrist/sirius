@@ -34,11 +34,11 @@ struct temporary_yaml {
 
 }  // namespace
 
-TEST_CASE("dynamic-filter build priority config defaults to legacy",
+TEST_CASE("dynamic-filter build priority config defaults to off",
           "[config][dynamic_filter][priority]")
 {
   CHECK(sirius::operator_params{}.dynamic_filter_build_priority ==
-        sirius::dynamic_filter_build_priority_mode::LEGACY);
+        sirius::dynamic_filter_build_priority_mode::OFF);
 }
 
 TEST_CASE("dynamic-filter build priority string helpers round-trip",
@@ -58,9 +58,10 @@ TEST_CASE("dynamic-filter build priority string helpers round-trip",
 TEST_CASE("sirius_config loads dynamic-filter build priority from YAML",
           "[config][dynamic_filter][priority]")
 {
-  temporary_yaml yaml{"sirius:\n"
-                      "  operator_params:\n"
-                      "    dynamic_filter_build_priority: off\n"};
+  temporary_yaml yaml{
+    "sirius:\n"
+    "  operator_params:\n"
+    "    dynamic_filter_build_priority: off\n"};
   sirius::sirius_config config;
   config.load_from_file(yaml.path);
   CHECK(config.get_operator_params().dynamic_filter_build_priority ==
@@ -70,9 +71,10 @@ TEST_CASE("sirius_config loads dynamic-filter build priority from YAML",
 TEST_CASE("sirius_config rejects unknown dynamic-filter build priority",
           "[config][dynamic_filter][priority]")
 {
-  temporary_yaml yaml{"sirius:\n"
-                      "  operator_params:\n"
-                      "    dynamic_filter_build_priority: fastest\n"};
+  temporary_yaml yaml{
+    "sirius:\n"
+    "  operator_params:\n"
+    "    dynamic_filter_build_priority: fastest\n"};
   sirius::sirius_config config;
   CHECK_THROWS(config.load_from_file(yaml.path));
 }

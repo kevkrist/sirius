@@ -145,7 +145,7 @@ struct operator_params {
   /// Scheduler policy for queued tasks that feed dynamic-filter builds. LEGACY gives those tasks
   /// soft dispatch priority; OFF preserves normal queue order while retaining instrumentation.
   dynamic_filter_build_priority_mode dynamic_filter_build_priority =
-    dynamic_filter_build_priority_mode::LEGACY;
+    dynamic_filter_build_priority_mode::OFF;
 };
 
 struct telemetry_config {

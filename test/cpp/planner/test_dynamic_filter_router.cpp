@@ -68,6 +68,7 @@ TEST_CASE("dynamic-filter build priority gate follows operator params",
 {
   CHECK(sirius::pipeline::filter_build_priority_enabled(nullptr));
   sirius::operator_params params;
+  params.dynamic_filter_build_priority = sirius::dynamic_filter_build_priority_mode::LEGACY;
   CHECK(sirius::pipeline::filter_build_priority_enabled(&params));
   params.dynamic_filter_build_priority = sirius::dynamic_filter_build_priority_mode::OFF;
   CHECK_FALSE(sirius::pipeline::filter_build_priority_enabled(&params));
