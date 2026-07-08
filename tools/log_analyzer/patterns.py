@@ -14,7 +14,7 @@ that consumes this data can detect mismatched parser versions.
 
 import re
 
-SHAPE_VERSION = "1.6"
+SHAPE_VERSION = "1.7"
 
 # Timestamp at the start of every log line, e.g. "[2026-05-20 14:25:02.368]"
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]")
@@ -22,6 +22,18 @@ TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\]")
 # --- Level tags used by the trace-level check --------------------------------
 TRACE_TAG = "[trace]"
 DEBUG_TAG = "[debug]"
+
+# --- Metric: dynamic-filter instrumentation ---------------------------------
+# Component/file prefixes deliberately stay outside these expressions: events
+# are emitted by planner, scheduler, producer, channel, and scan files.
+DYNF_EVENT_ANCHOR = "[dynf] "
+DYNF_SUMMARY_ANCHOR = "[dynf_summary] "
+DYNF_EVENT_RE = re.compile(
+    r"\[(?P<ts>[\d\-: .]+)\].*\[dynf\] (?P<event>[a-z_]+) (?P<fields>.*)$"
+)
+DYNF_SUMMARY_RE = re.compile(
+    r"\[(?P<ts>[\d\-: .]+)\].*\[dynf_summary\] (?P<event>[a-z_]+) (?P<fields>.*)$"
+)
 
 # --- Query boundaries (info-level) -------------------------------------------
 # Example: "[2026-06-10 19:52:14.000] [info] [:] [host_pool] HOST:0 QueryBegin allocated=5242880 bytes peak=307232768 bytes free_blocks=5115"

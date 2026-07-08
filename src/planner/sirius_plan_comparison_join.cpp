@@ -44,6 +44,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_context.hpp"
+#include "telemetry/dynamic_filter_telemetry.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -532,6 +533,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // decisions; runtime code only consumes this value.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> filter_targets;
     std::vector<sirius::op::dynamic_filter_replica_space> filter_replica_spaces;
+    sirius::op::dynamic_filter_publication_plan_id filter_plan_id{0};
     if (op.filter_pushdown) {
       // An unfiltered build is (for FK-shaped joins) the whole key domain — its filter keeps
       // every probe row by construction, so wiring a producer target for it only buys overhead.
@@ -539,7 +541,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       if (!op.filter_pushdown->build_side_has_filter) {
         SIRIUS_LOG_INFO(
           "[sirius_plan_comparison_join] Not wiring dynamic filter(s): build side is "
-          "unfiltered (build est {} rows).",
+          "unfiltered (build est {} rows). [dynf] candidate_rejected "
+          "reason=build_unfiltered",
           rhs_cardinality);
       } else {
         auto& memory_manager = sirius_context->get_memory_manager();
@@ -550,7 +553,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
         if (gpu_spaces.empty() || host_spaces.empty()) {
           SIRIUS_LOG_INFO(
             "[sirius_plan_comparison_join] Not wiring dynamic filter(s): a GPU and HOST "
-            "memory space are required for device-local replicas.");
+            "memory space are required for device-local replicas. [dynf] candidate_rejected "
+            "reason=no_replica_spaces");
         } else {
           filter_targets.reserve(op.filter_pushdown->probe_info.size());
           for (auto const& pi : op.filter_pushdown->probe_info) {
@@ -558,6 +562,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
             if (!channel) { continue; }
             channel->register_producer();
             sirius::op::dynamic_filter_publish_plan::probe_target target{std::move(channel), {}};
+            target.target_id =
+              sirius::telemetry::dynamic_filter_query_stats::instance().next_target_id();
             target.probe_col_idx.reserve(pi.columns.size());
             target.probe_col_type.reserve(pi.columns.size());
             for (auto const& col : pi.columns) {
@@ -573,6 +579,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
             filter_targets.push_back(std::move(target));
           }
           if (!filter_targets.empty()) {
+            auto const publication_plan_id =
+              sirius::telemetry::dynamic_filter_query_stats::instance().next_publication_plan_id();
             // Resolve each replica's NUMA-local Sirius HOST space once at plan time. The transfer
             // path borrows fixed pinned blocks from that explicit space if peer DMA is unavailable.
             auto const& topology = sirius_context->get_config().get_hw_topology();
@@ -599,15 +607,29 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
               filter_replica_spaces.emplace_back(*mutable_gpu_space, *host_space);
             }
             SIRIUS_LOG_INFO(
-              "[sirius_plan_comparison_join] Wired hash join with {} dynamic-filter probe "
-              "target(s) (build est {} rows).",
+              "[sirius_plan_comparison_join] [dynf] publication_plan_created pub_plan={} "
+              "targets={} keys={} build_est={}",
+              publication_plan_id,
               filter_targets.size(),
+              op.filter_pushdown->join_condition.size(),
               rhs_cardinality);
+            for (auto const& target : filter_targets) {
+              SIRIUS_LOG_INFO(
+                "[sirius_plan_comparison_join] [dynf] target_planned target={} pub_plan={} "
+                "channel={} cols={}",
+                target.target_id,
+                publication_plan_id,
+                target.filter_set->channel_id(),
+                target.probe_col_idx.size());
+            }
+            // Store the id only for enabled plans. A disabled plan retains id 0.
+            filter_plan_id = publication_plan_id;
           }
         }
       }
     }
     sirius::op::dynamic_filter_publish_plan filter_plan{
+      filter_plan_id,
       std::move(filter_targets),
       op_params.enable_dynamic_zone_map_filter,
       std::move(build_key_domains),

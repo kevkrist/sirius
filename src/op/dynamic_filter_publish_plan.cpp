@@ -25,17 +25,23 @@
 namespace sirius::op {
 
 dynamic_filter_publish_plan::dynamic_filter_publish_plan(
+  dynamic_filter_publication_plan_id id,
   std::vector<probe_target> probe_targets,
   bool emit_zone_map_filters,
   std::vector<std::size_t> build_key_domain_cardinalities,
   std::vector<dynamic_filter_replica_space> replica_spaces,
   double domain_coverage_threshold)
-  : _probe_targets(std::move(probe_targets)),
+  : _id(id),
+    _probe_targets(std::move(probe_targets)),
     _emit_zone_map_filters(emit_zone_map_filters),
     _build_key_domain_cardinalities(std::move(build_key_domain_cardinalities)),
     _domain_coverage_threshold(domain_coverage_threshold),
     _replica_spaces(std::move(replica_spaces))
 {
+  if (!_probe_targets.empty() && _id == 0) {
+    throw std::invalid_argument(
+      "[dynamic_filter_publish_plan] An enabled plan requires a non-zero query-relative id");
+  }
   if (!_probe_targets.empty() && _replica_spaces.empty()) {
     throw std::invalid_argument(
       "[dynamic_filter_publish_plan] An enabled dynamic-filter publish plan requires at least one "

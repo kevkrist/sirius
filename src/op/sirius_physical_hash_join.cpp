@@ -43,6 +43,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/dynamic_filter_telemetry.hpp"
 
 #include <rmm/cuda_device.hpp>
 
@@ -947,12 +948,14 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         std::lock_guard<std::mutex> lg(op_state_mutex);
         _built_table_cast_columns = std::move(build_keys_result.owned_cast_columns);
         _build_table              = build_batch_ro;
+        telemetry::dynamic_filter_query_stats::instance().on_build_batch_pinned();
         if (join_type == duckdb::JoinType::MARK || join_type == duckdb::JoinType::SEMI ||
             join_type == duckdb::JoinType::ANTI) {
           // MARK/SEMI/ANTI: build a reusable filtered_join on the right (filter) keys; each probe
           // batch's semi_join/anti_join returns left-row match indices (scattered into a BOOL8 mark
           // for MARK, gathered as the output rows for SEMI/ANTI).
           _filtered_table = make_right_filtered_join_ptr(build_keys, stream);
+          telemetry::dynamic_filter_query_stats::instance().on_hash_table_built();
           SIRIUS_LOG_DEBUG("sirius_physical_hash_join id {}: using filtered_join (BUILD_PROBE {})",
                            this->get_operator_id(),
                            duckdb::JoinTypeToString(join_type));
@@ -960,12 +963,14 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                    (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT)) {
           _distinct_hash_table = std::make_unique<cudf::distinct_hash_join>(
             build_keys, cudf::null_equality::UNEQUAL, 0.5, stream);
+          telemetry::dynamic_filter_query_stats::instance().on_hash_table_built();
           SIRIUS_LOG_DEBUG(
             "sirius_physical_hash_join id {}: using distinct_hash_join (BUILD_PROBE)",
             this->get_operator_id());
         } else {
           _hash_table =
             std::make_unique<cudf::hash_join>(build_keys, cudf::null_equality::UNEQUAL, stream);
+          telemetry::dynamic_filter_query_stats::instance().on_hash_table_built();
         }
         stream.synchronize();  // Ensure the hash table is fully built before we allow any probe
                                // batches to proceed.
@@ -1351,17 +1356,44 @@ void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& 
     return;
   }
 
+  SIRIUS_LOG_DEBUG("[sirius_physical_hash_join] [dynf] publication_started pub_plan={}",
+                   _dynamic_filter_plan.id());
+
   try {
     if (filter_pushdown && _dynamic_filter_plan.enabled()) {
-      dynamic_filter_publisher{
-        *filter_pushdown, _dynamic_filter_plan, key_casts, right_key_col_indices}
-        .publish(build_view, stream);
+      auto const result =
+        dynamic_filter_publisher{
+          *filter_pushdown, _dynamic_filter_plan, key_casts, right_key_col_indices}
+          .publish(build_view, stream);
+      telemetry::dynamic_filter_query_stats::instance().count_publication_outcome(result.outcome,
+                                                                                  result.reason);
+      std::string filter_ids;
+      for (auto const id : result.filter_ids) {
+        if (!filter_ids.empty()) { filter_ids.push_back(','); }
+        filter_ids += std::to_string(id);
+      }
+      SIRIUS_LOG_INFO(
+        "[sirius_physical_hash_join] [dynf] publication_completed pub_plan={} outcome={} "
+        "reason={} filters_built={} filters_pushed={} active_targets={} filter_ids=[{}]",
+        _dynamic_filter_plan.id(),
+        sirius::op::to_string(result.outcome),
+        sirius::op::to_string(result.reason),
+        result.filters_built,
+        result.filters_pushed,
+        result.active_targets,
+        filter_ids);
     }
     _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FINISHED,
                                             std::memory_order_release);
   } catch (...) {
     _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
                                             std::memory_order_release);
+    telemetry::dynamic_filter_query_stats::instance().count_publication_outcome(
+      dynamic_filter_publication_outcome::FAILED, dynamic_filter_no_materialization_reason::NONE);
+    SIRIUS_LOG_INFO(
+      "[sirius_physical_hash_join] [dynf] publication_completed pub_plan={} outcome=FAILED "
+      "reason=NONE filters_built=0 filters_pushed=0 active_targets=0 filter_ids=[]",
+      _dynamic_filter_plan.id());
     throw;
   }
 }
@@ -1378,6 +1410,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   // BUILD_PROBE join currently.
   std::optional<::cucascade::read_only_data_batch> build_ro;
   if (port_id == "build" && batch) {
+    telemetry::dynamic_filter_query_stats::instance().count_build_batch_delivered();
     bool claim = false;
     {
       std::scoped_lock lg(op_state_mutex);
@@ -1399,7 +1432,15 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   auto* ms = build_ro->get_data() ? build_ro->get_memory_space() : nullptr;
   // Non-GPU residency here means the batch was already downgraded before this delivery (it can be
   // shared with an earlier consumer, e.g. CTE fan-out). Publication is best-effort: skip it.
-  if (!ms || build_ro->get_current_tier() != ::cucascade::memory::Tier::GPU) { return; }
+  if (!ms || build_ro->get_current_tier() != ::cucascade::memory::Tier::GPU) {
+    _dynamic_filter_skip_reason.store(dynamic_filter_no_materialization_reason::SOURCE_UNAVAILABLE,
+                                      std::memory_order_release);
+    SIRIUS_LOG_DEBUG(
+      "[sirius_physical_hash_join] [dynf] publication_skipped pub_plan={} "
+      "reason=SOURCE_UNAVAILABLE",
+      _dynamic_filter_plan.id());
+    return;
+  }
 
   // The build batch was produced on a different stream than the publication stream. Order the
   // publication stream after the batch's writer event.
@@ -1428,24 +1469,53 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
 
 void sirius_physical_hash_join::on_finalize_operator()
 {
-  std::scoped_lock lg(op_state_mutex);
+  bool closed_now = false;
+  dynamic_filter_no_materialization_reason close_reason =
+    dynamic_filter_no_materialization_reason::NONE;
+  {
+    std::scoped_lock lg(op_state_mutex);
 
-  // Close an unclaimed publication window before BUILD_PROBE state is released. If publication
-  // already started, its explicit PUBLISHING -> FINISHED/FAILED transition remains authoritative.
-  auto expected = dynamic_filter_publication_state::OPEN;
-  _dynamic_filter_publication_state.compare_exchange_strong(
-    expected,
-    dynamic_filter_publication_state::CLOSED,
-    std::memory_order_acq_rel,
-    std::memory_order_acquire);
+    // Close an unclaimed publication window before BUILD_PROBE state is released. If publication
+    // already started, its explicit PUBLISHING -> FINISHED/FAILED transition remains authoritative.
+    auto expected = dynamic_filter_publication_state::OPEN;
+    closed_now    = _dynamic_filter_publication_state.compare_exchange_strong(
+      expected,
+      dynamic_filter_publication_state::CLOSED,
+      std::memory_order_acq_rel,
+      std::memory_order_acquire);
+    if (closed_now && _dynamic_filter_plan.enabled()) {
+      close_reason = _join_mode != HASH_JOIN_MODE::BUILD_PROBE
+                       ? dynamic_filter_no_materialization_reason::UNSUPPORTED_MODE
+                       : _dynamic_filter_skip_reason.load(std::memory_order_acquire);
+      if (close_reason == dynamic_filter_no_materialization_reason::NONE) {
+        close_reason = dynamic_filter_no_materialization_reason::NO_BUILD_DELIVERY;
+      }
+    }
 
-  if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
-    _hash_table.reset();
-    _distinct_hash_table.reset();
-    _filtered_table.reset();
-    _build_table = std::nullopt;
-    _built_table_cast_columns.clear();
-    _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
+    if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
+      if (_hash_table_build_state == BUILD_HASH_TABLE_STATE::BUILT) {
+        auto const tables = static_cast<std::size_t>(static_cast<bool>(_hash_table)) +
+                            static_cast<std::size_t>(static_cast<bool>(_distinct_hash_table)) +
+                            static_cast<std::size_t>(static_cast<bool>(_filtered_table));
+        telemetry::dynamic_filter_query_stats::instance().on_build_state_released(1, tables);
+      }
+      _hash_table.reset();
+      _distinct_hash_table.reset();
+      _filtered_table.reset();
+      _build_table = std::nullopt;
+      _built_table_cast_columns.clear();
+      _hash_table_build_state = BUILD_HASH_TABLE_STATE::DESTROYED;
+    }
+  }
+  if (closed_now && _dynamic_filter_plan.enabled()) {
+    telemetry::dynamic_filter_query_stats::instance().count_publication_outcome(
+      dynamic_filter_publication_outcome::NO_MATERIALIZATION, close_reason);
+    SIRIUS_LOG_INFO(
+      "[sirius_physical_hash_join] [dynf] publication_completed pub_plan={} "
+      "outcome=NO_MATERIALIZATION reason={} filters_built=0 filters_pushed=0 "
+      "active_targets=0 filter_ids=[]",
+      _dynamic_filter_plan.id(),
+      sirius::op::to_string(close_reason));
   }
 }
 

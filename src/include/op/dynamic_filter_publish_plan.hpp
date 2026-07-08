@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/dynamic_filter_ids.hpp"
 #include "op/dynamic_filter_replica_space.hpp"
 
 #include <cudf/types.hpp>
@@ -45,6 +46,7 @@ class dynamic_filter_publish_plan final {
     std::shared_ptr<sirius_dynamic_filter_set> filter_set;
     std::vector<std::size_t> probe_col_idx;
     std::vector<cudf::data_type> probe_col_type;
+    dynamic_filter_target_id target_id{0};
   };
 
   /// Default fraction of a key's domain a build may cover and still publish that key's filters.
@@ -52,6 +54,7 @@ class dynamic_filter_publish_plan final {
 
   dynamic_filter_publish_plan() = default;
   dynamic_filter_publish_plan(
+    dynamic_filter_publication_plan_id id,
     std::vector<probe_target> probe_targets,
     bool emit_zone_map_filters,
     std::vector<std::size_t> build_key_domain_cardinalities,
@@ -59,6 +62,10 @@ class dynamic_filter_publish_plan final {
     double domain_coverage_threshold = k_default_domain_coverage_threshold);
 
   [[nodiscard]] bool enabled() const noexcept { return !_probe_targets.empty(); }
+  [[nodiscard]] dynamic_filter_publication_plan_id id() const noexcept
+  {
+    return enabled() ? _id : 0;
+  }
   [[nodiscard]] std::vector<probe_target> const& probe_targets() const noexcept
   {
     return _probe_targets;
@@ -80,6 +87,7 @@ class dynamic_filter_publish_plan final {
   }
 
  private:
+  dynamic_filter_publication_plan_id _id{0};
   std::vector<probe_target> _probe_targets;
   bool _emit_zone_map_filters = false;
   std::vector<std::size_t> _build_key_domain_cardinalities;

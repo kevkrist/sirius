@@ -255,6 +255,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// Exactly-once arbitration between the publication hook and finalization.
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
     dynamic_filter_publication_state::OPEN};
+  std::atomic<dynamic_filter_no_materialization_reason> _dynamic_filter_skip_reason{
+    dynamic_filter_no_materialization_reason::NONE};
   //===----------------------------------------------------------------------===//
 
  public:

@@ -26,10 +26,12 @@
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "pipeline/task_request.hpp"
+#include "telemetry/dynamic_filter_telemetry.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <rmm/cuda_device.hpp>
 
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <util/stream_check_wrapper.hpp>
 
 #include <algorithm>
@@ -42,6 +44,20 @@
 #include <utility>
 namespace sirius {
 namespace pipeline {
+
+namespace {
+struct feeder_running_scope {
+  bool active;
+  explicit feeder_running_scope(bool is_feeder) : active(is_feeder)
+  {
+    if (active) { telemetry::dynamic_filter_query_stats::instance().feeder_running_inc(); }
+  }
+  ~feeder_running_scope()
+  {
+    if (active) { telemetry::dynamic_filter_query_stats::instance().feeder_running_dec(); }
+  }
+};
+}  // namespace
 
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
@@ -268,6 +284,12 @@ void gpu_pipeline_executor::manager_loop()
         gpu_task->get_task_id(),
         reservation->size());
     }
+    if (auto* resource =
+          _memory_space
+            ->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>()) {
+      telemetry::dynamic_filter_query_stats::instance().sample_gpu_allocated(
+        _memory_space->get_device_id(), resource->get_total_allocated_bytes());
+    }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);
@@ -292,6 +314,8 @@ void gpu_pipeline_executor::manager_loop()
        exc_stream = std::move(exc_stream),
        consumers  = std::move(output_consumers),
        pipeline]() mutable {
+        feeder_running_scope feeder_scope{
+          telemetry::dynamic_filter_query_stats::instance().is_feeder(pipeline)};
         try {
           task->execute(exc_stream);
         } catch (oom_reschedule_exception& oom) {
@@ -312,6 +336,11 @@ void gpu_pipeline_executor::manager_loop()
 
           // Sync the stream to ensure all memory is released before the reschedule.
           exc_stream->synchronize();
+          if (auto* resource = _memory_space->get_memory_resource_as<
+                               cucascade::memory::reservation_aware_resource_adaptor>()) {
+            telemetry::dynamic_filter_query_stats::instance().sample_gpu_allocated(
+              _memory_space->get_device_id(), resource->get_total_allocated_bytes());
+          }
 
           // Determine retry count and original task ID for this rescheduled attempt.
           auto* cur_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state());
@@ -422,6 +451,12 @@ void gpu_pipeline_executor::manager_loop()
           });
           pipeline_task->telemetry_handle().exit();
           pipeline_task->set_telemetry_finalized();
+        }
+        if (auto* resource =
+              _memory_space
+                ->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>()) {
+          telemetry::dynamic_filter_query_stats::instance().sample_gpu_allocated(
+            _memory_space->get_device_id(), resource->get_total_allocated_bytes());
         }
         task.reset();
 

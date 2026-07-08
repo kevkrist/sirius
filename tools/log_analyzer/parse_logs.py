@@ -35,6 +35,7 @@ if __package__ in (None, ""):
     from tools.log_analyzer import aggregator, patterns, plan_parser, segmenter
     from tools.log_analyzer.metrics import (
         downgrade,
+        dynamic_filters,
         memory_history,
         memory_reservation,
         task_input,
@@ -45,6 +46,7 @@ else:
     from . import aggregator, patterns, plan_parser, segmenter
     from .metrics import (
         downgrade,
+        dynamic_filters,
         memory_history,
         memory_reservation,
         task_input,
@@ -57,9 +59,9 @@ def _check_trace_level(lines):
     """Fail fast unless the log was captured with at least trace/debug enabled."""
     has_trace = any(patterns.TRACE_TAG in ln for ln in lines)
     has_debug = any(patterns.DEBUG_TAG in ln for ln in lines)
-    if not (has_trace and has_debug):
+    if not (has_trace or has_debug):
         print(
-            "ERROR: the logs were not capture with the trace log level",
+            "ERROR: the logs were not captured with debug or trace logging",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -154,12 +156,14 @@ def process_query(seg, out_dir: Path, warnings: FormatWarnings) -> dict:
     to_rows = task_output.parse(seg.lines, warnings)
     mh_rows = memory_history.parse(seg.lines, warnings)
     dg_rows = downgrade.parse(seg.lines, warnings)
+    df_rows = dynamic_filters.parse(seg.lines, warnings)
 
     _write_csv(qdir / "memory_reservations.csv", memory_reservation.COLUMNS, mr_rows)
     _write_csv(qdir / "task_inputs.csv", task_input.COLUMNS, ti_rows)
     _write_csv(qdir / "task_outputs.csv", task_output.COLUMNS, to_rows)
     _write_csv(qdir / "memory_history.csv", memory_history.COLUMNS, mh_rows)
     _write_csv(qdir / "downgrades.csv", downgrade.COLUMNS, dg_rows)
+    _write_csv(qdir / "dynamic_filters.csv", dynamic_filters.COLUMNS, df_rows)
 
     # plan
     plan = plan_parser.parse_plan(seg.lines, warnings)
@@ -198,6 +202,7 @@ def process_query(seg, out_dir: Path, warnings: FormatWarnings) -> dict:
             "task_outputs": len(to_rows),
             "memory_history": len(mh_rows),
             "downgrades": len(dg_rows),
+            "dynamic_filters": len(df_rows),
             "pipelines_in_plan": plan["counts"]["pipelines"] if plan else 0,
         },
     }

@@ -33,6 +33,7 @@
 
 // sirius
 #include <log/logging.hpp>
+#include <telemetry/dynamic_filter_telemetry.hpp>
 
 // standard library
 #include <algorithm>
@@ -40,6 +41,16 @@
 #include <utility>
 
 namespace sirius::op {
+
+sirius_dynamic_filter::sirius_dynamic_filter()
+  : _filter_id(telemetry::dynamic_filter_query_stats::instance().next_filter_id())
+{
+}
+
+sirius_dynamic_filter_set::sirius_dynamic_filter_set()
+  : _channel_id(telemetry::dynamic_filter_query_stats::instance().next_channel_id())
+{
+}
 
 namespace {
 
@@ -455,20 +466,43 @@ bool sirius_dynamic_filter_set::push_filter(std::size_t col_idx,
                                             std::shared_ptr<sirius_dynamic_filter const> f)
 {
   if (!f) { return false; }
+  auto const filter_id         = f->filter_id();
+  char const* rejection_reason = nullptr;
   {
     std::scoped_lock lk(_mu);
-    if (!_accepting_filters.load(std::memory_order_relaxed)) { return false; }
+    if (!_accepting_filters.load(std::memory_order_relaxed)) { rejection_reason = "closed"; }
     // Translate the producer's column_ids-space index to the consumer's output-column position.
     // An empty remap is identity; a column_ids entry mapping to no output column is rejected.
-    if (!_consumer_col_remap.empty()) {
-      if (col_idx >= _consumer_col_remap.size()) { return false; }
-      col_idx = _consumer_col_remap[col_idx];
-      if (col_idx == static_cast<std::size_t>(-1)) { return false; }
+    if (!rejection_reason && !_consumer_col_remap.empty()) {
+      if (col_idx >= _consumer_col_remap.size()) { rejection_reason = "remap_out_of_range"; }
+      if (!rejection_reason) {
+        col_idx = _consumer_col_remap[col_idx];
+        if (col_idx == static_cast<std::size_t>(-1)) { rejection_reason = "remap_dropped"; }
+      }
     }
-    if (_ignored_columns.count(col_idx) != 0) { return false; }
-    _filters[col_idx].push_back(std::move(f));
+    if (!rejection_reason && _ignored_columns.count(col_idx) != 0) {
+      rejection_reason = "ignored_column";
+    }
+    if (!rejection_reason) { _filters[col_idx].push_back(std::move(f)); }
   }
-  _filter_count.fetch_add(1, std::memory_order_release);
+  if (rejection_reason) {
+    SIRIUS_LOG_TRACE(
+      "[sirius_dynamic_filter_set] [dynf] channel_filter_visible channel={} filter={} col={} "
+      "accepted=0 reason={}",
+      _channel_id,
+      filter_id,
+      col_idx,
+      rejection_reason);
+    return false;
+  }
+  auto const generation = _filter_count.fetch_add(1, std::memory_order_release) + 1;
+  SIRIUS_LOG_DEBUG(
+    "[sirius_dynamic_filter_set] [dynf] channel_filter_visible channel={} filter={} col={} "
+    "generation={}",
+    _channel_id,
+    filter_id,
+    col_idx,
+    generation);
   return true;
 }
 
@@ -491,8 +525,18 @@ void sirius_dynamic_filter_set::register_producer()
 
 void sirius_dynamic_filter_set::close_for_new_filters()
 {
-  std::scoped_lock lk(_mu);
-  _accepting_filters.store(false, std::memory_order_release);
+  bool was_open = false;
+  {
+    std::scoped_lock lk(_mu);
+    was_open = _accepting_filters.exchange(false, std::memory_order_release);
+  }
+  if (was_open) {
+    SIRIUS_LOG_INFO(
+      "[sirius_dynamic_filter_set] [dynf] channel_closed channel={} "
+      "reason=consumer_drained filters_seen={}",
+      _channel_id,
+      _filter_count.load(std::memory_order_acquire));
+  }
 }
 
 std::vector<std::shared_ptr<sirius_dynamic_filter const>>

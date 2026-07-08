@@ -232,6 +232,11 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches(
     bool leave_locked = false) const;
 
+  [[nodiscard]] bool has_read_only_locks() const noexcept
+  {
+    return _read_only_data_batches.has_value();
+  }
+
   /**
    * @brief Release all read-only locks by resetting _read_only_data_batches.
    */

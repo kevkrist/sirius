@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/dynamic_filter_ids.hpp"
 #include "op/dynamic_filter_replica_space.hpp"
 
 // cudf
@@ -68,8 +69,13 @@ enum class sirius_dynamic_filter_kind { ZONE_MAP, IN_LIST, BLOOM };
  * the capability they need; a failed cast means the filter does not support that path.
  */
 class sirius_dynamic_filter {
+ protected:
+  sirius_dynamic_filter();
+
  public:
   virtual ~sirius_dynamic_filter() = default;
+
+  [[nodiscard]] dynamic_filter_filter_id filter_id() const noexcept { return _filter_id; }
 
   /// The kind of this filter.
   [[nodiscard]] virtual sirius_dynamic_filter_kind kind() const = 0;
@@ -80,6 +86,9 @@ class sirius_dynamic_filter {
   {
     return true;
   }
+
+ private:
+  dynamic_filter_filter_id _filter_id;
 };
 
 /**
@@ -326,6 +335,7 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   /// stays in the .cu translation unit.
   struct set_impl;
   std::unique_ptr<set_impl> _set;
+  std::size_t _resident_bytes{0};
 };
 
 //===----------------------------------------------------------------------===//
@@ -380,6 +390,7 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
  private:
   struct impl;
   std::unique_ptr<impl> _impl;
+  std::size_t _resident_bytes{0};
 };
 
 //===----------------------------------------------------------------------===//
@@ -418,6 +429,9 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
  */
 class sirius_dynamic_filter_set {
  public:
+  sirius_dynamic_filter_set();
+
+  [[nodiscard]] dynamic_filter_channel_id channel_id() const noexcept { return _channel_id; }
   /**
    * @brief Register a filter for column @p col_idx. No-op if @p f is null or the channel is
    * closed.
@@ -509,6 +523,7 @@ class sirius_dynamic_filter_set {
   }
 
  private:
+  dynamic_filter_channel_id _channel_id;
   mutable std::mutex _mu;
   std::unordered_map<std::size_t, std::vector<std::shared_ptr<sirius_dynamic_filter const>>>
     _filters;

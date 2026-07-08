@@ -68,8 +68,8 @@ std::size_t device_l2_cache_bytes(
 }
 }  // namespace
 
-void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
-                                       rmm::cuda_stream_view stream) const
+dynamic_filter_publish_result dynamic_filter_publisher::publish(cudf::table_view const& build_view,
+                                                                rmm::cuda_stream_view stream) const
 {
   nvtx3::scoped_range nvtx_range{"dynfilter::push_build_side"};
   assert(_plan.enabled());
@@ -77,7 +77,8 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
   if (build_view.num_rows() == 0) {
     SIRIUS_LOG_DEBUG(
       "[sirius_physical_hash_join] Skipping dynamic filter push: empty build table.");
-    return;
+    return {dynamic_filter_publication_outcome::NO_MATERIALIZATION,
+            dynamic_filter_no_materialization_reason::EMPTY_BUILD};
   }
 
   auto target_accepts_filters = [](dynamic_filter_publish_plan::probe_target const& tgt) {
@@ -87,7 +88,8 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
   if (std::none_of(probe_targets.begin(), probe_targets.end(), target_accepts_filters)) {
     SIRIUS_LOG_DEBUG(
       "[sirius_physical_hash_join] Skipping dynamic filter push: all target scans drained.");
-    return;
+    return {dynamic_filter_publication_outcome::NO_MATERIALIZATION,
+            dynamic_filter_no_materialization_reason::CONSUMER_CLOSED};
   }
 
   auto const& key_domains = _plan.build_key_domain_cardinalities();
@@ -260,15 +262,33 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
       choice = "bloom";
     }
     SIRIUS_LOG_DEBUG(
-      "[sirius_physical_hash_join] dynamic filter key {}: build_rows={} zone_map={} membership: "
-      "in_list_set={}B bloom={}B L2={}B -> {}",
+      "[sirius_physical_hash_join] [dynf] materialization_key key={} build_rows={} zone_map={} "
+      "membership={} in_list_set={} bloom={} l2={} filter_id_zm={} filter_id_mem={}",
       k,
       build_rows,
       per_key_zone_map[k] ? "yes" : "no",
+      choice,
       set_bytes,
       bloom_bytes,
       l2_bytes,
-      choice);
+      per_key_zone_map[k] ? per_key_zone_map[k]->filter_id() : 0,
+      per_key_membership[k] ? per_key_membership[k]->filter_id() : 0);
+  }
+
+  dynamic_filter_publish_result result{dynamic_filter_publication_outcome::PUBLISHED,
+                                       dynamic_filter_no_materialization_reason::NONE};
+  for (auto const& filters : {&per_key_zone_map, &per_key_membership}) {
+    for (auto const& filter : *filters) {
+      if (filter) {
+        ++result.filters_built;
+        result.filter_ids.push_back(filter->filter_id());
+      }
+    }
+  }
+  if (result.filters_built == 0) {
+    result.outcome = dynamic_filter_publication_outcome::NO_MATERIALIZATION;
+    result.reason  = dynamic_filter_no_materialization_reason::POLICY_SKIPPED;
+    return result;
   }
 
   // Publish is cross-stream: consumers probe these structures from their own task streams the
@@ -304,7 +324,14 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
   std::size_t total_pushed   = 0;
   std::size_t active_targets = 0;
   for (auto const& tgt : probe_targets) {
-    if (!target_accepts_filters(tgt)) { continue; }
+    if (!target_accepts_filters(tgt)) {
+      SIRIUS_LOG_INFO(
+        "[dynamic_filter_publisher] [dynf] target_publication_terminal target={} channel={} "
+        "outcome=consumer_closed pushed=0",
+        tgt.target_id,
+        tgt.filter_set ? tgt.filter_set->channel_id() : 0);
+      continue;
+    }
     ++active_targets;
 
     if (tgt.probe_col_idx.size() != per_key_membership.size()) {
@@ -313,8 +340,14 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
         "skipping target to preserve correctness.",
         tgt.probe_col_idx.size(),
         per_key_membership.size());
+      SIRIUS_LOG_INFO(
+        "[dynamic_filter_publisher] [dynf] target_publication_terminal target={} channel={} "
+        "outcome=arity_mismatch pushed=0",
+        tgt.target_id,
+        tgt.filter_set->channel_id());
       continue;
     }
+    auto const pushed_before = total_pushed;
     for (std::size_t k = 0; k < per_key_membership.size(); ++k) {
       if (per_key_zone_map[k] && k < tgt.probe_col_type.size() &&
           tgt.probe_col_type[k] == per_key_build_type[k] &&
@@ -326,15 +359,25 @@ void dynamic_filter_publisher::publish(cudf::table_view const& build_view,
         ++total_pushed;
       }
     }
+    SIRIUS_LOG_INFO(
+      "[dynamic_filter_publisher] [dynf] target_publication_terminal target={} channel={} "
+      "outcome=accepted pushed={}",
+      tgt.target_id,
+      tgt.filter_set->channel_id(),
+      total_pushed - pushed_before);
   }
   SIRIUS_LOG_INFO(
     "[sirius_physical_hash_join] Pushed {} dynamic filter(s) across {} active target(s) "
-    "of {} wired target(s) ({} build rows, {} keys).",
+    "of {} wired target(s) ({} build rows, {} keys). pub_plan={}",
     total_pushed,
     active_targets,
     probe_targets.size(),
     build_view.num_rows(),
-    _filter_pushdown.join_condition.size());
+    _filter_pushdown.join_condition.size(),
+    _plan.id());
+  result.filters_pushed = total_pushed;
+  result.active_targets = active_targets;
+  return result;
 }
 
 }  // namespace sirius::op

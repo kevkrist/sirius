@@ -20,6 +20,7 @@
 #include <op/dynamic_filter_replica_reservation.hpp>
 #include <op/dynamic_filter_replica_transfer.hpp>
 #include <op/sirius_dynamic_filter.hpp>
+#include <telemetry/dynamic_filter_telemetry.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -202,6 +203,8 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
         "[sirius_dynamic_in_list_filter] supported key type changed during construction.");
   }
   _set->replicas.push_back(std::move(source));
+  _resident_bytes = estimated_set_bytes(_num_keys, _key_type);
+  telemetry::dynamic_filter_query_stats::instance().add_replica_bytes(_resident_bytes);
 }
 
 bool sirius_dynamic_in_list_filter::supports(cudf::column_view const& keys) noexcept
@@ -210,7 +213,10 @@ bool sirius_dynamic_in_list_filter::supports(cudf::column_view const& keys) noex
   return (id == cudf::type_id::INT32 || id == cudf::type_id::INT64) && keys.null_count() == 0;
 }
 
-sirius_dynamic_in_list_filter::~sirius_dynamic_in_list_filter() = default;
+sirius_dynamic_in_list_filter::~sirius_dynamic_in_list_filter()
+{
+  telemetry::dynamic_filter_query_stats::instance().sub_replica_bytes(_resident_bytes);
+}
 
 bool sirius_dynamic_in_list_filter::has_persistent_set() const noexcept
 {
@@ -317,6 +323,9 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
       stream.synchronize();
       _set->replicas.push_back(std::move(replica));
+      auto const bytes = estimated_set_bytes(_num_keys, _key_type);
+      _resident_bytes += bytes;
+      telemetry::dynamic_filter_query_stats::instance().add_replica_bytes(bytes);
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
         "[sirius_dynamic_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. "

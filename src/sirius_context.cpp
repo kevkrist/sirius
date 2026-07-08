@@ -29,6 +29,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "telemetry/dynamic_filter_telemetry.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
@@ -172,6 +173,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
   try {
     log_pool_stats("QueryBegin");
+    sirius::telemetry::dynamic_filter_query_stats::instance().begin_query(memory_manager_.get());
 
     // Clear any stale captured plan from a previous query.
     captured_logical_plan_.reset();
@@ -248,6 +250,7 @@ void SiriusContext::QueryEnd()
     // sliced host_data_representation are gone before we drop the providers.
     if (scan_manager_) { scan_manager_->reset(); }
 
+    sirius::telemetry::dynamic_filter_query_stats::instance().end_query();
     log_pool_stats("QueryEnd");
   } catch (...) {
     release_query_lifecycle_slot();

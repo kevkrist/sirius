@@ -33,12 +33,14 @@
 #include <op/dynamic_filter_replica_reservation.hpp>
 #include <op/dynamic_filter_replica_transfer.hpp>
 #include <op/sirius_dynamic_filter.hpp>
+#include <telemetry/dynamic_filter_telemetry.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -237,9 +239,14 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
         "[sirius_dynamic_bloom_filter] supported key type changed during construction.");
   }
   _impl->replicas.push_back(std::move(source));
+  _resident_bytes = estimated_bytes(static_cast<std::size_t>(n));
+  telemetry::dynamic_filter_query_stats::instance().add_replica_bytes(_resident_bytes);
 }
 
-sirius_dynamic_bloom_filter::~sirius_dynamic_bloom_filter() = default;
+sirius_dynamic_bloom_filter::~sirius_dynamic_bloom_filter()
+{
+  telemetry::dynamic_filter_query_stats::instance().sub_replica_bytes(_resident_bytes);
+}
 
 void sirius_dynamic_bloom_filter::replicate_to_devices(
   std::span<dynamic_filter_replica_space const> spaces)
@@ -261,7 +268,8 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
 
   // Retain all destination objects and streams until direct peer copies have been submitted to
   // every target. The completion pass then waits on transfers already running in parallel.
-  std::vector<std::pair<std::unique_ptr<bloom_replica>, rmm::cuda_stream_view>> pending;
+  std::vector<std::tuple<std::unique_ptr<bloom_replica>, rmm::cuda_stream_view, std::size_t>>
+    pending;
   pending.reserve(spaces.size());
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
   for (auto const& target : spaces) {
@@ -312,7 +320,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
           bytes);
         continue;
       }
-      pending.emplace_back(std::move(replica), stream);
+      pending.emplace_back(std::move(replica), stream, bytes);
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
         "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} unavailable: {}. "
@@ -328,12 +336,14 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
                      device_id);
   }
 
-  for (auto& [replica, stream] : pending) {
+  for (auto& [replica, stream, bytes] : pending) {
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
       stream.synchronize();
       _impl->replicas.push_back(std::move(replica));
+      _resident_bytes += bytes;
+      telemetry::dynamic_filter_query_stats::instance().add_replica_bytes(bytes);
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
         "[sirius_dynamic_bloom_filter] replica GPU {} -> GPU {} unavailable: {}. "

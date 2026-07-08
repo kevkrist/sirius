@@ -741,6 +741,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   std::optional<gpu_expression_translator::translated_expression> dynamic_ast_expression =
     std::nullopt;
   cudf::ast::expression const* reader_filter_root = nullptr;
+  bool dynamic_filter_merged                      = false;
 
   if (_duckdb_filter_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
@@ -754,6 +755,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 
   if (!split.disable_filter_pushdown && _sirius_dynamic_filters &&
       _sirius_dynamic_filters->has_filters()) {
+    auto const* root_before_dynamic = reader_filter_root;
     if (ast_expression) {
       reader_filter_root = merge_dynamic_filters_into_ast(ast_expression->tree,
                                                           reader_filter_root,
@@ -769,6 +771,14 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
                                                           mem_space.get_device_id());
       if (!reader_filter_root) { dynamic_ast_expression.reset(); }
     }
+    dynamic_filter_merged = reader_filter_root != root_before_dynamic;
+    SIRIUS_LOG_DEBUG(
+      "[parquet_gpu_ingestible] [dynf] reader_pushdown channel={} dyn_merged={} static_ast={} "
+      "visible={}",
+      _sirius_dynamic_filters->channel_id(),
+      dynamic_filter_merged ? 1 : 0,
+      ast_expression.has_value() ? 1 : 0,
+      _sirius_dynamic_filters->filter_count());
   }
 
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }

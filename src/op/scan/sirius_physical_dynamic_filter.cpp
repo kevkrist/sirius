@@ -16,8 +16,10 @@
 
 // sirius
 #include <data/data_batch_utils.hpp>
+#include <log/logging.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/sirius_physical_dynamic_filter.hpp>
+#include <telemetry/dynamic_filter_telemetry.hpp>
 
 // nvtx
 #include <nvtx3/nvtx3.hpp>
@@ -56,7 +58,26 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   // intentionally empty publication. The gate remains filter-count-aware if later splits observe
   // additional filters.
   if (!_filters || !_gate.applicable(*_filters)) {
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    auto const& batches = input.get_data_batches();
+    if (_filters) {
+      std::int64_t rows = -1;
+      if (input.has_read_only_locks()) {
+        rows = 0;
+        for (auto const& ro : input.get_read_only_batches(false)) {
+          if (ro.get_data()) { rows += sirius::get_cudf_table_view(ro).num_rows(); }
+        }
+      }
+      telemetry::dynamic_filter_query_stats::instance().record_channel_passthrough(
+        _filters->channel_id(), batches.size(), rows);
+      SIRIUS_LOG_TRACE(
+        "[sirius_physical_dynamic_filter] [dynf] consume_passthrough channel={} batches={} "
+        "rows={} reason={}",
+        _filters->channel_id(),
+        batches.size(),
+        rows,
+        _filters->has_filters() ? "gate_disabled" : "no_filters");
+    }
+    return std::make_unique<pipelineable_operator_data>(batches);
   }
 
   auto const& idle_batches = input.get_data_batches();

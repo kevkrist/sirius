@@ -29,6 +29,15 @@
 
 namespace sirius::op {
 
+struct dynamic_filter_publish_result {
+  dynamic_filter_publication_outcome outcome;
+  dynamic_filter_no_materialization_reason reason;
+  std::size_t filters_built{};
+  std::size_t filters_pushed{};
+  std::size_t active_targets{};
+  std::vector<dynamic_filter_filter_id> filter_ids;
+};
+
 //===----------------------------------------------------------------------===//
 // dynamic_filter_publisher
 //===----------------------------------------------------------------------===//
@@ -52,7 +61,8 @@ class dynamic_filter_publisher final {
   }
 
   /// Apply publication gates, materialize device replicas, then publish to accepting targets.
-  void publish(cudf::table_view const& build_view, rmm::cuda_stream_view stream) const;
+  [[nodiscard]] dynamic_filter_publish_result publish(cudf::table_view const& build_view,
+                                                      rmm::cuda_stream_view stream) const;
 
  private:
   duckdb::JoinFilterPushdownInfo const& _filter_pushdown;

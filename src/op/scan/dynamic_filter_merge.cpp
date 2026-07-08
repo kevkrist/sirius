@@ -24,6 +24,7 @@
 #include <log/logging.hpp>
 #include <op/dynamic_filter_device.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
+#include <telemetry/dynamic_filter_telemetry.hpp>
 
 #include <algorithm>
 #include <mutex>
@@ -72,9 +73,13 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   nvtx3::scoped_range nvtx_range{"dynfilter::apply_output"};
   if (input.num_rows() == 0 || input.num_columns() == 0) { return nullptr; }
 
-  device_id           = sirius::op::detail::resolve_dynamic_filter_device_id(device_id);
-  auto const num_cols = static_cast<std::size_t>(input.num_columns());
-  auto const mr       = cudf::get_current_device_resource_ref();
+  device_id                   = sirius::op::detail::resolve_dynamic_filter_device_id(device_id);
+  auto const num_cols         = static_cast<std::size_t>(input.num_columns());
+  auto const mr               = cudf::get_current_device_resource_ref();
+  auto const visible          = filters.filter_count();
+  std::uint32_t masks_applied = 0;
+  std::uint32_t masks_skipped = 0;
+  std::uint32_t replica_unavailable = 0;
 
   // Filters apply as a CASCADE, most-selective-first (for membership filters) and AND-merge (for
   // AST-lowerable filters).
@@ -82,6 +87,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view current = input;
   auto const cascade_step  = [&](std::unique_ptr<cudf::column> mask) -> double {
     if (!mask || current.num_rows() == 0) { return 1.0; }
+    ++masks_applied;
     auto const rows_before = current.num_rows();
     owned                  = cudf::apply_boolean_mask(current, mask->view(), stream, mr);
     current                = owned->view();
@@ -99,7 +105,10 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
       if (col_idx >= num_cols) { continue; }
       cudf::ast::expression const* col_ref = nullptr;
       for (auto const& f : filters.filters_for_column(col_idx)) {
-        if (!f->is_available_on_device(device_id)) { continue; }
+        if (!f->is_available_on_device(device_id)) {
+          ++replica_unavailable;
+          continue;
+        }
         auto const* lowerable = dynamic_cast<sirius::op::sirius_ast_lowerable const*>(f.get());
         if (!lowerable) { continue; }
         if (!col_ref) {
@@ -132,11 +141,17 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   for (auto const col_idx : filters.filtered_columns()) {
     if (col_idx >= num_cols) { continue; }
     for (auto const& f : filters.filters_for_column(col_idx)) {
-      if (!f->is_available_on_device(device_id)) { continue; }
+      if (!f->is_available_on_device(device_id)) {
+        ++replica_unavailable;
+        continue;
+      }
       auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(f.get());
       if (!applicable) { continue; }
       auto recorded = gate ? gate->filter_keep_ratio(f.get()) : std::nullopt;
-      if (recorded && dynamic_filter_gate::filter_skippable(*recorded)) { continue; }
+      if (recorded && dynamic_filter_gate::filter_skippable(*recorded)) {
+        ++masks_skipped;
+        continue;
+      }
       entries.push_back({col_idx, applicable, f.get(), recorded});
     }
   }
@@ -151,15 +166,29 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
     if (gate && !e.recorded) { gate->record_filter_keep_ratio(e.identity, kept); }
   }
 
-  if (!owned) { return nullptr; }
   auto const* mode_name = mode == dynamic_filter_apply_mode::include_ast_row_masks
                             ? "include_ast_row_masks"
                             : "membership_masks_only";
-  SIRIUS_LOG_DEBUG("[apply_dynamic_filters] device={} mode={} apply: {} -> {} rows.",
-                   device_id,
-                   mode_name,
-                   input.num_rows(),
-                   owned->num_rows());
+  auto const rows_out   = owned ? owned->num_rows() : input.num_rows();
+  telemetry::dynamic_filter_query_stats::instance().record_channel_batch(filters.channel_id(),
+                                                                         input.num_rows(),
+                                                                         rows_out,
+                                                                         visible > 0,
+                                                                         masks_applied,
+                                                                         masks_skipped,
+                                                                         replica_unavailable);
+  SIRIUS_LOG_DEBUG(
+    "[apply_dynamic_filters] [dynf] consume_batch channel={} device={} mode={} rows_in={} "
+    "rows_out={} visible={} masks_applied={} masks_skipped={} replica_unavailable={}",
+    filters.channel_id(),
+    device_id,
+    mode_name,
+    input.num_rows(),
+    rows_out,
+    visible,
+    masks_applied,
+    masks_skipped,
+    replica_unavailable);
   return owned;
 }
 

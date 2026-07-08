@@ -26,6 +26,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "planner/query.hpp"
+#include "telemetry/dynamic_filter_telemetry.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -100,6 +101,11 @@ task_scheduler::~task_scheduler() { stop(); }
 
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
+  if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get());
+      gpu_task &&
+      telemetry::dynamic_filter_query_stats::instance().is_feeder(gpu_task->get_pipeline())) {
+    telemetry::dynamic_filter_query_stats::instance().count_feeder_queued();
+  }
   if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
     pipeline_task->telemetry_handle().queued({
       .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
@@ -239,6 +245,13 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   _no_pref_rr_counter.store(0, std::memory_order_relaxed);
 
   _filter_build_pipelines = collect_filter_build_pipelines(*_query);
+  std::unordered_set<const void*> feeder_pipelines;
+  feeder_pipelines.reserve(_filter_build_pipelines.size());
+  for (auto const* pipeline : _filter_build_pipelines) {
+    feeder_pipelines.insert(static_cast<const void*>(pipeline));
+  }
+  telemetry::dynamic_filter_query_stats::instance().set_feeder_pipelines(
+    std::move(feeder_pipelines));
 }
 
 std::future<void> task_scheduler::start_query()
@@ -391,6 +404,7 @@ void task_scheduler::management_eventloop()
     for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
       const int device_id = *it;
       std::unique_ptr<sirius::parallel::itask> task;
+      bool prioritized = false;
 
       // Prefer queued tasks feeding a plan-wired dynamic-filter join's build input. This can make
       // the filter available to later splits of a transitive scan target; an immediate probe is
@@ -408,6 +422,7 @@ void task_scheduler::management_eventloop()
                    _gpu_executors.count(pref.value()) == 0;
           },
           /*front_to_back=*/true);
+        prioritized = static_cast<bool>(task);
       }
 
       // Exact preference match.
@@ -442,8 +457,14 @@ void task_scheduler::management_eventloop()
         continue;
       }
       uint64_t task_id = 0;
+      bool feeder      = false;
       if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
         task_id = gpu_task->get_task_id();
+        feeder =
+          telemetry::dynamic_filter_query_stats::instance().is_feeder(gpu_task->get_pipeline());
+        if (feeder) {
+          telemetry::dynamic_filter_query_stats::instance().count_feeder_dispatch(prioritized);
+        }
       }
 
       if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
@@ -457,7 +478,11 @@ void task_scheduler::management_eventloop()
       // Log prefix "[mgpu-audit] pipeline_task dispatched to GPU N" is
       // load-bearing — verification greps depend on it.
       SIRIUS_LOG_INFO(
-        "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={}", device_id, task_id);
+        "[mgpu-audit] pipeline_task dispatched to GPU {} task_id={} feeder={} prioritized={}",
+        device_id,
+        task_id,
+        feeder ? 1 : 0,
+        prioritized ? 1 : 0);
       _gpu_executors.at(device_id)->schedule(std::move(task));
       it = _ready_devices.erase(it);
     }
