@@ -242,7 +242,7 @@ TEST_CASE_METHOD(PinMvccFixture,
 
   // No checkpoint ran in between, so the decoded row count is unchanged and this
   // re-pin takes insert_pinned_entry's MERGE path — the metadata must still be
-  // refreshed (attach overwrites) with the newer, more conservative fence.
+  // refreshed by that path's atomic publication with the newer, more conservative fence.
   run_ok("CALL pin_table(format='duckdb', name='mvcc_repin_t', tier='gpu');");
   auto const second = probe_entry(*con, "mvcc_repin_t");
   REQUIRE(second.has_mvcc);

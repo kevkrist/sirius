@@ -41,12 +41,13 @@ namespace pipeline {
  */
 struct reservation_size_info {
   std::size_t input_basis = 0;  ///< Estimation basis (e.g. input data size)
-  std::size_t bytes_to_materialize_input =
-    0;  ///< Cost to materialize input into the task's target space (host/disk upgrades plus
-        ///< cross-GPU clones); 0 for scans
+  /// New target-space allocation cost for host/disk upgrades, cross-GPU clones,
+  /// and cached encoded-scan decoding. Already-resident source bytes are excluded.
+  std::size_t bytes_to_materialize_input = 0;
   std::size_t peak_memory_estimate = 0;  ///< Predicted operator peak; 2*input_basis if no history
-  std::size_t reservation_size     = 0;  ///< peak_memory_estimate + bytes_to_materialize_input
-  bool had_history                 = false;  ///< True if estimate came from pipeline_memory_history
+  /// Saturating sum of peak_memory_estimate and bytes_to_materialize_input.
+  std::size_t reservation_size = 0;
+  bool had_history             = false;  ///< True if estimate came from pipeline_memory_history
 };
 
 /**

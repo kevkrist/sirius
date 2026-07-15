@@ -15,6 +15,7 @@
 //     per column:
 //       name_len (uint16 LE) + name bytes   [0 = no name]
 //       dtype_tag (uint8)                   [decoded column type]
+//       scale (int32 LE)                    [fixed-point scale; 0 otherwise]
 //       num_rows (int64 LE)
 //       num_nodes (uint16 LE)
 //       per node:
@@ -30,6 +31,7 @@
 //         slot (int32 LE)                   [-1 = node's own rep, else output port]
 //         kind (uint8)                      [OpId]
 //         type_tag (uint8)                  [decoded element type]
+//         num_rows (uint64 LE)              [decoded row count; 0 = legacy unknown]
 //         meta_kind (uint8)  0=none 1=alp_rd 2=ans 3=bitcomp 4=cascaded 5=snappy 6=lz4 7=deflate
 //         meta bytes (variable per meta_kind; see push_meta)
 //         num_bufs (uint8)
@@ -46,6 +48,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -105,19 +108,32 @@ std::string build_compressed_table_header(compressed_table_inspection table,
 
 /// Copies @p size bytes of the external payload at logical @p offset into the
 /// pre-allocated device buffer @p dst_device, enqueued on @p stream.
+/// The callback's payload backing storage is borrowed: its owner must keep that
+/// storage alive until the work enqueued on @p stream has completed, including
+/// when a later reconstruction or decompression step fails.
 using payload_fetch_fn = std::function<void(
   std::uint64_t offset, std::size_t size, void* dst_device, rmm::cuda_stream_view stream)>;
 
 /// Reconstruct a compressed_table from a header produced by
 /// build_compressed_table_header plus a payload accessor. Re-parses the plan
-/// tree from @p header and pulls each leaf buffer's bytes into device memory via
-/// @p fetch. On failure writes an error to @p error_out (if non-null) and returns
-/// an empty compressed_table.
+/// tree from @p header and pulls each selected column's leaf buffers into device
+/// memory via @p fetch. A disengaged @p selected_columns reconstructs every
+/// column; an engaged empty span reconstructs none. Selection order is preserved
+/// and duplicate or out-of-range indices fail before any payload is fetched.
+/// Before allocating device storage or invoking @p fetch, the entire header is
+/// validated for type tags, fixed-width buffer sizing/divisibility, host and
+/// cudf row-count bounds, leaf/column row consistency, and in-range,
+/// internally-consistent plan references. Structural/header/selection failures
+/// write an error to @p error_out (if non-null) and return an empty table.
+/// Allocation failures and exceptions from @p fetch (including CUDA transport
+/// failures) propagate; callers must handle them separately from a returned
+/// parse error.
 compressed_table read_compressed_table_from_memory(
   std::span<const std::uint8_t> header,
   payload_fetch_fn const& fetch,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
-  std::string* error_out            = nullptr);
+  std::string* error_out            = nullptr,
+  std::optional<std::span<const std::size_t>> selected_columns = std::nullopt);
 
 }  // namespace simpatico

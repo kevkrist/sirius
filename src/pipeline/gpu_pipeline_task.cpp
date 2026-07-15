@@ -19,12 +19,14 @@
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
 #include <absl/cleanup/cleanup.h>
+#include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -33,6 +35,7 @@
 
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -40,6 +43,44 @@ namespace sirius {
 namespace pipeline {
 
 namespace {
+
+std::size_t saturating_add(std::size_t lhs, std::size_t rhs) noexcept
+{
+  constexpr auto max = std::numeric_limits<std::size_t>::max();
+  return rhs > max - lhs ? max : lhs + rhs;
+}
+
+std::size_t saturating_double(std::size_t value) noexcept
+{
+  constexpr auto max = std::numeric_limits<std::size_t>::max();
+  return value > max / 2 ? max : value * 2;
+}
+
+std::size_t cached_scan_materialization_bytes(const op::scan::scan_operator_input& input,
+                                              const cucascade::memory::memory_space* target_space)
+{
+  if (!input.is_resident()) { return 0; }
+
+  auto const batch = input.get_cached_batch();
+  if (!batch) { return 0; }
+
+  bool requires_gpu_table = false;
+  {
+    auto const ro    = batch->to_read_only();
+    auto const* data = ro.get_data();
+    if (!data) { return 0; }
+
+    auto const* source_space = ro.get_memory_space();
+    auto const cross_space =
+      target_space != nullptr &&
+      (source_space == nullptr || source_space->get_id() != target_space->get_id());
+    auto const plain_gpu_table =
+      dynamic_cast<const cucascade::gpu_table_representation*>(data) != nullptr;
+    requires_gpu_table =
+      ro.get_current_tier() != cucascade::memory::Tier::GPU || !plain_gpu_table || cross_space;
+  }
+  return requires_gpu_table ? input.get_estimated_working_set_size_in_bytes() : 0;
+}
 
 void validate_operator_output_types(const op::operator_data* data,
                                     const op::sirius_physical_operator& op)
@@ -181,6 +222,37 @@ std::unique_ptr<op::operator_data> run_one_operator(
 }
 
 }  // namespace
+
+std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_input(
+  const cucascade::memory::memory_space* target_space) const
+{
+  if (!_input_data) { return 0; }
+
+  if (auto const* scan_input =
+        dynamic_cast<const op::scan::scan_operator_input*>(_input_data.get())) {
+    return cached_scan_materialization_bytes(*scan_input, target_space);
+  }
+
+  auto const* pipelineable_input =
+    dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
+  if (!pipelineable_input) { return 0; }
+
+  std::size_t input_size = 0;
+  for (auto const& ro : pipelineable_input->get_read_only_batches(false)) {
+    auto const* data = ro.get_data();
+    if (!data) { continue; }
+
+    auto const* source_space = ro.get_memory_space();
+    auto const non_gpu       = ro.get_current_tier() != cucascade::memory::Tier::GPU;
+    auto const cross_space =
+      target_space != nullptr &&
+      (source_space == nullptr || source_space->get_id() != target_space->get_id());
+    if (non_gpu || cross_space) {
+      input_size = saturating_add(input_size, data->get_uncompressed_data_size_in_bytes());
+    }
+  }
+  return input_size;
+}
 
 gpu_pipeline_task::gpu_pipeline_task(
   uint64_t task_id,
@@ -522,7 +594,7 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     ls._input_data ? ls._input_data->get_type() : op::operator_data_type::BASE;
   const bool input_resident = ls._input_data && ls._input_data->is_resident();
   auto working_set_bytes    = input_basis;
-  if (input_type == op::operator_data_type::GPU_SCAN && !input_resident && ls._input_data) {
+  if (input_type == op::operator_data_type::GPU_SCAN && ls._input_data) {
     working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
@@ -533,6 +605,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
 
   if (peak_opt.has_value()) {
     info.peak_memory_estimate = *peak_opt;
+    // A fresh scan decodes during operator execution, so its working set belongs to the operator
+    // peak. A resident scan converts during prepare_for_processing instead; its reconstruction
+    // working set is already charged in bytes_to_materialize_input and must not also raise the
+    // history peak.
     if (input_type == op::operator_data_type::GPU_SCAN && !input_resident) {
       info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
     }
@@ -551,10 +627,10 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
       }
     }
     // If every operator returned 0 (all pass-throughs), fall back to the 2× default.
-    info.peak_memory_estimate = (max_estimate > 0) ? max_estimate : (input_basis * 2);
+    info.peak_memory_estimate = (max_estimate > 0) ? max_estimate : saturating_double(input_basis);
   }
 
-  info.reservation_size = info.peak_memory_estimate + bytes_to_materialize;
+  info.reservation_size = saturating_add(info.peak_memory_estimate, bytes_to_materialize);
   return info;
 }
 

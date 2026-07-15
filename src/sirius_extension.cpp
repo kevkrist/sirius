@@ -80,6 +80,7 @@ extern "C" int cudaProfilerStop();
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 // #include "from_substrait.hpp"
@@ -1194,6 +1195,15 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // ingestible_table_info and drives later cache-hit matching + the gather.
   auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
 
+  auto make_pin_mvcc = [&](std::vector<std::size_t> row_counts)
+    -> std::unique_ptr<sirius::scan_manager::duckdb_mvcc_metadata> {
+    if (data.args.format != "duckdb") { return nullptr; }
+    auto metadata    = std::make_unique<sirius::scan_manager::duckdb_mvcc_metadata>();
+    metadata->v_base = duckdb_pin_v_base;
+    metadata->base_row_count_per_chunk = std::move(row_counts);
+    return metadata;
+  };
+
   // Compression config (tier-agnostic): load the per-table plan DSL from the plan
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
@@ -1272,28 +1282,28 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     int const first_gpu_id          = gpu_spaces_mut[0]->get_device_id();
     auto* representative_host_space = host_space_by_gpu.at(first_gpu_id);
 
-    // Currently, we do not support mixed compressed/uncompressed results: either all batches were
-    // compressed or none (HOST and DEVICE).
-    if (!host_result.compressed_chunks.empty() && !host_result.host_chunks.empty()) {
-      throw std::runtime_error(
-        "pin_table: unexpected result: both compressed and uncompressed host chunks present");
-    }
-    if (!host_result.compressed_chunks.empty() && host_result.host_chunks.empty()) {
+    // A pin may compress some batches and leave others raw (sub-min-batch,
+    // ratio-rejected, or exception-latched). When any batch compressed, install a
+    // compressed entry; forward the raw arm and its scan-order interleaving only
+    // when both arms are populated (a pure-compressed result keeps an empty raw arm
+    // and empty logical_order, taking the homogeneous fast path).
+    auto mvcc = make_pin_mvcc(std::move(host_result.base_row_count_per_chunk));
+    if (!host_result.compressed_chunks.empty()) {
+      sirius::scan_manager::host_pinned_chunks chunks{
+        .compressed    = std::move(host_result.compressed_chunks),
+        .raw           = std::move(host_result.host_chunks),
+        .logical_order = std::move(host_result.logical_order)};
       scan_mgr.insert_pinned_entry_host_compressed(data.args.name,
                                                    std::move(cache_info),
-                                                   std::move(host_result.compressed_chunks),
-                                                   *representative_host_space);
+                                                   std::move(chunks),
+                                                   *representative_host_space,
+                                                   std::move(mvcc));
     } else {
       scan_mgr.insert_pinned_entry_host(data.args.name,
                                         std::move(cache_info),
                                         std::move(host_result.host_chunks),
-                                        *representative_host_space);
-    }
-    if (data.args.format == "duckdb") {
-      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
-      mvcc.v_base                   = duckdb_pin_v_base;
-      mvcc.base_row_count_per_chunk = std::move(host_result.base_row_count_per_chunk);
-      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+                                        *representative_host_space,
+                                        std::move(mvcc));
     }
   } else if (pin_comp.enabled) {
     // GPU tier, compressed: materialize each batch, compress it, and keep the
@@ -1302,42 +1312,38 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     auto dev_result = sirius::materialize_pin_to_device_with_compression(
       *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pin_comp);
 
-    if (!dev_result.compressed_chunks.empty() && !dev_result.tables.empty()) {
-      throw std::runtime_error(
-        "pin_table: unexpected result: both compressed and uncompressed device chunks present");
-    }
-    if (!dev_result.compressed_chunks.empty() && dev_result.tables.empty()) {
+    // Same mixed-result handling as the host tier: install a compressed entry when
+    // any batch compressed, forwarding the raw arm (uncompressed tables + their
+    // placements) and its interleaving only when both arms are populated.
+    auto mvcc = make_pin_mvcc(std::move(dev_result.base_row_count_per_chunk));
+    if (!dev_result.compressed_chunks.empty()) {
+      sirius::scan_manager::device_pinned_chunks chunks{
+        .compressed        = std::move(dev_result.compressed_chunks),
+        .raw               = std::move(dev_result.tables),
+        .raw_memory_spaces = std::move(dev_result.chunk_memory_spaces),
+        .logical_order     = std::move(dev_result.logical_order)};
       scan_mgr.insert_pinned_entry_device_compressed(data.args.name,
                                                      std::move(cache_info),
-                                                     std::move(dev_result.compressed_chunks),
-                                                     *gpu_spaces_mut[0]);
+                                                     std::move(chunks),
+                                                     *gpu_spaces_mut[0],
+                                                     std::move(mvcc));
     } else {
       scan_mgr.insert_pinned_entry(data.args.name,
                                    std::move(cache_info),
                                    std::move(dev_result.tables),
-                                   std::move(dev_result.chunk_memory_spaces));
-    }
-    if (data.args.format == "duckdb") {
-      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
-      mvcc.v_base                   = duckdb_pin_v_base;
-      mvcc.base_row_count_per_chunk = std::move(dev_result.base_row_count_per_chunk);
-      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
+                                   std::move(dev_result.chunk_memory_spaces),
+                                   std::move(mvcc));
     }
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
-    auto mat = sirius::materialize_all_batches(*ingestible, gpu_spaces_mut, *scan_mgr.io_ctx());
-    auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
+    auto mat  = sirius::materialize_all_batches(*ingestible, gpu_spaces_mut, *scan_mgr.io_ctx());
+    auto mvcc = make_pin_mvcc(std::move(mat.base_row_count_per_chunk));
     scan_mgr.insert_pinned_entry(data.args.name,
                                  std::move(cache_info),
                                  std::move(mat.tables),
-                                 std::move(mat.chunk_memory_spaces));
-    if (data.args.format == "duckdb") {
-      sirius::scan_manager::duckdb_mvcc_metadata mvcc;
-      mvcc.v_base                   = duckdb_pin_v_base;
-      mvcc.base_row_count_per_chunk = std::move(base_row_count_per_chunk);
-      scan_mgr.attach_mvcc_metadata(data.args.name, std::move(mvcc));
-    }
+                                 std::move(mat.chunk_memory_spaces),
+                                 std::move(mvcc));
   }
 
   output.SetCardinality(1);
@@ -1812,9 +1818,13 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().max_compressed_fraction =
-    DoubleValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction");
+  double const fraction = DoubleValue::Get(parameter);
+  if (!std::isfinite(fraction) || fraction < 0.0 || fraction > 1.0) {
+    throw InvalidInputException(
+      "pin_table_compression_max_compressed_fraction must be in [0.0, 1.0], got %f", fraction);
+  }
+  sirius_ctx->get_config().get_compression_config().max_compressed_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction to {}", fraction);
 }
 
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
@@ -2055,14 +2065,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     SetEnableGpuExecution);
 
   config.AddExtensionOption("pin_table_compression",
-                            "Enable Simpatico compression for pin_table(tier=>'host') chunks",
+                            "Enable Simpatico compression for pin_table host and GPU chunks",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(false),
                             SetEnablePinTableCompression);
 
   config.AddExtensionOption(
     "pin_table_input_compression_plan_dir",
-    "Directory containing per-table Simpatico plan files for pin_table(tier=>'host') compression. "
+    "Directory containing per-table Simpatico plan files for pin_table compression. "
     "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
     "Tables with no matching file are pinned uncompressed. No effect on spill compression.",
     LogicalType::VARCHAR,

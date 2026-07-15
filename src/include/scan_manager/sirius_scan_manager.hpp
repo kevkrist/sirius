@@ -24,6 +24,7 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/load_balancing_scan_batch_coalescer.hpp"
+#include "scan_manager/pinned_chunk_source.hpp"
 #include "scan_manager/split_provider.hpp"
 
 // Forward-declare sirius_ioctx via <io/types.hpp> for the gpu_ioctxs map type
@@ -78,6 +79,10 @@ class load_balancing_scan_batch_coalescer;
 namespace sirius::planner {
 class query;
 }  // namespace sirius::planner
+
+namespace sirius::telemetry {
+struct batch_telemetry_info;
+}  // namespace sirius::telemetry
 
 namespace sirius::scan_manager {
 
@@ -142,37 +147,69 @@ struct pinned_entry {
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
   /// HOST-tier compressed storage: one compressed_host_representation per chunk,
   /// each holding all pinned columns in Simpatico-compressed form. Populated by
-  /// @ref insert_pinned_entry_host_compressed. Takes priority over host_chunks
-  /// when non-empty (the ingestible factory checks this first).
+  /// @ref insert_pinned_entry_host_compressed. A homogeneous compressed entry
+  /// leaves @c host_chunks and @c logical_order empty; a mixed entry dispatches
+  /// between both dense arms through @c logical_order.
   std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_host_chunks;
   /// GPU-tier compressed storage: one compressed_device_representation per chunk,
   /// each holding all pinned columns compressed in device memory. Populated by
-  /// @ref insert_pinned_entry_device_compressed. Takes priority over
-  /// data_batches_by_column when non-empty.
+  /// @ref insert_pinned_entry_device_compressed. A homogeneous compressed entry
+  /// leaves the raw arm and @c logical_order empty; a mixed entry dispatches
+  /// between both dense arms through @c logical_order.
   std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_device_chunks;
+  /// Interleaving order for a MIXED entry: one entry per logical chunk in scan
+  /// order. EMPTY for a homogeneous entry (all-raw or all-compressed), which keeps
+  /// the single-arm fast path. When non-empty, arm_index indexes
+  /// compressed_{host,device}_chunks for `compressed` and the raw arm (host_chunks,
+  /// or data_batches_by_column + chunk_memory_spaces) for `raw`. Both arms stay
+  /// dense, so no null-padding and no index skew.
+  std::vector<chunk_source> logical_order;
   /// Tier the pinned data resides in. Drives which storage member above is used
   /// and which cached_split_provider variant @ref create_provider_for builds.
   cucascade::memory::Tier tier{cucascade::memory::Tier::GPU};
-  /// Memory space the pinned data resides in. Captured at pin time so the
-  /// cached_split_provider can wrap copied tables as data_batch instances.
+  /// Representative memory space retained for diagnostics and legacy callers.
+  /// Non-empty entries require a non-null value whose tier matches @c tier;
+  /// zero-chunk entries may leave it null. Serving still uses each representation's
+  /// own memory space or @c chunk_memory_spaces for individual raw GPU chunks.
   cucascade::memory::memory_space* memory_space{nullptr};
-  /// Total number of rows across all pinned chunks. Used by insert_pinned_entry
-  /// to decide whether a re-insert merges into the existing entry (same row
-  /// count → add unique columns) or replaces it (different row count).
+  /// Total number of rows across all pinned chunks. A homogeneous raw-GPU entry
+  /// may use this to merge a same-row-count re-pin; compressed, mixed, HOST, and
+  /// different-row-count entries are replaced.
   std::size_t num_rows{0};
-  /// MVCC snapshot metadata for duckdb-native pins, attached by
-  /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
-  /// for parquet pins (immutable sources need no visibility reconciliation).
+  /// MVCC snapshot metadata for DuckDB-native pins. Ownership is transferred into
+  /// the same registry-lock publication as the storage, so a DuckDB entry is never
+  /// serviceable without it. Null for immutable parquet pins.
   std::unique_ptr<duckdb_mvcc_metadata> mvcc;
 };
 
+/// Value-semantic input for installing a HOST compressed or mixed entry. The
+/// insert operation validates the three fields as one unit before publication.
+struct host_pinned_chunks {
+  std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed;
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> raw;
+  std::vector<chunk_source> logical_order;
+};
+
+/// Value-semantic input for installing a GPU compressed or mixed entry. Raw
+/// tables, their placements, and logical order are consumed and validated
+/// atomically, preventing call-site swaps among parallel containers.
+struct device_pinned_chunks {
+  std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed;
+  std::vector<std::unique_ptr<cudf::table>> raw;
+  std::vector<cucascade::memory::memory_space*> raw_memory_spaces;
+  std::vector<chunk_source> logical_order;
+};
+
 /// Validate that @p entry can serve @p selected_columns (positions into
-/// @c entry.cache_info.column_ids) without truncation. GPU tier: every
-/// selected column must be present in @c data_batches_by_column with exactly
-/// n_chunks non-null chunks, and @c chunk_memory_spaces must cover every chunk
-/// with non-null spaces. HOST tier: every host chunk must be non-null.
-/// Zero-chunk entries are legitimate and pass. Throws std::runtime_error
-/// naming the offending column/condition.
+/// @c entry.cache_info.column_ids) without truncation. Enforces aligned cache
+/// schema, storage/tier consistency, exact compressed schemas, dense raw arms,
+/// per-chunk row alignment, and (for mixed entries) a one-to-one @c logical_order
+/// permutation over both arms. DuckDB-native entries must carry MVCC metadata
+/// whose per-chunk counts exactly describe the stored logical chunks; parquet and
+/// identity-free entries must not. Raw GPU placements and stored representations
+/// must belong to their declared tier, and the stored row total must equal
+/// @c entry.num_rows. Zero-chunk entries are legitimate and pass. Throws
+/// std::runtime_error naming the offending condition.
 ///
 /// Serve-time defense against malformed entries: the cached serving loop reads
 /// a nullptr batch as end-of-stream, so a column with fewer chunks (or a null
@@ -181,6 +218,18 @@ struct pinned_entry {
 /// attaching the provider and converts a throw into a disk-read fallback.
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
+
+/// Build a value-semantic snapshot provider for @p entry, projected to
+/// @p selected_columns (positions into @c entry.cache_info.column_ids). The
+/// returned provider owns shared references to every chunk it can serve, so it
+/// remains valid if the scan manager later replaces or removes the entry. This
+/// function validates the entry before taking the snapshot. The caller must keep
+/// @p entry stable during this call; @c sirius_scan_manager does so under its
+/// pinned-entry registry mutex.
+std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
+  pinned_entry const& entry,
+  std::span<const std::size_t> selected_columns,
+  const telemetry::batch_telemetry_info& telemetry_info);
 
 /**
  * @brief Bind-time result of @ref sirius_scan_manager::describe_parquet.
@@ -263,14 +312,15 @@ class sirius_scan_manager {
   ///
   /// Re-insert semantics (keyed by @p name):
   ///   - If no entry exists for @p name, a fresh one is created.
-  ///   - If an entry exists and its @c num_rows equals the new total row count, the
-  ///     incoming columns whose names are not already present are merged in
-  ///     (duplicate columns are dropped), and the entry's @c cache_info is extended
-  ///     to the union of pinned columns so later cache-hit matching can serve them.
-  ///     The existing cache identity is preserved; the merge requires the incoming
-  ///     @p chunk_memory_spaces to be identical to the existing entry's and rejects
-  ///     any mismatch.
-  ///   - If row counts differ, the existing entry is dropped and replaced. (An
+  ///   - If the existing entry is homogeneous raw GPU storage and its @c num_rows
+  ///     equals the new total row count, incoming columns whose names are not already
+  ///     present are merged in (duplicates are dropped), and @c cache_info is extended
+  ///     to the union of pinned columns. The source identity must match and is preserved;
+  ///     the merge requires identical per-chunk placements and row boundaries.
+  ///     Refreshed DuckDB MVCC metadata is transferred under the same registry lock
+  ///     before the merged entry can be observed.
+  ///   - Otherwise the existing entry is dropped and replaced. In particular,
+  ///     compressed and mixed entries are replaced even when row counts match. (An
   ///     n_rows-capped "partial" pin therefore never merges with a full pin of the
   ///     same table, since their row counts differ.)
   ///
@@ -279,16 +329,19 @@ class sirius_scan_manager {
   ///                              catalog.schema.table) plus the cached columns by
   ///                              primary index and their @c column_ids-aligned names;
   ///                              drives later cache-hit matching and the per-column gather.
-  /// \param data_tables           Cudf tables produced by chunked reads, one per chunk
-  ///                              (may be empty). Each table's column count MUST equal
-  ///                              the number of columns described by @p cache_info.
-  /// \param chunk_memory_spaces   Per-chunk memory space placement; size MUST equal
-  ///                              data_tables.size() (the value at index i is shared by
-  ///                              all columns at chunk i).
+  /// \param data_tables           Non-null cudf tables produced by chunked reads, one
+  ///                              per chunk (the vector may be empty). Each table's column
+  ///                              count MUST equal the columns described by @p cache_info.
+  /// \param chunk_memory_spaces   Non-null GPU-tier placement per chunk; size MUST equal
+  ///                              data_tables.size() (index i is shared by every
+  ///                              column in chunk i).
+  /// \param mvcc                  Preallocated metadata required for DuckDB-native
+  ///                              cache identities; null for parquet/identity-free callers.
   void insert_pinned_entry(const std::string& name,
                            cache_entry_info cache_info,
                            std::vector<std::unique_ptr<cudf::table>> data_tables,
-                           std::vector<cucascade::memory::memory_space*> chunk_memory_spaces);
+                           std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
+                           std::unique_ptr<duckdb_mvcc_metadata> mvcc = nullptr);
 
   /// \brief Pin the host-tier entry for a table.
   ///
@@ -305,62 +358,74 @@ class sirius_scan_manager {
   ///                      host_data_representation corresponds to
   ///                      @c cache_info.column_names()[i]); drives cache-hit matching.
   /// \param host_chunks   One host_data_representation per emitted batch.
-  /// \param memory_space  Representative host memory space the chunks reside in
-  ///                      (metadata only; each chunk carries its own per-GPU
-  ///                      NUMA-local memory_space).
+  /// \param memory_space  Representative HOST-tier memory space used for invariant
+  ///                      validation; each chunk still carries its own per-GPU
+  ///                      NUMA-local placement.
+  /// \param mvcc          Preallocated DuckDB MVCC metadata; null for parquet.
   void insert_pinned_entry_host(
     const std::string& name,
     cache_entry_info cache_info,
     std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-    cucascade::memory::memory_space& memory_space);
+    cucascade::memory::memory_space& memory_space,
+    std::unique_ptr<duckdb_mvcc_metadata> mvcc = nullptr);
 
   /// \brief Pin the entry for a table on the host tier using Simpatico-compressed chunks.
   ///
-  /// Each entry in @p compressed_chunks holds all pinned columns in compressed form.
-  /// The cached provider prefers this over @c host_chunks when non-empty.
+  /// Each entry in @c chunks.compressed holds all pinned columns in compressed form.
+  ///
+  /// A MIXED entry populates all three fields of @p chunks; @c chunks.logical_order
+  /// describes the scan-order interleaving. Pass empty @c chunks.raw and
+  /// @c chunks.logical_order for a pure-compressed entry. Always
+  /// replaces (no per-column merge for compressed/mixed entries).
   ///
   /// \param name                Table name key.
   /// \param cache_info          Cache identity plus the cached columns and their
   ///                            @c column_ids-aligned names.
-  /// \param compressed_chunks   One compressed_host_representation per batch.
-  /// \param memory_space        Representative host memory space (metadata only).
-  void insert_pinned_entry_host_compressed(
-    const std::string& name,
-    cache_entry_info cache_info,
-    std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks,
-    cucascade::memory::memory_space& memory_space);
+  /// \param chunks              Compressed/raw dense arms plus their mixed interleaving.
+  /// \param memory_space        Representative memory space; must be HOST tier.
+  /// \param mvcc                Preallocated DuckDB MVCC metadata; null for parquet.
+  void insert_pinned_entry_host_compressed(const std::string& name,
+                                           cache_entry_info cache_info,
+                                           host_pinned_chunks chunks,
+                                           cucascade::memory::memory_space& memory_space,
+                                           std::unique_ptr<duckdb_mvcc_metadata> mvcc = nullptr);
 
   /// \brief Pin the entry for a table on the GPU tier using Simpatico-compressed chunks.
   ///
-  /// Each entry in @p compressed_chunks holds all pinned columns compressed in device
-  /// memory. The cached provider prefers this over @c data_batches_by_column when
-  /// non-empty; the batch is decompressed on demand by prepare_for_processing.
+  /// Each entry in @c chunks.compressed holds all pinned columns compressed in device
+  /// memory; the batch is decompressed on demand by prepare_for_processing.
   ///
-  /// \param name                Table name key.
-  /// \param cache_info          Cache identity plus the cached columns and their
-  ///                            @c column_ids-aligned names.
-  /// \param compressed_chunks   One compressed_device_representation per batch.
-  /// \param memory_space        Representative GPU memory space (metadata only).
-  void insert_pinned_entry_device_compressed(
-    const std::string& name,
-    cache_entry_info cache_info,
-    std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_chunks,
-    cucascade::memory::memory_space& memory_space);
+  /// A MIXED entry populates both dense arms in @p chunks and describes their
+  /// scan-order interleaving in @c chunks.logical_order; pass an empty raw arm and
+  /// empty logical order for a pure-compressed entry. Always replaces.
+  ///
+  /// \param name                     Table name key.
+  /// \param cache_info               Cache identity plus the cached columns and their
+  ///                                 @c column_ids-aligned names.
+  /// \param chunks                    Compressed/raw dense arms, raw placements, and mixed order.
+  /// \param memory_space             Representative memory space; must be GPU tier.
+  /// \param mvcc                     Preallocated DuckDB MVCC metadata; null for parquet.
+  void insert_pinned_entry_device_compressed(const std::string& name,
+                                             cache_entry_info cache_info,
+                                             device_pinned_chunks chunks,
+                                             cucascade::memory::memory_space& memory_space,
+                                             std::unique_ptr<duckdb_mvcc_metadata> mvcc = nullptr);
 
-  /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
+  /// \brief Replace metadata on an already-published DuckDB-native entry.
   ///
-  /// Called by the duckdb-format pin path immediately after insert_pinned_entry /
-  /// insert_pinned_entry_host. Overwrites any previous metadata: on a re-pin that
-  /// merged into an existing entry, the refreshed (newer) v_base is the more
-  /// conservative snapshot fence for every cached column, and the refreshed
-  /// per-chunk counts stay valid for every column because the merge path rejects
-  /// materializations whose per-chunk row counts differ from the existing
-  /// chunks'. Throws std::invalid_argument when no entry exists for @p name.
+  /// Legacy update API only: initial publication must pass preallocated ownership
+  /// to the relevant insert function, which rejects a DuckDB identity without it.
+  /// This replacement is itself serialized by the registry mutex. Throws
+  /// std::invalid_argument when the entry is absent or is not DuckDB-native.
   void attach_mvcc_metadata(const std::string& name, duckdb_mvcc_metadata metadata);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 
+  /// Invoke @p visitor over an ownership-safe point-in-time snapshot of the registry.
+  /// Snapshot construction is serialized by the registry mutex, but callbacks run
+  /// after it is released and may re-enter pinned-entry operations on this manager.
+  /// References are valid only for the callback. Return false to stop iteration.
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
@@ -411,6 +476,11 @@ class sirius_scan_manager {
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
+  /// Serializes registry lookup/snapshot construction, insertion, removal, and
+  /// metadata replacement. Providers and diagnostic snapshots retain shared chunk
+  /// owners after the lock is released; the map itself is never accessed
+  /// concurrently without this mutex, and visitor callbacks never run under it.
+  mutable std::mutex _pinned_entries_mtx;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh

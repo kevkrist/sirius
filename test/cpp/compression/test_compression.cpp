@@ -19,6 +19,7 @@
 //  [compression][plan_register]  — plan_register unit tests (no GPU required)
 //  [compression][pin_table]      — end-to-end SQL tests (GPU required):
 //    * compressed pin → cached scan result equality vs. uncompressed pin
+//    * mixed raw/compressed threshold pin → both arms installed and served
 //    * column-subset projection correctness
 //    * compressed footprint < uncompressed logical size
 //    * fallback when no plan / chunk below threshold
@@ -27,7 +28,9 @@
 #include <compression/plan_register.hpp>
 
 // standard library
+#include <algorithm>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // ─── plan_register unit tests (no GPU required) ─────────────────────────────
@@ -143,7 +146,7 @@ TEST_CASE("select_plan_blocks - picks blocks by full-table index in pinned order
 //   1. Create a small in-memory table.
 //   2. Pin it with tier='host' and compression enabled.
 //   3. SELECT from the cached table and compare against the raw table.
-//   4. Verify compressed_bytes < uncompressed_bytes in the pinned_entry.
+//   4. Verify genuine compressed and mixed entry state through the scan manager.
 //   5. Verify fallback (no plan / small chunk) does not error.
 
 #include "operator/mgpu_test_utils.hpp"
@@ -163,7 +166,8 @@ namespace fs = std::filesystem;
 namespace {
 
 // Build a minimal single-GPU Sirius YAML with compression enabled.
-void write_compression_yaml(const fs::path& yaml_path)
+void write_compression_yaml(const fs::path& yaml_path,
+                            std::size_t scan_task_batch_size = 100'000'000)
 {
   std::ofstream f(yaml_path);
   f << "sirius:\n"
@@ -187,7 +191,9 @@ void write_compression_yaml(const fs::path& yaml_path)
        "      num_threads: 1\n"
        "      monitor_period: 10ms\n"
        "  operator_params:\n"
-       "    scan_task_batch_size: 100000000\n"
+       "    scan_task_batch_size: "
+    << scan_task_batch_size
+    << "\n"
        "    default_scan_task_varchar_size: 256\n"
        "    max_sort_partition_bytes: 0\n"
        "    hash_partition_bytes: 100000000\n"
@@ -219,6 +225,25 @@ void write_plan_file(const fs::path& plan_dir,
   fs::create_directories(plan_dir);
   std::ofstream f(plan_dir / (table_name + ".txt"));
   f << dsl;
+}
+
+void generate_mixed_parquet_surface(fs::path const& dir)
+{
+  fs::create_directories(dir);
+  setenv("SIRIUS_DISABLE", "1", 1);
+  {
+    duckdb::DuckDB database(nullptr);
+    duckdb::Connection connection(database);
+    auto write_file = [&](std::string const& select_sql, fs::path const& path) {
+      auto result =
+        connection.Query("COPY (" + select_sql + ") TO '" + path.string() + "' (FORMAT PARQUET);");
+      REQUIRE(result);
+      REQUIRE_FALSE(result->HasError());
+    };
+    write_file("SELECT 3::BIGINT AS k FROM range(10)", dir / "p0.parquet");
+    write_file("SELECT 7::BIGINT AS k FROM range(10000)", dir / "p1.parquet");
+  }
+  unsetenv("SIRIUS_DISABLE");
 }
 
 }  // anonymous namespace
@@ -276,6 +301,101 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
 
   REQUIRE_FALSE(con.Query("CALL unpin_table('t_comp');")->HasError());
 
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - mixed threshold chunks serve end to end",
+          "[compression][pin_table][mixed][isolated_context]")
+{
+  if (!has_gpu()) {
+    WARN("Compression test requires a GPU — skipping");
+    return;
+  }
+
+  auto const tier = GENERATE(std::string{"host"}, std::string{"gpu"});
+  auto tmp        = make_comp_tmp("mixed-" + tier);
+  fs::remove_all(tmp);
+  fs::create_directories(tmp);
+  auto yaml_path = tmp / "comp.yaml";
+  // Keep each Parquet row group in its own materialized batch; the default
+  // coalescer budget would combine both files and erase the mixed outcome.
+  write_compression_yaml(yaml_path, 1024);
+  generate_mixed_parquet_surface(tmp);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con            = env.make_connection();
+  auto glob           = sirius::test::mgpu::parquet_glob(tmp);
+  auto const pin_name = "t_mixed_" + tier;
+
+  REQUIRE_FALSE(con.Query("SET pin_table_compression = true;")->HasError());
+  REQUIRE_FALSE(con.Query("SET pin_table_compression_min_batch_size_bytes = 1024;")->HasError());
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir, pin_name, "input -> rle -> runs, values\n");
+  REQUIRE_FALSE(
+    con.Query("SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';")
+      ->HasError());
+
+  auto pin =
+    con.Query("CALL pin_table('" + glob + "', tier='" + tier + "', name='" + pin_name + "');");
+  REQUIRE(pin);
+  if (pin->HasError()) { UNSCOPED_INFO("pin error: " << pin->GetError()); }
+  REQUIRE_FALSE(pin->HasError());
+
+  auto sirius_context = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_context != nullptr);
+
+  bool found{false};
+  std::size_t raw_chunks{0};
+  std::size_t compressed_chunks{0};
+  bool compressed_smaller{false};
+  std::vector<sirius::scan_manager::chunk_source> logical_order;
+  sirius_context->get_scan_manager().visit_pinned_entries(
+    [&](std::string_view name, sirius::scan_manager::pinned_entry const& entry) {
+      if (name != pin_name) return true;
+      found = true;
+      if (tier == "host") {
+        raw_chunks        = entry.host_chunks.size();
+        compressed_chunks = entry.compressed_host_chunks.size();
+        compressed_smaller =
+          compressed_chunks == 1 && entry.compressed_host_chunks.front() &&
+          entry.compressed_host_chunks.front()->get_size_in_bytes() <
+            entry.compressed_host_chunks.front()->get_uncompressed_data_size_in_bytes();
+      } else {
+        raw_chunks        = entry.chunk_memory_spaces.size();
+        compressed_chunks = entry.compressed_device_chunks.size();
+        compressed_smaller =
+          compressed_chunks == 1 && entry.compressed_device_chunks.front() &&
+          entry.compressed_device_chunks.front()->get_size_in_bytes() <
+            entry.compressed_device_chunks.front()->get_uncompressed_data_size_in_bytes();
+      }
+      logical_order = entry.logical_order;
+      return false;
+    });
+  REQUIRE(found);
+  REQUIRE(raw_chunks == 1);
+  REQUIRE(compressed_chunks == 1);
+  REQUIRE(compressed_smaller);
+  REQUIRE(logical_order.size() == 2);
+  REQUIRE(std::count_if(logical_order.begin(), logical_order.end(), [](auto const& source) {
+            return source.kind == sirius::scan_manager::chunk_kind::raw;
+          }) == 1);
+  REQUIRE(std::count_if(logical_order.begin(), logical_order.end(), [](auto const& source) {
+            return source.kind == sirius::scan_manager::chunk_kind::compressed;
+          }) == 1);
+
+  auto result = con.Query(
+    "CALL gpu_execution(\"SELECT COUNT(*), CAST(SUM(k) AS BIGINT) "
+    "FROM read_parquet('" +
+    glob + "')\");");
+  REQUIRE(result);
+  if (result->HasError()) { UNSCOPED_INFO("scan error: " << result->GetError()); }
+  REQUIRE_FALSE(result->HasError());
+  REQUIRE(result->RowCount() == 1);
+  REQUIRE(result->GetValue(0, 0) == duckdb::Value::BIGINT(10010));
+  REQUIRE(result->GetValue(1, 0) == duckdb::Value::BIGINT(70030));
+
+  REQUIRE_FALSE(con.Query("CALL unpin_table('" + pin_name + "');")->HasError());
   fs::remove_all(tmp);
 }
 

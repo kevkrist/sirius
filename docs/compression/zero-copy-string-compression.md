@@ -1,10 +1,9 @@
 # Zero-copy string compression/decompression in simpatico — staged root projection
 
-- Status: **reviewed design; contracts corrected; PR C and the audited PR D implementation are
-  present and verified locally**. Sirius integration and optional device-payload borrowing remain
-  future work.
-- Scope: simpatico engine API + Sirius pin/scan integration, branch
-  `compression-subsystem-port`.
+- Status: **reviewed design; contracts corrected; PR C and PR D are present and verified locally;
+  PR E Sirius integration and its post-audit corrections are present, with build/runtime
+  verification still pending**. Optional device-payload borrowing remains future work.
+- Scope: simpatico engine API + Sirius pin/scan integration on the current working branch.
 - **Out of scope: `.hpln` persistence to disk.** Header plus payload is an in-process transport
   between pin and scan in one binary. If disk persistence returns, it needs version dispatch and
   cross-version fixtures; it is not implied by this design.
@@ -50,7 +49,7 @@ complementary to, not a replacement for, the safe general-purpose owning result 
 
 ### Book grounding
 
-The design follows the principles in the repository's `C++ Software Design.pdf` (printed page /
+The design follows the principles in the local review reference *C++ Software Design* (printed page /
 PDF-viewer page):
 
 - Guideline 6, 44–52 / 64–72: an abstraction is a set of behavioral expectations. A staged result
@@ -439,9 +438,45 @@ On ratio rejection or recoverable staging failure, reject and recover the exact 
 cannot prove completion, fail the pin operation loudly and let the active stage take its safe
 abandonment path; never publish a pinned entry whose source lifetime is uncertain.
 
-Capture row count/allocation accounting before moving the owner. Selection-aware reads, mixed-chunk
-policy, STRING identity handling, valid plan spelling, and checked CUDA copy returns remain hard
-integration preconditions.
+Before accepting an individual batch, the external-payload transaction allocates the destination
+and shared ownership state, creates the compressed representation, reserves materializer-result
+capacity, validates every payload range, and enqueues all payload copies on the inspection stream.
+`accept()` proves current-tail completion; only prepared ownership moves append that batch to the
+materializer result afterward.
+
+Final scan-manager installation is a separate, ownership-safe transaction. The accepted payload is
+already independently owned. The manager constructs and validates the complete candidate
+off-registry; insertion of a new key may allocate, while replacement and merge commit by no-throw
+swap under the registry mutex. A publication failure cannot expose a partial entry, although it
+cannot recover the original uncompressed table after acceptance.
+
+The PR E implementation uses a dense two-arm representation for mixed pins: raw and compressed
+chunks remain independently dense, while a value-semantic `logical_order` records their scan-order
+interleaving. The manager validates the one-to-one permutation, storage tiers, schemas, row totals,
+and per-chunk placement before publication. DuckDB cache identity, storage, and preallocated MVCC
+metadata publish atomically; MVCC counts must match the logical chunk order elementwise. Raw-column
+merging additionally requires identical source identity, placement, and chunk row boundaries, and
+refreshes MVCC in the same commit.
+
+The v10 reader validates the complete structural header before device allocation or payload fetch:
+type and leaf tags, fixed-width sizes, row bounds and consistency, graph/bitjoin references, and
+leaf destinations. Selection is validated before fetching, only selected columns are reconstructed,
+file/external payload ranges are checked, and CUDA copy enqueue failures propagate.
+
+Cached-scan estimation uses the logical uncompressed byte count as its history/input basis.
+Preparation charges zero for a same-space plain GPU table, logical bytes for raw HOST or cross-space
+plain GPU materialization, and serialized header-plus-payload bytes plus logical output bytes for
+compressed materialization. The final reservation is a saturating sum of the disjoint preparation
+cost and the operator peak.
+
+Providers snapshot shared chunk ownership instead of borrowing mutable registry entries. Registry
+visitors snapshot ownership and MVCC under the mutex but invoke callbacks after releasing it.
+Payload ranges are checked before every external copy, and unsupported cross-device compressed
+conversion is rejected before enqueueing work.
+
+PR E remains conditional copy elision rather than strict end-to-end zero-copy: it avoids rebuilding
+the compression input and makes rejection allocation-preserving, but accepted payloads are still
+staged D2H for the host tier or D2D for the GPU tier. Strict external-sink commit remains Step 5.
 
 ### Step 5 — strict external commit and device-payload borrowing (deferred)
 
@@ -453,26 +488,23 @@ make completion, partial writes, cancellation, and resource lifetimes explicit.
 Treat direct device-payload borrowing as a separate opt-in change with sanitizer and cross-stream
 coverage. Neither future feature should weaken the safe PR D owning contract.
 
-## 6. Related integration defects to keep visible
+## 6. Related integration defect dispositions
 
-These defects were surfaced by the broader verification work and are not reasons to weaken the
-transaction contract:
+These findings do not weaken the transaction contract:
 
-1. Some generated plan files use bare `identity` blocks that the parser rejects, causing Sirius to
-   fall back to uncompressed pinning. Regenerate them as valid `input -> identity` plans and log
-   plan failures loudly.
-2. STRING identity serialization must describe offsets/chars/mask components, not pretend the
-   chars pointer begins one contiguous offsets-plus-chars allocation; otherwise reject the shape
-   loudly.
-3. Sirius payload staging must check every CUDA copy return code.
-4. Parallel view compression needs worker exception propagation rather than `std::terminate`.
-5. Decode memo reuse after move must be a hard error, not an implicit re-decode.
-6. STRING size accounting must honor INT64 offsets for large strings.
-7. Serialized reads should project columns before fetching all leaves.
-8. Compressed leaves beyond the v10 size field limit must fail loudly rather than truncate.
+| finding | disposition |
+|---|---|
+| Invalid bare-`identity` generated plans | Addressed by valid `input -> identity` spelling in the affected plans. |
+| Fabricated contiguous STRING-identity payload | Addressed by loud serialization rejection; production STRING plans use str_split. |
+| Unchecked asynchronous payload copies | Addressed in staging, reconstruction, and file I/O enqueue paths. |
+| Parallel view-worker exception propagation | Still deferred with the parallel owning driver. |
+| Decode memo reuse after move | Addressed by the PR C consumed-state contract. |
+| INT64/large STRING sizing | Addressed by widened-size guards and explicit projection decline to the copying path. |
+| Fetching every serialized column before projection | Addressed by selection-aware preflight and reconstruction. |
+| v10 leaf-size truncation | Addressed by checked size bounds and loud rejection. |
 
-Each item should be independently verified against the current branch before editing; line numbers
-from earlier audits are intentionally not treated as stable contracts.
+Runtime verification of these dispositions remains part of the final PR E gate; line numbers from
+earlier audits are intentionally not treated as stable contracts.
 
 ## 7. Rejected alternatives
 

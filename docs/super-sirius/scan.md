@@ -37,7 +37,12 @@ The single GPU scan source operator. It owns:
 
 The operator handles two split shapes transparently, both delivered as `scan_operator_input`: a **fresh read** (the input carries a `scan_info`, materialized via the ingestible) and a **pinned-cache hit** (the input carries a resident `data_batch`, forwarded as-is — or filtered when filter info is present). The operator never sees the source format directly.
 
-`no_history_peak_memory_estimate()` returns the input size for resident (cached) inputs. For fresh reads it reserves 8x the projected-column estimate plus decoded filter-only column buffers. The projected-column estimate remains the execution-history basis, and history-based reservations are clamped to the known decoded column-buffer footprint.
+Reservation history uses the logical uncompressed input size. For resident cached input, preparation
+is charged separately: zero for a same-space plain GPU table, logical bytes for raw HOST or
+cross-space GPU materialization, and serialized compressed bytes plus logical output bytes for
+compressed materialization. The final reservation is a saturating sum of that disjoint preparation
+cost and the operator peak. For fresh reads, `no_history_peak_memory_estimate()` still reserves 8x
+the projected-column estimate plus decoded filter-only buffers.
 
 > The `DUCKDB_SCAN` and `PARQUET_SCAN` physical operator types and the `sirius_physical_table_scan` / `sirius_physical_duckdb_scan` / `sirius_physical_parquet_scan` wrappers still exist for the CPU / DuckDB-source path, but the GPU read path for parquet and DuckDB-native tables runs entirely through `GPU_SCAN`.
 
@@ -207,22 +212,55 @@ CALL unpin_table('lineitem');
 
 ### Materializing a pin
 
-Pinning drives the source's `gpu_ingestible` to completion (`materialize_all_batches` / `materialize_pin_to_host` in `pin_table.cpp`):
+Pinning drives the source's `gpu_ingestible` to completion through the materializers in
+`pin_table.cpp`:
 
 - **GPU tier** (`materialize_all_batches`): each emitted batch is materialized into a GPU-resident `cudf::table`, round-robining placement across the GPU memory spaces. Placement is deterministic so re-pinning the same source yields identical per-chunk placement (required by the merge path below).
 - **HOST tier** (`materialize_pin_to_host`): each batch is materialized on its round-robin GPU, converted to a `host_data_representation` on that GPU's NUMA-local host space, then the GPU table is freed before the next batch. Peak GPU residency is therefore ~one batch, so a host pin never needs the whole table to fit in GPU memory.
+- **Compression-enabled tiers** (`materialize_pin_to_{host,device}_with_compression`): each owned
+  batch enters a reversible Simpatico stage. Header inspection, ratio policy, and payload staging
+  happen on the inspection stream. Ratio rejection or recoverable staging failure returns the exact
+  original allocation. Acceptance leaves an independently owned compressed representation in the
+  materializer result; the scan manager validates and publishes the completed entry afterward.
 
 ### Storage and matching
 
-Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a `cache_entry_info` (the cache identity + column layout) plus the cached batches: `data_batches_by_column` (one chunk vector per column) for the GPU tier, or `host_chunks` (one `host_data_representation` per batch, sliced by column at scan time) for the HOST tier.
+Each pinned table is a `pinned_entry` keyed by name in the scan manager. It holds a
+`cache_entry_info` (cache identity + column layout) and one or two dense storage arms. The raw GPU
+arm is `data_batches_by_column` plus per-chunk placements; the raw HOST arm is `host_chunks`.
+Compressed chunks use `compressed_device_chunks` or `compressed_host_chunks`, with each
+representation owning a shared header/payload blob. Homogeneous entries populate exactly one arm
+and leave `logical_order` empty. Mixed entries populate a raw and compressed arm and store one
+`chunk_source` per logical batch; that permutation preserves scan order without null-padding either
+arm.
 
 `cache_entry_info` captures format identity — the resolved parquet **file set**, or the duckdb **catalog.schema.table** — plus the cached columns (by storage index) and their names. `can_serve_with_columns(other)` returns a gather projection when this entry can serve a scan: same format, same identity, and a **column superset** of the scan's request. A parquet pin never serves a duckdb scan or vice-versa.
 
-During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The scan operator's `execute()` is unchanged; resident cached batches with an identity layout flow through untouched.
+During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's
+`table_info` against the pinned entries. On a hit it validates the complete storage contract and
+builds a `cached_databatch_provider` that snapshots shared chunk ownership. Column order follows the
+ingestible's `materialized_column_order()`, so cached and fresh reads present the same layout to
+`post_filter_and_project`; mixed entries additionally dispatch through `logical_order`.
+
+DuckDB-native storage and preallocated MVCC metadata publish under the same registry lock. A
+DuckDB identity without metadata is rejected, as is metadata on parquet/identity-free storage.
+Validation compares MVCC row counts elementwise with logical chunk boundaries and checks the total
+against `num_rows`. Registry visitors snapshot shared ownership and MVCC under the lock, then invoke
+callbacks after unlocking.
+
+Compressed column projection is applied by the v10 reader before payload fetch: the complete header
+is structurally validated before device allocation, but only selected columns' leaves are
+reconstructed. File and external-payload bounds, backing capacities, target GPU tier/device, and
+CUDA copy enqueue results are checked before unsafe work can proceed.
 
 ### Re-pin semantics
 
-For the GPU tier, `insert_pinned_entry` merges into an existing entry when the row count matches (adding only columns not already cached; per-chunk memory-space placement must match) and replaces it otherwise. The HOST tier always replaces, since each host chunk already holds every column.
+Only homogeneous raw GPU entries participate in the per-column merge: cache source identity, row
+count, chunk boundaries, and placements must all match. The incoming and merged candidates are
+built and validated off-map; an existing entry is replaced by a no-throw member swap under the
+registry mutex, with refreshed DuckDB MVCC in the same commit. A raw pin replaces an existing
+compressed/mixed entry, and every HOST or compressed/mixed insertion replaces, because those
+representations already bundle all pinned columns and cannot safely join the raw per-column merge.
 
 ## Batch Coalescing
 

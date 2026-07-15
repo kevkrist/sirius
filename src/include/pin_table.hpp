@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "scan_manager/pinned_chunk_source.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -134,11 +136,15 @@ materialized_pin materialize_all_batches(
   io::sirius_ioctx& io_ctx);
 
 /// Result of driving a host-tier pin with optional Simpatico compression.
-/// When every batch compresses successfully, @c compressed_chunks is non-empty
-/// and @c host_chunks is empty; otherwise uncompressed chunks land in @c host_chunks.
+/// A result may be wholly compressed, wholly uncompressed, or mixed; each batch
+/// lands in exactly one arm according to eligibility, outcome, and ratio policy.
 struct host_pin_result {
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks;
   std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks;
+  /// Per-logical-chunk arm+slot, in emission order (parallel to
+  /// base_row_count_per_chunk). Populated only for a mixed result; homogeneous
+  /// results leave it empty and use their sole non-empty storage arm.
+  std::vector<sirius::scan_manager::chunk_source> logical_order;
   /// Row count of each materialized batch, in emission order (covers compressed
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
@@ -153,20 +159,23 @@ struct compression_pin_config {
   std::size_t min_batch_size_bytes{0};
   /// Keep the compressed form only if header+payload <= this fraction of the
   /// batch's original device size; otherwise pin uncompressed. See
-  /// compression_config::max_compressed_fraction.
+  /// compression_config::max_compressed_fraction. For a zero-byte original,
+  /// only a zero-byte compressed form qualifies.
   double max_compressed_fraction{0.95};
   std::vector<std::string> column_names;
 };
 
 /// Result of driving a GPU-tier pin with optional Simpatico compression.
-/// When every batch compresses successfully, @c compressed_chunks is non-empty
-/// and @c tables is empty; otherwise the uncompressed GPU tables (with their
-/// per-chunk placement) land in @c tables / @c chunk_memory_spaces for the plain
-/// insert_pinned_entry path.
+/// A result may be wholly compressed, wholly uncompressed, or mixed; raw tables
+/// retain their per-chunk placement in @c tables / @c chunk_memory_spaces.
 struct device_pin_result {
   std::vector<std::unique_ptr<cudf::table>> tables;
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
   std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_chunks;
+  /// Per-logical-chunk arm+slot, in emission order (parallel to
+  /// base_row_count_per_chunk). Populated only for a mixed result; homogeneous
+  /// results leave it empty and use their sole non-empty storage arm.
+  std::vector<sirius::scan_manager::chunk_source> logical_order;
   /// Row count of each materialized batch, in emission order (covers compressed
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.

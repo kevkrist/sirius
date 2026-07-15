@@ -25,6 +25,7 @@
 #include "scan_manager/round_robin_strategy.hpp"
 
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -40,12 +41,15 @@
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -218,8 +222,9 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
     // post_filter_and_project (which would only apply a row filter or re-project to a
     // query's output layout, neither of which a pin needs). `batch` is borrowed by const
     // ref and outlives the call.
-    auto materialized     = ingestible.materialize_metadata_to_table(*batch, *target, stream);
-    auto tbl              = materialized.table.release(stream, target->get_default_allocator());
+    auto materialized = ingestible.materialize_metadata_to_table(*batch, *target, stream);
+    auto tbl          = materialized.table.release(stream, target->get_default_allocator());
+    if (!tbl) { throw std::runtime_error("pin-table materialization produced no owned table"); }
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
     rows_materialized += chunk_rows;
@@ -302,6 +307,265 @@ materialized_host_pin materialize_pin_to_host(
   return out;
 }
 
+namespace {
+
+enum class staged_batch_outcome { keep_compressed, ratio_reject, compression_failure };
+
+/// A reversible compression stage plus the inspection data needed to stage its
+/// payload. The outcome is a single state, so impossible keep/latch boolean
+/// combinations are not representable.
+struct staged_batch_decision {
+  simpatico::staged_compression stage;
+  staged_batch_outcome outcome{staged_batch_outcome::compression_failure};
+  rmm::cuda_stream_view inspection_stream;
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes{0};
+  std::size_t payload_size{0};
+  std::size_t compressed_bytes{0};
+  std::string log_reason;
+};
+
+/// Own the source transaction and the external payload destination as one
+/// exception-safe unit. Before accept, the destination may contain asynchronous
+/// writes from the candidate. Reject proves the current stream tail before freeing
+/// it. If that proof fails, both sides are retained rather than recycled while GPU
+/// work may still reference them.
+template <typename Destination>
+class staged_payload_transaction {
+ public:
+  explicit staged_payload_transaction(simpatico::staged_compression stage) noexcept
+    : stage_(std::move(stage))
+  {
+  }
+
+  staged_payload_transaction(staged_payload_transaction const&)            = delete;
+  staged_payload_transaction& operator=(staged_payload_transaction const&) = delete;
+  staged_payload_transaction(staged_payload_transaction&&)                 = delete;
+  staged_payload_transaction& operator=(staged_payload_transaction&&)      = delete;
+
+  ~staged_payload_transaction() noexcept
+  {
+    if (!active_) return;
+    try {
+      [[maybe_unused]] auto original = std::move(stage_).reject();
+      active_                        = false;
+      release_destination_after_completion();
+    } catch (...) {
+      retain_destination();
+    }
+  }
+
+  Destination& emplace_destination()
+  {
+    if (destination_) {
+      throw std::logic_error("staged payload transaction already has a destination");
+    }
+
+    // Construct every shared-ownership allocation while the stage is reversible.
+    // Until accept publishes ownership, the shared deleter is deliberately inert
+    // and the unique_ptr remains the sole deleting owner.
+    auto destination       = std::make_unique<Destination>();
+    auto destination_state = std::make_shared<shared_destination_state>();
+    auto destination_owner = std::shared_ptr<Destination>{
+      destination.get(), shared_destination_deleter{destination_state}};
+    destination_       = std::move(destination);
+    destination_state_ = std::move(destination_state);
+    destination_owner_ = std::move(destination_owner);
+    return *destination_;
+  }
+
+  [[nodiscard]] std::shared_ptr<Destination> const& destination_owner() const
+  {
+    if (!destination_owner_) {
+      throw std::logic_error("staged payload transaction has no destination");
+    }
+    return destination_owner_;
+  }
+
+  [[nodiscard]] std::unique_ptr<cudf::table> reject()
+  {
+    auto original = std::move(stage_).reject();
+    active_       = false;
+    release_destination_after_completion();
+    return original;
+  }
+
+  [[nodiscard]] simpatico::compressed_table accept()
+  {
+    if (!destination_ || !destination_state_ || !destination_owner_ ||
+        destination_owner_.use_count() < 2) {
+      throw std::logic_error("staged payload destination must have a prepared owner before accept");
+    }
+
+    // accept() is the only fallible operation below. If its completion proof
+    // throws, this transaction is still active and its destructor can retry
+    // reject before choosing the final leak-safe fallback.
+    auto accepted                        = std::move(stage_).accept();
+    destination_state_->owns_destination = true;
+    [[maybe_unused]] auto* transferred   = destination_.release();
+    active_                              = false;
+    destination_owner_.reset();
+    destination_state_.reset();
+    return accepted;
+  }
+
+ private:
+  struct shared_destination_state {
+    bool owns_destination{false};
+  };
+
+  struct shared_destination_deleter {
+    std::shared_ptr<shared_destination_state> state;
+
+    void operator()(Destination* destination) const noexcept
+    {
+      if (state->owns_destination) { delete destination; }
+    }
+  };
+
+  void release_destination_after_completion() noexcept
+  {
+    if (destination_owner_ && destination_owner_.use_count() > 1) {
+      destination_state_->owns_destination = true;
+      [[maybe_unused]] auto* transferred   = destination_.release();
+    }
+    destination_owner_.reset();
+    destination_state_.reset();
+    destination_.reset();
+  }
+
+  void retain_destination() noexcept
+  {
+    // A failed final completion proof means queued GPU work may still target the
+    // destination. Keep the deleter inert and intentionally retain the storage.
+    [[maybe_unused]] auto* retained = destination_.release();
+  }
+
+  std::unique_ptr<Destination> destination_;
+  std::shared_ptr<shared_destination_state> destination_state_;
+  std::shared_ptr<Destination> destination_owner_;
+  simpatico::staged_compression stage_;
+  bool active_{true};
+};
+
+struct payload_copy_region {
+  std::size_t offset;
+  std::size_t size;
+};
+
+[[nodiscard]] payload_copy_region checked_payload_copy_region(
+  simpatico::payload_buffer_ref const& buffer, std::size_t payload_size)
+{
+  if (buffer.offset > std::numeric_limits<std::size_t>::max() ||
+      buffer.size_bytes > std::numeric_limits<std::size_t>::max()) {
+    throw std::overflow_error("compressed leaf buffer exceeds the platform size limit");
+  }
+
+  auto const offset = static_cast<std::size_t>(buffer.offset);
+  auto const size   = static_cast<std::size_t>(buffer.size_bytes);
+  if (offset > payload_size || size > payload_size - offset) {
+    throw std::out_of_range("compressed leaf buffer lies outside the staged payload");
+  }
+  if (size != 0 && buffer.device_ptr == nullptr) {
+    throw std::invalid_argument("non-empty compressed leaf buffer has a null device pointer");
+  }
+  return {.offset = offset, .size = size};
+}
+
+template <typename T>
+void reserve_one_more(std::vector<T>& values)
+{
+  if (values.size() == values.max_size()) {
+    throw std::length_error("pin result cannot hold another chunk");
+  }
+  values.reserve(values.size() + 1);
+}
+
+void validate_compression_config(compression_pin_config const& compression)
+{
+  if (compression.enabled &&
+      (!std::isfinite(compression.max_compressed_fraction) ||
+       compression.max_compressed_fraction < 0.0 || compression.max_compressed_fraction > 1.0)) {
+    throw std::invalid_argument("max_compressed_fraction must be finite and in [0, 1]");
+  }
+}
+
+void set_failure_reason(staged_batch_decision& decision, std::string_view reason) noexcept
+{
+  decision.outcome = staged_batch_outcome::compression_failure;
+  try {
+    decision.log_reason.assign(reason);
+  } catch (...) {
+    // Preserve the rejectable stage even when recording a diagnostic runs out of
+    // host memory. The caller supplies a stable fallback message.
+  }
+}
+
+/// Move @p table into a reversible compression stage, build the header through
+/// its stream-bound inspection facade, and apply the ratio while both outcomes
+/// remain available.
+staged_batch_decision stage_and_decide(std::unique_ptr<cudf::table> table,
+                                       compression_pin_config const& compression,
+                                       std::size_t uncompressed_bytes,
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr)
+{
+  staged_batch_decision decision{
+    .stage = simpatico::try_compress_with_plan(
+      std::move(table), compression.plan_dsl, stream, mr, compression.column_names),
+    .inspection_stream = stream};
+  if (!decision.stage.ok()) {
+    set_failure_reason(decision, decision.stage.error());
+    return decision;
+  }
+
+  try {
+    auto const inspection       = decision.stage.table();
+    decision.inspection_stream  = inspection.stream();
+    std::string const hdr_error = simpatico::build_compressed_table_header(
+      inspection, decision.header, decision.buffers, decision.payload_bytes);
+    if (!hdr_error.empty()) {
+      set_failure_reason(decision, "build_compressed_table_header: " + hdr_error);
+      return decision;
+    }
+  } catch (cudf::fatal_cuda_error const&) {
+    throw;
+  } catch (std::bad_alloc const&) {
+    set_failure_reason(decision, "host allocation failed while inspecting compressed payload");
+    return decision;
+  } catch (std::exception const& failure) {
+    set_failure_reason(decision, failure.what());
+    return decision;
+  } catch (...) {
+    set_failure_reason(decision, "compressed payload inspection failed");
+    return decision;
+  }
+
+  if (decision.payload_bytes > std::numeric_limits<std::size_t>::max()) {
+    set_failure_reason(decision, "compressed payload exceeds the platform size limit");
+    return decision;
+  }
+  decision.payload_size = static_cast<std::size_t>(decision.payload_bytes);
+  if (decision.payload_size > std::numeric_limits<std::size_t>::max() - decision.header.size()) {
+    set_failure_reason(decision, "compressed header and payload size overflow");
+    return decision;
+  }
+  decision.compressed_bytes = decision.header.size() + decision.payload_size;
+  decision.outcome          = staged_batch_outcome::ratio_reject;
+  if ((uncompressed_bytes == 0 && decision.compressed_bytes != 0) ||
+      (uncompressed_bytes != 0 &&
+       static_cast<double>(decision.compressed_bytes) >
+         compression.max_compressed_fraction * static_cast<double>(uncompressed_bytes))) {
+    return decision;
+  }
+
+  decision.outcome = staged_batch_outcome::keep_compressed;
+  return decision;
+}
+
+}  // namespace
+
 host_pin_result materialize_pin_to_host_with_compression(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
@@ -309,6 +573,7 @@ host_pin_result materialize_pin_to_host_with_compression(
   io::sirius_ioctx& io_ctx,
   compression_pin_config const& compression)
 {
+  validate_compression_config(compression);
   auto& registry = converter_registry::get();
   host_pin_result out;
   bool compression_failed = false;
@@ -317,106 +582,120 @@ host_pin_result materialize_pin_to_host_with_compression(
     ingestible,
     gpu_spaces,
     io_ctx,
-    [&](std::unique_ptr<cudf::table> tbl,
+    [&](std::unique_ptr<cudf::table> table,
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream) {
-      auto* target_host_space    = host_space_by_gpu.at(src_space->get_device_id());
-      bool compressed_this_chunk = false;
-      out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
+      if (!table) {
+        throw std::runtime_error(
+          "materialize_pin_to_host_with_compression received a null materialized table");
+      }
+      auto* target_host_space = host_space_by_gpu.at(src_space->get_device_id());
+      bool compressed_this_chunk{false};
+      auto const num_rows          = static_cast<std::int64_t>(table->num_rows());
+      auto const uncompressed_size = table->alloc_size();
+      out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(num_rows));
 
-      if (compression.enabled && !compression_failed && tbl && tbl->num_columns() > 0 &&
-          !compression.plan_dsl.empty()) {
-        try {
-          // Total device footprint of the batch (includes string chars/offsets
-          // and null masks), so string columns count toward the threshold.
-          std::size_t uncompressed_bytes = tbl->alloc_size();
-          if (uncompressed_bytes >= compression.min_batch_size_bytes) {
-            auto ct = simpatico::compress_with_plan(tbl->view(),
-                                                    compression.plan_dsl,
-                                                    stream,
-                                                    rmm::mr::get_current_device_resource_ref(),
-                                                    compression.column_names);
+      if (compression.enabled && !compression_failed && table->num_columns() > 0 &&
+          !compression.plan_dsl.empty() && uncompressed_size >= compression.min_batch_size_bytes) {
+        auto decision = stage_and_decide(std::move(table),
+                                         compression,
+                                         uncompressed_size,
+                                         stream,
+                                         src_space->get_default_allocator());
 
-            // Build the structural header and enumerate the payload buffers
-            // (no bytes copied yet).
-            std::vector<std::uint8_t> header;
-            std::vector<simpatico::payload_buffer_ref> buffers;
-            std::uint64_t payload_bytes = 0;
-            const std::string hdr_err =
-              simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
-            if (!hdr_err.empty()) {
-              throw std::runtime_error("build_compressed_table_header: " + hdr_err);
-            }
-
-            // Keep the compressed form only if it saves enough: compare the
-            // total compressed footprint (header + payload) against the batch's
-            // original device size. Otherwise discard it and pin uncompressed.
-            const std::size_t original_bytes   = tbl->alloc_size();
-            const std::size_t compressed_bytes = header.size() + payload_bytes;
-            if (original_bytes > 0 &&
-                static_cast<double>(compressed_bytes) >
-                  compression.max_compressed_fraction * static_cast<double>(original_bytes)) {
-              SIRIUS_LOG_DEBUG(
-                "[materialize_pin_to_host_with_compression] compressed {}B > {:.0f}% of {}B "
-                "original; pinning uncompressed",
-                compressed_bytes,
-                compression.max_compressed_fraction * 100.0,
-                original_bytes);
-            } else {
-              // Allocate the pinned payload from the target host space's chunked
-              // pool (the same tracked pool the uncompressed path uses) and stage
-              // every compressed buffer device->pinned. Sync before `ct` (which
-              // owns the device buffers) leaves scope.
-              auto* host_mr =
-                target_host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
-              if (host_mr == nullptr) {
-                throw std::runtime_error(
-                  "target host space has no fixed_size_host_memory_resource");
-              }
-              auto blob           = std::make_shared<sirius::pinned_compressed_blob>();
-              blob->header        = std::move(header);
-              blob->payload       = host_mr->allocate_multiple_blocks(payload_bytes);
-              blob->payload_bytes = payload_bytes;
-              for (auto const& b : buffers) {
-                if (b.size_bytes > 0 && b.device_ptr != nullptr) {
-                  sirius::copy_device_to_pinned_blocks(b.device_ptr,
-                                                       *blob->payload,
-                                                       b.offset,
-                                                       static_cast<std::size_t>(b.size_bytes),
-                                                       stream);
-                }
-              }
-              stream.synchronize();
-
-              out.compressed_chunks.emplace_back(
-                std::make_shared<sirius::compressed_host_representation>(
-                  *target_host_space,
-                  std::move(blob),
-                  compression.column_names,
-                  static_cast<std::size_t>(payload_bytes),
-                  uncompressed_bytes,
-                  static_cast<int64_t>(tbl->num_rows())));
-              compressed_this_chunk = true;
-            }
+        if (decision.outcome != staged_batch_outcome::keep_compressed) {
+          table = std::move(decision.stage).reject();
+          if (decision.outcome == staged_batch_outcome::compression_failure) {
+            compression_failed = true;
+            SIRIUS_LOG_WARN(
+              "[materialize_pin_to_host_with_compression] compression failed: {}; "
+              "pinning uncompressed and disabling compression for the rest of the pin",
+              decision.log_reason.empty() ? "no diagnostic available" : decision.log_reason);
+          } else {
+            SIRIUS_LOG_DEBUG(
+              "[materialize_pin_to_host_with_compression] compressed {}B > {:.0f}% of {}B "
+              "original; pinning uncompressed",
+              decision.compressed_bytes,
+              compression.max_compressed_fraction * 100.0,
+              uncompressed_size);
           }
-        } catch (const std::exception& e) {
-          compression_failed = true;
-          SIRIUS_LOG_WARN(
-            "[materialize_pin_to_host_with_compression] compression failed: {}; "
-            "falling back to uncompressed for this chunk",
-            e.what());
+        } else {
+          staged_payload_transaction<sirius::pinned_compressed_blob> transfer{
+            std::move(decision.stage)};
+          std::shared_ptr<sirius::compressed_host_representation> prepared_representation;
+          bool payload_ready{false};
+          try {
+            auto& blob  = transfer.emplace_destination();
+            blob.header = std::move(decision.header);
+            auto* host_mr =
+              target_host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+            if (host_mr == nullptr) {
+              throw std::runtime_error("target host space has no fixed_size_host_memory_resource");
+            }
+            blob.payload       = host_mr->allocate_multiple_blocks(decision.payload_size);
+            blob.payload_bytes = decision.payload_bytes;
+            reserve_one_more(out.compressed_chunks);
+            reserve_one_more(out.logical_order);
+            prepared_representation =
+              std::make_shared<sirius::compressed_host_representation>(*target_host_space,
+                                                                       transfer.destination_owner(),
+                                                                       compression.column_names,
+                                                                       decision.compressed_bytes,
+                                                                       uncompressed_size,
+                                                                       num_rows);
+            for (auto const& buffer : decision.buffers) {
+              auto const region = checked_payload_copy_region(buffer, decision.payload_size);
+              if (region.size == 0) { continue; }
+              sirius::copy_device_to_pinned_blocks(buffer.device_ptr,
+                                                   *blob.payload,
+                                                   region.offset,
+                                                   region.size,
+                                                   decision.inspection_stream);
+            }
+            decision.buffers.clear();
+            payload_ready = true;
+          } catch (std::exception const& failure) {
+            prepared_representation.reset();
+            table              = transfer.reject();
+            compression_failed = true;
+            SIRIUS_LOG_WARN(
+              "[materialize_pin_to_host_with_compression] payload staging failed: {}; "
+              "pinning uncompressed and disabling compression for the rest of the pin",
+              failure.what());
+          } catch (...) {
+            prepared_representation.reset();
+            table              = transfer.reject();
+            compression_failed = true;
+            SIRIUS_LOG_WARN(
+              "[materialize_pin_to_host_with_compression] payload staging failed; "
+              "pinning uncompressed and disabling compression for the rest of the pin");
+          }
+
+          if (payload_ready) {
+            [[maybe_unused]] auto accepted = transfer.accept();
+            auto const compressed_index    = out.compressed_chunks.size();
+            // Capacity and shared ownership were prepared before accept, so
+            // publishing the completed transaction cannot allocate.
+            out.compressed_chunks.push_back(std::move(prepared_representation));
+            out.logical_order.push_back(
+              {sirius::scan_manager::chunk_kind::compressed, compressed_index});
+            compressed_this_chunk = true;
+          }
         }
       }
 
       if (!compressed_this_chunk) {
-        cucascade::gpu_table_representation gpu_repr(std::move(tbl), *src_space, stream);
+        cucascade::gpu_table_representation gpu_repr(std::move(table), *src_space, stream);
         auto host_repr = registry.convert<cucascade::host_data_representation>(
           gpu_repr, target_host_space, stream);
         stream.synchronize();
         out.host_chunks.emplace_back(std::move(host_repr));
+        out.logical_order.push_back(
+          {sirius::scan_manager::chunk_kind::raw, out.host_chunks.size() - 1});
       }
     });
 
+  if (out.host_chunks.empty() || out.compressed_chunks.empty()) { out.logical_order.clear(); }
   return out;
 }
 
@@ -426,6 +705,7 @@ device_pin_result materialize_pin_to_device_with_compression(
   io::sirius_ioctx& io_ctx,
   compression_pin_config const& compression)
 {
+  validate_compression_config(compression);
   device_pin_result out;
   bool compression_failed = false;
 
@@ -433,103 +713,114 @@ device_pin_result materialize_pin_to_device_with_compression(
     ingestible,
     gpu_spaces,
     io_ctx,
-    [&](std::unique_ptr<cudf::table> tbl,
+    [&](std::unique_ptr<cudf::table> table,
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream) {
-      bool compressed_this_chunk = false;
-      out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
+      if (!table) {
+        throw std::runtime_error(
+          "materialize_pin_to_device_with_compression received a null materialized table");
+      }
+      bool compressed_this_chunk{false};
+      auto const num_rows          = static_cast<std::int64_t>(table->num_rows());
+      auto const uncompressed_size = table->alloc_size();
+      out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(num_rows));
 
-      if (compression.enabled && !compression_failed && tbl && tbl->num_columns() > 0 &&
-          !compression.plan_dsl.empty()) {
-        try {
-          // Total device footprint of the batch (includes string chars/offsets
-          // and null masks), so string columns count toward the threshold.
-          std::size_t uncompressed_bytes = tbl->alloc_size();
-          if (uncompressed_bytes >= compression.min_batch_size_bytes) {
-            auto ct = simpatico::compress_with_plan(tbl->view(),
-                                                    compression.plan_dsl,
-                                                    stream,
-                                                    rmm::mr::get_current_device_resource_ref(),
-                                                    compression.column_names);
-
-            std::vector<std::uint8_t> header;
-            std::vector<simpatico::payload_buffer_ref> buffers;
-            std::uint64_t payload_bytes = 0;
-            const std::string hdr_err =
-              simpatico::build_compressed_table_header(ct, header, buffers, payload_bytes, stream);
-            if (!hdr_err.empty()) {
-              throw std::runtime_error("build_compressed_table_header: " + hdr_err);
-            }
-
-            // Keep the compressed form only if it saves enough (header + payload
-            // vs the batch's original device size); otherwise discard and pin
-            // uncompressed.
-            const std::size_t original_bytes   = tbl->alloc_size();
-            const std::size_t compressed_bytes = header.size() + payload_bytes;
-            if (original_bytes > 0 &&
-                static_cast<double>(compressed_bytes) >
-                  compression.max_compressed_fraction * static_cast<double>(original_bytes)) {
-              SIRIUS_LOG_DEBUG(
-                "[materialize_pin_to_device_with_compression] compressed {}B > {:.0f}% of {}B "
-                "original; pinning uncompressed",
-                compressed_bytes,
-                compression.max_compressed_fraction * 100.0,
-                original_bytes);
-            } else {
-              // Keep the compressed payload in one contiguous device buffer on the
-              // source GPU; copy each compressed leaf buffer device->device, then
-              // sync before `ct` (owning the source device buffers) leaves scope.
-              rmm::device_buffer payload(static_cast<std::size_t>(payload_bytes),
+      if (compression.enabled && !compression_failed && table->num_columns() > 0 &&
+          !compression.plan_dsl.empty() && uncompressed_size >= compression.min_batch_size_bytes) {
+        auto decision = stage_and_decide(std::move(table),
+                                         compression,
+                                         uncompressed_size,
                                          stream,
                                          src_space->get_default_allocator());
-              for (auto const& b : buffers) {
-                if (b.size_bytes > 0 && b.device_ptr != nullptr) {
-                  CUCASCADE_CUDA_TRY(
-                    cudaMemcpyAsync(static_cast<std::byte*>(payload.data()) + b.offset,
-                                    b.device_ptr,
-                                    static_cast<std::size_t>(b.size_bytes),
-                                    cudaMemcpyDeviceToDevice,
-                                    stream.value()));
-                }
-              }
-              stream.synchronize();
 
-              auto blob           = std::make_shared<sirius::device_compressed_blob>();
-              blob->header        = std::move(header);
-              blob->payload       = std::move(payload);
-              blob->payload_bytes = payload_bytes;
-
-              out.compressed_chunks.emplace_back(
-                std::make_shared<sirius::compressed_device_representation>(
-                  *src_space,
-                  std::move(blob),
-                  compression.column_names,
-                  static_cast<std::size_t>(payload_bytes),
-                  uncompressed_bytes,
-                  static_cast<int64_t>(tbl->num_rows())));
-              compressed_this_chunk = true;
-            }
+        if (decision.outcome != staged_batch_outcome::keep_compressed) {
+          table = std::move(decision.stage).reject();
+          if (decision.outcome == staged_batch_outcome::compression_failure) {
+            compression_failed = true;
+            SIRIUS_LOG_WARN(
+              "[materialize_pin_to_device_with_compression] compression failed: {}; "
+              "pinning uncompressed and disabling compression for the rest of the pin",
+              decision.log_reason.empty() ? "no diagnostic available" : decision.log_reason);
+          } else {
+            SIRIUS_LOG_DEBUG(
+              "[materialize_pin_to_device_with_compression] compressed {}B > {:.0f}% of {}B "
+              "original; pinning uncompressed",
+              decision.compressed_bytes,
+              compression.max_compressed_fraction * 100.0,
+              uncompressed_size);
           }
-        } catch (const std::exception& e) {
-          compression_failed = true;
-          SIRIUS_LOG_WARN(
-            "[materialize_pin_to_device_with_compression] compression failed: {}; "
-            "falling back to uncompressed for this chunk",
-            e.what());
+        } else {
+          staged_payload_transaction<sirius::device_compressed_blob> transfer{
+            std::move(decision.stage)};
+          std::shared_ptr<sirius::compressed_device_representation> prepared_representation;
+          bool payload_ready{false};
+          try {
+            auto& blob         = transfer.emplace_destination();
+            blob.header        = std::move(decision.header);
+            blob.payload       = rmm::device_buffer(decision.payload_size,
+                                              decision.inspection_stream,
+                                              src_space->get_default_allocator());
+            blob.payload_bytes = decision.payload_bytes;
+            reserve_one_more(out.compressed_chunks);
+            reserve_one_more(out.logical_order);
+            prepared_representation = std::make_shared<sirius::compressed_device_representation>(
+              *src_space,
+              transfer.destination_owner(),
+              compression.column_names,
+              decision.compressed_bytes,
+              uncompressed_size,
+              num_rows);
+            for (auto const& buffer : decision.buffers) {
+              auto const region = checked_payload_copy_region(buffer, decision.payload_size);
+              if (region.size == 0) { continue; }
+              CUCASCADE_CUDA_TRY(
+                cudaMemcpyAsync(static_cast<std::byte*>(blob.payload.data()) + region.offset,
+                                buffer.device_ptr,
+                                region.size,
+                                cudaMemcpyDeviceToDevice,
+                                decision.inspection_stream.value()));
+            }
+            decision.buffers.clear();
+            payload_ready = true;
+          } catch (std::exception const& failure) {
+            prepared_representation.reset();
+            table              = transfer.reject();
+            compression_failed = true;
+            SIRIUS_LOG_WARN(
+              "[materialize_pin_to_device_with_compression] payload staging failed: {}; "
+              "pinning uncompressed and disabling compression for the rest of the pin",
+              failure.what());
+          } catch (...) {
+            prepared_representation.reset();
+            table              = transfer.reject();
+            compression_failed = true;
+            SIRIUS_LOG_WARN(
+              "[materialize_pin_to_device_with_compression] payload staging failed; "
+              "pinning uncompressed and disabling compression for the rest of the pin");
+          }
+
+          if (payload_ready) {
+            [[maybe_unused]] auto accepted = transfer.accept();
+            auto const compressed_index    = out.compressed_chunks.size();
+            // Capacity and shared ownership were prepared before accept, so
+            // publishing the completed transaction cannot allocate.
+            out.compressed_chunks.push_back(std::move(prepared_representation));
+            out.logical_order.push_back(
+              {sirius::scan_manager::chunk_kind::compressed, compressed_index});
+            compressed_this_chunk = true;
+          }
         }
       }
 
       if (!compressed_this_chunk) {
-        // Retain the uncompressed GPU table in place (device pin holds all
-        // chunks on the GPU by definition). Sync so the table is fully resident
-        // before it is stored (its writer stream is not tracked downstream).
         stream.synchronize();
-        out.tables.emplace_back(std::move(tbl));
+        out.tables.emplace_back(std::move(table));
         out.chunk_memory_spaces.push_back(src_space);
+        out.logical_order.push_back({sirius::scan_manager::chunk_kind::raw, out.tables.size() - 1});
       }
     });
 
+  if (out.tables.empty() || out.compressed_chunks.empty()) { out.logical_order.clear(); }
   return out;
 }
-
 }  // namespace sirius

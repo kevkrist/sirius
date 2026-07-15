@@ -55,8 +55,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -64,117 +66,142 @@ namespace sirius::scan_manager {
 
 namespace {
 
-struct cached_databatch_provider : public databatch_provider {
+class cached_databatch_provider final : public databatch_provider {
+ public:
   cached_databatch_provider(pinned_entry const& entry,
-                            std::span<size_t> selected_columns,
+                            std::span<const std::size_t> selected_columns,
                             const telemetry::batch_telemetry_info& telemetry_info)
-    : _entry(entry), _telemetry_info(telemetry_info)
+    : _tier(entry.tier),
+      _logical_order(entry.logical_order),
+      _chunk_memory_spaces(entry.chunk_memory_spaces),
+      _host_chunks(entry.host_chunks),
+      _compressed_host_chunks(entry.compressed_host_chunks),
+      _compressed_device_chunks(entry.compressed_device_chunks),
+      _telemetry_info(telemetry_info)
   {
-    auto const& entry_column_names = _entry.cache_info.column_names();
-    std::ranges::for_each(selected_columns, [this, &entry_column_names](size_t idx) {
-      _column_names.emplace_back(entry_column_names[idx]);
-      _column_indices.push_back(idx);
-    });
+    auto const& entry_column_names = entry.cache_info.column_names();
+    _column_indices.assign(selected_columns.begin(), selected_columns.end());
 
-    if (_entry.tier == cucascade::memory::Tier::GPU) {
-      if (!_entry.compressed_device_chunks.empty()) {
-        _n_chunks = _entry.compressed_device_chunks.size();
-      } else if (!_entry.data_batches_by_column.empty()) {
-        _n_chunks = _entry.data_batches_by_column.begin()->second.size();
-      } else {
-        _n_chunks = 0;
+    if (_tier == cucascade::memory::Tier::GPU && !entry.data_batches_by_column.empty()) {
+      _raw_device_columns.reserve(selected_columns.size());
+      for (std::size_t const index : selected_columns) {
+        _raw_device_columns.push_back(
+          entry.data_batches_by_column.at(entry_column_names.at(index)));
       }
-    } else if (_entry.tier == cucascade::memory::Tier::HOST) {
-      if (!_entry.compressed_host_chunks.empty()) {
-        _n_chunks = _entry.compressed_host_chunks.size();
-      } else {
-        _n_chunks = _entry.host_chunks.size();
+    }
+
+    // A provider snapshots the entry's shared owners instead of borrowing the map
+    // element. An in-flight scan therefore survives a concurrent re-pin/unpin.
+    if (!_logical_order.empty()) {
+      _n_chunks = _logical_order.size();
+    } else if (_tier == cucascade::memory::Tier::GPU) {
+      if (!_compressed_device_chunks.empty()) {
+        _n_chunks = _compressed_device_chunks.size();
+      } else if (!entry.data_batches_by_column.empty()) {
+        _n_chunks = entry.data_batches_by_column.begin()->second.size();
       }
+    } else if (_tier == cucascade::memory::Tier::HOST) {
+      _n_chunks =
+        !_compressed_host_chunks.empty() ? _compressed_host_chunks.size() : _host_chunks.size();
     }
   }
 
   std::shared_ptr<cucascade::data_batch> get_next_batch() override
   {
-    auto index = _index.fetch_add(1);
+    auto const index = _index.fetch_add(1);
     if (index >= _n_chunks) { return nullptr; }
-    if (_entry.tier == cucascade::memory::Tier::GPU) {
-      return get_device_databatch(index);
-    } else if (_entry.tier == cucascade::memory::Tier::HOST) {
-      return get_host_databatch(index);
-    }
-    return nullptr;
+    return _tier == cucascade::memory::Tier::GPU ? get_device_databatch(index)
+                                                 : get_host_databatch(index);
   }
 
  private:
   std::shared_ptr<cucascade::data_batch> get_host_databatch(std::size_t index)
   {
-    if (!_entry.compressed_host_chunks.empty()) {
-      if (index >= _entry.compressed_host_chunks.size()) { return nullptr; }
-      const auto& chunk = _entry.compressed_host_chunks.at(index);
-      if (!chunk) { return nullptr; }
-      auto projected = chunk->select_columns(_column_indices);
-      return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
+    if (!_logical_order.empty()) {
+      auto const source = _logical_order.at(index);
+      switch (source.kind) {
+        case chunk_kind::compressed: return serve_compressed_host(source.arm_index);
+        case chunk_kind::raw: return serve_raw_host(source.arm_index);
+      }
+      throw std::runtime_error("pinned entry has an invalid chunk kind");
     }
-    if (index >= _entry.host_chunks.size()) { return nullptr; }
-    const auto& chunk = _entry.host_chunks.at(index);
-    if (!chunk) { return nullptr; }
-    auto data_rep       = chunk->slice(_column_indices);
-    const auto batch_id = get_next_batch_id();
+    return !_compressed_host_chunks.empty() ? serve_compressed_host(index) : serve_raw_host(index);
+  }
+
+  std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
+  {
+    if (!_logical_order.empty()) {
+      auto const source = _logical_order.at(index);
+      switch (source.kind) {
+        case chunk_kind::compressed: return serve_compressed_device(source.arm_index);
+        case chunk_kind::raw: return serve_raw_device(source.arm_index);
+      }
+      throw std::runtime_error("pinned entry has an invalid chunk kind");
+    }
+    return !_compressed_device_chunks.empty() ? serve_compressed_device(index)
+                                              : serve_raw_device(index);
+  }
+
+  std::shared_ptr<cucascade::data_batch> serve_compressed_host(std::size_t arm_index)
+  {
+    auto projected = _compressed_host_chunks.at(arm_index)->select_columns(_column_indices);
+    return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
+  }
+
+  std::shared_ptr<cucascade::data_batch> serve_raw_host(std::size_t arm_index)
+  {
+    auto data_rep       = _host_chunks.at(arm_index)->slice(_column_indices);
+    auto const batch_id = get_next_batch_id();
     return cucascade::data_batch::make(
       batch_id,
       std::move(data_rep),
       telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
-  std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
+  std::shared_ptr<cucascade::data_batch> serve_compressed_device(std::size_t arm_index)
   {
-    // GPU-tier compressed: hand out the projected compressed chunk; the batch is
-    // decompressed on demand by scan_operator_input::prepare_for_processing.
-    if (!_entry.compressed_device_chunks.empty()) {
-      if (index >= _entry.compressed_device_chunks.size()) { return nullptr; }
-      const auto& chunk = _entry.compressed_device_chunks.at(index);
-      if (!chunk) { return nullptr; }
-      auto projected = chunk->select_columns(_column_indices);
-      return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
-    }
-    if (index >= _entry.chunk_memory_spaces.size()) { return nullptr; }
+    auto projected = _compressed_device_chunks.at(arm_index)->select_columns(_column_indices);
+    return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
+  }
+
+  std::shared_ptr<cucascade::data_batch> serve_raw_device(std::size_t arm_index)
+  {
     std::vector<std::shared_ptr<cudf::column>> columns;
     std::vector<cudf::column_view> column_views;
+    columns.reserve(_raw_device_columns.size());
+    column_views.reserve(_raw_device_columns.size());
     std::size_t alloc_size = 0;
-    for (const auto& col_idx : _column_names) {
-      const auto& col_chunks = _entry.data_batches_by_column.at(col_idx);
-      if (index >= col_chunks.size()) { return nullptr; }
-      columns.push_back(col_chunks.at(index));
+    for (auto const& column_chunks : _raw_device_columns) {
+      columns.push_back(column_chunks.at(arm_index));
       column_views.emplace_back(columns.back()->view());
       alloc_size += columns.back()->alloc_size();
     }
     cudf::table_view view(column_views);
-    auto* chunk_space = !_entry.chunk_memory_spaces.empty() ? _entry.chunk_memory_spaces.at(index)
-                                                            : _entry.memory_space;
-    auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
-      view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
-    const auto batch_id = ::sirius::get_next_batch_id();
+    auto gpu_repr =
+      std::make_unique<::cucascade::gpu_table_representation>(view,
+                                                              std::move(columns),
+                                                              alloc_size,
+                                                              *_chunk_memory_spaces.at(arm_index),
+                                                              rmm::cuda_stream_view{});
+    auto const batch_id = ::sirius::get_next_batch_id();
     return ::cucascade::data_batch::make(
       batch_id,
       std::move(gpu_repr),
       telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
-  std::size_t _n_chunks;
-  std::vector<std::string> _column_names;
-  std::vector<size_t> _column_indices;
-  const pinned_entry& _entry;
+  cucascade::memory::Tier _tier{cucascade::memory::Tier::GPU};
+  std::size_t _n_chunks{0};
+  std::vector<std::size_t> _column_indices;
+  std::vector<chunk_source> _logical_order;
+  std::vector<std::vector<std::shared_ptr<cudf::column>>> _raw_device_columns;
+  std::vector<cucascade::memory::memory_space*> _chunk_memory_spaces;
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> _host_chunks;
+  std::vector<std::shared_ptr<sirius::compressed_host_representation>> _compressed_host_chunks;
+  std::vector<std::shared_ptr<sirius::compressed_device_representation>> _compressed_device_chunks;
   telemetry::batch_telemetry_info _telemetry_info;
   std::atomic<std::size_t> _index{0};
 };
-
-std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
-  pinned_entry const& entry,
-  std::span<size_t> selected_columns,
-  const telemetry::batch_telemetry_info& telemetry_info)
-{
-  return std::make_unique<cached_databatch_provider>(entry, selected_columns, telemetry_info);
-}
 
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
 /// resolved by a local-file backend.
@@ -194,7 +221,145 @@ std::string normalize_path(std::string const& p)
   return p;
 }
 
+// Transpose a run of per-chunk GPU tables into the entry's per-column dense arm
+// (data_batches_by_column), preserving chunk order. Each table must expose exactly
+// column_names.size() columns in column_ids order. Consumes the tables — release()
+// empties each one. Shared by the plain GPU rebuild and the mixed device-compressed
+// insert's raw arm.
+void release_tables_into(pinned_entry& entry,
+                         std::vector<std::unique_ptr<cudf::table>>& data_tables,
+                         std::span<const std::string> column_names)
+{
+  for (auto& table : data_tables) {
+    if (!table) {
+      throw std::invalid_argument("[sirius_scan_manager] raw GPU chunk table must be non-null");
+    }
+    if (static_cast<std::size_t>(table->num_columns()) != column_names.size()) {
+      throw std::runtime_error(
+        "[sirius_scan_manager] table column count " + std::to_string(table->num_columns()) +
+        " does not match column_names size " + std::to_string(column_names.size()));
+    }
+    auto cols = table->release();
+    for (std::size_t i = 0; i < cols.size(); ++i) {
+      entry.data_batches_by_column[std::string{column_names[i]}].emplace_back(std::move(cols[i]));
+    }
+  }
+}
+
+void add_rows_checked(std::size_t& total, std::int64_t rows, std::string_view source)
+{
+  if (rows < 0) { throw std::runtime_error(std::string{source} + " has a negative row count"); }
+  auto const count = static_cast<std::size_t>(rows);
+  if (count > std::numeric_limits<std::size_t>::max() - total) {
+    throw std::overflow_error(std::string{source} + " row-count total overflowed");
+  }
+  total += count;
+}
+
+[[nodiscard]] bool has_same_cache_source(cache_entry_info const& lhs, cache_entry_info const& rhs)
+{
+  return lhs.resolved_file_paths == rhs.resolved_file_paths &&
+         lhs.catalog_name == rhs.catalog_name && lhs.schema_name == rhs.schema_name &&
+         lhs.table_name == rhs.table_name;
+}
+
+void validate_mvcc_publication(cache_entry_info const& cache_info,
+                               std::unique_ptr<duckdb_mvcc_metadata> const& mvcc)
+{
+  bool const any_duckdb_identity = !cache_info.catalog_name.empty() ||
+                                   !cache_info.schema_name.empty() ||
+                                   !cache_info.table_name.empty();
+  bool const duckdb_identity = !cache_info.catalog_name.empty() &&
+                               !cache_info.schema_name.empty() && !cache_info.table_name.empty();
+  bool const parquet_identity = !cache_info.resolved_file_paths.empty();
+  if (any_duckdb_identity && !duckdb_identity) {
+    throw std::invalid_argument("DuckDB-native pinned entries require a complete cache identity");
+  }
+  if (duckdb_identity && parquet_identity) {
+    throw std::invalid_argument("pinned cache identity cannot be both DuckDB and parquet");
+  }
+  if (duckdb_identity != static_cast<bool>(mvcc)) {
+    throw std::invalid_argument(
+      duckdb_identity ? "DuckDB-native pinned entries require MVCC metadata at publication"
+                      : "MVCC metadata is valid only for DuckDB-native pinned entries");
+  }
+}
+
+void swap_cache_entry_info(cache_entry_info& lhs, cache_entry_info& rhs) noexcept
+{
+  lhs.resolved_file_paths.swap(rhs.resolved_file_paths);
+  lhs.catalog_name.swap(rhs.catalog_name);
+  lhs.schema_name.swap(rhs.schema_name);
+  lhs.table_name.swap(rhs.table_name);
+  lhs.column_ids.swap(rhs.column_ids);
+  lhs.names.swap(rhs.names);
+}
+
+void swap_pinned_entries(pinned_entry& lhs, pinned_entry& rhs) noexcept
+{
+  using std::swap;
+  swap_cache_entry_info(lhs.cache_info, rhs.cache_info);
+  lhs.data_batches_by_column.swap(rhs.data_batches_by_column);
+  lhs.chunk_memory_spaces.swap(rhs.chunk_memory_spaces);
+  lhs.host_chunks.swap(rhs.host_chunks);
+  lhs.compressed_host_chunks.swap(rhs.compressed_host_chunks);
+  lhs.compressed_device_chunks.swap(rhs.compressed_device_chunks);
+  lhs.logical_order.swap(rhs.logical_order);
+  swap(lhs.tier, rhs.tier);
+  swap(lhs.memory_space, rhs.memory_space);
+  swap(lhs.num_rows, rhs.num_rows);
+  lhs.mvcc.swap(rhs.mvcc);
+}
+
+void publish_pinned_entry(std::unordered_map<std::string, pinned_entry>& entries,
+                          std::string const& name,
+                          pinned_entry& entry)
+{
+  auto const existing = entries.find(name);
+  if (existing == entries.end()) {
+    entries.emplace(name, std::move(entry));
+    return;
+  }
+  swap_pinned_entries(existing->second, entry);
+}
+
+[[nodiscard]] pinned_entry snapshot_pinned_entry(pinned_entry const& source)
+{
+  pinned_entry snapshot;
+  snapshot.cache_info               = source.cache_info;
+  snapshot.data_batches_by_column   = source.data_batches_by_column;
+  snapshot.chunk_memory_spaces      = source.chunk_memory_spaces;
+  snapshot.host_chunks              = source.host_chunks;
+  snapshot.compressed_host_chunks   = source.compressed_host_chunks;
+  snapshot.compressed_device_chunks = source.compressed_device_chunks;
+  snapshot.logical_order            = source.logical_order;
+  snapshot.tier                     = source.tier;
+  snapshot.memory_space             = source.memory_space;
+  snapshot.num_rows                 = source.num_rows;
+  if (source.mvcc) { snapshot.mvcc = std::make_unique<duckdb_mvcc_metadata>(*source.mvcc); }
+  return snapshot;
+}
+
+void validate_entry_before_install(pinned_entry const& entry)
+{
+  std::vector<std::size_t> all_columns;
+  all_columns.reserve(entry.cache_info.column_names().size());
+  for (std::size_t index = 0; index < entry.cache_info.column_names().size(); ++index) {
+    all_columns.push_back(index);
+  }
+  validate_pinned_entry_for_serving(entry, all_columns);
+}
+
 }  // namespace
+
+std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
+  pinned_entry const& entry,
+  std::span<const std::size_t> selected_columns,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
+  validate_pinned_entry_for_serving(entry, selected_columns);
+  return std::make_unique<cached_databatch_provider>(entry, selected_columns, telemetry_info);
+}
 
 sirius_scan_manager::sirius_scan_manager(
   const scan_manager_config& config,
@@ -575,8 +740,10 @@ void sirius_scan_manager::insert_pinned_entry(
   const std::string& name,
   cache_entry_info cache_info,
   std::vector<std::unique_ptr<cudf::table>> data_tables,
-  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces)
+  std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
+  std::unique_ptr<duckdb_mvcc_metadata> mvcc)
 {
+  validate_mvcc_publication(cache_info, mvcc);
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per
   // chunked_parquet_reader::read_chunk() result, and there is exactly one
@@ -587,13 +754,6 @@ void sirius_scan_manager::insert_pinned_entry(
       "[sirius_scan_manager::insert_pinned_entry] chunk_memory_spaces.size() (" +
       std::to_string(chunk_memory_spaces.size()) + ") must equal data_tables.size() (" +
       std::to_string(data_tables.size()) + ")");
-  }
-
-  // Compute the total row count of the incoming tables before releasing them
-  // (release() empties the table; num_rows() would then return 0).
-  std::size_t new_num_rows = 0;
-  for (auto const& table : data_tables) {
-    if (table) { new_num_rows += static_cast<std::size_t>(table->num_rows()); }
   }
 
   // Column names (aligned with the cached column_ids) key data_batches_by_column.
@@ -611,12 +771,54 @@ void sirius_scan_manager::insert_pinned_entry(
       std::to_string(column_names.size()) + ")");
   }
 
+  // Validate every parallel input before a merge can mutate an existing entry.
+  // Accumulate rows here too, while each table is still intact.
+  std::size_t new_num_rows = 0;
+  for (std::size_t index = 0; index < data_tables.size(); ++index) {
+    auto const& table = data_tables[index];
+    if (!table) {
+      throw std::invalid_argument("[sirius_scan_manager::insert_pinned_entry] data_tables[" +
+                                  std::to_string(index) + "] must be non-null");
+    }
+    if (static_cast<std::size_t>(table->num_columns()) != column_names.size()) {
+      throw std::invalid_argument("[sirius_scan_manager::insert_pinned_entry] data_tables[" +
+                                  std::to_string(index) +
+                                  "] column count must equal cache_info column count");
+    }
+    auto const* space = chunk_memory_spaces[index];
+    if (space == nullptr || space->get_tier() != cucascade::memory::Tier::GPU) {
+      throw std::invalid_argument(
+        "[sirius_scan_manager::insert_pinned_entry] chunk_memory_spaces[" + std::to_string(index) +
+        "] must be a non-null GPU-tier memory space");
+    }
+    add_rows_checked(new_num_rows, table->num_rows(), "raw GPU chunk");
+  }
+
+  pinned_entry incoming;
+  incoming.cache_info          = std::move(cache_info);
+  incoming.chunk_memory_spaces = std::move(chunk_memory_spaces);
+  incoming.tier                = cucascade::memory::Tier::GPU;
+  incoming.num_rows            = new_num_rows;
+  incoming.memory_space =
+    incoming.chunk_memory_spaces.empty() ? nullptr : incoming.chunk_memory_spaces.front();
+  incoming.mvcc = std::move(mvcc);
+  release_tables_into(incoming, data_tables, column_names);
+  validate_entry_before_install(incoming);
+
+  std::lock_guard pinned_entries_lock{_pinned_entries_mtx};
   auto existing_it = _pinned_entries.find(name);
   if (existing_it != _pinned_entries.end()) {
-    // Same-row-count merge only applies when the completeness contracts match.
-    // Mixing a full pin with a partial pin produces an entry whose columns came
-    // from different row coverage — drop and rebuild instead.
-    if (existing_it->second.num_rows == new_num_rows) {
+    auto const& existing = existing_it->second;
+    bool const mergeable_raw_gpu =
+      existing.tier == cucascade::memory::Tier::GPU && existing.logical_order.empty() &&
+      existing.compressed_device_chunks.empty() && existing.compressed_host_chunks.empty() &&
+      existing.host_chunks.empty() && !existing.data_batches_by_column.empty();
+    // Column merge is defined only for an existing homogeneous raw-GPU entry.
+    // A compressed or mixed entry has a different chunk model and must be replaced,
+    // even when its total row count happens to match the incoming raw materialization.
+    if (mergeable_raw_gpu && !incoming.data_batches_by_column.empty() &&
+        existing.num_rows == incoming.num_rows &&
+        has_same_cache_source(existing.cache_info, incoming.cache_info)) {
       // Same-row-count merge MUST preserve per-chunk memory_space alignment
       // between existing and new entry. The round-robin counter restarts at
       // chunk 0 → GPU 0 per pin_table call, and chunks at index i across all
@@ -626,16 +828,16 @@ void sirius_scan_manager::insert_pinned_entry(
       // identical chunk_memory_spaces vectors. Reject any mismatch loudly
       // rather than silently aliasing.
       auto& entry = existing_it->second;
-      if (entry.chunk_memory_spaces.size() != chunk_memory_spaces.size()) {
+      if (entry.chunk_memory_spaces.size() != incoming.chunk_memory_spaces.size()) {
         throw std::runtime_error(
           "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
           "existing.chunk_memory_spaces.size() (" +
           std::to_string(entry.chunk_memory_spaces.size()) +
-          ") != new chunk_memory_spaces.size() (" + std::to_string(chunk_memory_spaces.size()) +
-          ")");
+          ") != new chunk_memory_spaces.size() (" +
+          std::to_string(incoming.chunk_memory_spaces.size()) + ")");
       }
-      for (std::size_t i = 0; i < chunk_memory_spaces.size(); ++i) {
-        if (entry.chunk_memory_spaces[i] != chunk_memory_spaces[i]) {
+      for (std::size_t i = 0; i < incoming.chunk_memory_spaces.size(); ++i) {
+        if (entry.chunk_memory_spaces[i] != incoming.chunk_memory_spaces[i]) {
           throw std::runtime_error(
             "[sirius_scan_manager::insert_pinned_entry] merge mismatch — "
             "chunk_memory_spaces[" +
@@ -648,102 +850,65 @@ void sirius_scan_manager::insert_pinned_entry(
       // chunk counts and — because round-robin placement is a function of chunk
       // index alone — identical memory_spaces. Merging such chunks would corrupt
       // the entry positionally (columns disagreeing on chunk boundaries) and
-      // silently invalidate the per-chunk MVCC row-count map a duckdb pin stamps
-      // via attach_mvcc_metadata. Reject loudly instead.
-      if (!entry.data_batches_by_column.empty()) {
-        auto const& existing_chunks = entry.data_batches_by_column.begin()->second;
-        if (existing_chunks.size() != data_tables.size()) {
+      // invalidate the per-chunk MVCC row-count map published with the entry.
+      auto const& existing_chunks =
+        entry.data_batches_by_column.at(entry.cache_info.column_names().front());
+      auto const& incoming_chunks =
+        incoming.data_batches_by_column.at(incoming.cache_info.column_names().front());
+      if (existing_chunks.size() != incoming_chunks.size()) {
+        throw std::runtime_error(
+          "[sirius_scan_manager::insert_pinned_entry] merge mismatch — existing entry has " +
+          std::to_string(existing_chunks.size()) + " chunks but the new materialization has " +
+          std::to_string(incoming_chunks.size()));
+      }
+      for (std::size_t i = 0; i < incoming_chunks.size(); ++i) {
+        if (existing_chunks[i]->size() != incoming_chunks[i]->size()) {
           throw std::runtime_error(
-            "[sirius_scan_manager::insert_pinned_entry] merge mismatch — existing entry has " +
-            std::to_string(existing_chunks.size()) + " chunks but the new materialization has " +
-            std::to_string(data_tables.size()));
-        }
-        for (std::size_t i = 0; i < data_tables.size(); ++i) {
-          if (!data_tables[i]) { continue; }
-          if (existing_chunks[i]->size() != data_tables[i]->num_rows()) {
-            throw std::runtime_error(
-              "[sirius_scan_manager::insert_pinned_entry] merge mismatch — chunk " +
-              std::to_string(i) + " has " + std::to_string(existing_chunks[i]->size()) +
-              " rows in the existing entry but " + std::to_string(data_tables[i]->num_rows()) +
-              " in the new materialization (same total, different chunk boundaries)");
-          }
+            "[sirius_scan_manager::insert_pinned_entry] merge mismatch — chunk " +
+            std::to_string(i) + " has " + std::to_string(existing_chunks[i]->size()) +
+            " rows in the existing entry but " + std::to_string(incoming_chunks[i]->size()) +
+            " in the new materialization (same total, different chunk boundaries)");
         }
       }
-      // Same row count → merge unique columns into the existing entry.
-      // Decide which column INDICES are new BEFORE iterating chunks. Doing
-      // the contains() check per-chunk would let chunk 0 install a new
-      // column and then chunks 1..N-1 see contains()==true and skip — leaving
-      // the new column with only chunk 0 and tripping cached_split_provider's
-      // "mismatched chunk count across requested columns" invariant.
-      std::vector<bool> is_new_col(column_names.size(), false);
+
+      // Stage every allocation and ownership transfer away from the published
+      // map element. Failure leaves the prior entry intact; the final swap cannot throw.
+      pinned_entry merged;
+      merged.cache_info             = entry.cache_info;
+      merged.data_batches_by_column = entry.data_batches_by_column;
+      merged.chunk_memory_spaces    = entry.chunk_memory_spaces;
+      merged.tier                   = entry.tier;
+      merged.memory_space           = entry.memory_space;
+      merged.num_rows               = entry.num_rows;
+      merged.mvcc                   = std::move(incoming.mvcc);
+
       for (std::size_t i = 0; i < column_names.size(); ++i) {
-        is_new_col[i] = !entry.data_batches_by_column.contains(column_names[i]);
+        auto const& column_name = column_names[i];
+        if (merged.data_batches_by_column.contains(column_name)) { continue; }
+        auto incoming_column = incoming.data_batches_by_column.find(column_name);
+        if (incoming_column == incoming.data_batches_by_column.end()) { continue; }
+        merged.data_batches_by_column.emplace(column_name, std::move(incoming_column->second));
+        merged.cache_info.column_ids.push_back(incoming.cache_info.column_ids[i]);
+        merged.cache_info.names.push_back(column_name);
       }
-      for (auto& table : data_tables) {
-        if (!table) { continue; }
-        auto cols = table->release();
-        if (cols.size() != column_names.size()) {
-          throw std::runtime_error(
-            "[sirius_scan_manager::insert_pinned_entry] table column count " +
-            std::to_string(cols.size()) + " does not match column_names size " +
-            std::to_string(column_names.size()));
-        }
-        for (std::size_t i = 0; i < cols.size(); ++i) {
-          if (!is_new_col[i]) {
-            // Column was already cached before this merge call — drop the
-            // duplicate chunk.
-            continue;
-          }
-          entry.data_batches_by_column[std::string{column_names[i]}].emplace_back(
-            std::move(cols[i]));
-        }
-      }
-      // Reflect the merged columns in cache_info so can_serve_with_columns'
-      // superset match — and the gather it drives — actually see them. Append
-      // only columns that received data above (an empty data_tables call must
-      // not list a column with no backing chunks in data_batches_by_column).
-      // column_ids and names grow together and we only append, so the projection
-      // positions already handed out for existing columns stay valid.
-      for (std::size_t i = 0; i < is_new_col.size(); ++i) {
-        if (!is_new_col[i]) { continue; }
-        if (!entry.data_batches_by_column.contains(column_names[i])) { continue; }
-        entry.cache_info.column_ids.push_back(cache_info.column_ids[i]);
-        entry.cache_info.names.push_back(column_names[i]);
-      }
+      validate_entry_before_install(merged);
+      swap_pinned_entries(entry, merged);
       return;
     }
-    // Row count or completeness contract differs → drop the stale entry and rebuild below.
-    _pinned_entries.erase(existing_it);
+    // Non-mergeable, different-source, or different-row-count entries are replaced below.
   }
 
-  pinned_entry entry;
-  entry.cache_info          = std::move(cache_info);
-  entry.chunk_memory_spaces = std::move(chunk_memory_spaces);
-  entry.tier                = cucascade::memory::Tier::GPU;
-  entry.num_rows            = new_num_rows;
-
-  for (auto& table : data_tables) {
-    if (!table) { continue; }
-    auto cols = table->release();
-    if (cols.size() != column_names.size()) {
-      throw std::runtime_error("[sirius_scan_manager::insert_pinned_entry] table column count " +
-                               std::to_string(cols.size()) + " does not match column_names size " +
-                               std::to_string(column_names.size()));
-    }
-    for (std::size_t i = 0; i < cols.size(); ++i) {
-      entry.data_batches_by_column[std::string{column_names[i]}].emplace_back(std::move(cols[i]));
-    }
-  }
-
-  _pinned_entries[name] = std::move(entry);
+  publish_pinned_entry(_pinned_entries, name, incoming);
 }
 
 void sirius_scan_manager::insert_pinned_entry_host(
   const std::string& name,
   cache_entry_info cache_info,
   std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
-  cucascade::memory::memory_space& memory_space)
+  cucascade::memory::memory_space& memory_space,
+  std::unique_ptr<duckdb_mvcc_metadata> mvcc)
 {
+  validate_mvcc_publication(cache_info, mvcc);
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column. Re-insert always replaces — there is no per-column merge analog
   // to the GPU path because the chunk-vs-column dimensions are flipped.
@@ -752,7 +917,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
     if (!chunk) { continue; }
     auto const& host_table = chunk->get_host_table();
     if (host_table && !host_table->columns.empty()) {
-      new_num_rows += static_cast<std::size_t>(host_table->columns.front().num_rows);
+      add_rows_checked(new_num_rows, host_table->columns.front().num_rows, "raw HOST chunk");
     }
   }
 
@@ -762,19 +927,45 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.memory_space = &memory_space;
   entry.num_rows     = new_num_rows;
   entry.host_chunks  = std::move(host_chunks);
+  entry.mvcc         = std::move(mvcc);
+  validate_entry_before_install(entry);
 
-  _pinned_entries[name] = std::move(entry);
+  std::lock_guard pinned_entries_lock{_pinned_entries_mtx};
+  publish_pinned_entry(_pinned_entries, name, entry);
 }
 
 void sirius_scan_manager::insert_pinned_entry_host_compressed(
   const std::string& name,
   cache_entry_info cache_info,
-  std::vector<std::shared_ptr<sirius::compressed_host_representation>> compressed_chunks,
-  cucascade::memory::memory_space& memory_space)
+  host_pinned_chunks chunks,
+  cucascade::memory::memory_space& memory_space,
+  std::unique_ptr<duckdb_mvcc_metadata> mvcc)
 {
-  std::size_t new_num_rows = 0;
+  validate_mvcc_publication(cache_info, mvcc);
+  auto compressed_chunks = std::move(chunks.compressed);
+  auto raw_chunks        = std::move(chunks.raw);
+  auto logical_order     = std::move(chunks.logical_order);
+  std::size_t new_num_rows{0};
   for (auto const& chunk : compressed_chunks) {
-    if (chunk) { new_num_rows += static_cast<std::size_t>(chunk->num_rows()); }
+    if (!chunk) {
+      throw std::invalid_argument(
+        "[sirius_scan_manager::insert_pinned_entry_host_compressed] null compressed chunk");
+    }
+    add_rows_checked(new_num_rows, chunk->num_rows(), "compressed HOST chunk");
+  }
+  for (auto const& chunk : raw_chunks) {
+    if (!chunk) {
+      throw std::invalid_argument(
+        "[sirius_scan_manager::insert_pinned_entry_host_compressed] null raw chunk");
+    }
+    auto const& host_table = chunk->get_host_table();
+    if (!host_table) {
+      throw std::invalid_argument(
+        "[sirius_scan_manager::insert_pinned_entry_host_compressed] raw chunk has no table");
+    }
+    if (!host_table->columns.empty()) {
+      add_rows_checked(new_num_rows, host_table->columns.front().num_rows, "raw HOST chunk");
+    }
   }
 
   pinned_entry entry;
@@ -783,25 +974,67 @@ void sirius_scan_manager::insert_pinned_entry_host_compressed(
   entry.memory_space           = &memory_space;
   entry.num_rows               = new_num_rows;
   entry.compressed_host_chunks = std::move(compressed_chunks);
+  entry.host_chunks            = std::move(raw_chunks);
+  entry.logical_order          = std::move(logical_order);
+  entry.mvcc                   = std::move(mvcc);
+  validate_entry_before_install(entry);
 
   SIRIUS_LOG_DEBUG(
-    "[sirius_scan_manager::insert_pinned_entry_host_compressed] '{}' chunks={} rows={}",
+    "[sirius_scan_manager::insert_pinned_entry_host_compressed] '{}' compressed={} raw={} rows={}",
     name,
     entry.compressed_host_chunks.size(),
+    entry.host_chunks.size(),
     new_num_rows);
 
-  _pinned_entries[name] = std::move(entry);
+  std::lock_guard pinned_entries_lock{_pinned_entries_mtx};
+  publish_pinned_entry(_pinned_entries, name, entry);
 }
 
 void sirius_scan_manager::insert_pinned_entry_device_compressed(
   const std::string& name,
   cache_entry_info cache_info,
-  std::vector<std::shared_ptr<sirius::compressed_device_representation>> compressed_chunks,
-  cucascade::memory::memory_space& memory_space)
+  device_pinned_chunks chunks,
+  cucascade::memory::memory_space& memory_space,
+  std::unique_ptr<duckdb_mvcc_metadata> mvcc)
 {
-  std::size_t new_num_rows = 0;
+  validate_mvcc_publication(cache_info, mvcc);
+  auto compressed_chunks       = std::move(chunks.compressed);
+  auto raw_tables              = std::move(chunks.raw);
+  auto raw_chunk_memory_spaces = std::move(chunks.raw_memory_spaces);
+  auto logical_order           = std::move(chunks.logical_order);
+  if (raw_chunk_memory_spaces.size() != raw_tables.size()) {
+    throw std::invalid_argument(
+      "[sirius_scan_manager::insert_pinned_entry_device_compressed] "
+      "raw_chunk_memory_spaces and raw_tables must have equal size");
+  }
+  for (auto const* space : raw_chunk_memory_spaces) {
+    if (space == nullptr) {
+      throw std::invalid_argument(
+        "[sirius_scan_manager::insert_pinned_entry_device_compressed] "
+        "null raw memory_space");
+    }
+    if (space->get_tier() != cucascade::memory::Tier::GPU) {
+      throw std::invalid_argument(
+        "[sirius_scan_manager::insert_pinned_entry_device_compressed] "
+        "raw memory_space must be GPU tier");
+    }
+  }
+
+  std::vector<std::string> column_names = cache_info.column_names();
+  std::size_t new_num_rows{0};
   for (auto const& chunk : compressed_chunks) {
-    if (chunk) { new_num_rows += static_cast<std::size_t>(chunk->num_rows()); }
+    if (!chunk) {
+      throw std::invalid_argument(
+        "[sirius_scan_manager::insert_pinned_entry_device_compressed] null compressed chunk");
+    }
+    add_rows_checked(new_num_rows, chunk->num_rows(), "compressed GPU chunk");
+  }
+  for (auto const& table : raw_tables) {
+    if (!table) {
+      throw std::invalid_argument(
+        "[sirius_scan_manager::insert_pinned_entry_device_compressed] null raw table");
+    }
+    add_rows_checked(new_num_rows, table->num_rows(), "raw GPU chunk");
   }
 
   pinned_entry entry;
@@ -810,76 +1043,296 @@ void sirius_scan_manager::insert_pinned_entry_device_compressed(
   entry.memory_space             = &memory_space;
   entry.num_rows                 = new_num_rows;
   entry.compressed_device_chunks = std::move(compressed_chunks);
+  entry.chunk_memory_spaces      = std::move(raw_chunk_memory_spaces);
+  entry.logical_order            = std::move(logical_order);
+  entry.mvcc                     = std::move(mvcc);
+  release_tables_into(entry, raw_tables, column_names);
+  validate_entry_before_install(entry);
 
   SIRIUS_LOG_DEBUG(
-    "[sirius_scan_manager::insert_pinned_entry_device_compressed] '{}' chunks={} rows={}",
+    "[sirius_scan_manager::insert_pinned_entry_device_compressed] '{}' compressed={} raw={} "
+    "rows={}",
     name,
     entry.compressed_device_chunks.size(),
+    entry.chunk_memory_spaces.size(),
     new_num_rows);
 
-  _pinned_entries[name] = std::move(entry);
+  std::lock_guard pinned_entries_lock{_pinned_entries_mtx};
+  publish_pinned_entry(_pinned_entries, name, entry);
 }
 
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
                                                duckdb_mvcc_metadata metadata)
 {
+  auto replacement = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
+
+  std::lock_guard pinned_entries_lock{_pinned_entries_mtx};
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) {
     throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
   }
-  it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
+  validate_mvcc_publication(it->second.cache_info, replacement);
+
+  auto previous   = std::move(it->second.mvcc);
+  it->second.mvcc = std::move(replacement);
+  try {
+    validate_entry_before_install(it->second);
+  } catch (...) {
+    it->second.mvcc = std::move(previous);
+    throw;
+  }
 }
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
+  std::lock_guard pinned_entries_lock{_pinned_entries_mtx};
   _pinned_entries.erase(name);
 }
 
 void sirius_scan_manager::visit_pinned_entries(
   const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const
 {
-  for (auto const& [name, entry] : _pinned_entries) {
+  std::vector<std::pair<std::string, pinned_entry>> snapshot;
+  {
+    std::lock_guard pinned_entries_lock{_pinned_entries_mtx};
+    snapshot.reserve(_pinned_entries.size());
+    for (auto const& [name, entry] : _pinned_entries) {
+      snapshot.emplace_back(name, snapshot_pinned_entry(entry));
+    }
+  }
+
+  for (auto const& [name, entry] : snapshot) {
     if (!visitor(name, entry)) { break; }
   }
 }
 
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
-                                       std::span<std::size_t const> selected_columns)
+                                       std::span<const std::size_t> selected_columns)
 {
-  auto const& entry_column_names = entry.cache_info.column_names();
+  auto const& column_names = entry.cache_info.column_names();
+  if (entry.cache_info.column_ids.size() != column_names.size()) {
+    throw std::runtime_error("pinned entry's column ids and names are not aligned");
+  }
 
-  if (entry.tier == cucascade::memory::Tier::GPU) {
-    if (entry.data_batches_by_column.empty()) { return; }  // legitimate zero-chunk entry
-    auto const n_chunks = entry.data_batches_by_column.begin()->second.size();
-    if (entry.chunk_memory_spaces.size() != n_chunks) {
-      throw std::runtime_error(
-        "pinned entry's chunk_memory_spaces does not cover every chunk of the entry");
+  bool const any_duckdb_identity = !entry.cache_info.catalog_name.empty() ||
+                                   !entry.cache_info.schema_name.empty() ||
+                                   !entry.cache_info.table_name.empty();
+  bool const duckdb_identity = !entry.cache_info.catalog_name.empty() &&
+                               !entry.cache_info.schema_name.empty() &&
+                               !entry.cache_info.table_name.empty();
+  bool const parquet_identity = !entry.cache_info.resolved_file_paths.empty();
+  if (any_duckdb_identity && !duckdb_identity) {
+    throw std::runtime_error("pinned entry has an incomplete DuckDB cache identity");
+  }
+  if (duckdb_identity && parquet_identity) {
+    throw std::runtime_error("pinned entry cannot have both DuckDB and parquet identities");
+  }
+  if (duckdb_identity != static_cast<bool>(entry.mvcc)) {
+    throw std::runtime_error(duckdb_identity ? "DuckDB-native pinned entry has no MVCC metadata"
+                                             : "non-DuckDB pinned entry carries MVCC metadata");
+  }
+
+  for (std::size_t const index : selected_columns) {
+    if (index >= column_names.size()) {
+      throw std::runtime_error("pinned entry selection contains an out-of-range column index");
     }
+  }
+
+  bool const gpu  = entry.tier == cucascade::memory::Tier::GPU;
+  bool const host = entry.tier == cucascade::memory::Tier::HOST;
+  if (!gpu && !host) { throw std::runtime_error("pinned entry has an unsupported tier"); }
+  bool const has_storage = !entry.data_batches_by_column.empty() ||
+                           !entry.chunk_memory_spaces.empty() || !entry.host_chunks.empty() ||
+                           !entry.compressed_host_chunks.empty() ||
+                           !entry.compressed_device_chunks.empty();
+  if (has_storage && entry.memory_space == nullptr) {
+    throw std::runtime_error("pinned entry has a null representative memory_space");
+  }
+  if (entry.memory_space != nullptr && entry.memory_space->get_tier() != entry.tier) {
+    throw std::runtime_error("pinned entry's representative memory_space has the wrong tier");
+  }
+
+  if (gpu && (!entry.host_chunks.empty() || !entry.compressed_host_chunks.empty())) {
+    throw std::runtime_error("GPU pinned entry contains HOST-tier storage");
+  }
+  if (host && (!entry.data_batches_by_column.empty() || !entry.chunk_memory_spaces.empty() ||
+               !entry.compressed_device_chunks.empty())) {
+    throw std::runtime_error("HOST pinned entry contains GPU-tier storage");
+  }
+
+  std::vector<std::size_t> compressed_row_counts;
+  auto validate_compressed =
+    [&](auto const& chunks, char const* tier_name, cucascade::memory::Tier expected_tier) {
+      for (auto const& chunk : chunks) {
+        if (!chunk) {
+          throw std::runtime_error(std::string{"pinned entry has a null compressed "} + tier_name +
+                                   " chunk");
+        }
+        if (chunk->get_memory_space().get_tier() != expected_tier) {
+          throw std::runtime_error(std::string{"pinned entry's compressed "} + tier_name +
+                                   " chunk has the wrong memory tier");
+        }
+        if (chunk->selected_indices().has_value()) {
+          throw std::runtime_error(std::string{"pinned entry stores a projected compressed "} +
+                                   tier_name + " chunk");
+        }
+        if (chunk->column_names() != column_names) {
+          throw std::runtime_error(std::string{"pinned entry's compressed "} + tier_name +
+                                   " schema does not match its cache schema");
+        }
+        if (chunk->num_rows() < 0) {
+          throw std::runtime_error(std::string{"pinned entry has a negative compressed "} +
+                                   tier_name + " row count");
+        }
+        compressed_row_counts.push_back(static_cast<std::size_t>(chunk->num_rows()));
+      }
+    };
+  validate_compressed(entry.compressed_host_chunks, "HOST", cucascade::memory::Tier::HOST);
+  validate_compressed(entry.compressed_device_chunks, "GPU", cucascade::memory::Tier::GPU);
+
+  std::size_t const n_compressed =
+    gpu ? entry.compressed_device_chunks.size() : entry.compressed_host_chunks.size();
+  std::size_t n_raw = 0;
+  std::vector<std::size_t> raw_row_counts;
+
+  if (gpu) {
+    if (!entry.data_batches_by_column.empty() &&
+        entry.data_batches_by_column.size() != column_names.size()) {
+      throw std::runtime_error("GPU pinned entry's raw columns do not match its cache schema");
+    }
+    if (entry.data_batches_by_column.empty() && !entry.chunk_memory_spaces.empty()) {
+      throw std::runtime_error("GPU pinned entry has raw placements but no raw columns");
+    }
+
+    n_raw = entry.chunk_memory_spaces.size();
+    raw_row_counts.resize(n_raw);
     for (auto const* space : entry.chunk_memory_spaces) {
-      if (!space) { throw std::runtime_error("pinned entry has a null chunk memory_space"); }
+      if (space == nullptr) {
+        throw std::runtime_error("pinned entry has a null chunk memory_space");
+      }
+      if (space->get_tier() != cucascade::memory::Tier::GPU) {
+        throw std::runtime_error("pinned entry has a raw GPU chunk in a non-GPU memory space");
+      }
     }
-    for (auto idx : selected_columns) {
-      auto const& name = entry_column_names.at(idx);
-      auto it          = entry.data_batches_by_column.find(name);
-      if (it == entry.data_batches_by_column.end() || it->second.size() != n_chunks) {
+    for (std::size_t column_index = 0; column_index < column_names.size(); ++column_index) {
+      auto const& name = column_names[column_index];
+      auto const it    = entry.data_batches_by_column.find(name);
+      if (it == entry.data_batches_by_column.end()) {
+        if (n_raw == 0 && entry.data_batches_by_column.empty()) { continue; }
+        throw std::runtime_error("pinned entry is missing raw column '" + name + "'");
+      }
+      if (it->second.size() != n_raw) {
         throw std::runtime_error("pinned column '" + name +
-                                 "' does not cover every chunk of the entry");
+                                 "' does not cover every raw chunk of the entry");
       }
-      for (auto const& chunk : it->second) {
+      for (std::size_t chunk_index = 0; chunk_index < n_raw; ++chunk_index) {
+        auto const& chunk = it->second[chunk_index];
         if (!chunk) { throw std::runtime_error("pinned column '" + name + "' has a null chunk"); }
+        auto const rows = static_cast<std::size_t>(chunk->size());
+        if (column_index == 0) {
+          raw_row_counts[chunk_index] = rows;
+        } else if (raw_row_counts[chunk_index] != rows) {
+          throw std::runtime_error("raw GPU chunk columns have different row counts at index " +
+                                   std::to_string(chunk_index));
+        }
       }
     }
-    return;
-  }
-
-  if (entry.tier == cucascade::memory::Tier::HOST) {
+  } else {
+    n_raw = entry.host_chunks.size();
+    raw_row_counts.reserve(n_raw);
     for (auto const& chunk : entry.host_chunks) {
-      if (!chunk) { throw std::runtime_error("pinned entry has a null host chunk"); }
+      if (!chunk) { throw std::runtime_error("pinned entry has a null HOST chunk"); }
+      auto const& table = chunk->get_host_table();
+      if (chunk->get_memory_space().get_tier() != cucascade::memory::Tier::HOST) {
+        throw std::runtime_error("pinned entry has a raw HOST chunk in a non-HOST memory space");
+      }
+      if (!table) { throw std::runtime_error("pinned entry has a HOST chunk with no table"); }
+      if (table->columns.size() != column_names.size()) {
+        throw std::runtime_error(
+          "pinned entry's HOST chunk schema does not match its cache schema");
+      }
+      if (table->columns.empty()) {
+        throw std::runtime_error("pinned entry has a HOST chunk with no row-count-bearing column");
+      }
+      auto const rows = table->columns.front().num_rows;
+      if (rows < 0) { throw std::runtime_error("pinned entry has a negative HOST row count"); }
+      for (auto const& column : table->columns) {
+        if (column.num_rows != rows) {
+          throw std::runtime_error("pinned entry's HOST chunk columns have different row counts");
+        }
+      }
+      raw_row_counts.push_back(static_cast<std::size_t>(rows));
     }
-    return;
   }
 
-  throw std::runtime_error("pinned entry has an unsupported tier");
+  std::vector<std::size_t> logical_chunk_rows;
+  if (entry.logical_order.empty()) {
+    if (n_compressed != 0 && n_raw != 0) {
+      throw std::runtime_error("pinned entry populates both arms without a logical_order");
+    }
+    logical_chunk_rows = n_compressed != 0 ? compressed_row_counts : raw_row_counts;
+  } else {
+    if (n_compressed == 0 || n_raw == 0) {
+      throw std::runtime_error("pinned entry has a logical_order but is not mixed");
+    }
+    if (n_compressed > std::numeric_limits<std::size_t>::max() - n_raw ||
+        entry.logical_order.size() != n_compressed + n_raw) {
+      throw std::runtime_error("pinned entry's logical_order does not densely cover both arms");
+    }
+
+    std::vector<bool> compressed_seen(n_compressed, false);
+    std::vector<bool> raw_seen(n_raw, false);
+    logical_chunk_rows.reserve(entry.logical_order.size());
+    for (auto const& source : entry.logical_order) {
+      std::vector<bool>* seen                    = nullptr;
+      std::vector<std::size_t> const* row_counts = nullptr;
+      switch (source.kind) {
+        case chunk_kind::compressed:
+          seen       = &compressed_seen;
+          row_counts = &compressed_row_counts;
+          break;
+        case chunk_kind::raw:
+          seen       = &raw_seen;
+          row_counts = &raw_row_counts;
+          break;
+        default: throw std::runtime_error("pinned entry's logical_order has an invalid chunk kind");
+      }
+      if (source.arm_index >= seen->size() || (*seen)[source.arm_index]) {
+        throw std::runtime_error(
+          "pinned entry's logical_order is not a one-to-one cover of both arms");
+      }
+      (*seen)[source.arm_index] = true;
+      logical_chunk_rows.push_back((*row_counts)[source.arm_index]);
+    }
+  }
+
+  auto checked_sum = [](auto const& counts, std::string_view description) {
+    std::size_t total = 0;
+    for (std::size_t const count : counts) {
+      if (count > std::numeric_limits<std::size_t>::max() - total) {
+        throw std::overflow_error(std::string{description} + " row-count total overflowed");
+      }
+      total += count;
+    }
+    return total;
+  };
+
+  auto const stored_rows = checked_sum(logical_chunk_rows, "pinned storage");
+  if (stored_rows != entry.num_rows) {
+    throw std::runtime_error("pinned entry's stored row total does not match num_rows");
+  }
+
+  if (entry.mvcc) {
+    auto const mvcc_rows =
+      checked_sum(entry.mvcc->base_row_count_per_chunk, "pinned MVCC metadata");
+    if (entry.mvcc->base_row_count_per_chunk != logical_chunk_rows) {
+      throw std::runtime_error(
+        "pinned entry's MVCC row counts do not match its logical chunk boundaries");
+    }
+    if (mvcc_rows != entry.num_rows) {
+      throw std::runtime_error("pinned entry's MVCC row total does not match num_rows");
+    }
+  }
 }
 
 bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_operator* op)
@@ -887,25 +1340,33 @@ bool sirius_scan_manager::try_assign_cached_entries(op::scan::sirius_gpu_scan_op
   const auto& table_info = op->get_ingestible().table_info();
 
   try {
-    for (auto const& [pinned_name, entry] : _pinned_entries) {
-      // Identity + serviceability gate: empty when this cache cannot serve the scan
-      // (wrong format / file-set / table, or missing a requested column).
-      if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
-      // Serve cached columns in the ingestible's materialized (disk-decode) order rather
-      // than raw column_ids order, so post_filter_and_project's index-based filter and
-      // projection bind to the same columns they would on the disk read path.
-      auto cols = gather_by_primary_index(entry.cache_info.column_ids,
-                                          op->get_ingestible().materialized_column_order());
-      if (cols.empty()) { continue; }  // defensive: materialized set must be a cache subset
-      // Serve-time defense: a malformed entry would end the cached batch stream
-      // early (nullptr mid-stream reads as end-of-stream) and silently truncate
-      // the scan; validate up front so it throws here and the catch below falls
-      // back to the disk read instead.
-      validate_pinned_entry_for_serving(entry, cols);
-      auto provider = make_provider_for_pinned_entry(entry, cols, op->batch_telemetry());
-      _metadata_processor->use_cached_entries_for_pipeline(op, std::move(provider));
+    std::unique_ptr<databatch_provider> cached_provider;
+    std::string cached_name;
+    {
+      std::lock_guard pinned_entries_lock{_pinned_entries_mtx};
+      for (auto const& [pinned_name, entry] : _pinned_entries) {
+        // Identity + serviceability gate: empty when this cache cannot serve the scan
+        // (wrong format / file-set / table, or missing a requested column).
+        if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
+        // Serve cached columns in the ingestible's materialized (disk-decode) order rather
+        // than raw column_ids order, so post_filter_and_project's index-based filter and
+        // projection bind to the same columns they would on the disk read path.
+        auto cols = gather_by_primary_index(entry.cache_info.column_ids,
+                                            op->get_ingestible().materialized_column_order());
+        if (cols.empty()) { continue; }  // defensive: materialized set must be a cache subset
+        // Serve-time defense: a malformed entry would end the cached batch stream
+        // early (nullptr mid-stream reads as end-of-stream) and silently truncate
+        // the scan; validate up front so it throws here and the catch below falls
+        // back to the disk read instead.
+        cached_provider = make_provider_for_pinned_entry(entry, cols, op->batch_telemetry());
+        cached_name     = pinned_name;
+        break;
+      }
+    }
+    if (cached_provider) {
+      _metadata_processor->use_cached_entries_for_pipeline(op, std::move(cached_provider));
       spdlog::info("[sirius_scan_manager] assigned pinned entry '{}' to operator '{}'",
-                   pinned_name,
+                   cached_name,
                    op->get_operator_id());
       return true;
     }

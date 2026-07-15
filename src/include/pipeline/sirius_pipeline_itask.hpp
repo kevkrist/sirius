@@ -84,8 +84,10 @@ class sirius_pipeline_itask : public parallel::itask {
    *
    * @param target_space The memory space the task will execute in, so inputs residing outside it
    *                     (host/disk tiers, or GPU data on a different device that prepare will
-   *                     clone) are counted in bytes_to_materialize_input. nullptr means no single
-   *                     target space is known; only non-GPU-tier inputs are counted.
+   *                     clone) and cached encoded scans requiring decode are counted in
+   *                     bytes_to_materialize_input. nullptr means no single target space is known:
+   *                     non-GPU upgrades and representation-changing cached scans are still
+   *                     counted, while a cross-GPU clone cannot be identified.
    * @return reservation_size_info with input_basis, bytes_to_materialize_input,
    *         peak_memory_estimate, reservation_size, and had_history populated.
    */

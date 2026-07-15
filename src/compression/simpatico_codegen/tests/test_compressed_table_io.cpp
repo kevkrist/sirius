@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Tests for write_compressed_table / read_compressed_table (.hpln v6).
+// Tests for write_compressed_table / read_compressed_table (.hpln v10).
 //
 // Each test_* function throws std::runtime_error on failure; main() catches and
 // reports.  Tests are intentionally independent so a failure in one does not
@@ -19,11 +19,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -40,6 +45,155 @@ struct TmpFile {
   }
   ~TmpFile() { std::remove(path.c_str()); }
 };
+template <typename T>
+std::size_t append_le(std::vector<std::uint8_t>& bytes, T value)
+{
+  auto const offset  = bytes.size();
+  auto const encoded = std::bit_cast<std::array<std::uint8_t, sizeof(T)>>(value);
+  bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+  return offset;
+}
+
+void append_str16(std::vector<std::uint8_t>& bytes, std::string_view value)
+{
+  append_le(bytes, static_cast<std::uint16_t>(value.size()));
+  bytes.insert(bytes.end(), value.begin(), value.end());
+}
+
+template <typename T>
+void overwrite_le(std::vector<std::uint8_t>& bytes, std::size_t offset, T value)
+{
+  if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) {
+    throw std::logic_error("malformed-header fixture overwrite is out of range");
+  }
+  auto const encoded = std::bit_cast<std::array<std::uint8_t, sizeof(T)>>(value);
+  std::copy(encoded.begin(), encoded.end(), bytes.begin() + offset);
+}
+
+struct IdentityHeaderFixture {
+  std::vector<std::uint8_t> bytes;
+  std::size_t column_type{};
+  std::size_t column_rows{};
+  std::size_t root_child{};
+  std::size_t num_leaves{};
+  std::size_t leaf_start{};
+  std::size_t leaf_kind{};
+  std::size_t leaf_type{};
+  std::size_t leaf_rows{};
+  std::size_t buffer_type{};
+  std::size_t buffer_size{};
+  std::size_t buffer_offset{};
+};
+
+IdentityHeaderFixture make_identity_header_fixture()
+{
+  IdentityHeaderFixture fixture;
+  auto& bytes = fixture.bytes;
+  bytes.insert(bytes.end(), {'H', 'P', 'L', 'N'});
+  append_le(bytes, std::uint8_t{10});
+  append_le(bytes, std::uint16_t{1});
+
+  append_str16(bytes, "");
+  fixture.column_type = append_le(bytes, std::uint8_t{2});
+  append_le(bytes, std::int32_t{0});
+  fixture.column_rows = append_le(bytes, std::int64_t{4});
+
+  append_le(bytes, std::uint16_t{2});
+  append_str16(bytes, "input");
+  append_le(bytes, std::uint8_t{0});
+  append_le(bytes, std::uint16_t{1});
+  append_str16(bytes, "identity");
+  fixture.root_child = append_le(bytes, std::uint32_t{1});
+  append_le(bytes, std::uint16_t{0});
+
+  append_str16(bytes, "identity");
+  append_le(bytes, std::uint8_t{0});
+  append_le(bytes, std::uint16_t{0});
+  append_le(bytes, std::uint16_t{0});
+
+  fixture.num_leaves = append_le(bytes, std::uint16_t{1});
+  fixture.leaf_start = bytes.size();
+  append_le(bytes, std::uint32_t{1});
+  append_le(bytes, std::int32_t{-1});
+  fixture.leaf_kind = append_le(bytes, std::uint8_t{5});
+  fixture.leaf_type = append_le(bytes, std::uint8_t{2});
+  fixture.leaf_rows = append_le(bytes, std::uint64_t{4});
+  append_le(bytes, std::uint8_t{0});
+  append_le(bytes, std::uint8_t{1});
+
+  append_str16(bytes, "data");
+  fixture.buffer_type   = append_le(bytes, std::uint8_t{2});
+  fixture.buffer_size   = append_le(bytes, std::uint64_t{16});
+  fixture.buffer_offset = append_le(bytes, std::uint64_t{0});
+  return fixture;
+}
+
+struct BitjoinHeaderFixture {
+  std::vector<std::uint8_t> bytes;
+  std::size_t output_type{};
+  std::size_t input_node{};
+};
+
+BitjoinHeaderFixture make_bitjoin_header_fixture()
+{
+  BitjoinHeaderFixture fixture;
+  auto& bytes = fixture.bytes;
+  bytes.insert(bytes.end(), {'H', 'P', 'L', 'N'});
+  append_le(bytes, std::uint8_t{10});
+  append_le(bytes, std::uint16_t{1});
+
+  append_str16(bytes, "");
+  append_le(bytes, std::uint8_t{2});
+  append_le(bytes, std::int32_t{0});
+  append_le(bytes, std::int64_t{0});
+
+  append_le(bytes, std::uint16_t{3});
+  append_str16(bytes, "input");
+  append_le(bytes, std::uint8_t{0});
+  append_le(bytes, std::uint16_t{1});
+  append_str16(bytes, "identity");
+  append_le(bytes, std::uint32_t{1});
+  append_le(bytes, std::uint16_t{0});
+
+  append_str16(bytes, "identity");
+  append_le(bytes, std::uint8_t{0});
+  append_le(bytes, std::uint16_t{1});
+  append_str16(bytes, "value");
+  append_le(bytes, std::uint32_t{2});
+  append_le(bytes, std::uint16_t{1});
+  append_str16(bytes, "value");
+
+  append_str16(bytes, "bitjoin_i32");
+  append_le(bytes, std::uint8_t{1});
+  fixture.output_type = append_le(bytes, std::uint8_t{2});
+  append_le(bytes, std::uint16_t{1});
+  fixture.input_node = append_le(bytes, std::uint32_t{1});
+  append_str16(bytes, "value");
+  append_le(bytes, std::uint8_t{0});
+  append_le(bytes, std::uint16_t{0});
+  append_le(bytes, std::uint16_t{0});
+
+  append_le(bytes, std::uint16_t{0});
+  return fixture;
+}
+
+void expect_memory_header_rejected(std::vector<std::uint8_t> const& header,
+                                   std::string_view expected_error,
+                                   std::string_view label)
+{
+  std::size_t fetch_calls{0};
+  simpatico::payload_fetch_fn fetch =
+    [&fetch_calls](std::uint64_t, std::size_t, void*, rmm::cuda_stream_view) { ++fetch_calls; };
+
+  std::string error;
+  auto restored = simpatico::read_compressed_table_from_memory(
+    header, fetch, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref(), &error);
+  expect(restored.columns.empty(), (std::string(label) + ": expected an empty table").c_str());
+  expect(fetch_calls == 0,
+         (std::string(label) + ": payload was fetched before header rejection").c_str());
+  expect(error.find(expected_error) != std::string::npos,
+         (std::string(label) + ": unexpected error: " + error).c_str());
+}
 
 // Flatten leaf kinds from describe() into a simple vector for comparison.
 std::vector<simpatico::OpId> leaf_kinds(simpatico::compressed_table const& ct)
@@ -396,6 +550,118 @@ void test_error_bad_version()
   expect(!err.empty(), "error_bad_version: expected non-empty error");
 }
 
+void test_malformed_headers_fail_before_payload_fetch()
+{
+  auto const identity = make_identity_header_fixture();
+  auto reject_identity_mutation =
+    [&](std::size_t offset, auto value, std::string_view expected_error, std::string_view label) {
+      auto header = identity.bytes;
+      overwrite_le(header, offset, value);
+      expect_memory_header_rejected(header, expected_error, label);
+    };
+
+  reject_identity_mutation(
+    identity.column_type, std::uint8_t{254}, "invalid column type tag", "invalid column type");
+  reject_identity_mutation(identity.column_rows,
+                           std::numeric_limits<std::int64_t>::max(),
+                           "row count is outside",
+                           "oversized column row count");
+  reject_identity_mutation(
+    identity.root_child, std::uint32_t{99}, "invalid child index", "invalid plan edge");
+  reject_identity_mutation(identity.leaf_kind,
+                           static_cast<std::uint8_t>(simpatico::OpId::StrSplit),
+                           "invalid serialized leaf kind",
+                           "structural leaf kind");
+  reject_identity_mutation(
+    identity.leaf_type, std::uint8_t{254}, "invalid leaf type tag", "invalid leaf type");
+
+  auto const too_many_rows =
+    static_cast<std::uint64_t>(std::numeric_limits<cudf::size_type>::max()) + 1;
+  reject_identity_mutation(
+    identity.leaf_rows, too_many_rows, "row count is outside", "oversized leaf row count");
+  reject_identity_mutation(
+    identity.leaf_rows, std::uint64_t{3}, "root leaf row count", "root row disagreement");
+  reject_identity_mutation(
+    identity.buffer_type, std::uint8_t{254}, "invalid type tag", "invalid buffer type");
+  reject_identity_mutation(
+    identity.buffer_type, std::uint8_t{10}, "not a fixed-width payload type", "string buffer type");
+  reject_identity_mutation(identity.buffer_size,
+                           std::uint64_t{15},
+                           "not divisible by the element size",
+                           "non-divisible buffer size");
+  reject_identity_mutation(identity.buffer_size,
+                           std::uint64_t{12},
+                           "identity buffer row count",
+                           "identity buffer row disagreement");
+
+  auto oversized_buffer = identity.bytes;
+  overwrite_le(oversized_buffer, identity.buffer_type, std::uint8_t{0});
+  overwrite_le(oversized_buffer, identity.buffer_size, too_many_rows);
+  expect_memory_header_rejected(
+    oversized_buffer, "derived row count is outside", "oversized derived buffer row count");
+
+  auto duplicate_destination = identity.bytes;
+  std::vector<std::uint8_t> const duplicate_leaf(identity.bytes.begin() + identity.leaf_start,
+                                                 identity.bytes.end());
+  overwrite_le(duplicate_destination, identity.num_leaves, std::uint16_t{2});
+  duplicate_destination.insert(
+    duplicate_destination.end(), duplicate_leaf.begin(), duplicate_leaf.end());
+  expect_memory_header_rejected(
+    duplicate_destination, "duplicate leaf destination", "duplicate leaf destination");
+  auto const bitjoin        = make_bitjoin_header_fixture();
+  auto invalid_bitjoin_type = bitjoin.bytes;
+  overwrite_le(invalid_bitjoin_type, bitjoin.output_type, std::uint8_t{254});
+  expect_memory_header_rejected(invalid_bitjoin_type, "plan node", "invalid bitjoin output type");
+
+  auto invalid_bitjoin_input = bitjoin.bytes;
+  overwrite_le(invalid_bitjoin_input, bitjoin.input_node, std::uint32_t{99});
+  expect_memory_header_rejected(
+    invalid_bitjoin_input, "invalid input node index", "invalid bitjoin input node");
+
+  auto overflowing_file_range = identity.bytes;
+  overwrite_le(overflowing_file_range,
+               identity.buffer_offset,
+               std::numeric_limits<std::uint64_t>::max() - std::uint64_t{15});
+  TmpFile tmp;
+  {
+    std::ofstream file(tmp.path, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<char const*>(overflowing_file_range.data()),
+               static_cast<std::streamsize>(overflowing_file_range.size()));
+    expect(static_cast<bool>(file), "overflowing file-range fixture write failed");
+  }
+
+  std::string error;
+  auto restored = simpatico::read_compressed_table(
+    tmp.path, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref(), &error);
+  expect(restored.columns.empty(), "overflowing file payload range returned a table");
+  expect(!error.empty(), "overflowing file payload range was not rejected");
+}
+
+void test_v10_wire_widths_rejected()
+{
+  auto const wire_limit = static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max());
+  auto reject = [&](simpatico::compressed_table const& source, std::string_view expected_error) {
+    std::vector<std::uint8_t> header{1, 2, 3};
+    std::vector<simpatico::payload_buffer_ref> buffers{{7, nullptr, 9}};
+    std::uint64_t payload_bytes = 11;
+    auto const error            = simpatico::build_compressed_table_header(
+      source, header, buffers, payload_bytes, cudf::get_default_stream());
+    expect(error.find(expected_error) != std::string::npos,
+           ("v10 width limit: unexpected error: " + error).c_str());
+    expect(header.empty() && buffers.empty() && payload_bytes == 0,
+           "v10 width limit: outputs were not cleared on rejection");
+  };
+
+  simpatico::compressed_table too_many_columns;
+  too_many_columns.columns.resize(wire_limit + 1);
+  reject(too_many_columns, "column count");
+
+  simpatico::compressed_table long_column_name;
+  long_column_name.columns.resize(1);
+  long_column_name.columns.front().name = std::string(wire_limit + 1, 'x');
+  reject(long_column_name, "name length");
+}
+
 // Error: identity on a STRING column has no single contiguous payload buffer;
 // build_compressed_table_header must reject it loudly and clear its outputs.
 void test_identity_string_header_rejected()
@@ -465,6 +731,214 @@ void test_str_split_plan_shapes_roundtrip()
   memory_roundtrip("str_split_phone_shape_mem", phone_tbl->view(), phone_dsl);
 }
 
+void test_memory_reader_selection_fetches_only_requested_columns()
+{
+  auto stream     = cudf::get_default_stream();
+  auto mr         = rmm::mr::get_current_device_resource_ref();
+  auto input      = make_int32_table(3, 512, 41);
+  auto compressed = simpatico::compress_with_plan(input->view(),
+                                                  "input -> identity\n---\n"
+                                                  "input -> identity\n---\n"
+                                                  "input -> identity\n",
+                                                  stream,
+                                                  mr,
+                                                  {"a", "b", "c"});
+
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes{0};
+  auto const header_error =
+    simpatico::build_compressed_table_header(compressed, header, buffers, payload_bytes, stream);
+  expect(header_error.empty(), ("selection header: " + header_error).c_str());
+  expect(buffers.size() == 3, "selection fixture must have one buffer per column");
+
+  std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_bytes));
+  stream.synchronize();
+  for (auto const& buffer : buffers) {
+    expect(cudaMemcpy(payload.data() + buffer.offset,
+                      buffer.device_ptr,
+                      static_cast<std::size_t>(buffer.size_bytes),
+                      cudaMemcpyDeviceToHost) == cudaSuccess,
+           "selection payload staging failed");
+  }
+
+  std::vector<std::uint64_t> fetched_offsets;
+  simpatico::payload_fetch_fn fetch = [&payload, &fetched_offsets](
+                                        std::uint64_t offset,
+                                        std::size_t size,
+                                        void* destination,
+                                        rmm::cuda_stream_view fetch_stream) {
+    fetched_offsets.push_back(offset);
+    if (cudaMemcpyAsync(destination,
+                        payload.data() + offset,
+                        size,
+                        cudaMemcpyHostToDevice,
+                        fetch_stream.value()) != cudaSuccess) {
+      throw std::runtime_error("selection fetch failed");
+    }
+  };
+
+  std::vector<std::size_t> selected{2, 0};
+  std::string error;
+  auto restored = simpatico::read_compressed_table_from_memory(
+    header,
+    fetch,
+    stream,
+    mr,
+    &error,
+    std::optional<std::span<const std::size_t>>{std::span<const std::size_t>{selected}});
+  expect(error.empty(), ("selection read: " + error).c_str());
+  expect(restored.num_columns() == 2, "selection returned the wrong column count");
+  expect(restored.columns[0].name == std::optional<std::string>{"c"} &&
+           restored.columns[1].name == std::optional<std::string>{"a"},
+         "selection did not preserve requested order");
+  expect(fetched_offsets == std::vector<std::uint64_t>{buffers[2].offset, buffers[0].offset},
+         "selection fetched an unrequested column or changed fetch order");
+
+  auto decoded = simpatico::decompress(std::move(restored), stream, mr);
+  expect(columns_equal_any(input->view().column(2), decoded->view().column(0), stream),
+         "selection data mismatch for source column 2");
+  expect(columns_equal_any(input->view().column(0), decoded->view().column(1), stream),
+         "selection data mismatch for source column 0");
+
+  fetched_offsets.clear();
+  std::vector<std::size_t> duplicate{1, 1};
+  error.clear();
+  auto invalid = simpatico::read_compressed_table_from_memory(
+    header,
+    fetch,
+    stream,
+    mr,
+    &error,
+    std::optional<std::span<const std::size_t>>{std::span<const std::size_t>{duplicate}});
+  expect(!error.empty() && invalid.num_columns() == 0, "duplicate selection was not rejected");
+  expect(fetched_offsets.empty(), "invalid selection fetched payload bytes before failing");
+
+  std::vector<std::size_t> none;
+  error.clear();
+  auto empty = simpatico::read_compressed_table_from_memory(
+    header,
+    fetch,
+    stream,
+    mr,
+    &error,
+    std::optional<std::span<const std::size_t>>{std::span<const std::size_t>{none}});
+  expect(error.empty() && empty.num_columns() == 0,
+         "engaged empty selection did not reconstruct an empty table");
+  expect(fetched_offsets.empty(), "empty selection fetched payload bytes");
+}
+
+void test_memory_reader_selection_fetches_all_buffers_for_selected_column()
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+
+  std::vector<std::string> values{"alpha", "", "charlie", "delta", "echo", "foxtrot"};
+  std::vector<bool> validity{true, false, true, true, false, true};
+  auto strings         = make_strings_table(values, validity, stream);
+  auto integers        = make_int32_table(1, static_cast<int>(values.size()), 53);
+  auto columns         = strings->release();
+  auto integer_columns = integers->release();
+  columns.push_back(std::move(integer_columns.front()));
+  auto input = std::make_unique<cudf::table>(std::move(columns));
+
+  auto compressed =
+    simpatico::compress_with_plan(input->view(),
+                                  "input -> str_split -> offsets, chars, null_mask\n"
+                                  "str_split.offsets -> delta -> differences\n"
+                                  "str_split.offsets.differences -> bitpack\n"
+                                  "str_split.chars -> lz4\n"
+                                  "str_split.null_mask -> identity\n"
+                                  "---\n"
+                                  "input -> identity\n",
+                                  stream,
+                                  mr,
+                                  {"text", "number"});
+
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes{0};
+  auto const header_error =
+    simpatico::build_compressed_table_header(compressed, header, buffers, payload_bytes, stream);
+  expect(header_error.empty(), ("multi-buffer selection header: " + header_error).c_str());
+
+  auto const description = compressed.describe();
+  expect(description.size() == 2, "multi-buffer selection fixture must have two columns");
+  auto count_buffers = [](auto const& leaves) {
+    std::size_t count{0};
+    for (auto const& leaf : leaves)
+      count += leaf.buffers.size();
+    return count;
+  };
+  auto const string_buffer_count  = count_buffers(description[0]);
+  auto const integer_buffer_count = count_buffers(description[1]);
+  expect(string_buffer_count > 1, "string selection fixture must have multiple payload buffers");
+  expect(integer_buffer_count == 1, "integer selection fixture must have one payload buffer");
+  expect(string_buffer_count + integer_buffer_count == buffers.size(),
+         "described buffer count does not match serialized payload");
+
+  std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_bytes));
+  stream.synchronize();
+  for (auto const& buffer : buffers) {
+    if (buffer.size_bytes == 0) continue;
+    expect(cudaMemcpy(payload.data() + buffer.offset,
+                      buffer.device_ptr,
+                      static_cast<std::size_t>(buffer.size_bytes),
+                      cudaMemcpyDeviceToHost) == cudaSuccess,
+           "multi-buffer selection payload staging failed");
+  }
+
+  std::vector<std::uint64_t> fetched_offsets;
+  simpatico::payload_fetch_fn fetch = [&payload, &fetched_offsets](
+                                        std::uint64_t offset,
+                                        std::size_t size,
+                                        void* destination,
+                                        rmm::cuda_stream_view fetch_stream) {
+    if (offset > payload.size() || size > payload.size() - static_cast<std::size_t>(offset))
+      throw std::out_of_range("multi-buffer selection fetch range");
+    fetched_offsets.push_back(offset);
+    if (cudaMemcpyAsync(destination,
+                        payload.data() + offset,
+                        size,
+                        cudaMemcpyHostToDevice,
+                        fetch_stream.value()) != cudaSuccess)
+      throw std::runtime_error("multi-buffer selection fetch failed");
+  };
+
+  auto read_selection = [&](std::size_t index) {
+    std::vector<std::size_t> selected{index};
+    std::string error;
+    auto restored = simpatico::read_compressed_table_from_memory(
+      header,
+      fetch,
+      stream,
+      mr,
+      &error,
+      std::optional<std::span<const std::size_t>>{std::span<const std::size_t>{selected}});
+    expect(error.empty(), ("multi-buffer selection read: " + error).c_str());
+    expect(restored.num_columns() == 1, "multi-buffer selection returned wrong column count");
+    return restored;
+  };
+
+  auto restored_string = read_selection(0);
+  std::vector<std::uint64_t> expected_string_offsets;
+  expected_string_offsets.reserve(string_buffer_count);
+  for (std::size_t i = 0; i < string_buffer_count; ++i)
+    expected_string_offsets.push_back(buffers[i].offset);
+  expect(fetched_offsets == expected_string_offsets,
+         "string selection did not fetch exactly all buffers for that column");
+  auto decoded_string = simpatico::decompress(std::move(restored_string), stream, mr);
+  expect(columns_equal_any(input->view().column(0), decoded_string->view().column(0), stream),
+         "multi-buffer string selection data mismatch");
+
+  fetched_offsets.clear();
+  auto restored_integer = read_selection(1);
+  expect(fetched_offsets == std::vector<std::uint64_t>{buffers[string_buffer_count].offset},
+         "integer selection fetched buffers from the string column");
+  auto decoded_integer = simpatico::decompress(std::move(restored_integer), stream, mr);
+  expect(columns_equal_any(input->view().column(1), decoded_integer->view().column(0), stream),
+         "multi-buffer integer selection data mismatch");
+}
 }  // namespace
 
 int main()
@@ -490,12 +964,17 @@ int main()
     {"alp_rd_f64", test_alp_rd_f64},
     {"dictionary", test_dictionary},
     {"multi_column", test_multi_column},
+    {"memory_reader_selection", test_memory_reader_selection_fetches_only_requested_columns},
+    {"memory_reader_multi_buffer_selection",
+     test_memory_reader_selection_fetches_all_buffers_for_selected_column},
     {"column_names_survive", test_column_names_survive},
     {"zero_rows", test_zero_rows},
     {"error_not_found", test_error_not_found},
     {"error_garbage", test_error_garbage},
     {"error_bad_magic", test_error_bad_magic},
     {"error_bad_version", test_error_bad_version},
+    {"malformed_headers", test_malformed_headers_fail_before_payload_fetch},
+    {"v10_wire_widths_rejected", test_v10_wire_widths_rejected},
     {"identity_string_header_rejected", test_identity_string_header_rejected},
     {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
   };

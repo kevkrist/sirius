@@ -27,6 +27,31 @@
 
 namespace sirius {
 
+namespace {
+
+template <typename Blob>
+void require_backing_blob(const std::shared_ptr<Blob>& blob)
+{
+  if (!blob) {
+    throw std::invalid_argument("[compressed_representation] backing blob must not be null");
+  }
+}
+
+void validate_block_copy_range(std::uint64_t offset, std::size_t size, std::size_t capacity)
+{
+  if (std::cmp_greater(offset, capacity) || size > capacity - static_cast<std::size_t>(offset)) {
+    throw std::out_of_range(
+      "[compressed_representation] pinned block copy exceeds the backing allocation");
+  }
+}
+
+std::vector<std::size_t> resolve_absolute_indices(
+  std::span<const std::size_t> indices,
+  const std::optional<std::vector<std::size_t>>& existing_selection,
+  std::size_t num_all_columns);
+
+}  // namespace
+
 // ── Block-aware pinned copies ────────────────────────────────────────────────
 
 void copy_device_to_pinned_blocks(
@@ -36,10 +61,16 @@ void copy_device_to_pinned_blocks(
   std::size_t size,
   rmm::cuda_stream_view stream)
 {
+  validate_block_copy_range(dst_offset, size, dst.size_bytes());
   if (size == 0) return;
+  if (src_device == nullptr) {
+    throw std::invalid_argument(
+      "[compressed_representation] device-to-host copy source must not be null");
+  }
   const std::size_t bs = dst.block_size();
-  std::size_t d_idx    = dst_offset / bs;
-  std::size_t d_off    = dst_offset % bs;
+  auto const offset    = static_cast<std::size_t>(dst_offset);
+  std::size_t d_idx    = offset / bs;
+  std::size_t d_off    = offset % bs;
   const auto* src      = static_cast<const std::byte*>(src_device);
   std::size_t copied   = 0;
   while (copied < size) {
@@ -62,10 +93,16 @@ void copy_pinned_blocks_to_device(
   std::size_t size,
   rmm::cuda_stream_view stream)
 {
+  validate_block_copy_range(src_offset, size, src.size_bytes());
   if (size == 0) return;
+  if (dst_device == nullptr) {
+    throw std::invalid_argument(
+      "[compressed_representation] host-to-device copy destination must not be null");
+  }
   const std::size_t bs = src.block_size();
-  std::size_t s_idx    = src_offset / bs;
-  std::size_t s_off    = src_offset % bs;
+  auto const offset    = static_cast<std::size_t>(src_offset);
+  std::size_t s_idx    = offset / bs;
+  std::size_t s_off    = offset % bs;
   auto* dst            = static_cast<std::byte*>(dst_device);
   std::size_t copied   = 0;
   while (copied < size) {
@@ -97,6 +134,7 @@ compressed_host_representation::compressed_host_representation(
     _uncompressed_bytes(uncompressed_bytes),
     _num_rows(num_rows)
 {
+  require_backing_blob(_blob);
 }
 
 // ── Sharing constructor (private) ────────────────────────────────────────────
@@ -117,6 +155,17 @@ compressed_host_representation::compressed_host_representation(
     _num_rows(num_rows),
     _selected_indices(std::move(selected_indices))
 {
+  require_backing_blob(_blob);
+}
+
+const cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation&
+compressed_host_representation::payload() const
+{
+  if (!_blob->payload) {
+    throw std::logic_error(
+      "[compressed_host_representation::payload] backing allocation is not present");
+  }
+  return *_blob->payload;
 }
 
 // ── idata_representation interface ───────────────────────────────────────────
@@ -140,24 +189,7 @@ std::unique_ptr<cucascade::idata_representation> compressed_host_representation:
 std::unique_ptr<compressed_host_representation> compressed_host_representation::select_columns(
   std::span<const std::size_t> indices) const
 {
-  // Build absolute indices into _column_names, respecting any existing projection.
-  std::vector<std::size_t> absolute;
-  absolute.reserve(indices.size());
-  for (auto idx : indices) {
-    if (_selected_indices.has_value()) {
-      if (idx >= _selected_indices->size()) {
-        throw std::out_of_range(
-          "[compressed_host_representation::select_columns] index out of range");
-      }
-      absolute.push_back((*_selected_indices)[idx]);
-    } else {
-      if (idx >= _column_names.size()) {
-        throw std::out_of_range(
-          "[compressed_host_representation::select_columns] index out of range");
-      }
-      absolute.push_back(idx);
-    }
-  }
+  auto absolute = resolve_absolute_indices(indices, _selected_indices, _column_names.size());
 
   // const_cast is safe: select_columns is logically const (it creates a
   // projection sharing the same blob) but the base-class constructor requires
@@ -186,20 +218,30 @@ std::vector<std::size_t> resolve_absolute_indices(
 {
   std::vector<std::size_t> absolute;
   absolute.reserve(indices.size());
+  std::vector<std::uint8_t> seen(num_all_columns, 0);
   for (auto idx : indices) {
+    std::size_t absolute_index;
     if (existing_selection.has_value()) {
       if (idx >= existing_selection->size()) {
-        throw std::out_of_range(
-          "[compressed_device_representation::select_columns] index out of range");
+        throw std::out_of_range("[compressed_representation::select_columns] index out of range");
       }
-      absolute.push_back((*existing_selection)[idx]);
+      absolute_index = (*existing_selection)[idx];
     } else {
       if (idx >= num_all_columns) {
-        throw std::out_of_range(
-          "[compressed_device_representation::select_columns] index out of range");
+        throw std::out_of_range("[compressed_representation::select_columns] index out of range");
       }
-      absolute.push_back(idx);
+      absolute_index = idx;
     }
+    if (absolute_index >= num_all_columns) {
+      throw std::out_of_range(
+        "[compressed_representation::select_columns] resolved index out of range");
+    }
+    if (seen[absolute_index]) {
+      throw std::invalid_argument(
+        "[compressed_representation::select_columns] duplicate column index");
+    }
+    seen[absolute_index] = 1;
+    absolute.push_back(absolute_index);
   }
   return absolute;
 }
@@ -220,6 +262,7 @@ compressed_device_representation::compressed_device_representation(
     _uncompressed_bytes(uncompressed_bytes),
     _num_rows(num_rows)
 {
+  require_backing_blob(_blob);
 }
 
 compressed_device_representation::compressed_device_representation(
@@ -238,6 +281,7 @@ compressed_device_representation::compressed_device_representation(
     _num_rows(num_rows),
     _selected_indices(std::move(selected_indices))
 {
+  require_backing_blob(_blob);
 }
 
 std::unique_ptr<cucascade::idata_representation> compressed_device_representation::clone(

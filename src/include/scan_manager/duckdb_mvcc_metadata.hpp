@@ -45,9 +45,12 @@ struct duckdb_mvcc_metadata {
   /// be served from this cache.
   duckdb::transaction_t v_base{0};
 
-  /// Physical row count of each pinned chunk, in materialization order — parallel
-  /// to pinned_entry::chunk_memory_spaces (GPU tier) / host_chunks (HOST tier).
-  /// Prefix sums map each chunk to its absolute rowid range [start, start + count).
+  /// One physical row count per logical emitted chunk, in scan order. For a
+  /// homogeneous raw entry this is parallel to chunk_memory_spaces (GPU) or
+  /// host_chunks (HOST); for a homogeneous compressed entry it is parallel to the
+  /// tier's compressed chunk vector; for a mixed entry it is parallel to
+  /// pinned_entry::logical_order, not either dense arm. Prefix sums map each chunk
+  /// to its absolute rowid range [start, start + count).
   /// Each chunk is a contiguous run of whole row groups (validated at pin time),
   /// so per-chunk visibility masks can be assembled at row-group granularity.
   std::vector<std::size_t> base_row_count_per_chunk;

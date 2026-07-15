@@ -18,8 +18,6 @@
 
 #include "compressed_representation.hpp"
 
-#include <rmm/mr/per_device_resource.hpp>
-
 #include <cuda_runtime.h>
 
 #include <api/compressed_table_io.hpp>
@@ -30,6 +28,7 @@
 #include <log/logging.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -39,6 +38,29 @@ namespace sirius {
 
 namespace {
 
+cucascade::memory::memory_space& require_gpu_target(
+  const cucascade::memory::memory_space* target_memory_space)
+{
+  if (target_memory_space == nullptr) {
+    throw std::invalid_argument(
+      "[compression_converters] a non-null target GPU memory space is required");
+  }
+  if (target_memory_space->get_tier() != cucascade::memory::Tier::GPU) {
+    throw std::invalid_argument("[compression_converters] target memory space must be GPU-tier");
+  }
+  return *const_cast<cucascade::memory::memory_space*>(target_memory_space);
+}
+
+void validate_payload_fetch_range(std::uint64_t offset,
+                                  std::size_t size,
+                                  std::uint64_t payload_bytes)
+{
+  if (offset > payload_bytes || std::cmp_greater(size, payload_bytes - offset)) {
+    throw std::out_of_range(
+      "[compression_converters] compressed payload fetch exceeds the declared payload size");
+  }
+}
+
 // Reconstruct + project + decompress a compressed_table into a GPU table
 // representation. Shared by the host and device compression converters — only
 // the byte transport (how `fetch` pulls the payload) differs between them.
@@ -46,48 +68,30 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   std::span<const std::uint8_t> header,
   simpatico::payload_fetch_fn const& fetch,
   const std::optional<std::vector<std::size_t>>& selected_indices,
-  cucascade::idata_representation& source,
-  const cucascade::memory::memory_space* target_memory_space,
+  cucascade::memory::memory_space& target_memory_space,
   rmm::cuda_stream_view stream)
 {
+  auto const mr = target_memory_space.get_default_allocator();
+  std::optional<std::span<const std::size_t>> selection;
+  if (selected_indices.has_value()) { selection.emplace(*selected_indices); }
+
   std::string read_error;
-  simpatico::compressed_table ct = simpatico::read_compressed_table_from_memory(
-    header, fetch, stream, rmm::mr::get_current_device_resource_ref(), &read_error);
+  auto compressed =
+    simpatico::read_compressed_table_from_memory(header, fetch, stream, mr, &read_error, selection);
   if (!read_error.empty()) {
     throw std::runtime_error("[compression_converters] read_compressed_table_from_memory failed: " +
                              read_error);
   }
 
-  // Project to the selected columns before decompressing to avoid
-  // inflating memory with unrequested columns.
-  simpatico::compressed_table subset;
-  if (selected_indices.has_value()) {
-    const auto& indices = *selected_indices;
-    subset.columns.reserve(indices.size());
-    for (auto idx : indices) {
-      if (idx >= ct.columns.size()) {
-        throw std::out_of_range(
-          "[compression_converters] selected column index out of range during decompress");
-      }
-      subset.columns.push_back(std::move(ct.columns[idx]));
-    }
-  } else {
-    subset = std::move(ct);
-  }
-
-  auto decompressed =
-    simpatico::decompress(subset, stream, rmm::mr::get_current_device_resource_ref());
-
-  const cucascade::memory::memory_space* space =
-    (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
+  auto decompressed = simpatico::decompress(std::move(compressed), stream, mr);
 
   SIRIUS_LOG_DEBUG("[compression_converters] decompressed cols={} rows={} → GPU device={}",
                    decompressed->num_columns(),
                    decompressed->num_rows(),
-                   space->get_device_id());
+                   target_memory_space.get_device_id());
 
   return std::make_unique<cucascade::gpu_table_representation>(
-    std::move(decompressed), *const_cast<cucascade::memory::memory_space*>(space), stream);
+    std::move(decompressed), target_memory_space, stream);
 }
 
 // compressed_host_representation (pinned host) → GPU.
@@ -98,16 +102,25 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
 {
   auto& rep = source.cast<compressed_host_representation>();
 
+  auto& target_space = require_gpu_target(target_memory_space);
+
+  auto const payload_bytes = rep.payload_bytes();
+  if (std::cmp_greater(payload_bytes, rep.payload_capacity_bytes())) {
+    throw std::runtime_error(
+      "[compression_converters] declared host payload exceeds its backing allocation");
+  }
+
   // Pull each compressed leaf buffer straight from the pinned host payload into
   // device memory (block-aware, since the payload is a multi-block allocation).
-  auto const& payload = rep.payload();
   simpatico::payload_fetch_fn fetch =
-    [&payload](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
-      copy_pinned_blocks_to_device(payload, off, dst, sz, s);
+    [&rep, payload_bytes](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
+      validate_payload_fetch_range(off, sz, payload_bytes);
+      if (sz == 0) { return; }
+      copy_pinned_blocks_to_device(rep.payload(), off, dst, sz, s);
     };
 
   return reconstruct_and_decompress_to_gpu(
-    rep.header(), fetch, rep.selected_indices(), source, target_memory_space, stream);
+    rep.header(), fetch, rep.selected_indices(), target_space, stream);
 }
 
 // compressed_device_representation (device memory) → GPU.
@@ -116,19 +129,42 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   const cucascade::memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream)
 {
-  auto& rep = source.cast<compressed_device_representation>();
+  auto& rep          = source.cast<compressed_device_representation>();
+  auto& target_space = require_gpu_target(target_memory_space);
+
+  if (target_space.get_device_id() != rep.get_memory_space().get_device_id()) {
+    throw std::invalid_argument(
+      "[compression_converters] cross-device compressed payload conversion is unsupported; "
+      "route decompression to the payload's device");
+  }
+
+  auto const payload_bytes = rep.payload_bytes();
+  if (std::cmp_greater(payload_bytes, rep.payload_capacity_bytes())) {
+    throw std::runtime_error(
+      "[compression_converters] declared device payload exceeds its backing allocation");
+  }
 
   // The payload is already a single contiguous device buffer — each leaf buffer
   // is one device→device copy at its offset.
-  const auto* payload_base = static_cast<const std::byte*>(rep.payload_device_ptr());
-  simpatico::payload_fetch_fn fetch =
-    [payload_base](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
-      CUCASCADE_CUDA_TRY(
-        cudaMemcpyAsync(dst, payload_base + off, sz, cudaMemcpyDeviceToDevice, s.value()));
-    };
+  const auto* payload_base          = static_cast<const std::byte*>(rep.payload_device_ptr());
+  simpatico::payload_fetch_fn fetch = [payload_base, payload_bytes](std::uint64_t off,
+                                                                    std::size_t sz,
+                                                                    void* dst,
+                                                                    rmm::cuda_stream_view s) {
+    validate_payload_fetch_range(off, sz, payload_bytes);
+    if (sz == 0) { return; }
+    if (dst == nullptr) {
+      throw std::invalid_argument("[compression_converters] payload destination is null");
+    }
+    if (payload_base == nullptr) {
+      throw std::runtime_error("[compression_converters] device payload storage is null");
+    }
+    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+      dst, payload_base + static_cast<std::size_t>(off), sz, cudaMemcpyDeviceToDevice, s.value()));
+  };
 
   return reconstruct_and_decompress_to_gpu(
-    rep.header(), fetch, rep.selected_indices(), source, target_memory_space, stream);
+    rep.header(), fetch, rep.selected_indices(), target_space, stream);
 }
 
 }  // namespace

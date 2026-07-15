@@ -124,13 +124,13 @@ struct telemetry_config {
   std::string engine_name{"siriusDB"};
 };
 
-/// Parameters controlling Simpatico compression for pin_table(tier=>'host').
+/// Parameters controlling Simpatico compression for host- and GPU-tier pin_table.
 /// These settings apply exclusively to cached input-table pinning and have no
 /// effect on spill-path compression (Phase 3).
 struct compression_config {
-  /// When true, pin_table(tier=>'host') attempts to compress each chunk with
-  /// Simpatico before storing it in host memory. Falls back to uncompressed
-  /// host storage when no plan file is found for a table or compression fails.
+  /// When true, pin_table attempts to compress each chunk with Simpatico before
+  /// storing it in the requested tier. Falls back to uncompressed storage when
+  /// no plan file is found for a table or compression fails.
   bool enable_pin_table_compression{false};
 
   /// Minimum chunk size (uncompressed bytes) below which compression is

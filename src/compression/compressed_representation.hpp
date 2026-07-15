@@ -59,6 +59,8 @@ struct pinned_compressed_blob {
 
 /// Copy @p size bytes from device @p src_device into the pinned payload at
 /// logical byte offset @p dst_offset, enqueued on @p stream (device→host).
+/// @throws std::out_of_range if the destination range exceeds the pinned allocation.
+/// @throws std::invalid_argument if @p src_device is null for a non-empty copy.
 void copy_device_to_pinned_blocks(
   const void* src_device,
   cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& dst,
@@ -68,6 +70,8 @@ void copy_device_to_pinned_blocks(
 
 /// Copy @p size bytes from the pinned payload at logical byte offset @p src_offset
 /// into device @p dst_device, enqueued on @p stream (host→device).
+/// @throws std::out_of_range if the source range exceeds the pinned allocation.
+/// @throws std::invalid_argument if @p dst_device is null for a non-empty copy.
 void copy_pinned_blocks_to_device(
   const cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& src,
   std::uint64_t src_offset,
@@ -83,7 +87,8 @@ void copy_pinned_blocks_to_device(
  * gpu_table_representation rebuilds the compressed_table from the blob
  * (read_compressed_table_from_memory), projects to the selected columns (if any),
  * then decompresses to a cudf::table. It is registered by
- * register_compression_converters().
+ * register_compression_converters(). Conversion requires a non-null GPU target
+ * memory space.
  *
  * Multiple compressed_host_representation objects may share the same underlying
  * blob (e.g. after select_columns() or clone()).
@@ -101,6 +106,7 @@ class compressed_host_representation : public cucascade::idata_representation {
    *                            (cudf::table::alloc_size: data + null masks +
    *                            padding + string offsets/chars).
    * @param num_rows            Row count.
+   * @throws std::invalid_argument if @p blob is null.
    */
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
                                  std::shared_ptr<pinned_compressed_blob> blob,
@@ -119,7 +125,7 @@ class compressed_host_representation : public cucascade::idata_representation {
 
   // ── idata_representation interface ──────────────────────────────────────────
 
-  /// Returns the compressed (payload) size.
+  /// Returns the serialized compressed footprint (header plus payload).
   [[nodiscard]] std::size_t get_size_in_bytes() const override { return _compressed_bytes; }
 
   /// Returns the logical (uncompressed) data size.
@@ -138,9 +144,13 @@ class compressed_host_representation : public cucascade::idata_representation {
    * @brief Return a projection that exposes only the requested column indices.
    *
    * The returned representation shares the same backing blob. The converter
-   * will reconstruct all columns but decompress only the selected subset.
+   * reconstructs and decompresses only the selected subset.
    *
-   * @param indices  Indices into column_names() to expose (must be valid).
+   * Indices are relative to the columns exposed by this representation. Their
+   * order is preserved. Duplicate resolved column indices are rejected.
+   *
+   * @throws std::out_of_range if an index is outside the current projection.
+   * @throws std::invalid_argument if two indices resolve to the same stored column.
    */
   [[nodiscard]] std::unique_ptr<compressed_host_representation> select_columns(
     std::span<const std::size_t> indices) const;
@@ -151,11 +161,18 @@ class compressed_host_representation : public cucascade::idata_representation {
   [[nodiscard]] std::span<const std::uint8_t> header() const noexcept { return _blob->header; }
 
   /// The pinned payload holding every compressed leaf buffer, concatenated.
+  /// @throws std::logic_error if no backing allocation exists.
   [[nodiscard]] const cucascade::memory::fixed_size_host_memory_resource::
     multiple_blocks_allocation&
-    payload() const noexcept
+    payload() const;
+
+  /// Logical number of payload bytes described by the serialized header.
+  [[nodiscard]] std::uint64_t payload_bytes() const noexcept { return _blob->payload_bytes; }
+
+  /// Bytes actually reserved by the backing pinned allocation.
+  [[nodiscard]] std::size_t payload_capacity_bytes() const noexcept
   {
-    return *_blob->payload;
+    return _blob->payload ? _blob->payload->size_bytes() : 0;
   }
 
   [[nodiscard]] const std::vector<std::string>& column_names() const noexcept
@@ -216,10 +233,15 @@ struct device_compressed_blob {
  * selected columns (if any), then decompresses to a cudf::table. It is registered
  * by register_compression_converters() and fired by
  * scan_operator_input::prepare_for_processing when a GPU-tier batch's data is not
- * already a gpu_table_representation.
+ * already a gpu_table_representation. Conversion requires a non-null GPU target
+ * on the same CUDA device as this representation. Cross-device conversion is
+ * rejected because the compressed payload has no peer-transfer ownership
+ * adapter.
  */
 class compressed_device_representation : public cucascade::idata_representation {
  public:
+  /// Construct a device representation sharing @p blob.
+  /// @throws std::invalid_argument if @p blob is null.
   compressed_device_representation(cucascade::memory::memory_space& memory_space,
                                    std::shared_ptr<device_compressed_blob> blob,
                                    std::vector<std::string> column_names,
@@ -245,7 +267,13 @@ class compressed_device_representation : public cucascade::idata_representation 
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
     rmm::cuda_stream_view stream) override;
 
-  /// Projection sharing the same backing blob (see compressed_host_representation).
+  /// Projection sharing the same backing blob.
+  ///
+  /// Indices are relative to the columns exposed by this representation. Their
+  /// order is preserved. Duplicate resolved column indices are rejected.
+  ///
+  /// @throws std::out_of_range if an index is outside the current projection.
+  /// @throws std::invalid_argument if two indices resolve to the same stored column.
   [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(
     std::span<const std::size_t> indices) const;
 
@@ -256,6 +284,10 @@ class compressed_device_representation : public cucascade::idata_representation 
   [[nodiscard]] const void* payload_device_ptr() const noexcept { return _blob->payload.data(); }
   [[nodiscard]] std::uint64_t payload_bytes() const noexcept { return _blob->payload_bytes; }
 
+  [[nodiscard]] std::size_t payload_capacity_bytes() const noexcept
+  {
+    return _blob->payload.size();
+  }
   [[nodiscard]] const std::vector<std::string>& column_names() const noexcept
   {
     return _column_names;

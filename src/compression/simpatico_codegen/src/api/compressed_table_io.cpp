@@ -18,15 +18,21 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace simpatico {
@@ -36,6 +42,27 @@ namespace {
 // LE binary helpers — std::bit_cast (C++20); asserts little-endian platform.
 // ---------------------------------------------------------------------------
 static_assert(std::endian::native == std::endian::little, "LE-only serialization");
+
+[[nodiscard]] static bool is_valid_type_tag(std::uint8_t tag) noexcept
+{
+  for (auto const& [type, candidate] : kTypeTags) {
+    (void)type;
+    if (candidate == tag) return true;
+  }
+  return false;
+}
+
+[[nodiscard]] static bool is_serialized_leaf_kind(OpId kind) noexcept
+{
+  auto const tag = static_cast<std::uint8_t>(kind);
+  return tag >= static_cast<std::uint8_t>(OpId::Delta) &&
+         tag <= static_cast<std::uint8_t>(OpId::Zigzag);
+}
+
+[[nodiscard]] static bool fits_cudf_size_type(std::uint64_t rows) noexcept
+{
+  return rows <= static_cast<std::uint64_t>(std::numeric_limits<cudf::size_type>::max());
+}
 
 template <typename T>
 static void push_le(std::vector<std::uint8_t>& v, T x)
@@ -296,6 +323,104 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 
 static constexpr std::uint8_t kVersion = 10;
 
+[[nodiscard]] static bool exceeds_u16(std::size_t value) noexcept
+{
+  return value > std::numeric_limits<std::uint16_t>::max();
+}
+
+[[nodiscard]] static bool exceeds_u8(std::size_t value) noexcept
+{
+  return value > std::numeric_limits<std::uint8_t>::max();
+}
+
+// Validate every container/string whose size is narrowed into the v10 wire
+// format before emitting any bytes. Keeping this separate from push_node keeps
+// serialization infallible after the preflight (apart from host allocation).
+[[nodiscard]] static std::string validate_v10_structure_widths(compressed_table const& table)
+{
+  if (exceeds_u16(table.columns.size())) {
+    return "v10 column count exceeds the uint16 wire-format limit";
+  }
+
+  for (std::size_t column_index = 0; column_index < table.columns.size(); ++column_index) {
+    auto const& column = table.columns[column_index];
+    auto const prefix  = "column " + std::to_string(column_index);
+    if (column.name.has_value() && exceeds_u16(column.name->size())) {
+      return prefix + " name length exceeds the uint16 wire-format limit";
+    }
+    if (!column.compound) continue;
+
+    auto const& nodes = column.compound->nodes;
+    if (exceeds_u16(nodes.size())) {
+      return prefix + " plan-node count exceeds the uint16 wire-format limit";
+    }
+    for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
+      auto const& node       = nodes[node_index];
+      auto const node_prefix = prefix + ", node " + std::to_string(node_index);
+      if (exceeds_u16(node.op.size())) {
+        return node_prefix + " operator-name length exceeds the uint16 wire-format limit";
+      }
+      if (node.attrs.bitjoin.has_value()) {
+        auto const& inputs = node.attrs.bitjoin->inputs;
+        if (exceeds_u16(inputs.size())) {
+          return node_prefix + " bitjoin-input count exceeds the uint16 wire-format limit";
+        }
+        for (std::size_t input_index = 0; input_index < inputs.size(); ++input_index) {
+          if (exceeds_u16(inputs[input_index].channel.size())) {
+            return node_prefix + ", bitjoin input " + std::to_string(input_index) +
+                   " channel-name length exceeds the uint16 wire-format limit";
+          }
+        }
+      }
+      if (exceeds_u16(node.children.size())) {
+        return node_prefix + " edge count exceeds the uint16 wire-format limit";
+      }
+      for (std::size_t edge_index = 0; edge_index < node.children.size(); ++edge_index) {
+        if (exceeds_u16(node.children[edge_index].channel.size())) {
+          return node_prefix + ", edge " + std::to_string(edge_index) +
+                 " channel-name length exceeds the uint16 wire-format limit";
+        }
+      }
+      if (exceeds_u16(node.output_names.size())) {
+        return node_prefix + " output count exceeds the uint16 wire-format limit";
+      }
+      for (std::size_t output_index = 0; output_index < node.output_names.size(); ++output_index) {
+        if (exceeds_u16(node.output_names[output_index].size())) {
+          return node_prefix + ", output " + std::to_string(output_index) +
+                 " name length exceeds the uint16 wire-format limit";
+        }
+      }
+    }
+  }
+  return {};
+}
+
+[[nodiscard]] static std::string validate_v10_description_widths(
+  std::vector<std::vector<leaf_desc>> const& all_descs)
+{
+  for (std::size_t column_index = 0; column_index < all_descs.size(); ++column_index) {
+    auto const& descs     = all_descs[column_index];
+    auto const col_prefix = "column " + std::to_string(column_index);
+    if (exceeds_u16(descs.size())) {
+      return col_prefix + " leaf count exceeds the uint16 wire-format limit";
+    }
+    for (std::size_t leaf_index = 0; leaf_index < descs.size(); ++leaf_index) {
+      auto const& leaf       = descs[leaf_index];
+      auto const leaf_prefix = col_prefix + ", leaf " + std::to_string(leaf_index);
+      if (exceeds_u8(leaf.buffers.size())) {
+        return leaf_prefix + " buffer count exceeds the uint8 wire-format limit";
+      }
+      for (std::size_t buffer_index = 0; buffer_index < leaf.buffers.size(); ++buffer_index) {
+        if (exceeds_u16(leaf.buffers[buffer_index].name.size())) {
+          return leaf_prefix + ", buffer " + std::to_string(buffer_index) +
+                 " name length exceeds the uint16 wire-format limit";
+        }
+      }
+    }
+  }
+  return {};
+}
+
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
 static void push_node(std::vector<std::uint8_t>& hdr, PlanNode const& node)
@@ -339,11 +464,11 @@ static bool read_node(Reader& r, PlanNode& node)
 {
   if (!r.read_str16(node.op)) return false;
   std::uint8_t is_bitjoin;
-  if (!r.read_le(is_bitjoin)) return false;
+  if (!r.read_le(is_bitjoin) || is_bitjoin > 1) return false;
   if (is_bitjoin) {
     bitjoin_attrs bj;
     std::uint8_t ot;
-    if (!r.read_le(ot)) return false;
+    if (!r.read_le(ot) || !is_valid_type_tag(ot)) return false;
     bj.output_type = tag_to_dtype(ot);
     std::uint16_t nin;
     if (!r.read_le(nin)) return false;
@@ -351,7 +476,7 @@ static bool read_node(Reader& r, PlanNode& node)
     for (auto& in : bj.inputs) {
       if (!r.read_le(in.node) || !r.read_str16(in.channel)) return false;
       std::uint8_t has_range;
-      if (!r.read_le(has_range)) return false;
+      if (!r.read_le(has_range) || has_range > 1) return false;
       if (has_range) {
         std::uint32_t hi, lo;
         if (!r.read_le(hi) || !r.read_le(lo)) return false;
@@ -389,7 +514,197 @@ struct ColRecord {
   std::vector<std::vector<std::uint64_t>> buf_offsets;  // [leaf][buffer] -> payload offset
 };
 
-// Parse the .hpln v8 header from `r` into one ColRecord per column. On success
+static bool validate_col_records(std::vector<ColRecord>& records, std::string* err)
+{
+  auto bad = [&](std::string message) {
+    if (err) *err = std::move(message);
+    return false;
+  };
+
+  for (std::size_t column_index = 0; column_index < records.size(); ++column_index) {
+    auto& record            = records[column_index];
+    auto const column_label = "column " + std::to_string(column_index);
+
+    if (!is_valid_type_tag(record.dtype_tag)) {
+      return bad(column_label + ": invalid column type tag " + std::to_string(record.dtype_tag));
+    }
+    if (record.num_rows < 0 || !fits_cudf_size_type(static_cast<std::uint64_t>(record.num_rows))) {
+      return bad(column_label + ": row count is outside cudf::size_type");
+    }
+    auto const column_rows = static_cast<std::uint64_t>(record.num_rows);
+
+    auto const& nodes = record.tree.nodes;
+    if (!nodes.empty() && nodes.front().op != "input") {
+      return bad(column_label + ": plan node 0 is not the input node");
+    }
+
+    std::vector<std::size_t> incoming_edges(nodes.size(), 0);
+    for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
+      auto const& node = nodes[node_index];
+      if (node.output_names.size() >
+          static_cast<std::size_t>(std::numeric_limits<ChannelId>::max()) + 1) {
+        return bad(column_label + ": plan node " + std::to_string(node_index) +
+                   " has too many output channels");
+      }
+
+      auto const has_output = [](PlanNode const& producer, std::string const& channel) {
+        return std::find(producer.output_names.begin(), producer.output_names.end(), channel) !=
+               producer.output_names.end();
+      };
+
+      for (auto const& edge : node.children) {
+        if (edge.child <= node_index || edge.child >= nodes.size()) {
+          return bad(column_label + ": plan edge from node " + std::to_string(node_index) +
+                     " has an invalid child index");
+        }
+        if (node_index != 0 && !has_output(node, edge.channel)) {
+          return bad(column_label + ": plan edge from node " + std::to_string(node_index) +
+                     " names an unknown output channel");
+        }
+        ++incoming_edges[edge.child];
+      }
+
+      if (node.attrs.bitjoin.has_value()) {
+        for (auto const& input : node.attrs.bitjoin->inputs) {
+          if (input.node >= node_index) {
+            return bad(column_label + ": bitjoin node " + std::to_string(node_index) +
+                       " has an invalid input node index");
+          }
+          if (input.node != 0 && !has_output(nodes[input.node], input.channel)) {
+            return bad(column_label + ": bitjoin node " + std::to_string(node_index) +
+                       " names an unknown input channel");
+          }
+          auto const& producer     = nodes[input.node];
+          auto const matching_edge = std::find_if(
+            producer.children.begin(), producer.children.end(), [&](PlanEdge const& edge) {
+              return edge.child == node_index && edge.channel == input.channel;
+            });
+          if (matching_edge == producer.children.end()) {
+            return bad(column_label + ": bitjoin node " + std::to_string(node_index) +
+                       " input is inconsistent with the plan edges");
+          }
+        }
+      }
+    }
+
+    for (std::size_t node_index = 1; node_index < nodes.size(); ++node_index) {
+      auto const& node = nodes[node_index];
+      auto const expected_inputs =
+        node.attrs.bitjoin.has_value() ? node.attrs.bitjoin->inputs.size() : std::size_t{1};
+      if (incoming_edges[node_index] != expected_inputs) {
+        return bad(column_label + ": plan node " + std::to_string(node_index) +
+                   " has an invalid incoming-edge count");
+      }
+    }
+
+    std::unordered_set<std::uint64_t> leaf_destinations;
+    for (std::size_t leaf_index = 0; leaf_index < record.leaf_descs.size(); ++leaf_index) {
+      auto& leaf            = record.leaf_descs[leaf_index];
+      auto const leaf_label = column_label + ", leaf " + std::to_string(leaf_index);
+
+      if (!is_serialized_leaf_kind(leaf.kind)) {
+        return bad(leaf_label + ": invalid serialized leaf kind");
+      }
+      if (!is_valid_type_tag(leaf.type_tag)) {
+        return bad(leaf_label + ": invalid leaf type tag " + std::to_string(leaf.type_tag));
+      }
+      if (!fits_cudf_size_type(leaf.num_rows)) {
+        return bad(leaf_label + ": row count is outside cudf::size_type");
+      }
+      if (leaf.node_index == 0 || leaf.node_index >= nodes.size()) {
+        return bad(leaf_label + ": node index does not name a non-input plan node");
+      }
+
+      auto const& node = nodes[leaf.node_index];
+      if (leaf.slot != kSelfRepSlot &&
+          (leaf.slot < 0 || static_cast<std::size_t>(leaf.slot) >= node.output_paths.size())) {
+        return bad(leaf_label + ": slot is out of range");
+      }
+
+      auto const destination =
+        (static_cast<std::uint64_t>(leaf.node_index) << 32) | static_cast<std::uint32_t>(leaf.slot);
+      if (!leaf_destinations.insert(destination).second) {
+        return bad(leaf_label + ": duplicate leaf destination");
+      }
+
+      if (leaf.slot == kSelfRepSlot) {
+        auto const node_kind = op_id_from_name(node.op);
+        if (!node_kind.has_value() || *node_kind != leaf.kind) {
+          return bad(leaf_label + ": leaf kind is inconsistent with the owning node");
+        }
+      }
+
+      if (leaf.slot == kSelfRepSlot && leaf.num_rows != 0 && !nodes.empty()) {
+        auto const root_edge = std::find_if(
+          nodes.front().children.begin(), nodes.front().children.end(), [&](PlanEdge const& edge) {
+            return edge.child == leaf.node_index;
+          });
+        if (root_edge != nodes.front().children.end() && leaf.num_rows != column_rows) {
+          return bad(leaf_label + ": root leaf row count disagrees with the column");
+        }
+      }
+
+      if (record.buf_offsets[leaf_index].size() != leaf.buffers.size()) {
+        return bad(leaf_label + ": buffer-offset count is inconsistent");
+      }
+
+      for (std::size_t buffer_index = 0; buffer_index < leaf.buffers.size(); ++buffer_index) {
+        auto& buffer            = leaf.buffers[buffer_index];
+        auto const buffer_label = leaf_label + ", buffer " + std::to_string(buffer_index);
+
+        if (!is_valid_type_tag(buffer.type_tag)) {
+          return bad(buffer_label + ": invalid type tag " + std::to_string(buffer.type_tag));
+        }
+
+        auto const buffer_type = tag_to_dtype(buffer.type_tag);
+        if (buffer_type.id() == cudf::type_id::STRING) {
+          return bad(buffer_label + ": STRING is not a fixed-width payload type");
+        }
+        if (!std::in_range<std::size_t>(buffer.size_bytes)) {
+          return bad(buffer_label + ": byte size does not fit std::size_t");
+        }
+        if (!std::in_range<std::size_t>(record.buf_offsets[leaf_index][buffer_index])) {
+          return bad(buffer_label + ": payload offset does not fit std::size_t");
+        }
+
+        auto const element_size = static_cast<std::uint64_t>(cudf::size_of(buffer_type));
+        if (buffer.size_bytes % element_size != 0) {
+          return bad(buffer_label + ": byte size is not divisible by the element size");
+        }
+
+        buffer.num_rows = buffer.size_bytes / element_size;
+        if (!fits_cudf_size_type(buffer.num_rows)) {
+          return bad(buffer_label + ": derived row count is outside cudf::size_type");
+        }
+      }
+
+      bool const is_plain_identity = leaf.kind == OpId::Identity && leaf.buffers.size() == 1 &&
+                                     leaf.buffers.front().name == "data";
+      if (is_plain_identity) {
+        auto const& data = leaf.buffers.front();
+        if (data.type_tag != leaf.type_tag) {
+          return bad(leaf_label + ": identity data type disagrees with the leaf type");
+        }
+        if (leaf.num_rows != 0 && data.num_rows != leaf.num_rows) {
+          return bad(leaf_label + ": identity buffer row count disagrees with the leaf");
+        }
+        if (leaf.num_rows == 0 && leaf.slot == kSelfRepSlot) {
+          auto const root_edge =
+            std::find_if(nodes.front().children.begin(),
+                         nodes.front().children.end(),
+                         [&](PlanEdge const& edge) { return edge.child == leaf.node_index; });
+          if (root_edge != nodes.front().children.end() && data.num_rows != column_rows) {
+            return bad(leaf_label + ": identity buffer row count disagrees with the column");
+          }
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+// Parse the .hpln v10 header from `r` into one ColRecord per column. On success
 // `r` is left pointing just past the header (i.e. at the payload region for the
 // concatenated file layout). Returns false and sets *err on any structural error.
 static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::string* err)
@@ -457,74 +772,95 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
         std::uint64_t poff;
         if (!r.read_le(poff)) return bad("truncated buf payload_offset");
         cr.buf_offsets[li][bi] = poff;
-        bd.num_rows =
-          (bd.size_bytes > 0 && bd.type_tag < 255)
-            ? bd.size_bytes / static_cast<std::uint64_t>(cudf::size_of(tag_to_dtype(bd.type_tag)))
-            : 0;
       }
     }
   }
-  return true;
+  return validate_col_records(out, err);
 }
 
 // Reconstruct a compressed_table from parsed column records, pulling each leaf
 // buffer's bytes into device memory via `fetch(offset, size, dst_device, stream)`.
 // `recs` is consumed (plan trees are moved into the result).
-static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
-                                                 payload_fetch_fn const& fetch,
-                                                 rmm::cuda_stream_view stream,
-                                                 rmm::device_async_resource_ref mr,
-                                                 std::string* err)
+static compressed_table reconstruct_from_records(
+  std::vector<ColRecord>& recs,
+  payload_fetch_fn const& fetch,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* err,
+  std::optional<std::span<const std::size_t>> selected_columns = std::nullopt)
 {
-  auto fail = [&](std::string const& m) -> compressed_table {
-    if (err) *err = m;
+  auto fail = [&](std::string const& message) -> compressed_table {
+    if (err) *err = message;
     return {};
   };
 
+  if (selected_columns.has_value()) {
+    std::vector<bool> seen(recs.size(), false);
+    for (std::size_t const index : *selected_columns) {
+      if (index >= recs.size()) {
+        return fail("selected column index " + std::to_string(index) + " is out of range");
+      }
+      if (seen[index]) {
+        return fail("selected column index " + std::to_string(index) + " is duplicated");
+      }
+      seen[index] = true;
+    }
+  }
+
+  std::size_t const output_columns =
+    selected_columns.has_value() ? selected_columns->size() : recs.size();
   compressed_table result;
-  result.columns.resize(recs.size());
+  result.columns.resize(output_columns);
 
-  for (std::size_t ci = 0; ci < recs.size(); ++ci) {
-    auto& cr      = recs[ci];
-    auto& out_col = result.columns[ci];
+  for (std::size_t output_index = 0; output_index < output_columns; ++output_index) {
+    std::size_t const source_index =
+      selected_columns.has_value() ? (*selected_columns)[output_index] : output_index;
+    auto& record  = recs[source_index];
+    auto& out_col = result.columns[output_index];
 
-    if (!cr.name.empty()) out_col.name = cr.name;
-    auto const dtype_id = tag_to_dtype(cr.dtype_tag).id();
+    if (!record.name.empty()) out_col.name = record.name;
+    auto const dtype_id = tag_to_dtype(record.dtype_tag).id();
     out_col.dtype = (dtype_id == cudf::type_id::DECIMAL32 || dtype_id == cudf::type_id::DECIMAL64 ||
                      dtype_id == cudf::type_id::DECIMAL128)
-                      ? cudf::data_type{dtype_id, cr.scale}
+                      ? cudf::data_type{dtype_id, record.scale}
                       : cudf::data_type{dtype_id};
-    out_col.num_rows = cr.num_rows;
+    out_col.num_rows = record.num_rows;
 
-    if (cr.tree.nodes.empty()) continue;  // column stored without a plan
+    if (record.tree.nodes.empty()) continue;
 
     auto compound = std::make_unique<PlanTree>();
-    *compound     = std::move(cr.tree);
+    *compound     = std::move(record.tree);
     auto& nodes   = compound->nodes;
 
-    for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
-      auto const& ld    = cr.leaf_descs[li];
-      auto const& boffs = cr.buf_offsets[li];
-      if (ld.node_index >= nodes.size())
-        return fail("leaf node_index out of range in col " + std::to_string(ci));
+    for (std::size_t leaf_index = 0; leaf_index < record.leaf_descs.size(); ++leaf_index) {
+      auto const& leaf    = record.leaf_descs[leaf_index];
+      auto const& offsets = record.buf_offsets[leaf_index];
+      if (leaf.node_index >= nodes.size()) {
+        return fail("leaf node_index out of range in col " + std::to_string(source_index));
+      }
 
-      auto fill = [&](std::size_t bi, void* dst, std::size_t sz, rmm::cuda_stream_view s) {
-        fetch(boffs[bi], sz, dst, s);
+      auto fill = [&](std::size_t buffer_index,
+                      void* destination,
+                      std::size_t size,
+                      rmm::cuda_stream_view fill_stream) {
+        fetch(offsets[buffer_index], size, destination, fill_stream);
       };
 
-      std::string rep_err;
+      std::string rep_error;
       auto rep = rep_from_leaf_desc(
-        ld, static_cast<cudf::size_type>(cr.num_rows), fill, stream, mr, &rep_err);
-      if (!rep) return fail("rep_from_leaf_desc (col " + std::to_string(ci) + "): " + rep_err);
+        leaf, static_cast<cudf::size_type>(record.num_rows), fill, stream, mr, &rep_error);
+      if (!rep) {
+        return fail("rep_from_leaf_desc (col " + std::to_string(source_index) + "): " + rep_error);
+      }
 
-      PlanNode& node = nodes[ld.node_index];
-      if (ld.slot == kSelfRepSlot) {
+      PlanNode& node = nodes[leaf.node_index];
+      if (leaf.slot == kSelfRepSlot) {
         node.meta = rep->describe_meta();
         node.rep  = std::move(rep);
-      } else if (ld.slot >= 0 && static_cast<std::size_t>(ld.slot) < node.output_paths.size()) {
-        node.channels.emplace(node.output_paths[ld.slot], std::move(rep));
+      } else if (leaf.slot >= 0 && static_cast<std::size_t>(leaf.slot) < node.output_paths.size()) {
+        node.channels.emplace(node.output_paths[leaf.slot], std::move(rep));
       } else {
-        return fail("leaf slot out of range in col " + std::to_string(ci));
+        return fail("leaf slot out of range in col " + std::to_string(source_index));
       }
     }
 
@@ -553,18 +889,28 @@ std::string write_compressed_table(compressed_table const& table,
   std::string err = build_compressed_table_header(table, hdr, buffers, payload_bytes, stream);
   if (!err.empty()) return err;
 
+  if (!std::in_range<std::size_t>(payload_bytes)) {
+    return "compressed payload size does not fit std::size_t";
+  }
   std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_bytes));
+  std::string copy_error;
   for (auto const& b : buffers) {
     if (b.size_bytes > 0 && b.device_ptr) {
-      cudaMemcpyAsync(payload.data() + b.offset,
-                      b.device_ptr,
-                      static_cast<std::size_t>(b.size_bytes),
-                      cudaMemcpyDeviceToHost,
-                      stream.value());
+      auto const status = cudaMemcpyAsync(payload.data() + static_cast<std::size_t>(b.offset),
+                                          b.device_ptr,
+                                          static_cast<std::size_t>(b.size_bytes),
+                                          cudaMemcpyDeviceToHost,
+                                          stream.value());
+      if (status != cudaSuccess) {
+        copy_error =
+          "device-to-host payload copy enqueue failed: " + std::string(cudaGetErrorString(status));
+        break;
+      }
     }
   }
   stream.synchronize();  // D→H copies must complete before the file write
 
+  if (!copy_error.empty()) return copy_error;
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) return "failed to open '" + path + "' for writing";
   f.write(reinterpret_cast<const char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
@@ -586,8 +932,20 @@ compressed_table read_compressed_table(std::string const& path,
 
   std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f) return fail("failed to open '" + path + "' for reading");
-  auto file_size = static_cast<std::size_t>(f.tellg());
+  auto const end_position = f.tellg();
+  if (end_position == std::streampos{-1}) {
+    return fail("failed to determine size of '" + path + "'");
+  }
+  auto const end_offset = static_cast<std::streamoff>(end_position);
+  if (end_offset < 0 || !std::in_range<std::size_t>(end_offset)) {
+    return fail("size of '" + path + "' does not fit std::size_t");
+  }
+  auto const file_size = static_cast<std::size_t>(end_offset);
+  if (std::cmp_greater(file_size, std::numeric_limits<std::streamsize>::max())) {
+    return fail("size of '" + path + "' exceeds the stream read limit");
+  }
   f.seekg(0);
+  if (!f) return fail("failed to seek to the beginning of '" + path + "'");
   std::vector<std::uint8_t> raw(file_size);
   f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(file_size));
   if (!f) return fail("read error on '" + path + "'");
@@ -605,16 +963,23 @@ compressed_table read_compressed_table(std::string const& path,
   for (auto const& cr : col_records) {
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
-        std::size_t sz = static_cast<std::size_t>(cr.leaf_descs[li].buffers[bi].size_bytes);
-        if (sz > 0 && cr.buf_offsets[li][bi] + sz > payload_total)
+        auto const offset = static_cast<std::size_t>(cr.buf_offsets[li][bi]);
+        auto const size   = static_cast<std::size_t>(cr.leaf_descs[li].buffers[bi].size_bytes);
+        if (offset > payload_total || size > payload_total - offset) {
           return fail("payload out of bounds");
+        }
       }
     }
   }
 
   payload_fetch_fn fetch =
-    [&](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
-      cudaMemcpyAsync(dst, payload_base + off, sz, cudaMemcpyHostToDevice, s.value());
+    [&](std::uint64_t offset, std::size_t size, void* destination, rmm::cuda_stream_view s) {
+      auto const status = cudaMemcpyAsync(destination,
+                                          payload_base + static_cast<std::size_t>(offset),
+                                          size,
+                                          cudaMemcpyHostToDevice,
+                                          s.value());
+      if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
     };
 
   return reconstruct_from_records(col_records, fetch, stream, mr, error_out);
@@ -628,7 +993,14 @@ std::string build_compressed_table_header(compressed_table const& table,
                                           std::uint64_t& out_payload_bytes,
                                           rmm::cuda_stream_view stream)
 {
+  out_header.clear();
+  out_buffers.clear();
+  out_payload_bytes = 0;
+
+  if (auto const error = validate_v10_structure_widths(table); !error.empty()) return error;
+
   auto const all_descs = table.describe(stream);
+  if (auto const error = validate_v10_description_widths(all_descs); !error.empty()) return error;
 
   // A STRING column is physically split across offsets and chars (plus an
   // optional null mask), so no single parent head() pointer describes its
@@ -638,25 +1010,16 @@ std::string build_compressed_table_header(compressed_table const& table,
     for (auto const& desc : descs) {
       if (desc.kind == OpId::Identity &&
           tag_to_dtype(desc.type_tag).id() == cudf::type_id::STRING) {
-        out_header.clear();
-        out_buffers.clear();
-        out_payload_bytes = 0;
         return "identity STRING leaves are not serializable; use str_split";
       }
       for (auto const& buffer : desc.buffers) {
         if (tag_to_dtype(buffer.type_tag).id() == cudf::type_id::STRING) {
-          out_header.clear();
-          out_buffers.clear();
-          out_payload_bytes = 0;
           return "raw STRING payload channels are not serializable; decompose into offsets and "
                  "chars";
         }
       }
     }
   }
-
-  out_header.clear();
-  out_buffers.clear();
 
   auto& hdr = out_header;
   hdr.push_back('H');
@@ -722,16 +1085,18 @@ std::string build_compressed_table_header(compressed_table_inspection table,
     *table.table_, out_header, out_buffers, out_payload_bytes, table.stream_);
 }
 
-compressed_table read_compressed_table_from_memory(std::span<const std::uint8_t> header,
-                                                   payload_fetch_fn const& fetch,
-                                                   rmm::cuda_stream_view stream,
-                                                   rmm::device_async_resource_ref mr,
-                                                   std::string* error_out)
+compressed_table read_compressed_table_from_memory(
+  std::span<const std::uint8_t> header,
+  payload_fetch_fn const& fetch,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out,
+  std::optional<std::span<const std::size_t>> selected_columns)
 {
-  Reader r{header.data(), header.size()};
-  std::vector<ColRecord> col_records;
-  if (!parse_hpln_header(r, col_records, error_out)) return {};
-  return reconstruct_from_records(col_records, fetch, stream, mr, error_out);
+  Reader reader{header.data(), header.size()};
+  std::vector<ColRecord> column_records;
+  if (!parse_hpln_header(reader, column_records, error_out)) return {};
+  return reconstruct_from_records(column_records, fetch, stream, mr, error_out, selected_columns);
 }
 
 }  // namespace simpatico

@@ -15,10 +15,12 @@
  */
 
 #include "catch.hpp"
+#include "compression/compressed_representation.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
@@ -296,12 +298,108 @@ TEST_CASE("scan working set is a lower bound for history-based reservations",
       std::make_unique<scan_sizing_input>()),
     std::move(global_state));
 
-  // nullptr target space: scan inputs are not pipelineable, so no materialization is counted
-  // regardless; this test sizes from history + scan working set only.
+  // This synthetic fresh-scan input carries no cached batch to prepare, so this test sizes from
+  // history plus the fresh-scan working set only.
   auto const estimate = task->get_estimated_reservation_size_info(nullptr);
   CHECK(estimate.had_history);
   CHECK(estimate.peak_memory_estimate == 500);
   CHECK(estimate.reservation_size == 500);
+}
+
+TEST_CASE("cached compressed scan materialization is charged once alongside history",
+          "[gpu_pipeline_task][history][scan][compression]")
+{
+  constexpr std::size_t compressed_bytes     = 17;
+  constexpr std::size_t logical_bytes        = 100;
+  constexpr std::size_t history_peak         = 25;
+  constexpr std::size_t reconstruction_bytes = compressed_bytes + logical_bytes;
+
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  std::unique_ptr<cucascade::idata_representation> representation;
+  SECTION("GPU-tier encoded source")
+  {
+    representation = std::make_unique<sirius::compressed_device_representation>(
+      *f.gpu_space,
+      std::make_shared<sirius::device_compressed_blob>(),
+      std::vector<std::string>{"value"},
+      compressed_bytes,
+      logical_bytes,
+      3);
+  }
+  SECTION("HOST-tier encoded source")
+  {
+    representation = std::make_unique<sirius::compressed_host_representation>(
+      *f.host_space,
+      std::make_shared<sirius::pinned_compressed_blob>(),
+      std::vector<std::string>{"value"},
+      compressed_bytes,
+      logical_bytes,
+      3);
+  }
+  auto batch = cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(representation));
+
+  auto ctx          = create_pipeline_context();
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+  global_state->get_memory_history().record({logical_bytes, history_peak, logical_bytes});
+
+  auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    1,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+      std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch))),
+    std::move(global_state));
+
+  auto const estimate = task->get_estimated_reservation_size_info(f.gpu_space);
+  CHECK(estimate.had_history);
+  CHECK(estimate.input_basis == logical_bytes);
+  CHECK(estimate.bytes_to_materialize_input == reconstruction_bytes);
+  CHECK(estimate.peak_memory_estimate == history_peak);
+  CHECK(estimate.reservation_size == history_peak + reconstruction_bytes);
+
+  auto const unknown_target = task->get_estimated_reservation_size_info(nullptr);
+  CHECK(unknown_target.bytes_to_materialize_input == reconstruction_bytes);
+  CHECK(unknown_target.reservation_size == history_peak + reconstruction_bytes);
+}
+
+TEST_CASE("cached raw scan materialization follows the source tier",
+          "[gpu_pipeline_task][scan][materialization]")
+{
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  rmm::cuda_stream stream;
+
+  SECTION("plain table on the target GPU")
+  {
+    auto batch = f.create_gpu_data_batch(16, stream.view());
+    auto input = std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch));
+    sirius::pipeline::gpu_pipeline_task_local_state local_state(std::move(input));
+    CHECK(local_state.get_estimated_bytes_to_materialize_input(f.gpu_space) == 0);
+    CHECK(local_state.get_estimated_bytes_to_materialize_input(nullptr) == 0);
+  }
+
+  SECTION("plain table in host memory")
+  {
+    auto batch = f.create_host_data_batch(16, stream.view());
+    std::size_t logical_bytes;
+    {
+      auto const ro = batch->to_read_only();
+      logical_bytes = ro.get_data()->get_uncompressed_data_size_in_bytes();
+    }
+    auto input = std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch));
+    sirius::pipeline::gpu_pipeline_task_local_state local_state(std::move(input));
+    CHECK(local_state.get_estimated_bytes_to_materialize_input(f.gpu_space) == logical_bytes);
+    CHECK(local_state.get_estimated_bytes_to_materialize_input(nullptr) == logical_bytes);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,8 +1,10 @@
 # Zero-copy string compression — implementation plan (v10-frozen, minimal-footprint)
 
 - Status: PR A + PR B landed. PR C is implemented in this working tree and is pending review.
-  The audited PR D implementation is present and locally verified; PR E and PR F remain future
-  work. Before submission, C and D still need isolated footprint measurements and a budget decision.
+  The audited PR D implementation is present and locally verified. PR E is implemented and has
+  received a whole-PR static audit plus corrective changes; build/runtime verification remains
+  pending. Its measured footprint requires decomposition or an explicit budget exception. PR F
+  remains future work. Before submission, C and D still need isolated footprint measurements.
 - Companion to: [zero-copy-string-compression.md](zero-copy-string-compression.md) (the design).
   This document sequences that design. It does not revive attempt #1 (`stash@{0}`, evaluated
   2026-07-09); stash references are evidence only.
@@ -194,37 +196,64 @@ memcheck, and Compute Sanitizer racecheck. Module CTest passed 11 of 12; the sol
 known missing `cli/test/cli_roundtrip_test.sh` fixture and is baseline infrastructure, not a PR D
 regression.
 
-### PR E — Step 4 Sirius integration — FUTURE (budget net ≤ +250, two commits)
+### PR E — Step 4 Sirius integration — IMPLEMENTED, post-audit verification pending
 
-#### E0. Mixed-chunk support
+The implementation is reviewable as three units even though all are present in this worktree:
+E0 mixed storage/provider and atomic registry publication, E1 reversible staged payload transfer,
+and E2 selective serving plus safety/accounting hardening. The original product budget is net
+≤ +250; the measured net +1,474 requires an explicit decomposition or budget exception before
+landing, not reclassification of contract code as tests or documentation.
 
-Generalize the existing `insert_pinned_entry_{host,device}_compressed` functions to accept raw
-chunks, compressed chunks, and logical order. Reuse `pinned_chunk_ref`, `logical_chunks`, and
-`cached_databatch_provider`; do not add parallel `*_mixed` implementations. Fix order indices
-across null `data_tables` slots, validate size, debug-assert a permutation, and remove PR A's
-mixed-set guard only after the host/device behavioral tests pass.
+#### E0. Mixed storage, serving, and atomic registry publication
 
-E0 has no dependency on C or D and may be hoisted if useful.
+E0 adds `chunk_source` and a dense two-arm representation to the existing `pinned_entry` /
+`cached_databatch_provider` model. Raw and compressed arms contain only their own chunks;
+`logical_order` is empty for homogeneous entries and is a one-to-one permutation over both arms
+for mixed entries. Named host/device chunk bundles prevent adjacent-container argument swaps.
+
+The complete candidate is built and validated off-registry. DuckDB identity, storage, and
+preallocated MVCC metadata publish atomically; MVCC row counts must equal the logical storage
+boundaries elementwise. Raw re-pin merging additionally requires the same cache source, placement,
+and chunk boundaries, stages the merged value off-map, and commits by no-throw swap. Providers
+retain shared ownership, and diagnostic visitors snapshot under the registry mutex but invoke
+callbacks after releasing it. E0 has no dependency on C or D and may be hoisted if useful.
 
 #### E1. Stage, inspect, stage bytes, decide
 
-Use the audited transaction in one shared helper:
+The implementation uses the audited transaction through one shared helper:
 
 1. Move the owned input into `try_compress_with_plan` on the same stream used to build/stage it.
 2. Capture the read-only inspection and build the header through the inspection overload.
 3. Apply the ratio decision while the stage is active.
 4. Enqueue every payload read on `inspection.stream()` (or join other work into it).
-5. Accept only after staging is ready; on ratio or recoverable staging failure, reject.
-6. Install cache entries only after accept succeeds. Never retain the facade or a payload pointer
-   across the decision.
+5. Before accepting a batch, allocate its external destination and shared owner, construct its
+   representation, reserve materializer-result capacity, and validate every copy range.
+6. Accept only after payload staging is ready; on ratio or recoverable staging failure, reject.
+   After acceptance, append that batch using only the prepared ownership moves. Never retain the
+   inspection facade or a payload pointer across the decision.
+
+Final manager installation is a separate ownership-safe transaction. Insertion of a new registry
+key may allocate, but failure cannot expose a partial entry or create a source-lifetime violation;
+the unpublished candidate safely reclaims its independently owned payload. It cannot recover the
+original uncompressed table after acceptance.
 
 If reject cannot prove completion, fail the pin loudly and let safe abandonment retain uncertain
 storage. A host allocation failure before a stage can be returned is a documented loss window;
 it must fail the pin rather than inspect a moved-from table.
 
-Keep converter changes narrow: consuming decompress via `std::move`, deletion of the old subset
-projection branch, and a defaulted selection parameter on the existing reader. Gate E with TPC-H
-compressed-pin roundtrips on host and device tiers plus E0's mixed-chunk tests.
+#### E2. Selective serving, malformed-input defense, and sizing
+
+The existing memory reader has a defaulted selected-column parameter. It validates the complete v10
+header before device allocation or payload fetch and reconstructs only selected columns. Converter
+bounds, backing ownership, target-tier, and same-device contracts fail before unsafe copies.
+Cached-scan estimation uses logical bytes as its history basis and separately charges preparation:
+zero for same-space plain GPU data, logical bytes for HOST/cross-space raw data, and serialized plus
+logical bytes for compressed materialization, with saturating totals.
+
+Gate E with host/device compressed-pin roundtrips, a true materializer-to-decompression mixed case,
+malformed-header rejection before fetch, atomic MVCC/re-pin and callback re-entry cases,
+reservation tests, and external-payload transaction failure injection. These runtime gates remain
+pending until builds/tests are re-enabled.
 
 ### PR F — Step 5 device-payload borrowing — FUTURE, optional
 
@@ -296,18 +325,21 @@ Attempt #1 was **+4,343 / −587 over 43 files**. Excluding lockfile/tests, it w
 wire work, and 400+ lines of duplicate drivers and validation walls.
 
 The planned product budgets remain A ≤ +110, B ≤ 0, C ≤ +250, D ≤ +450, E ≤ +250. PR F and a
-possible external-sink API are separate, profile-gated budgets. Tests are accounted separately.
-The reported pre-audit D size (+698 net) exceeded its gate; before submission, isolate C and D,
-measure each against the correct parent, and either bring D within the review threshold or record
-an explicit approved exception. Comments that specify ownership, failure, and stream contracts
-are product safety work, but they do not disappear from the raw metric.
+possible external-sink API are separate, profile-gated budgets. Tests and documentation are
+excluded from product counts. Against the PR D `HEAD` baseline, current PR E tracked product files
+are +2,183/−731, plus the 22-line new `pinned_chunk_source.hpp`: **net +1,474**. That is +1,224
+above the budget (about 490% over, or 5.90× the budget). Split E0/E1/E2 or record an explicit
+approved exception before landing. The reported pre-audit D size (+698 net) also exceeded its gate;
+before submission, isolate C and D against their correct parents and resolve those budget decisions.
 
-Final C + D gate:
+Final C + D + E gate:
 
 - clang-format/pre-commit and `git diff --check`;
-- focused C/D ownership and staged-compression binaries;
-- existing compression plan, header/I/O, and decode roundtrips;
+- focused ownership, destructive-decode, staged-compression, malformed-header, mixed-serving,
+  atomic-MVCC, reservation, and external-payload failure-injection binaries;
+- existing compression plan, header/I/O, decode, and host/device pin roundtrips;
 - module ctest with the missing CLI fixture classified against baseline;
 - extension build;
-- memcheck and racecheck on the staged transaction tests;
-- a clean diff with no `.orig`/`.rej`, generated artifacts, or unrelated changes.
+- memcheck and racecheck on the staged/external-payload transaction tests;
+- a clean submitted diff containing the new `pinned_chunk_source.hpp` and no patch artifacts or
+  unrelated changes.
