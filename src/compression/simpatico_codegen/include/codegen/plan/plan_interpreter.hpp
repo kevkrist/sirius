@@ -48,10 +48,6 @@ struct plan_compound_builder {
 /// (delta / rle / bitpack / for / zigzag).
 bool is_codegen_compressor(std::string const& op);
 
-/// True if `nid` is a fusable node whose producer is itself a fusable op —
-/// decoded as part of its region root's single JIT launch, not on its own.
-bool is_fusion_interior(NodeId nid, PlanTree const& tree);
-
 /// The staged owning driver's view of one root column, threaded through the walk by
 /// ``simpatico::try_compress_with_plan``. The stage keeps the root structurally intact while
 /// the walk runs; `provenance` records which values may be read directly from it by downstream
@@ -88,7 +84,7 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
 /// * Non-fused (identity, dictionary, alp, ans, snappy, lz4, …): delegates
 ///   to ``make_compressor(op_name)->compress()``.
 /// * Fused (delta / rle / bitpack / for / zigzag): builds a single-node
-///   PlanTree and invokes ``jit_encode_subtree``.
+///   PlanTree and invokes ``encode_fused_subtree``.
 ///
 /// Returns nullptr and sets ``*error_out`` on failure.  The caller can then
 /// use ``compressed_representation::named_channels()`` for BFS child outputs

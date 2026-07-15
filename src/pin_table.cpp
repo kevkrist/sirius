@@ -22,6 +22,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
+#include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
 #include <cudf/table/table.hpp>
@@ -145,15 +146,19 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 
 namespace {
 
-/// Per-materialized-batch sink: receives one GPU-resident table, its GPU placement, and the
-/// stream it was decoded on. The driver does NOT synchronize — the sink owns the sync, because
-/// the host-streaming path must synchronize while the GPU table (and the gpu_table_representation
-/// wrapping it) is still alive, after the D2H conversion has been enqueued on the same stream.
-using pin_batch_sink = std::function<void(std::unique_ptr<cudf::table>,
-                                          cucascade::memory::memory_space* target,
-                                          rmm::cuda_stream_view stream)>;
+/// Per-materialized-batch sink: receives one GPU-resident table, its GPU placement, the
+/// stream it was decoded on, and the chunk's zone-map capture (empty when capture is off).
+/// The driver does NOT synchronize — the sink owns the sync, because the host-streaming path
+/// must synchronize while the GPU table (and the gpu_table_representation wrapping it) is
+/// still alive, after the D2H conversion has been enqueued on the same stream.
+using pin_batch_sink =
+  std::function<void(std::unique_ptr<cudf::table>,
+                     cucascade::memory::memory_space* target,
+                     rmm::cuda_stream_view stream,
+                     std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats)>;
 
-/// Shared driver behind @ref materialize_all_batches and @ref materialize_pin_to_host: walk the
+/// Shared driver behind @ref materialize_all_batches and the pin_to_host/device_with_compression
+/// drivers: walk the
 /// ingestible's metadata + batch coalescer to completion, materialize each emitted batch onto a
 /// round-robin GPU, and hand it to @p on_batch. The single-threaded, deterministic round-robin
 /// placement means re-pinning the same source yields identical placement (required by
@@ -162,6 +167,7 @@ using pin_batch_sink = std::function<void(std::unique_ptr<cudf::table>,
 void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
                              std::span<cucascade::memory::memory_space* const> gpu_spaces,
                              io::sirius_ioctx& io_ctx,
+                             duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
                              const pin_batch_sink& on_batch)
 {
   if (gpu_spaces.empty()) {
@@ -228,7 +234,17 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
     rows_materialized += chunk_rows;
-    on_batch(std::move(tbl), target, stream);
+    // Zone-map capture, while the decode device guard + stream are active and the
+    // GPU table is alive. The scalar downloads inside are synchronous, so the
+    // capture is complete before the sink converts or frees the table. Clean
+    // unsupported-metadata cases degrade to null cells inside; CUDA errors
+    // propagate and abort the pin like any other pin-time CUDA failure.
+    std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats;
+    if (!pinned_column_types.empty()) {
+      chunk_stats = scan_manager::compute_pinned_chunk_stats(
+        tbl->view(), pinned_column_types, stream, target->get_default_allocator());
+    }
+    on_batch(std::move(tbl), target, stream, std::move(chunk_stats));
   };
 
   while (!ingestible.has_processed_all_metadata()) {
@@ -251,59 +267,27 @@ void materialize_pin_batches(op::scan::gpu_ingestible& ingestible,
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::sirius_ioctx& io_ctx)
+  io::sirius_ioctx& io_ctx,
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types)
 {
   materialized_pin out;
   materialize_pin_batches(
     ingestible,
     gpu_spaces,
     io_ctx,
+    pinned_column_types,
     [&](std::unique_ptr<cudf::table> tbl,
         cucascade::memory::memory_space* target,
-        rmm::cuda_stream_view stream) {
+        rmm::cuda_stream_view stream,
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       // Cached GPU batches are stored with a null writer stream, so the data
       // must be fully resident before it can be served or host-converted.
       stream.synchronize();
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       out.tables.emplace_back(std::move(tbl));
       out.chunk_memory_spaces.push_back(target);
+      if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
     });
-  return out;
-}
-
-materialized_host_pin materialize_pin_to_host(
-  op::scan::gpu_ingestible& ingestible,
-  std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
-  io::sirius_ioctx& io_ctx)
-{
-  auto& registry = converter_registry::get();
-  materialized_host_pin out;
-
-  materialize_pin_batches(
-    ingestible,
-    gpu_spaces,
-    io_ctx,
-    [&](std::unique_ptr<cudf::table> tbl,
-        cucascade::memory::memory_space* src_space,
-        rmm::cuda_stream_view stream) {
-      // Stream this freshly-materialized batch straight to pinned host memory and let the GPU
-      // table free before the next batch is materialized — so peak GPU residency stays at ~one
-      // batch and the whole table never needs to fit in GPU memory. The chunk is pinned on the
-      // source GPU's NUMA-local host space (host_space_by_gpu), so on multi-GPU systems the
-      // chunks land round-robin across NUMA nodes. The conversion reuses the decode stream; the
-      // GPU->HOST converter (convert_gpu_to_host_fast) synchronizes internally before returning,
-      // so the host copy is complete once convert() returns. The explicit sync below is
-      // belt-and-suspenders before gpu_repr (which owns the GPU table's buffers) leaves scope.
-      auto* target_host_space = host_space_by_gpu.at(src_space->get_device_id());
-      out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
-      cucascade::gpu_table_representation gpu_repr(std::move(tbl), *src_space, stream);
-      auto host_repr =
-        registry.convert<cucascade::host_data_representation>(gpu_repr, target_host_space, stream);
-      stream.synchronize();
-      out.host_chunks.emplace_back(std::move(host_repr));
-    });
-
   return out;
 }
 
@@ -571,7 +555,8 @@ host_pin_result materialize_pin_to_host_with_compression(
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
   io::sirius_ioctx& io_ctx,
-  compression_pin_config const& compression)
+  compression_pin_config const& compression,
+  duckdb::vector<duckdb::LogicalType> const& pinned_column_types)
 {
   validate_compression_config(compression);
   auto& registry = converter_registry::get();
@@ -582,9 +567,11 @@ host_pin_result materialize_pin_to_host_with_compression(
     ingestible,
     gpu_spaces,
     io_ctx,
+    pinned_column_types,
     [&](std::unique_ptr<cudf::table> table,
         cucascade::memory::memory_space* src_space,
-        rmm::cuda_stream_view stream) {
+        rmm::cuda_stream_view stream,
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       if (!table) {
         throw std::runtime_error(
           "materialize_pin_to_host_with_compression received a null materialized table");
@@ -692,6 +679,10 @@ host_pin_result materialize_pin_to_host_with_compression(
         out.host_chunks.emplace_back(std::move(host_repr));
         out.logical_order.push_back(
           {sirius::scan_manager::chunk_kind::raw, out.host_chunks.size() - 1});
+        // Keep the raw arm's zone maps positional with host_chunks. Empty when capture is
+        // off; a compressed chunk contributes no entry, so a homogeneous uncompressed pin
+        // yields chunk_stats.size() == host_chunks.size() for insert_pinned_entry_host.
+        out.chunk_stats.push_back(std::move(chunk_stats));
       }
     });
 
@@ -713,9 +704,11 @@ device_pin_result materialize_pin_to_device_with_compression(
     ingestible,
     gpu_spaces,
     io_ctx,
+    {},
     [&](std::unique_ptr<cudf::table> table,
         cucascade::memory::memory_space* src_space,
-        rmm::cuda_stream_view stream) {
+        rmm::cuda_stream_view stream,
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> /*chunk_stats*/) {
       if (!table) {
         throw std::runtime_error(
           "materialize_pin_to_device_with_compression received a null materialized table");
