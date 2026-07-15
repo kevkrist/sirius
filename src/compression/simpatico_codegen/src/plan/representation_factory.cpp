@@ -480,6 +480,11 @@ std::unique_ptr<compressed_representation> str_split_compressed_representation::
     if (error_out) *error_out = "str_split expects 2 (offsets, chars) or 3 (+ null_mask) outputs";
     return nullptr;
   }
+  if (output_names.size() != outputs.size() || !outputs[0] || !outputs[1] ||
+      (has_mask && !outputs[2])) {
+    if (error_out) *error_out = "str_split outputs have invalid names/columns";
+    return nullptr;
+  }
   if (output_names[0] != "offsets" || output_names[1] != "chars" ||
       (has_mask && output_names[2] != "null_mask")) {
     if (error_out) *error_out = "str_split outputs must be 'offsets, chars[, null_mask]'";
@@ -504,7 +509,7 @@ std::unique_ptr<compressed_representation> str_split_compressed_representation::
   }
   cudf::size_type const n = offsets->size() > 0 ? offsets->size() - 1 : 0;
   return std::make_unique<str_split_compressed_representation>(
-    n, std::move(offsets), std::move(chars), std::move(null_mask));
+    n, std::move(offsets), std::move(chars), std::move(null_mask), has_mask ? -1 : 0);
 }
 
 std::unique_ptr<compressed_representation> bitextract_compressed_representation::from_outputs(

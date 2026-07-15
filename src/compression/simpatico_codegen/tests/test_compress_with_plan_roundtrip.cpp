@@ -807,9 +807,6 @@ int main()
 
       for (char const* plan :
            {"input -> dictionary\n", "input -> dictionary_fast\n", "input -> str_split\n"}) {
-        // describe() runs on a FRESH compress: str_split's single-shot
-        // decompress consumes its channels, so describe-after-decompress
-        // legitimately enumerates nothing.
         auto t0 = make_strings_table({}, {}, stream);
         compress_with_plan(t0->view(), plan, stream, mr).describe(stream);
         roundtrip_once(t0->view(), plan, 1, "string_zero_row");

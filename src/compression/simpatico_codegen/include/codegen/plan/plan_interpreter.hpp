@@ -52,6 +52,17 @@ bool is_codegen_compressor(std::string const& op);
 /// decoded as part of its region root's single JIT launch, not on its own.
 bool is_fusion_interior(NodeId nid, PlanTree const& tree);
 
+/// The staged owning driver's view of one root column, threaded through the walk by
+/// ``simpatico::try_compress_with_plan``. The stage keeps the root structurally intact while
+/// the walk runs; `provenance` records which values may be read directly from it by downstream
+/// materializing compressors.
+///
+/// This sits beside the walk's ordinary representation/refcount maps and never interferes with
+/// them: a root-backed value owns no representation, so eager release has nothing to free.
+struct staged_root_context {
+  std::unordered_map<ValueId, root_component, ValueIdHash> provenance;
+};
+
 /// Compress a single column using the plan DSL.  Returns nullptr on error.
 /// The lower-level building block behind the table-level
 /// ``simpatico::compress_with_plan``.
@@ -60,11 +71,16 @@ bool is_fusion_interior(NodeId nid, PlanTree const& tree);
 /// parallelism is the caller's concern: fan one column per worker thread,
 /// each on its own stream.  Intermediate device buffers are released
 /// eagerly as the tree walk consumes them.
+///
+/// ``staged`` is null for the view API, which copies whatever it stores; the staged owning
+/// driver passes a context so identity and str_split can feed root views directly to downstream
+/// materializing compressors. Candidate leaves always own their storage.
 std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
                                           std::string_view plan_dsl,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr,
-                                          std::string* error_out);
+                                          std::string* error_out,
+                                          staged_root_context* staged = nullptr);
 
 /// Compress a single column with ONE operator and return the resulting
 /// ``compressed_representation``.  A thin wrapper for the BFS explorer:
@@ -83,11 +99,20 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
                                                               rmm::device_async_resource_ref mr,
                                                               std::string* error_out);
 
+/// Explicitly selects destructive traversal without crossing a const tree.
+struct consume_tag {};
+
 /// Decompress a compound produced by compress_column.  A single post-order
 /// walk over the plan tree: each codegen-fused subtree root is inverted by one
 /// JIT-compiled kernel (``dispatch_codegen_subtree``) and every other step by
 /// its rep's own decompress().  Runs entirely on ``stream``.
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
+                                                rmm::cuda_stream_view stream,
+                                                rmm::device_async_resource_ref mr,
+                                                std::string* error_out);
+
+std::unique_ptr<cudf::column> decompress_column(PlanTree& tree,
+                                                consume_tag,
                                                 rmm::cuda_stream_view stream,
                                                 rmm::device_async_resource_ref mr,
                                                 std::string* error_out);

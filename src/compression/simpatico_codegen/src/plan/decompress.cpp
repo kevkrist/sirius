@@ -183,11 +183,11 @@ std::size_t elem_size_for_slot(std::string const& slot, std::size_t element_size
   return element_size;  // chunk_min, delta_first, data, rle_run_values
 }
 
-// Reconstructs node `nid`'s produced value into the shared memo and returns a
-// non-owning view the memo keeps alive. One resolver serves the top-level walk
-// and fused-region tail binding, so both share a single memo. Defined below.
+// Reconstructs node `nid` in the shared memo for top-level and fused-tail walks.
+// Defined below.
+template <bool Take = false, typename Tree>
 cudf::column const* materialize(NodeId nid,
-                                PlanTree const& tree,
+                                Tree& tree,
                                 DecodeMemo& memo,
                                 rmm::cuda_stream_view stream,
                                 rmm::device_async_resource_ref mr,
@@ -649,16 +649,21 @@ bool decode_bitjoin(NodeId nid,
 
 // The single decode resolver. Reconstructs and memoises the value(s) node `nid`
 // produces on decode — its input_source(s) — and returns the primary one, keyed
-// by structural (node, port) identity so every consumer and the codegen tail
-// binders share one memo without matching path strings.
+// structurally so all consumers share one memo. `Take` selects destructive
+// access only for reps stored in a mutable tree.
+template <bool Take, typename Tree>
 cudf::column const* materialize(NodeId nid,
-                                PlanTree const& tree,
+                                Tree& tree,
                                 DecodeMemo& memo,
                                 rmm::cuda_stream_view stream,
                                 rmm::device_async_resource_ref mr,
                                 std::string* error_out)
 {
-  PlanNode const& node  = tree.nodes[nid];
+  auto decode_rep = [&](auto& rep) -> std::unique_ptr<cudf::column> {
+    if constexpr (Take) return rep.take_decompressed(stream, mr);
+    return rep.decompress(stream, mr);
+  };
+  auto& node            = tree.nodes[nid];
   ValueId const primary = node.input_sources.empty() ? ValueId{nid, 0} : node.input_sources.front();
   std::uint64_t const pk = value_key(primary);
   if (auto it = memo.values.find(pk); it != memo.values.end()) {
@@ -673,7 +678,8 @@ cudf::column const* materialize(NodeId nid,
 
   // bitjoin recovers all its input values from one packed leaf.
   if (node.attrs.bitjoin.has_value()) {
-    if (!decode_bitjoin(nid, tree, memo, stream, mr, error_out)) return nullptr;
+    if (!decode_bitjoin(nid, static_cast<PlanTree const&>(tree), memo, stream, mr, error_out))
+      return nullptr;
     auto it = memo.values.find(pk);
     return it != memo.values.end() ? it->second.get() : nullptr;
   }
@@ -681,10 +687,11 @@ cudf::column const* materialize(NodeId nid,
   std::unique_ptr<cudf::column> col;
   if (is_codegen_compressor(node.op)) {
     // Fused op (bitpack/delta/rle/for/zigzag): one JIT kernel inverts the whole
-    // region (its rep's decompress() throws); tail slots resolve via materialize.
-    col = dispatch_codegen_subtree(nid, tree, stream, mr, memo, error_out);
+    // region. It remains const/copying even during a destructive traversal.
+    col = dispatch_codegen_subtree(
+      nid, static_cast<PlanTree const&>(tree), stream, mr, memo, error_out);
   } else if (node.rep) {
-    col = node.rep->decompress(stream, mr);
+    col = decode_rep(*node.rep);
   } else {
     // Multi-output non-codegen op (alp/alp_rd/dictionary/bitextract): gather its
     // outputs in port order (reconstruct matches by name). An output routed to a
@@ -701,7 +708,8 @@ cudf::column const* materialize(NodeId nid,
         ValueId const output_value{nid, static_cast<ChannelId>(i)};
         // Recurse only when the value isn't yet in the memo
         if (!memo.values.count(value_key(output_value))) {
-          if (!materialize(child_it->child, tree, memo, stream, mr, error_out)) return nullptr;
+          if (!materialize<Take>(child_it->child, tree, memo, stream, mr, error_out))
+            return nullptr;
         }
         auto output = consume_memo_value(output_value, memo, stream, mr, error_out);
         if (!output) return nullptr;
@@ -712,7 +720,7 @@ cudf::column const* materialize(NodeId nid,
       auto ch_it = node.channels.find(node.output_paths[i]);
       if (ch_it == node.channels.end()) continue;  // not produced here
       if (!ch_it->second) return nullptr;
-      auto c = ch_it->second->decompress(stream, mr);
+      auto c = decode_rep(*ch_it->second);
       if (!c) return nullptr;
       names.push_back(name);
       outputs.push_back(std::move(c));
@@ -724,7 +732,9 @@ cudf::column const* materialize(NodeId nid,
       if (error_out) *error_out = err;
       return nullptr;
     }
-    col = rep->decompress(stream, mr);
+    // This transient rep owns fresh inputs, so both policies may take from it.
+    // That avoids another copy when routed str_split reassembles its channels.
+    col = rep->take_decompressed(stream, mr);
     memo.kept.push_back(std::move(rep));
   }
   if (!col) return nullptr;
@@ -735,10 +745,11 @@ cudf::column const* materialize(NodeId nid,
 
 }  // namespace
 
-std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
-                                                rmm::cuda_stream_view stream,
-                                                rmm::device_async_resource_ref mr,
-                                                std::string* error_out)
+template <bool Take, typename Tree>
+std::unique_ptr<cudf::column> decompress_column_impl(Tree& tree,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr,
+                                                     std::string* error_out)
 {
   nvtx3::scoped_range r_decompress{"decompress_column"};
 
@@ -760,14 +771,15 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   std::uint64_t const input_key = value_key(ValueId{0, 0});
   for (auto const& e : tree.nodes[0].children) {
     if (memo.values.count(input_key)) break;
-    if (!materialize(e.child, tree, memo, stream, mr, error_out)) return nullptr;
+    if (!materialize<Take>(e.child, tree, memo, stream, mr, error_out)) return nullptr;
   }
   if (!memo.values.count(input_key)) {
     for (NodeId nid = 1; nid < tree.nodes.size() && !memo.values.count(input_key); ++nid) {
       bool consumes_input = false;
       for (auto const& src : tree.nodes[nid].input_sources)
         if (src.node == 0 && src.channel == 0) consumes_input = true;
-      if (consumes_input && !materialize(nid, tree, memo, stream, mr, error_out)) return nullptr;
+      if (consumes_input && !materialize<Take>(nid, tree, memo, stream, mr, error_out))
+        return nullptr;
     }
   }
 
@@ -780,6 +792,23 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
   auto result = std::move(root_it->second);
   if (error_out) error_out->clear();
   return result;
+}
+
+std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
+                                                rmm::cuda_stream_view stream,
+                                                rmm::device_async_resource_ref mr,
+                                                std::string* error_out)
+{
+  return decompress_column_impl<false>(tree, stream, mr, error_out);
+}
+
+std::unique_ptr<cudf::column> decompress_column(PlanTree& tree,
+                                                consume_tag,
+                                                rmm::cuda_stream_view stream,
+                                                rmm::device_async_resource_ref mr,
+                                                std::string* error_out)
+{
+  return decompress_column_impl<true>(tree, stream, mr, error_out);
 }
 
 // ---------------------------------------------------------------------------

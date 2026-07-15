@@ -21,12 +21,15 @@
 #include "codegen/plan/representation.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -143,7 +146,11 @@ struct CompressWalk {
   rmm::cuda_stream_view stream;
   rmm::device_async_resource_ref mr;
   std::string* error_out;
-  bool failed = false;
+  // Null for the view API (which copies what it stores). When set, the caller owns the root
+  // column and keeps it whole for the walk's duration, so storage-preserving projections can
+  // feed downstream materializing compressors without an intermediate copy.
+  staged_root_context* staged = nullptr;
+  bool failed                 = false;
 
   // Eager-release bookkeeping: which reprs_by_input key owns each live column,
   // and how many of a key's consumed outputs are still referenced in `columns`.
@@ -255,11 +262,11 @@ void CompressWalk::emit_bitjoin_node(NodeId n)
                                                cudf::mask_state::UNALLOCATED,
                                                stream,
                                                mr);
-  cudaMemsetAsync(
+  CUDF_CUDA_TRY(cudaMemsetAsync(
     out_col->mutable_view().head<void>(),
     0,
     static_cast<size_t>(n_elements) * static_cast<size_t>(cudf::size_of(layout.output_type)),
-    stream.value());
+    stream.value()));
 
   for (size_t fi = 0; fi < node.input_sources.size(); ++fi) {
     launch_bitjoin_field(out_col->mutable_view(),
@@ -439,6 +446,12 @@ bool CompressWalk::emit_fused_node(NodeId n, cudf::column_view col)
 
 // generic single-input op: run the registered compressor and route its named
 // output channels (terminal → identity leaf; consumed → recurse downstream).
+//
+// The staged owning driver may PROJECT a root-backed value through identity / str_split. A
+// projected channel can feed a downstream materializing compressor without an intermediate
+// copy. Terminal channels are still copied, so the candidate is self-contained before it is
+// exposed and accept() never has to detach storage from the original table. An op with no
+// projection (or one that declines this input) uses the ordinary copying path.
 void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
 {
   PlanNode const& node    = tree.nodes[n];
@@ -450,42 +463,81 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
     return;
   }
 
-  // For identity compressor on keys_chars, convert to UINT8 first.
-  cudf::column_view col_to_compress = col;
-  std::unique_ptr<cudf::column> temp_col;
-  if (node.op == "identity" && is_keys_chars_path(path)) {
-    temp_col = copy_column_view_as_uint8(col, stream, mr);
-    if (!temp_col) {
-      set_error("failed to convert keys_chars to UINT8");
+  // Either the op's channels come from a representation it built (the copying path), or from a
+  // projection of the root (the staged path). `component_of` is non-empty only in the latter.
+  std::unique_ptr<compressed_representation> repr;
+  std::vector<compressible_output> outputs;
+  std::vector<std::string> required;
+  std::unordered_map<std::string, root_component> component_of;
+
+  root_component const* provenance = nullptr;
+  if (staged) {
+    auto const it = staged->provenance.find(input_val);
+    if (it != staged->provenance.end()) provenance = &it->second;
+  }
+  std::optional<staged_root_projection> projection;
+  // A bare representation is itself terminal and therefore must own its storage.
+  if (provenance && !node.output_names.empty())
+    projection = compressor->project_staged_root(col, stream, mr);
+
+  if (projection) {
+    root_component const source = *provenance;
+    // A channel claiming the whole of its input inherits that input's own provenance, so
+    // identity over `str_split.chars` remains root-backed. Only str_split names components,
+    // and only ever over the whole root.
+    if (source != root_component::whole_column) {
+      for (auto const& channel : projection->channels) {
+        if (channel.source == root_component::whole_column) continue;
+        set_error("staged compress: '" + node.op + "' decomposed a non-root component");
+        return;
+      }
+    }
+    required           = std::move(projection->required_channels);
+    tree.nodes[n].meta = leaf_meta::none{};
+    for (auto& channel : projection->channels) {
+      component_of.emplace(
+        channel.output.name,
+        channel.source == root_component::whole_column ? source : channel.source);
+      outputs.push_back(std::move(channel.output));
+    }
+  } else {
+    // For identity compressor on keys_chars, convert to UINT8 first.
+    cudf::column_view col_to_compress = col;
+    std::unique_ptr<cudf::column> temp_col;
+    if (node.op == "identity" && is_keys_chars_path(path)) {
+      temp_col = copy_column_view_as_uint8(col, stream, mr);
+      if (!temp_col) {
+        set_error("failed to convert keys_chars to UINT8");
+        return;
+      }
+      col_to_compress = temp_col->view();
+    }
+
+    repr = compressor->compress(col_to_compress, stream, mr);
+    // Single-stream mode: sync so async compressors complete before we read
+    // output column views/sizes.
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    if (!repr) {
+      set_error("compressor '" + node.op + "' returned null representation");
       return;
     }
-    col_to_compress = temp_col->view();
+
+    // Capture decode metadata before the rep is moved or dropped. For codecs whose rep only
+    // backs downstream channels, node.meta is what survives after eager release.
+    tree.nodes[n].meta = repr->describe_meta();
+
+    if (node.output_names.empty()) {
+      release_column(input_val);
+      // A bare op becomes this node's own representation. Do not enumerate lazy channels:
+      // preserving this early return keeps the ordinary view path allocation-for-allocation.
+      place(n, input_val, path, std::move(repr));
+      return;
+    }
+
+    outputs  = repr->named_channels(stream);
+    required = repr->required_channels();
   }
 
-  auto repr = compressor->compress(col_to_compress, stream, mr);
-  // Single-stream mode: sync so async compressors complete before we read
-  // output column views/sizes.
-  cudaStreamSynchronize(stream.value());
-  if (!repr) {
-    set_error("compressor '" + node.op + "' returned null representation");
-    return;
-  }
-  // Capture decode metadata now, before the rep is moved or dropped.
-  // This is the only safe window — for ops like ANS/Bitcomp the repr is
-  // NOT placed onto the tree node; it stays in reprs_by_input until its
-  // consumers release it and then is freed. node.meta persists and carries
-  // uncompressed_size / original_type_id / algorithm to the decode path.
-  tree.nodes[n].meta = repr->describe_meta();
-
-  if (node.output_names.empty()) {
-    release_column(input_val);
-    // No declared output: the whole rep becomes this node's own rep (place sees
-    // the node consuming input_val and stores it on tree.nodes[n].rep).
-    place(n, input_val, path, std::move(repr));
-    return;
-  }
-
-  auto outputs = repr->named_channels(stream);
   std::unordered_map<std::string, cudf::column_view> output_by_name;
   output_by_name.reserve(outputs.size());
   for (auto const& output : outputs)
@@ -495,15 +547,9 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   // data (e.g. a nullable column's validity via str_split's null_mask) would be
   // silently dropped. Runs only when some outputs are declared (a bare terminal
   // `input -> str_split` stored the whole rep above and is safe).
-  for (auto const& req : repr->required_channels()) {
-    bool declared = false;
-    for (auto const& out_name : node.output_names) {
-      if (req == out_name) {
-        declared = true;
-        break;
-      }
-    }
-    if (!declared) {
+  for (auto const& req : required) {
+    if (std::find(node.output_names.begin(), node.output_names.end(), req) ==
+        node.output_names.end()) {
       set_error("compressor '" + node.op + "' requires output '" + req +
                 "' to be routed by the plan (nullable input)");
       return;
@@ -524,11 +570,12 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
     }
     std::string const& output_path = node.output_paths[idx];
     ValueId const output_val       = ValueId{n, static_cast<ChannelId>(idx)};
+    auto const component           = component_of.find(out_name);
     columns.emplace(output_val, out_it->second);
 
     if (!consumer_by_input.count(output_val)) {
-      // Terminal leaf — copy the channel into an identity leaf (reps stay whole
-      // on the PlanTree; no destructuring).
+      // A terminal leaf always owns its bytes. Projected root views may feed codecs, but can
+      // never escape into the candidate.
       auto leaf_col = copy_identity_leaf(out_it->second, output_path, stream, mr);
       if (!leaf_col) {
         set_error("failed to get column for identity leaf '" + output_path + "'");
@@ -538,6 +585,11 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
             output_val,
             output_path,
             std::make_unique<identity_compressed_representation>(std::move(leaf_col)));
+    } else if (component != component_of.end()) {
+      // Consumed downstream: its compressor may materialize directly from the borrowed view.
+      // Root-backed values have no repr key; release_column only drops their view.
+      staged->provenance.emplace(output_val, component->second);
+      to_recurse.push_back(output_val);
     } else {
       ++pending;
       col_to_repr_key[output_val] = repr_key;
@@ -552,9 +604,8 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
     reprs_by_input.emplace(repr_key, std::move(repr));
     repr_pending[repr_key] = pending;
   }
-  // The input column is fully consumed (compress already ran + synced and all
-  // output views derive from `repr`, not the input); release it now so an
-  // upstream rep it backed can be freed before we descend.
+  // Ordinary outputs are backed by `repr`; projected outputs are backed by the stage-owned root.
+  // release_column handles either without freeing a live source.
   release_column(input_val);
   for (auto const& output_val : to_recurse) {
     if (failed) return;
@@ -568,7 +619,8 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
                                           std::string_view plan_dsl,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr,
-                                          std::string* error_out)
+                                          std::string* error_out,
+                                          staged_root_context* staged)
 {
   // Single-stream per column: all work runs on `stream`. Cross-column
   // parallelism is the caller's job (one column per worker thread, each on its
@@ -620,8 +672,12 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
     reprs_by_input;
   std::vector<bool> visited(tree.nodes.size(), false);
 
+  // Seed the staged driver's provenance: the input value IS the whole root the stage owns.
+  // Every other root-backed value descends from it through a projection.
+  if (staged) staged->provenance.emplace(ValueId{0, 0}, root_component::whole_column);
+
   CompressWalk walk{
-    tree, consumer_by_input, columns, reprs_by_input, visited, stream, mr, error_out};
+    tree, consumer_by_input, columns, reprs_by_input, visited, stream, mr, error_out, staged};
   walk.emit_path(ValueId{0, 0});
   if (walk.failed) return nullptr;
 

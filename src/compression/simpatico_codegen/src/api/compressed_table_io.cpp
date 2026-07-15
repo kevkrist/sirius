@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// C++-native .hpln v8 write/read for compressed_table.
+// C++-native .hpln v10 write/read for compressed_table.
 // See compressed_table_io.hpp for the on-disk layout.
 
 #include "api/compressed_table_io.hpp"
@@ -711,6 +711,15 @@ std::string build_compressed_table_header(compressed_table const& table,
 
   out_payload_bytes = payload_offset;
   return {};
+}
+
+std::string build_compressed_table_header(compressed_table_inspection table,
+                                          std::vector<std::uint8_t>& out_header,
+                                          std::vector<payload_buffer_ref>& out_buffers,
+                                          std::uint64_t& out_payload_bytes)
+{
+  return build_compressed_table_header(
+    *table.table_, out_header, out_buffers, out_payload_bytes, table.stream_);
 }
 
 compressed_table read_compressed_table_from_memory(std::span<const std::uint8_t> header,

@@ -119,6 +119,23 @@ struct compressible_output {
   cudf::column_view view;
 };
 
+/// Which piece of an owned root column backs a projected channel. `whole_column` means "all of
+/// the storage I was handed"; the rest name the buffers of a STRING column.
+enum class root_component : std::uint8_t { whole_column, offsets, chars };
+
+/// One channel of a root projection, tagged with the component whose storage backs it.
+struct projected_root_channel {
+  compressible_output output;
+  root_component source;
+};
+
+/// A storage-preserving decomposition of an intact root column. The views are used only as
+/// inputs to downstream compressors; any terminal channel is copied into an owning leaf.
+struct staged_root_projection {
+  std::vector<projected_root_channel> channels;
+  std::vector<std::string> required_channels;
+};
+
 /// Opaque compressed data; decompress(stream, mr) reconstructs the original column.
 struct compressed_representation {
   // Reconstructed column's type and row count, carried uniformly by every rep.
@@ -132,20 +149,33 @@ struct compressed_representation {
   virtual std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                                    rmm::device_async_resource_ref mr) const = 0;
 
+  /// Destructive decode hook; transferable reps make subsequent observable access fail loudly.
+  virtual std::unique_ptr<cudf::column> take_decompressed(rmm::cuda_stream_view stream,
+                                                          rmm::device_async_resource_ref mr)
+  {
+    ensure_not_consumed();
+    return decompress(stream, mr);
+  }
+
   /// Canonical channel enumeration: this rep's named output channels, in
   /// manifest/wire order. This is the ONE accessor for a rep's channels,
   /// serving both the compress/writer side (further-compress a channel, sum
   /// wire size) and the decode-side JIT gather.
-  ///
+  /// Views borrow rep storage; callers provide lifetime and stream ordering.
   virtual std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const
   {
+    ensure_not_consumed();
     return {};
   }
 
   /// Channels that MUST be routed by the plan, else the driver errors -- preventing silent data
   /// loss. Default: none. str_split returns {"null_mask"} for a nullable input so a plan can never
   /// silently drop validity.
-  virtual std::vector<std::string> required_channels() const { return {}; }
+  virtual std::vector<std::string> required_channels() const
+  {
+    ensure_not_consumed();
+    return {};
+  }
 
   /// SAFETY invariant: a representation owns everything it exposes — all
   /// compressors create new data during compression, and the original user
@@ -181,7 +211,21 @@ struct compressed_representation {
   // ---- Leaf descriptor hooks (serialization / describe()) ----
   virtual OpId kind() const { return OpId::Unknown; }
   virtual cudf::data_type decoded_type() const { return original_type; }
-  virtual leaf_meta_v describe_meta() const { return leaf_meta::none{}; }
+  virtual leaf_meta_v describe_meta() const
+  {
+    ensure_not_consumed();
+    return leaf_meta::none{};
+  }
+
+ protected:
+  void ensure_not_consumed() const
+  {
+    if (consumed_) {
+      throw std::logic_error("compressed representation was already destructively consumed");
+    }
+  }
+
+  bool consumed_{false};
 };
 
 /// Identity / passthrough: stores a column as-is (e.g. keys_chars "stored as-is" in plan).
@@ -206,11 +250,22 @@ struct identity_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override
   {
+    ensure_not_consumed();
     if (col == nullptr) return nullptr;
     return std::make_unique<cudf::column>(*col, stream, mr);
   }
+
+  std::unique_ptr<cudf::column> take_decompressed(rmm::cuda_stream_view,
+                                                  rmm::device_async_resource_ref) override
+  {
+    ensure_not_consumed();
+    consumed_ = true;
+    return std::move(col);  // owns its copy; hand it straight out
+  }
+
   std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
   {
+    ensure_not_consumed();
     if (col == nullptr) return {};
     return {{"data", col->view()}};
   }
@@ -229,6 +284,16 @@ struct compressor {
     compressed_representation const& data_to_decompress,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) = 0;
+
+  /// Decompose an intact ROOT column into borrowed channels, for the staged owning driver only.
+  /// A projected view may feed a materializing compressor but never becomes candidate-owned
+  /// storage. `std::nullopt` falls back to compress(), which copies. Only identity and str_split
+  /// project.
+  virtual std::optional<staged_root_projection> project_staged_root(
+    cudf::column_view, rmm::cuda_stream_view, rmm::device_async_resource_ref) const
+  {
+    return std::nullopt;
+  }
 };
 
 /// Identity compressor: no-op passthrough, used for leaf nodes that are stored as-is.
@@ -239,6 +304,15 @@ struct identity_compressor : compressor {
   {
     auto col_copy = std::make_unique<cudf::column>(column_to_compress, stream, mr);
     return std::make_unique<identity_compressed_representation>(std::move(col_copy));
+  }
+
+  /// Identity stores its input as-is, so its one channel is the whole of whatever it was
+  /// handed. The driver rebases `whole_column` onto that value's own provenance: identity
+  /// over `str_split.chars` propagates chars provenance rather than root-column provenance.
+  std::optional<staged_root_projection> project_staged_root(
+    cudf::column_view column, rmm::cuda_stream_view, rmm::device_async_resource_ref) const override
+  {
+    return staged_root_projection{{{{"data", column}, root_component::whole_column}}, {}};
   }
   std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
                                            rmm::cuda_stream_view stream,
@@ -330,6 +404,9 @@ struct dictionary_compressed_representation : compressed_representation {
 
     // Full dict_column mode: expose keys_offsets, keys_chars, indices and —
     // for a nullable column — null_mask.
+    if (!dict_column) {
+      throw std::logic_error("dictionary representation full mode has no dictionary column");
+    }
     auto dict_view            = dict_column->view();
     bool const childless_dict = dict_column->num_children() == 0;  // zero-row compress
     bool const childless_keys =  // encode of an all-null column: zero keys, no offsets child
@@ -459,44 +536,31 @@ struct str_split_compressed_representation : compressed_representation {
     rmm::device_async_resource_ref mr,
     std::string* error_out);
 
-  // The decomposed channels. mutable: decompress() moves them into make_strings_column.
-  mutable std::unique_ptr<cudf::column>
-    offsets_;                                    // INT32 (or INT64 for >2GB chars), size num_rows+1
-  mutable std::unique_ptr<cudf::column> chars_;  // UINT8, or widened (UINT32/UINT64) past 2GB
-  mutable std::unique_ptr<cudf::column> null_mask_;  // UINT8 bitmask bytes, or null (no nulls)
+  // Raw chars/mask buffers transfer directly; cached metadata preserves widened chars views.
+  std::unique_ptr<cudf::column> offsets_;
+  rmm::device_buffer chars_;
+  rmm::device_buffer null_mask_;
+  cudf::data_type chars_type_{cudf::type_id::UINT8};
+  cudf::size_type chars_size_{0};
+  cudf::size_type null_mask_size_{0};
+  cudf::size_type null_count_{-1};
+  bool has_null_mask_{false};
 
   str_split_compressed_representation(cudf::size_type n_rows,
                                       std::unique_ptr<cudf::column> offsets,
                                       std::unique_ptr<cudf::column> chars,
-                                      std::unique_ptr<cudf::column> null_mask)
-    : compressed_representation(cudf::data_type{cudf::type_id::STRING}, n_rows),
-      offsets_(std::move(offsets)),
-      chars_(std::move(chars)),
-      null_mask_(std::move(null_mask))
-  {
-  }
+                                      std::unique_ptr<cudf::column> null_mask,
+                                      cudf::size_type null_count);
 
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view /*stream*/) const override
-  {
-    std::vector<compressible_output> out;
-    // The single-shot decompress() MOVES the channels into make_strings_column;
-    // a consumed rep has no channels left to enumerate (describe/serialize
-    // must run before decompress).
-    if (!offsets_ || !chars_) return out;
-    out.push_back({"offsets", offsets_->view()});
-    out.push_back({"chars", chars_->view()});
-    if (null_mask_) out.push_back({"null_mask", null_mask_->view()});  // 2- or 3-channel
-    return out;
-  }
+  std::unique_ptr<cudf::column> take_decompressed(rmm::cuda_stream_view stream,
+                                                  rmm::device_async_resource_ref mr) override;
 
-  std::vector<std::string> required_channels() const override
-  {
-    if (null_mask_) return {"null_mask"};
-    return {};
-  }
+  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override;
+
+  std::vector<std::string> required_channels() const override;
 
   // kind() defaults to Unknown -- only the deferred .hpln path reads it.
 };
@@ -508,6 +572,11 @@ struct str_split_compressor : compressor {
   std::unique_ptr<cudf::column> decompress(compressed_representation const& data_to_decompress,
                                            rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) override;
+
+  std::optional<staged_root_projection> project_staged_root(
+    cudf::column_view column,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
 };
 
 // -----------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 // Shared test utilities for codegen tests.
 #pragma once
+#include "codegen/plan/plan_tree.hpp"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
@@ -18,6 +20,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -237,6 +241,48 @@ inline bool columns_equal(cudf::column_view a, cudf::column_view b)
 inline void expect(bool cond, char const* msg)
 {
   if (!cond) throw std::runtime_error(msg);
+}
+
+inline constexpr std::string_view kConsumedRepresentationError =
+  "compressed representation was already destructively consumed";
+
+template <typename Rep>
+Rep* find_rep(simpatico::PlanTree& tree)
+{
+  for (auto& node : tree.nodes) {
+    if (auto* rep = dynamic_cast<Rep*>(node.rep.get())) return rep;
+    for (auto& [path, stored] : node.channels) {
+      (void)path;
+      if (auto* rep = dynamic_cast<Rep*>(stored.get())) return rep;
+    }
+  }
+  return nullptr;
+}
+
+template <typename Rep>
+Rep const* find_rep(simpatico::PlanTree const& tree)
+{
+  for (auto const& node : tree.nodes) {
+    if (auto const* rep = dynamic_cast<Rep const*>(node.rep.get())) return rep;
+    for (auto const& [path, stored] : node.channels) {
+      (void)path;
+      if (auto const* rep = dynamic_cast<Rep const*>(stored.get())) return rep;
+    }
+  }
+  return nullptr;
+}
+
+template <typename Function>
+void expect_consumed_error(Function&& function, char const* message)
+{
+  bool loud_error = false;
+  try {
+    std::forward<Function>(function)();
+  } catch (std::exception const& error) {
+    loud_error =
+      std::string_view(error.what()).find(kConsumedRepresentationError) != std::string_view::npos;
+  }
+  expect(loud_error, message);
 }
 
 // ---------------------------------------------------------------------------

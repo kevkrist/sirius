@@ -75,6 +75,7 @@ add_library(
   src/plan/representation_factory.cpp
   src/plan/bitjoin_layout.cpp
   src/plan/compress.cpp
+  src/plan/staged_compression.cpp
   src/plan/decompress.cpp
   src/util/stream_pool.cpp
   src/util/isoc23_compat.c
@@ -123,6 +124,8 @@ endfunction()
 
 add_codegen_host_test(test_compress_with_plan_roundtrip)
 add_codegen_host_test(test_compressed_table_io)
+add_codegen_host_test(test_decompress_ownership)
+add_codegen_host_test(test_staged_compression)
 add_codegen_host_test(test_leaf_describe)
 add_codegen_host_test(test_plan_tree)
 add_codegen_host_test(test_fused_tree_build)
@@ -155,6 +158,8 @@ enable_testing()
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
 add_test(NAME compressed_table_io COMMAND test_compressed_table_io)
+add_test(NAME decompress_ownership COMMAND test_decompress_ownership)
+add_test(NAME staged_compression COMMAND test_staged_compression)
 add_test(NAME leaf_describe COMMAND test_leaf_describe)
 add_test(NAME plan_tree COMMAND test_plan_tree)
 add_test(NAME fused_tree_build COMMAND test_fused_tree_build)

@@ -115,9 +115,15 @@ std::int64_t compressed_table::num_rows() const
 }
 
 std::unique_ptr<cudf::table> compressed_table::decompress(rmm::cuda_stream_view stream,
-                                                          rmm::device_async_resource_ref mr) const
+                                                          rmm::device_async_resource_ref mr) const&
 {
   return simpatico::decompress(*this, stream, mr);
+}
+
+std::unique_ptr<cudf::table> compressed_table::decompress(rmm::cuda_stream_view stream,
+                                                          rmm::device_async_resource_ref mr) &&
+{
+  return simpatico::decompress(std::move(*this), stream, mr);
 }
 
 // ── split_plan_dsl ────────────────────────────────────────────────────────────
@@ -203,6 +209,22 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
     if (!col.compound) throw plan_error("compressed_table column missing compound");
     cols.push_back(
       detail::apply_stored_dtype(simpatico::decompress(*col.compound, stream, mr), col.dtype));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+std::unique_ptr<cudf::table> decompress(compressed_table&& table,
+                                        rmm::cuda_stream_view stream,
+                                        rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(table.num_columns());
+  for (auto& col : table.columns) {
+    if (!col.compound) throw plan_error("compressed_table column missing compound");
+    std::string err;
+    auto c = decompress_column(*col.compound, consume_tag{}, stream, mr, &err);
+    if (!c) throw plan_error(err.empty() ? "decompress failed" : err);
+    cols.push_back(detail::apply_stored_dtype(std::move(c), col.dtype));
   }
   return std::make_unique<cudf::table>(std::move(cols));
 }

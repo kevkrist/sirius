@@ -10,7 +10,10 @@
 #include <cudf/column/column.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <cuda_runtime.h>
 
 #include <atomic>
 #include <mutex>
@@ -100,6 +103,16 @@ inline void validate_column_names(std::vector<std::string> const& column_names, 
                      ") does not match num_columns (" + std::to_string(num_columns) + ")");
   }
 }
+
+// ---------------------------------------------------------------------------
+// Staged-decision completion probe
+// ---------------------------------------------------------------------------
+
+/// How staged_compression proves its stream is quiescent before accept()/reject() move any
+/// ownership. Null in production, where the probe is cudaStreamSynchronize; tests point it at a
+/// failing stub to exercise the decision-failure contract without wedging the CUDA context.
+using completion_probe = cudaError_t (*)(rmm::cuda_stream_view) noexcept;
+extern thread_local completion_probe stage_completion_probe;
 
 // ---------------------------------------------------------------------------
 // Stream pool construction
@@ -210,24 +223,34 @@ inline std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table
   std::mutex err_mu;
 
   size_t const n_workers = pool.streams.size();
+  if (n_workers == 0) throw plan_error("stream_pool has no streams");
   std::vector<std::thread> workers;
   workers.reserve(n_workers);
   for (size_t w = 0; w < n_workers; ++w) {
     workers.emplace_back([&, w]() {
-      while (true) {
-        size_t i = next.fetch_add(1, std::memory_order_relaxed);
-        if (i >= table.num_columns()) break;
-        if (failed.load(std::memory_order_relaxed)) continue;
+      try {
+        while (true) {
+          size_t i = next.fetch_add(1, std::memory_order_relaxed);
+          if (i >= table.num_columns()) break;
+          if (failed.load(std::memory_order_relaxed)) continue;
 
-        rmm::cuda_stream_view stream{pool.streams[w % pool.streams.size()]};
-        std::string err;
-        auto col = decompress_column(*table.columns[i].compound, stream, mr, &err);
-        if (!col) {
-          std::lock_guard<std::mutex> lock(err_mu);
-          if (!failed.exchange(true)) err_msg = err;
-          continue;
+          if (!table.columns[i].compound) throw plan_error("compressed column missing compound");
+          rmm::cuda_stream_view stream{pool.streams[w % pool.streams.size()]};
+          std::string err;
+          auto col = decompress_column(*table.columns[i].compound, stream, mr, &err);
+          if (!col) {
+            std::lock_guard<std::mutex> lock(err_mu);
+            if (!failed.exchange(true)) err_msg = err;
+            continue;
+          }
+          cols[i] = apply_stored_dtype(std::move(col), table.columns[i].dtype);
         }
-        cols[i] = apply_stored_dtype(std::move(col), table.columns[i].dtype);
+      } catch (std::exception const& e) {
+        std::lock_guard<std::mutex> lock(err_mu);
+        if (!failed.exchange(true)) err_msg = e.what();
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(err_mu);
+        if (!failed.exchange(true)) err_msg = "unknown decompression worker exception";
       }
     });
   }
