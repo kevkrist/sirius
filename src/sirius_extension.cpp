@@ -82,6 +82,7 @@ extern "C" int cudaProfilerStop();
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 // #include "from_substrait.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_buffer_manager.hpp"
@@ -1270,9 +1271,12 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   if (data.args.tier == "host") {
-    auto host_result = sirius::materialize_pin_to_host_with_compression(
-      *ingestible, gpu_spaces_mut, host_space_by_gpu, *scan_mgr.io_ctx(), pin_comp,
-      pinned_column_types);
+    auto host_result = sirius::materialize_pin_to_host_with_compression(*ingestible,
+                                                                        gpu_spaces_mut,
+                                                                        host_space_by_gpu,
+                                                                        *scan_mgr.io_ctx(),
+                                                                        pin_comp,
+                                                                        pinned_column_types);
 
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
@@ -1336,7 +1340,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
-    auto mat  = sirius::materialize_all_batches(
+    auto mat = sirius::materialize_all_batches(
       *ingestible, gpu_spaces_mut, *scan_mgr.io_ctx(), pinned_column_types);
     auto mvcc = make_pin_mvcc(std::move(mat.base_row_count_per_chunk));
     scan_mgr.insert_pinned_entry(data.args.name,
@@ -1829,6 +1833,22 @@ static void SetPinTableCompressionMaxCompressedFraction(ClientContext& context,
   SIRIUS_LOG_DEBUG("Updated pin_table_compression_max_compressed_fraction to {}", fraction);
 }
 
+static void SetCompressionColumnThreads(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  const auto value = BigIntValue::Get(parameter);
+  if (value <= 0 || value > std::numeric_limits<int>::max()) {
+    throw InvalidInputException("compression_column_threads must be in [1, %d], got %lld",
+                                std::numeric_limits<int>::max(),
+                                static_cast<long long>(value));
+  }
+  const auto n                                                     = static_cast<int>(value);
+  sirius_ctx->get_config().get_compression_config().column_threads = n;
+  sirius::set_decompress_column_threads(n);
+  SIRIUS_LOG_DEBUG("Updated compression_column_threads to {}", n);
+}
+
 static void SetEnableDynamicFilterPushdown(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2113,6 +2133,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::DOUBLE,
     Value::DOUBLE(0.95),
     SetPinTableCompressionMaxCompressedFraction);
+
+  config.AddExtensionOption(
+    "compression_column_threads",
+    "Column-parallelism degree for scan-time Simpatico decompression: fan a table's columns "
+    "across this many worker threads/streams (one column per stream). Must be positive; 1 is "
+    "sequential and larger values are capped at the column count",
+    LogicalType::BIGINT,
+    Value::BIGINT(4),
+    SetCompressionColumnThreads);
 
   config.AddExtensionOption(
     "enable_dynamic_filter_pushdown",

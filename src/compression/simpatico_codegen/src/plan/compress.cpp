@@ -462,7 +462,12 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   PlanNode const& node    = tree.nodes[n];
   ValueId const input_val = node.input_sources[0];
   std::string const path  = path_for_value(tree, input_val);
-  auto compressor         = make_compressor(node.op);
+  // Identity's public channel contract is always {data}, including for STRING.
+  // Only a bare identity is a storage leaf; lower that one case to str_split so
+  // the candidate owns serializable offsets/chars[/null_mask] buffers.
+  bool const split_bare_string_identity =
+    node.op == "identity" && node.output_names.empty() && col.type().id() == cudf::type_id::STRING;
+  auto compressor = make_compressor(split_bare_string_identity ? "str_split" : node.op);
   if (!compressor) {
     set_error("unknown compressor '" + node.op + "'");
     return;
@@ -580,16 +585,19 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
 
     if (!consumer_by_input.count(output_val)) {
       // A terminal leaf always owns its bytes. Projected root views may feed codecs, but can
-      // never escape into the candidate.
-      auto leaf_col = copy_identity_leaf(out_it->second, output_path, stream, mr);
-      if (!leaf_col) {
-        set_error("failed to get column for identity leaf '" + output_path + "'");
+      // never escape into the candidate. A routed STRING identity is also a storage leaf, so
+      // lower it without changing identity's routed {data} contract above.
+      std::unique_ptr<compressed_representation> leaf;
+      if (node.op == "identity" && out_it->second.type().id() == cudf::type_id::STRING) {
+        leaf = str_split_compressor{}.compress(out_it->second, stream, mr);
+      } else if (auto leaf_col = copy_identity_leaf(out_it->second, output_path, stream, mr)) {
+        leaf = std::make_unique<identity_compressed_representation>(std::move(leaf_col));
+      }
+      if (!leaf) {
+        set_error("failed to materialize terminal leaf '" + output_path + "'");
         return;
       }
-      place(n,
-            output_val,
-            output_path,
-            std::make_unique<identity_compressed_representation>(std::move(leaf_col)));
+      place(n, output_val, output_path, std::move(leaf));
     } else if (component != component_of.end()) {
       // Consumed downstream: its compressor may materialize directly from the borrowed view.
       // Root-backed values have no repr key; release_column only drops their view.

@@ -11,7 +11,12 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <cuda_runtime.h>
+
+#include <algorithm>
 #include <atomic>
+#include <exception>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -30,6 +35,12 @@ class plan_error : public std::runtime_error {
  public:
   explicit plan_error(std::string const& msg) : std::runtime_error(msg) {}
 };
+
+void throw_if_cuda_error(cudaError_t status, std::string_view operation)
+{
+  if (status == cudaSuccess) return;
+  throw plan_error(std::string{operation} + ": " + cudaGetErrorString(status));
+}
 
 std::string trim_plan_block(std::string s)
 {
@@ -94,10 +105,10 @@ void validate_column_names(std::vector<std::string> const& column_names, size_t 
 }
 
 // Create a stream pool with exactly max(1, column_threads) streams.
-stream_pool make_internal_pool(int column_threads)
+std::shared_ptr<stream_pool> make_internal_pool(int column_threads)
 {
-  stream_pool pool;
-  if (!pool.init(static_cast<size_t>(std::max(1, column_threads)))) {
+  auto pool = std::make_shared<stream_pool>();
+  if (!pool->init(static_cast<size_t>(std::max(1, column_threads)))) {
     throw plan_error("failed to initialize internal stream_pool");
   }
   return pool;
@@ -105,8 +116,9 @@ stream_pool make_internal_pool(int column_threads)
 
 // Run `body(i, stream)` for every column index in [0, n_items) across the pool's
 // worker streams. Threads pull indices atomically; `body` signals failure by
-// throwing (any exception is caught, its message preserved). The first failure
-// is rethrown as plan_error after all workers join and the pool syncs.
+// throwing (any exception is caught, its message preserved). A worker failure
+// is rethrown as plan_error after all workers join and the pool syncs; a thread
+// construction failure propagates only after already-started workers join.
 template <typename Body>
 void run_column_workers(size_t n_items, stream_pool& pool, Body&& body)
 {
@@ -117,36 +129,53 @@ void run_column_workers(size_t n_items, stream_pool& pool, Body&& body)
 
   size_t const n_workers = pool.streams.size();
   if (n_workers == 0) throw plan_error("stream_pool has no streams");
-  std::vector<std::thread> workers;
-  workers.reserve(n_workers);
-  for (size_t w = 0; w < n_workers; ++w) {
-    workers.emplace_back([&, w]() {
-      try {
-        while (true) {
-          size_t i = next.fetch_add(1, std::memory_order_relaxed);
-          if (i >= n_items) break;
-          if (failed.load(std::memory_order_relaxed)) continue;
-          rmm::cuda_stream_view stream{pool.streams[w % pool.streams.size()]};
-          body(i, stream);
-        }
-      } catch (std::exception const& e) {
-        std::lock_guard<std::mutex> lock(err_mu);
-        if (!failed.exchange(true)) err_msg = e.what();
-      } catch (...) {
-        std::lock_guard<std::mutex> lock(err_mu);
-        if (!failed.exchange(true)) err_msg = "column worker failed with an unknown exception";
+  // Worker threads must bind the same device as the spawning thread: the fused
+  // codegen path launches kernels through the driver API (cuLaunchKernel), which
+  // uses the calling thread's current context — a fresh std::thread has none, so
+  // without this the launch fails with "invalid resource handle".
+  int device = 0;
+  throw_if_cuda_error(cudaGetDevice(&device), "cudaGetDevice for column workers");
+
+  std::exception_ptr thread_creation_error;
+  {
+    std::vector<std::jthread> workers;
+    try {
+      workers.reserve(n_workers);
+      for (size_t w = 0; w < n_workers; ++w) {
+        workers.emplace_back([&, w, device]() {
+          try {
+            throw_if_cuda_error(cudaSetDevice(device), "cudaSetDevice for column worker");
+            while (true) {
+              size_t i = next.fetch_add(1, std::memory_order_relaxed);
+              if (i >= n_items) break;
+              if (failed.load(std::memory_order_relaxed)) continue;
+              rmm::cuda_stream_view stream{pool.streams[w]};
+              body(i, stream);
+            }
+          } catch (std::exception const& e) {
+            std::lock_guard<std::mutex> lock(err_mu);
+            if (!failed.exchange(true)) err_msg = e.what();
+          } catch (...) {
+            std::lock_guard<std::mutex> lock(err_mu);
+            if (!failed.exchange(true)) err_msg = "column worker failed with an unknown exception";
+          }
+        });
       }
-    });
-  }
-  for (auto& t : workers)
-    t.join();
+    } catch (...) {
+      failed.store(true);
+      thread_creation_error = std::current_exception();
+    }
+  }  // jthread destruction joins every successfully-started worker.
+
   pool.sync_all();
+  if (thread_creation_error) std::rethrow_exception(thread_creation_error);
   if (failed.load()) throw plan_error(err_msg.empty() ? "column worker failed" : err_msg);
 }
 
 compressed_table compress_columns_parallel(cudf::table_view table,
                                            std::vector<std::string> const& plans,
                                            stream_pool& pool,
+                                           std::shared_ptr<stream_pool> const& stream_lifetime,
                                            rmm::device_async_resource_ref mr,
                                            std::vector<std::string> const& column_names)
 {
@@ -157,6 +186,7 @@ compressed_table compress_columns_parallel(cudf::table_view table,
     auto compound =
       compress_column(table.column(static_cast<cudf::size_type>(i)), plans[i], stream, mr, &err);
     if (!compound) throw plan_error(err.empty() ? "compress failed" : err);
+    compound->stream_lifetime = stream_lifetime;
     compressed_column col;
     col.dtype    = table.column(static_cast<cudf::size_type>(i)).type();
     col.num_rows = table.num_rows();
@@ -190,6 +220,38 @@ std::unique_ptr<cudf::column> apply_stored_dtype(std::unique_ptr<cudf::column> c
     stored, n, std::move(*contents.data), std::move(null_mask), nc, std::move(contents.children));
 }
 
+std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
+                                                   rmm::cuda_stream_view stream)
+{
+  if (!col) return col;
+
+  auto const dtype        = col->type();
+  auto const size         = col->size();
+  auto const nulls        = col->null_count();
+  auto contents           = col->release();
+  rmm::device_buffer data = contents.data ? std::move(*contents.data) : rmm::device_buffer{};
+  rmm::device_buffer null_mask =
+    contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
+  data.set_stream(stream);
+  null_mask.set_stream(stream);
+  for (auto& child : contents.children) {
+    child = rebind_column_stream(std::move(child), stream);
+  }
+  return std::make_unique<cudf::column>(
+    dtype, size, std::move(data), std::move(null_mask), nulls, std::move(contents.children));
+}
+
+std::unique_ptr<cudf::table> rebind_table_stream(std::unique_ptr<cudf::table> table,
+                                                 rmm::cuda_stream_view stream)
+{
+  if (!table) return table;
+  auto columns = table->release();
+  for (auto& column : columns) {
+    column = rebind_column_stream(std::move(column), stream);
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const& table,
                                                          stream_pool& pool,
                                                          rmm::device_async_resource_ref mr)
@@ -197,6 +259,9 @@ std::unique_ptr<cudf::table> decompress_columns_parallel(compressed_table const&
   std::vector<std::unique_ptr<cudf::column>> cols(table.num_columns());
   run_column_workers(
     static_cast<size_t>(table.num_columns()), pool, [&](size_t i, rmm::cuda_stream_view stream) {
+      if (!table.columns[i].compound) {
+        throw plan_error("compressed_table column missing compound");
+      }
       std::string err;
       auto col = decompress_column(*table.columns[i].compound, stream, mr, &err);
       if (!col) throw plan_error(err.empty() ? "decompress failed" : err);
@@ -282,7 +347,7 @@ compressed_table compress_with_plan(cudf::table_view table,
 {
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
   auto pool  = make_internal_pool(column_threads);
-  return compress_columns_parallel(table, plans, pool, mr, column_names);
+  return compress_columns_parallel(table, plans, *pool, pool, mr, column_names);
 }
 
 compressed_table compress_with_plan(cudf::table_view table,
@@ -292,7 +357,8 @@ compressed_table compress_with_plan(cudf::table_view table,
                                     std::vector<std::string> column_names)
 {
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
-  return compress_columns_parallel(table, plans, pool, mr, column_names);
+  return compress_columns_parallel(
+    table, plans, pool, std::shared_ptr<stream_pool>{}, mr, column_names);
 }
 
 // ── decompress ────────────────────────────────────────────────────────────────
@@ -331,7 +397,8 @@ std::unique_ptr<cudf::table> decompress(compressed_table&& table,
     std::string err;
     auto c = decompress_column(*col.compound, consume_tag{}, stream, mr, &err);
     if (!c) throw plan_error(err.empty() ? "decompress failed" : err);
-    cols.push_back(apply_stored_dtype(std::move(c), col.dtype));
+    c = apply_stored_dtype(std::move(c), col.dtype);
+    cols.push_back(rebind_column_stream(std::move(c), stream));
   }
   return std::make_unique<cudf::table>(std::move(cols));
 }
@@ -340,8 +407,9 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         int column_threads,
                                         rmm::device_async_resource_ref mr)
 {
-  auto pool = make_internal_pool(column_threads);
-  return decompress_columns_parallel(table, pool, mr);
+  auto pool   = make_internal_pool(column_threads);
+  auto result = decompress_columns_parallel(table, *pool, mr);
+  return rebind_table_stream(std::move(result), cudf::get_default_stream());
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,

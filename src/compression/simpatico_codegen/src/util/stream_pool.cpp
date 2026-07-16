@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "codegen/util/stream_pool.hpp"
 
+#include <stdexcept>
+#include <string>
+
 namespace simpatico {
 
 bool stream_pool::init(size_t n)
@@ -20,19 +23,25 @@ bool stream_pool::init(size_t n)
   return true;
 }
 
-void stream_pool::shutdown()
+void stream_pool::shutdown() noexcept
 {
   for (auto& stream : streams) {
-    cudaStreamSynchronize(stream);
-    cudaStreamDestroy(stream);
+    (void)cudaStreamSynchronize(stream);
+    (void)cudaStreamDestroy(stream);
   }
   streams.clear();
 }
 
 void stream_pool::sync_all()
 {
+  cudaError_t first_error = cudaSuccess;
   for (auto& stream : streams) {
-    cudaStreamSynchronize(stream);
+    auto const status = cudaStreamSynchronize(stream);
+    if (first_error == cudaSuccess && status != cudaSuccess) first_error = status;
+  }
+  if (first_error != cudaSuccess) {
+    throw std::runtime_error(std::string{"stream_pool synchronization failed: "} +
+                             cudaGetErrorString(first_error));
   }
 }
 

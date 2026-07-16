@@ -98,6 +98,16 @@ compressed_table roundtrip_once(cudf::table_view input,
       ? compress_with_plan(
           input, dsl, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref())
       : compress_with_plan(input, dsl, threads, rmm::mr::get_current_device_resource_ref());
+  if (threads > 1 && !ct.columns.empty()) {
+    expect(ct.columns.front().compound != nullptr, "internal parallel compression: null compound");
+    auto const owner = ct.columns.front().compound->stream_lifetime;
+    expect(owner != nullptr, "internal parallel compression must retain its stream pool");
+    for (auto const& column : ct.columns) {
+      expect(column.compound != nullptr, "internal parallel compression: null compound");
+      expect(column.compound->stream_lifetime == owner,
+             "internal parallel compression: compounds must share one stream pool");
+    }
+  }
   auto out =
     (threads <= 1)
       ? decompress(ct, cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref())

@@ -157,6 +157,12 @@ struct compression_config {
   /// exists for a table, that table is pinned uncompressed regardless of the
   /// enable flag.  Empty string = feature disabled.
   std::string input_plan_dir{};
+
+  /// Positive degree of column-parallelism for scan-time Simpatico
+  /// decompression. 1 selects the single-stream path; larger values are capped
+  /// at the column count. Staged pin-time compression remains single-stream
+  /// because its accept/reject transaction is bound to one stream's lifetime.
+  int column_threads{4};
 };
 
 struct sirius_config {

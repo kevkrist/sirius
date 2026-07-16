@@ -71,6 +71,7 @@ inline std::string type_id_to_name(cudf::data_type const& type)
 }
 
 namespace simpatico {
+
 namespace detail {
 
 /// Validate that a raw compressed payload can be represented as a cuDF UINT8 column. cuDF column
@@ -141,6 +142,8 @@ struct compressed_representation {
   // Reconstructed column's type and row count, carried uniformly by every rep.
   cudf::data_type original_type{cudf::type_id::EMPTY};
   cudf::size_type num_rows{0};
+  // Channel columns in registry order (populated by subclass constructors).
+  std::vector<std::unique_ptr<cudf::column>> channels_;
 
   compressed_representation() = default;
   compressed_representation(cudf::data_type t, cudf::size_type n) : original_type(t), num_rows(n) {}
@@ -157,15 +160,18 @@ struct compressed_representation {
     return decompress(stream, mr);
   }
 
-  /// Canonical channel enumeration: this rep's named output channels, in
-  /// manifest/wire order. This is the ONE accessor for a rep's channels,
-  /// serving both the compress/writer side (further-compress a channel, sum
-  /// wire size) and the decode-side JIT gather.
-  /// Views borrow rep storage; callers provide lifetime and stream ordering.
-  virtual std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const
+  /// Canonical channel enumeration: this rep's named output channels, in manifest/wire order.
+  /// Generic implementation: driven by channels_ + op_info(kind()).channels from the registry.
+  /// Subclasses with variable-arity or lazy synthesis (dictionary, bitextract) override this.
+  virtual std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const
   {
     ensure_not_consumed();
-    return {};
+    auto const& names = op_info(kind()).channels;
+    std::vector<compressible_output> out;
+    out.reserve(channels_.size());
+    for (size_t i = 0; i < channels_.size() && i < names.size(); ++i)
+      if (channels_[i]) out.push_back({names[i], channels_[i]->view()});
+    return out;
   }
 
   /// Channels that MUST be routed by the plan, else the driver errors -- preventing silent data
@@ -238,21 +244,19 @@ struct identity_compressed_representation : compressed_representation {
     rmm::device_async_resource_ref mr,
     std::string* error_out);
 
-  std::unique_ptr<cudf::column> col;
-
   explicit identity_compressed_representation(std::unique_ptr<cudf::column> c)
     : compressed_representation(c ? c->type() : cudf::data_type{cudf::type_id::EMPTY},
-                                c ? c->size() : 0),
-      col(std::move(c))
+                                c ? c->size() : 0)
   {
+    channels_.push_back(std::move(c));
   }
 
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override
   {
     ensure_not_consumed();
-    if (col == nullptr) return nullptr;
-    return std::make_unique<cudf::column>(*col, stream, mr);
+    if (channels_.empty() || !channels_[0]) return nullptr;
+    return std::make_unique<cudf::column>(*channels_[0], stream, mr);
   }
 
   std::unique_ptr<cudf::column> take_decompressed(rmm::cuda_stream_view,
@@ -260,14 +264,7 @@ struct identity_compressed_representation : compressed_representation {
   {
     ensure_not_consumed();
     consumed_ = true;
-    return std::move(col);  // owns its copy; hand it straight out
-  }
-
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
-  {
-    ensure_not_consumed();
-    if (col == nullptr) return {};
-    return {{"data", col->view()}};
+    return channels_.empty() ? nullptr : std::move(channels_[0]);
   }
   OpId kind() const override { return OpId::Identity; }
 };
@@ -296,15 +293,14 @@ struct compressor {
   }
 };
 
-/// Identity compressor: no-op passthrough, used for leaf nodes that are stored as-is.
+/// Identity compressor: no-op passthrough, used for values routed through the
+/// registry-defined `data` channel. Storage-specific lowering (for example,
+/// splitting a terminal STRING into serializable buffers) belongs to the plan
+/// driver rather than changing this compressor's channel contract.
 struct identity_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
                                                       rmm::cuda_stream_view stream,
-                                                      rmm::device_async_resource_ref mr) override
-  {
-    auto col_copy = std::make_unique<cudf::column>(column_to_compress, stream, mr);
-    return std::make_unique<identity_compressed_representation>(std::move(col_copy));
-  }
+                                                      rmm::device_async_resource_ref mr) override;
 
   /// Identity stores its input as-is, so its one channel is the whole of whatever it was
   /// handed. The driver rebases `whole_column` onto that value's own provenance: identity
@@ -531,6 +527,8 @@ struct dictionary_compressor : compressor {
 // {offsets, chars}; a nullable column also exposes null_mask, which is marked
 // required() so the driver errors if the plan fails to route it.
 // -----------------------------------------------------------------------------
+// Unlike fixed-arity representations backed directly by channels_, str_split keeps raw chars and
+// mask buffers so destructive decode can transfer them without making const decode single-use.
 struct str_split_compressed_representation : compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
@@ -565,7 +563,7 @@ struct str_split_compressed_representation : compressed_representation {
 
   std::vector<std::string> required_channels() const override;
 
-  // kind() defaults to Unknown -- only the deferred .hpln path reads it.
+  OpId kind() const override { return OpId::StrSplit; }
 };
 
 struct str_split_compressor : compressor {
@@ -583,190 +581,43 @@ struct str_split_compressor : compressor {
 };
 
 // -----------------------------------------------------------------------------
-// Bitpack compressor: variance-based chunking, min per chunk, bit-packed (value - min)
-// -----------------------------------------------------------------------------
-
-/// Bitpack format: chunks determined by variance heuristic (when range would need ~2x bits, start
-/// new chunk). Each chunk stores: min (original type), then bit-packed (value - min) with bits =
-/// ceil(log2(range+1)). Uses cudf::column for type-erased storage so chunk_min preserves
-/// INT8/INT16/INT32/INT64/timestamp/etc.
-struct bitpack_compressed_representation : compressed_representation {
-  // ``packed`` may be absent (entropy-tail-routed); matched by channel name.
-  // ``num_rows_hint`` (0 = unknown) skips the chunk_count device read.
-  static std::unique_ptr<compressed_representation> from_outputs(
-    std::vector<std::string> const& output_names,
-    std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr,
-    std::string* error_out,
-    std::uint64_t num_rows_hint = 0);
-
-  std::unique_ptr<cudf::column> chunk_min;    // min per chunk (original_type; one row per chunk)
-  std::unique_ptr<cudf::column> chunk_count;  // INT32, one row per chunk
-  std::unique_ptr<cudf::column> chunk_bits;   // UINT8, bits per element per chunk
-  std::unique_ptr<cudf::column> packed;       // UINT8, concatenated bit-packed bytes
-  // ``packed`` is always the tight, dense live-bytes buffer for any rep that
-  // escapes the encoder: file-read reps are built dense, and fused-encode reps
-  // are densified in place (compact_in_place()) before they are stored.
-
-  // ---- OverAllocate→Compact transient scratch ----
-  // The fused encode kernel emits ``packed`` in slot-strided OverAllocate
-  // layout; the OverAllocate ctor records the per-chunk slot stride
-  // (``stride_words_``, uint32 words = CHUNK*elem_size/4) and the precomputed
-  // total live byte count (``live_packed_bytes_sparse_``) so compact_in_place()
-  // can gather ``packed`` down to the tight Compact layout. They exist only to
-  // carry the OverAllocate layout from the encode kernel into that single
-  // compaction, and are cleared once it runs; a dense (file-read) rep leaves
-  // stride_words_=0.
-  std::int32_t stride_words_{0};
-  std::int64_t live_packed_bytes_sparse_{0};
-
-  OpId kind() const override { return OpId::Bitpack; }
-
-  /// Live byte count of the ``packed`` channel (UINT32 words: size x elem width).
-  std::int64_t live_packed_bytes() const
-  {
-    return packed ? static_cast<std::int64_t>(packed->size()) *
-                      static_cast<std::int64_t>(cudf::size_of(packed->type()))
-                  : 0;
-  }
-
-  /// Dense ctor. ``packed_data`` must already be tight/compact (no slot
-  /// padding) — the layout every stored rep has.
-  bitpack_compressed_representation(cudf::data_type type,
-                                    cudf::size_type n_rows,
-                                    std::unique_ptr<cudf::column> mins,
-                                    std::unique_ptr<cudf::column> counts,
-                                    std::unique_ptr<cudf::column> bits_per_chunk,
-                                    std::unique_ptr<cudf::column> packed_data)
-    : compressed_representation(type, n_rows),
-      chunk_min(std::move(mins)),
-      chunk_count(std::move(counts)),
-      chunk_bits(std::move(bits_per_chunk)),
-      packed(std::move(packed_data))
-  {
-  }
-
-  /// OverAllocate ctor. Takes ownership of the slot-strided ``packed_data``
-  /// straight from the fused encode kernel. ``stride_words`` is the per-chunk
-  /// slot stride in uint32 words; ``live_packed_bytes`` the precomputed total
-  /// live byte count. The caller MUST compact_in_place() this rep before it is
-  /// stored or enumerated — that gathers ``packed`` down to the tight Compact
-  /// layout (computing per-chunk live_words from chunk_bits × chunk_count).
-  bitpack_compressed_representation(cudf::data_type type,
-                                    cudf::size_type n_rows,
-                                    std::unique_ptr<cudf::column> mins,
-                                    std::unique_ptr<cudf::column> counts,
-                                    std::unique_ptr<cudf::column> bits_per_chunk,
-                                    std::unique_ptr<cudf::column> packed_data_overalloc,
-                                    std::int32_t stride_words,
-                                    std::int64_t live_packed_bytes)
-    : compressed_representation(type, n_rows),
-      chunk_min(std::move(mins)),
-      chunk_count(std::move(counts)),
-      chunk_bits(std::move(bits_per_chunk)),
-      packed(std::move(packed_data_overalloc)),
-      stride_words_(stride_words),
-      live_packed_bytes_sparse_(live_packed_bytes)
-  {
-  }
-
-  /// Densify ``*this`` in place: replace the OverAllocate ``packed`` with its
-  /// tight Compact bytes (scan+gather) and clear the OverAllocate scratch. The
-  /// existing meta columns (chunk_min/count/bits) are REUSED — no clone — so
-  /// this is the cheap path for the ephemeral OverAllocate rep the fused encode
-  /// owns and keeps (eager-compaction right after encode). No-op for a rep that
-  /// is already dense (stride_words_==0). Work is enqueued on ``stream``; the
-  /// caller must sync before reading the dense bytes from another stream.
-  void compact_in_place(
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
-
-  // Bitpack is a codegen-only operator: encode/decode go through the fused
-  // codegen backend (Bitpack node), so there is no C++ kernel decode path.
-  // The rep still carries the packed buffers for the codegen gather, compact,
-  // and file-write paths.
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view,
-                                           rmm::device_async_resource_ref) const override
-  {
-    throw std::runtime_error(
-      "bitpack_compressed_representation: reconstruct via the codegen decode "
-      "path, not C++ decompress()");
-  }
-
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
-  {
-    std::vector<compressible_output> outs;
-    outs.reserve(4);
-    if (chunk_min) outs.push_back({"chunk_min", chunk_min->view()});
-    if (chunk_count) outs.push_back({"chunk_count", chunk_count->view()});
-    if (chunk_bits) outs.push_back({"chunk_bits", chunk_bits->view()});
-    // ``packed`` is always the tight Compact buffer (the fused encode densifies
-    // via compact_in_place() before storing).
-    if (packed) { outs.push_back({"packed", packed->view()}); }
-    return outs;
-  }
-
-  size_t compressed_size_bytes(rmm::cuda_stream_view) const override
-  {
-    size_t total = 0;
-    if (chunk_min) {
-      total += static_cast<size_t>(chunk_min->size()) *
-               static_cast<size_t>(cudf::size_of(chunk_min->type()));
-    }
-    if (chunk_count) {
-      total += static_cast<size_t>(chunk_count->size()) *
-               static_cast<size_t>(cudf::size_of(chunk_count->type()));
-    }
-    if (chunk_bits) {
-      total += static_cast<size_t>(chunk_bits->size()) *
-               static_cast<size_t>(cudf::size_of(chunk_bits->type()));
-    }
-    total += static_cast<size_t>(live_packed_bytes());
-    return total;
-  }
-};
-
-// -----------------------------------------------------------------------------
 // nvcomp-backed representations
 // -----------------------------------------------------------------------------
 //
 // Every nvcomp codec (ans/bitcomp/cascaded and the simpler snappy/lz4/deflate)
-// stores the same thing: an opaque, worst-case-sized compressed byte payload
-// plus its actual size, surfaced as a single lazy "output" channel. This base
-// owns that storage and plumbing; concrete reps add codec-specific metadata
-// fields and supply kind()/describe_meta()/decompress().
+// stores the same thing: an opaque compressed byte payload held as a single
+// UINT8 channel (channels_[0], size = actual compressed bytes). Concrete reps
+// add codec-specific metadata fields and supply kind()/describe_meta()/decompress().
 struct nvcomp_payload_rep : compressed_representation {
   size_t uncompressed_size = 0;
-  std::unique_ptr<rmm::device_buffer> compressed_data;  // worst-case sized
-  size_t compressed_size = 0;                           // actual bytes used
 
+  // Takes ownership of the worst-case-sized device_buffer and wraps it as a
+  // UINT8 column of exactly comp_sz elements (logical size may be < buffer size;
+  // cudf allows that).
   nvcomp_payload_rep(cudf::data_type t,
                      cudf::size_type n,
                      std::unique_ptr<rmm::device_buffer> data,
                      size_t comp_sz,
                      size_t uncomp_sz)
-    : compressed_representation(t, n),
-      uncompressed_size(uncomp_sz),
-      compressed_data(std::move(data)),
-      compressed_size(comp_sz)
+    : compressed_representation(t, n), uncompressed_size(uncomp_sz)
   {
+    auto const payload = detail::compressed_payload_view(data.get(), comp_sz, "nvcomp");
+    channels_.push_back(
+      std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::UINT8},
+                                     payload.size(),
+                                     data ? std::move(*data) : rmm::device_buffer{},
+                                     rmm::device_buffer{},
+                                     0));
   }
 
-  // compressed_size is known at construction — no need to build the lazy column.
-  size_t compressed_size_bytes(rmm::cuda_stream_view) const override { return compressed_size; }
-
-  // Single "output" channel: a fabricated, non-owning UINT8 view over the first compressed_size
-  // bytes of the stored worst-case-sized payload — no copy, no allocation.
-  //
-  // Ordering contract: the bytes are meaningful only after the producing stream's compress work
-  // completes; the compress walk syncs the node's stream before describe/serialize runs. The view
-  // is valid exactly as long as this rep is alive.
-  [[nodiscard]] std::vector<compressible_output> named_channels(
-    rmm::cuda_stream_view) const override
+  // Raw access for decompress() impls (avoids a device_buffer round-trip).
+  const void* payload_data() const
   {
-    return {{"output",
-             detail::compressed_payload_view(compressed_data.get(), compressed_size, "nvcomp")}};
+    return (channels_.empty() || !channels_[0]) ? nullptr : channels_[0]->view().head<void>();
+  }
+  size_t payload_size() const
+  {
+    return (channels_.empty() || !channels_[0]) ? 0 : static_cast<size_t>(channels_[0]->size());
   }
 };
 
@@ -1044,11 +895,9 @@ struct deflate_compressor : compressor {
 
 // -----------------------------------------------------------------------------
 // ALP (Adaptive Lossless floating-Point), FLOAT32, multi-output.
-// See SIGMOD '24 (Afroozeh) + G-ALP DaMoN '25. Outputs:
-//   integers             INT32  — n_rows (0 at exception slots)
-//   exceptions           FLOAT32 — values that failed lossless encode
-//   exception_positions  INT32  — sorted row indices of exceptions
-//   metadata             UINT16 — one per 1024-vector: (e<<8) | f
+// See SIGMOD '24 (Afroozeh) + G-ALP DaMoN '25.
+// channels_[0]=integers (INT32/INT64), [1]=exceptions (FLOAT32/FLOAT64),
+// [2]=exception_positions (INT32), [3]=metadata (UINT16, one per 1024-vector).
 struct alp_compressed_representation : compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
@@ -1057,11 +906,7 @@ struct alp_compressed_representation : compressed_representation {
     rmm::device_async_resource_ref mr,
     std::string* error_out);
 
-  cudf::size_type num_vectors;                        // ceil(num_rows / 1024)
-  std::unique_ptr<cudf::column> integers;             // INT32 (f32) / INT64 (f64)
-  std::unique_ptr<cudf::column> exceptions;           // FLOAT32 / FLOAT64
-  std::unique_ptr<cudf::column> exception_positions;  // INT32
-  std::unique_ptr<cudf::column> metadata;             // UINT16
+  cudf::size_type num_vectors;  // ceil(num_rows / 1024)
 
   alp_compressed_representation(cudf::data_type type,
                                 cudf::size_type n_rows,
@@ -1074,14 +919,22 @@ struct alp_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
+  // Named accessors for decompress impl (channels_ in registry order).
+  const cudf::column* integers() const
   {
-    return {
-      {"integers", integers->view()},
-      {"exceptions", exceptions->view()},
-      {"exception_positions", exception_positions->view()},
-      {"metadata", metadata->view()},
-    };
+    return channels_.size() > 0 ? channels_[0].get() : nullptr;
+  }
+  const cudf::column* exceptions() const
+  {
+    return channels_.size() > 1 ? channels_[1].get() : nullptr;
+  }
+  const cudf::column* exception_positions() const
+  {
+    return channels_.size() > 2 ? channels_[2].get() : nullptr;
+  }
+  const cudf::column* metadata() const
+  {
+    return channels_.size() > 3 ? channels_[3].get() : nullptr;
   }
 
   OpId kind() const override { return OpId::Alp; }
@@ -1098,13 +951,10 @@ struct alp_compressor : compressor {
 
 // ALP-RD (Right-Dictionary), FLOAT32, multi-output. Column-wide K=8 dict +
 // right_bw; deviates from cwida CPU reference (per-rowgroup dict) to keep
-// right_parts fixed-width for downstream bitpack. Outputs:
-//   right_parts          UINT32 — low right_bw bits of each value
-//   dict_indices         UINT8  — 0..7 dict slot, 8 = exception marker
-//   dict                 UINT16 — 8 entries (column-wide)
-//   metadata             UINT8  — 1 entry: right_bw
-//   exceptions           UINT16 — rejected left parts
-//   exception_positions  INT32  — sorted row indices of exceptions
+// right_parts fixed-width for downstream bitpack.
+// channels_[0]=right_parts (UINT32/UINT64), [1]=dict_indices (UINT8),
+// [2]=dict (UINT16, 8 entries), [3]=metadata (UINT8, 1 entry: right_bw),
+// [4]=exceptions (UINT16), [5]=exception_positions (INT32).
 struct alp_rd_compressed_representation : compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
@@ -1113,13 +963,7 @@ struct alp_rd_compressed_representation : compressed_representation {
     rmm::device_async_resource_ref mr,
     std::string* error_out);
 
-  uint8_t right_bw;                                   // bits in right part (1..31 f32, 1..63 f64)
-  std::unique_ptr<cudf::column> right_parts;          // UINT32 (f32) / UINT64 (f64)
-  std::unique_ptr<cudf::column> dict_indices;         // UINT8
-  std::unique_ptr<cudf::column> dict;                 // UINT16, 8 entries (both precisions)
-  std::unique_ptr<cudf::column> metadata;             // UINT8, 1 entry
-  std::unique_ptr<cudf::column> exceptions;           // UINT16
-  std::unique_ptr<cudf::column> exception_positions;  // INT32
+  uint8_t right_bw;  // bits in right part (1..31 f32, 1..63 f64)
 
   alp_rd_compressed_representation(cudf::data_type type,
                                    cudf::size_type n_rows,
@@ -1134,16 +978,27 @@ struct alp_rd_compressed_representation : compressed_representation {
   std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr) const override;
 
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
+  // Named accessors for decompress impl (channels_ in registry order).
+  const cudf::column* right_parts() const
   {
-    return {
-      {"right_parts", right_parts->view()},
-      {"dict_indices", dict_indices->view()},
-      {"dict", dict->view()},
-      {"metadata", metadata->view()},
-      {"exceptions", exceptions->view()},
-      {"exception_positions", exception_positions->view()},
-    };
+    return channels_.size() > 0 ? channels_[0].get() : nullptr;
+  }
+  const cudf::column* dict_indices() const
+  {
+    return channels_.size() > 1 ? channels_[1].get() : nullptr;
+  }
+  const cudf::column* dict() const { return channels_.size() > 2 ? channels_[2].get() : nullptr; }
+  const cudf::column* metadata() const
+  {
+    return channels_.size() > 3 ? channels_[3].get() : nullptr;
+  }
+  const cudf::column* exceptions() const
+  {
+    return channels_.size() > 4 ? channels_[4].get() : nullptr;
+  }
+  const cudf::column* exception_positions() const
+  {
+    return channels_.size() > 5 ? channels_[5].get() : nullptr;
   }
 
   OpId kind() const override { return OpId::AlpRd; }
@@ -1466,17 +1321,19 @@ struct bitextract_compressor : compressor {
 // decompress() is unsupported; reconstruction goes through the decode kernels.
 // -----------------------------------------------------------------------------
 
-// Holds a codegen-fused subtree node (Delta, Rle, ...). Carries the node's
-// device buffers tagged by field name; the tree structure, op kind, and
-// tail-routing are recovered from the plan DSL at decode time. ``kind_tag``
-// ("DeltaFused"/"RleFused"/...) maps to the op kind. decompress() throws.
+// Holds a codegen-fused subtree node (Delta, Rle, Bitpack, ...). Buffers are
+// tagged with their manifest field name ("delta_first", "rle_runs_offsets", ...),
+// which differs from the registry's logical channel names — so this rep keeps its
+// own named-buffer storage and named_channels() rather than the registry-driven
+// generic path. decompress() throws; reconstruction goes through the decode
+// kernels. The tree structure and tail-routing are recovered from the plan DSL.
 struct codegen_fused_representation : compressed_representation {
-  std::string kind_tag;  // DSL op name for fusable ops ("delta", "rle"), or "RawFused"
+  OpId op_id_;
   // Buffers in manifest order, each tagged with its manifest field name.
   std::vector<std::pair<std::string, std::unique_ptr<cudf::column>>> buffers;
 
-  codegen_fused_representation(std::string k, cudf::data_type type, cudf::size_type n_rows)
-    : compressed_representation(type, n_rows), kind_tag(std::move(k))
+  codegen_fused_representation(OpId id, cudf::data_type type, cudf::size_type n_rows)
+    : compressed_representation(type, n_rows), op_id_(id)
   {
   }
 
@@ -1488,7 +1345,6 @@ struct codegen_fused_representation : compressed_representation {
       "decode path, not C++ decompress()");
   }
 
-  // File writer / codegen gather: expose all manifest buffers (all dense).
   std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
   {
     std::vector<compressible_output> out;
@@ -1499,16 +1355,7 @@ struct codegen_fused_representation : compressed_representation {
     return out;
   }
 
-  OpId kind() const override
-  {
-    if (kind_tag == "delta") return OpId::Delta;
-    if (kind_tag == "rle") return OpId::Rle;
-    if (kind_tag == "bitpack") return OpId::Bitpack;
-    if (kind_tag == "for") return OpId::For;
-    if (kind_tag == "zigzag") return OpId::Zigzag;
-    if (kind_tag == "RawFused") return OpId::Identity;
-    return OpId::Unknown;
-  }
+  OpId kind() const override { return op_id_; }
 };
 
 /// Resolve a DSL compressor name to a compressor instance, or nullptr if

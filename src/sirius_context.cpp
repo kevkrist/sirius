@@ -16,6 +16,7 @@
 
 #include "sirius_context.hpp"
 
+#include "compression/compression_converters.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "duckdb/common/helper.hpp"
@@ -286,6 +287,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
   config_ = config;
+
+  auto const column_threads = config_.get_compression_config().column_threads;
+  if (column_threads <= 0) {
+    throw std::invalid_argument(
+      "SiriusContext::initialize: compression.column_threads must be positive");
+  }
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
   // get_hw_topology() is the only authorised source of GPU/NUMA counts —
@@ -533,6 +540,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   scan_manager_->start();
   task_scheduler_->start();
 
+  // Converters cannot consult a client context at conversion time. Apply the
+  // effective context configuration after initialization succeeds so
+  // YAML/default configuration works even when no eligible table is pinned.
+  sirius::set_decompress_column_threads(column_threads);
   is_initialized_ = true;
 }
 

@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 namespace simpatico {
@@ -16,7 +17,7 @@ struct stream_pool {
   std::vector<cudaStream_t> streams;
 
   stream_pool() = default;
-  ~stream_pool() { shutdown(); }
+  ~stream_pool() noexcept { shutdown(); }
 
   // Not copyable: copying CUDA stream handles would alias them and cause
   // double-destroy on destruction.
@@ -35,9 +36,10 @@ struct stream_pool {
 
   /// Initialize with n streams. Returns false on error.
   bool init(size_t n);
-  /// Destroy all streams.
-  void shutdown();
-  /// Synchronize all streams.
+  /// Best-effort synchronization followed by destruction of all streams.
+  /// Errors are deliberately suppressed so this is safe during unwinding.
+  void shutdown() noexcept;
+  /// Synchronize all streams, throwing when CUDA reports a failure.
   void sync_all();
 };
 

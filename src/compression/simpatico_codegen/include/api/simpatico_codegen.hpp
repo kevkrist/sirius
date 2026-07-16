@@ -138,7 +138,8 @@ compressed_table compress_with_plan(
 /// Compress all columns in parallel using @p column_threads worker threads.
 ///
 /// An internal stream_pool of size `max(1, column_threads)` is created for the
-/// lifetime of the call and destroyed on return.
+/// call. The returned plan trees share ownership of it, so every allocation's
+/// deallocation stream remains valid until the compressed storage is destroyed.
 ///
 /// @param table          Source table.
 /// @param plan_dsl       Multi-column plan DSL string.
@@ -155,8 +156,10 @@ compressed_table compress_with_plan(
 
 /// Compress all columns in parallel using a caller-owned stream pool.
 ///
-/// The pool must remain valid for the duration of the call. Reusing the same
-/// pool across multiple calls is safe and avoids repeated stream allocation.
+/// The pool must outlive the returned compressed table and all of its stored
+/// representations; do not move, shut down, or destroy it while that storage
+/// exists. Reusing one sufficiently long-lived pool across calls avoids repeated
+/// stream allocation.
 ///
 /// @param table          Source table.
 /// @param plan_dsl       Multi-column plan DSL string.
@@ -299,13 +302,19 @@ std::unique_ptr<cudf::table> decompress(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
 /// Destructive single-stream decode. The source remains valid, but reps whose
-/// storage transfers cannot be reused or described. Not failure-atomic.
+/// storage transfers cannot be reused or described. Transferred buffers are
+/// rebound to @p stream for eventual deallocation, so that stream must outlive
+/// the result. Not failure-atomic.
 std::unique_ptr<cudf::table> decompress(
   compressed_table&& table,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
 /// Decompress all columns in parallel using @p column_threads worker threads.
+///
+/// The internal worker pool is synchronized before return. Returned buffers are
+/// rebound to the process-lifetime cuDF default stream before that pool is
+/// destroyed.
 ///
 /// @param table          Compressed table.
 /// @param column_threads Number of parallel CUDA streams / worker threads.
@@ -322,6 +331,10 @@ std::unique_ptr<cudf::table> decompress(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref()) = delete;
 
 /// Decompress all columns in parallel using a caller-owned stream pool.
+///
+/// The pool must outlive the returned table because its streams remain the
+/// deallocation streams of the returned column buffers. Do not move, shut down,
+/// or destroy it while the result exists.
 ///
 /// @param table  Compressed table.
 /// @param pool   Caller-supplied stream pool.

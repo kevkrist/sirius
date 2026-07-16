@@ -12,8 +12,8 @@ namespace simpatico {
 
 // Stable identity of an operator *kind*. Doubles as the on-disk leaf tag
 // (serialised as a uint8_t in the .hpln format). Values for leaf ops are
-// fixed; structural pre-processing ops (Bitextract, StrSplit) have values
-// that will never appear on disk and may be renumbered freely.
+// fixed. Bitextract remains structural-only; StrSplit is serialized for STRING
+// identity leaves, so its value is also a stable wire-format tag.
 enum class OpId : std::uint8_t {
   // Leaf ops — values are stable wire-format tags (do not reorder/renumber).
   Delta          = 1,
@@ -31,9 +31,9 @@ enum class OpId : std::uint8_t {
   Alp            = 13,
   AlpRd          = 14,
   Zigzag         = 15,
-  // Structural / pre-processing ops — not serialised as leaf tags.
+  // Structural / pre-processing ops.
   Bitextract = 16,
-  StrSplit   = 17,
+  StrSplit   = 17,  // stable wire-format tag for STRING identity leaves
   // Sentinel for unknown/unrecognised kinds read from file.
   Unknown = 255,
 };

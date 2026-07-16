@@ -40,9 +40,14 @@ namespace {
 using simpatico::staged_compression;
 using simpatico::try_compress_with_plan;
 
-constexpr char const* kBareIdentity = "input -> identity\n";
-constexpr char const* kBareSplit    = "input -> str_split\n";
-constexpr char const* kSplitDirect  = "input -> str_split -> offsets, chars, null_mask\n";
+constexpr char const* kBareIdentity   = "input -> identity\n";
+constexpr char const* kIdentityOutput = "input -> identity -> data\n";
+constexpr char const* kIdentityThenSplit =
+  "input -> identity -> data\n"
+  "identity.data -> str_split\n";
+
+constexpr char const* kBareSplit   = "input -> str_split\n";
+constexpr char const* kSplitDirect = "input -> str_split -> offsets, chars, null_mask\n";
 constexpr char const* kSplitIdentity =
   "input -> str_split -> offsets, chars, null_mask\n"
   "str_split.offsets -> identity\n"
@@ -208,6 +213,9 @@ void test_reject_returns_exact_original(rmm::cuda_stream_view stream,
   };
 
   check("identity", make_int32_table(1, 4096, 7), kBareIdentity);
+  check("bare STRING identity", make_strings_table(kValues, kNulls, stream), kBareIdentity);
+  check("terminal STRING identity", make_strings_table(kValues, kNulls, stream), kIdentityOutput);
+  check("routed STRING identity", make_strings_table(kValues, kNulls, stream), kIdentityThenSplit);
   check("bare split", make_strings_table(kValues, kNulls, stream), kBareSplit);
   check("direct split", make_strings_table(kValues, kNulls, stream), kSplitDirect);
   check("identity-routed split", make_strings_table(kValues, kNulls, stream), kSplitIdentity);
@@ -246,6 +254,9 @@ void test_accept_is_self_contained(rmm::cuda_stream_view stream, rmm::device_asy
            (std::string(label) + ": accept changed the strings").c_str());
   };
 
+  check_strings("bare STRING identity", kNulls, kBareIdentity);
+  check_strings("terminal STRING identity", kNulls, kIdentityOutput);
+  check_strings("routed STRING identity", kNulls, kIdentityThenSplit);
   check_strings("bare split", kNulls, kBareSplit);
   check_strings("direct split", kNulls, kSplitDirect);
   check_strings("identity-routed split", kNulls, kSplitIdentity);
@@ -270,7 +281,12 @@ void poison_mask_padding(cudf::column_view column, rmm::cuda_stream_view stream)
 void test_inspection_and_wire_identity(rmm::cuda_stream_view stream,
                                        rmm::device_async_resource_ref mr)
 {
-  for (char const* plan : {kSplitDirect, kSplitIdentity, kSplitCodec}) {
+  for (char const* plan : {kBareIdentity,
+                           kIdentityOutput,
+                           kIdentityThenSplit,
+                           kSplitDirect,
+                           kSplitIdentity,
+                           kSplitCodec}) {
     auto input = make_strings_table(kValues, kNulls, stream);
     auto expected =
       serialize(simpatico::compress_with_plan(input->view(), plan, stream, mr), stream);

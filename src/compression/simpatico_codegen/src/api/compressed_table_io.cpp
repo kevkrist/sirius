@@ -11,6 +11,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
@@ -56,8 +57,9 @@ static_assert(std::endian::native == std::endian::little, "LE-only serialization
 [[nodiscard]] static bool is_serialized_leaf_kind(OpId kind) noexcept
 {
   auto const tag = static_cast<std::uint8_t>(kind);
-  return tag >= static_cast<std::uint8_t>(OpId::Delta) &&
-         tag <= static_cast<std::uint8_t>(OpId::Zigzag);
+  return (tag >= static_cast<std::uint8_t>(OpId::Delta) &&
+          tag <= static_cast<std::uint8_t>(OpId::Zigzag)) ||
+         kind == OpId::StrSplit;
 }
 
 [[nodiscard]] static bool fits_cudf_size_type(std::uint64_t rows) noexcept
@@ -282,22 +284,22 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   // only for legacy blobs that predate the field (ld.num_rows == 0).
   const cudf::size_type node_rows =
     ld.num_rows > 0 ? static_cast<cudf::size_type>(ld.num_rows) : col_num_rows;
-  auto make_fused_rep = [&](const char* kind_tag) {
-    auto rep = std::make_unique<codegen_fused_representation>(
-      kind_tag, tag_to_dtype(ld.type_tag), node_rows);
+  auto make_fused_rep = [&](OpId op_id) {
+    auto rep =
+      std::make_unique<codegen_fused_representation>(op_id, tag_to_dtype(ld.type_tag), node_rows);
     for (std::size_t i = 0; i < bufs.size(); ++i) {
       rep->buffers.emplace_back(bufs[i].name, make_col(i));
     }
     return std::unique_ptr<compressed_representation>(std::move(rep));
   };
 
-  if (ld.kind == OpId::Delta) { return make_fused_rep("delta"); }
-  if (ld.kind == OpId::Rle) { return make_fused_rep("rle"); }
-  if (ld.kind == OpId::For) { return make_fused_rep("for"); }
-  if (ld.kind == OpId::Zigzag) { return make_fused_rep("zigzag"); }
+  if (ld.kind == OpId::Delta || ld.kind == OpId::Rle || ld.kind == OpId::For ||
+      ld.kind == OpId::Zigzag) {
+    return make_fused_rep(ld.kind);
+  }
   if (ld.kind == OpId::Identity) {
     bool is_fused = !(bufs.size() == 1 && bufs[0].name == "data");
-    if (is_fused) return make_fused_rep("RawFused");
+    if (is_fused) return make_fused_rep(ld.kind);
   }
 
   // All other kinds (and non-fused identity): route through reconstruct_representation.
@@ -469,12 +471,12 @@ static bool read_node(Reader& r, PlanNode& node)
   if (!r.read_le(is_bitjoin) || is_bitjoin > 1) return false;
   if (is_bitjoin) {
     bitjoin_attrs bj;
-    std::uint8_t ot;
-    if (!r.read_le(ot) || !is_valid_type_tag(ot)) return false;
-    bj.output_type = tag_to_dtype(ot);
-    std::uint16_t nin;
-    if (!r.read_le(nin)) return false;
-    bj.inputs.resize(nin);
+    std::uint8_t output_type_tag;
+    if (!r.read_le(output_type_tag) || !is_valid_type_tag(output_type_tag)) return false;
+    bj.output_type = tag_to_dtype(output_type_tag);
+    std::uint16_t input_count;
+    if (!r.read_le(input_count)) return false;
+    bj.inputs.resize(input_count);
     for (auto& in : bj.inputs) {
       if (!r.read_le(in.node) || !r.read_str16(in.channel)) return false;
       std::uint8_t has_range;
@@ -631,12 +633,21 @@ static bool validate_col_records(std::vector<ColRecord>& records, std::string* e
 
       if (leaf.slot == kSelfRepSlot) {
         auto const node_kind = op_id_from_name(node.op);
-        if (!node_kind.has_value() || *node_kind != leaf.kind) {
+        bool const is_string_identity_storage =
+          node_kind == OpId::Identity && leaf.kind == OpId::StrSplit &&
+          tag_to_dtype(leaf.type_tag).id() == cudf::type_id::STRING;
+        if (!node_kind.has_value() || (*node_kind != leaf.kind && !is_string_identity_storage)) {
           return bad(leaf_label + ": leaf kind is inconsistent with the owning node");
         }
       }
 
-      if (leaf.slot == kSelfRepSlot && leaf.num_rows != 0 && !nodes.empty()) {
+      // A zero row count is a legacy "unknown" sentinel only for older fused
+      // leaves. str_split has always carried its decoded STRING row count, so
+      // validate it exactly even when it is zero and even when it occupies an
+      // explicit terminal output slot.
+      bool const check_root_rows =
+        leaf.kind == OpId::StrSplit || (leaf.slot == kSelfRepSlot && leaf.num_rows != 0);
+      if (check_root_rows && !nodes.empty()) {
         auto const root_edge = std::find_if(
           nodes.front().children.begin(), nodes.front().children.end(), [&](PlanEdge const& edge) {
             return edge.child == leaf.node_index;
@@ -677,6 +688,45 @@ static bool validate_col_records(std::vector<ColRecord>& records, std::string* e
         buffer.num_rows = buffer.size_bytes / element_size;
         if (!fits_cudf_size_type(buffer.num_rows)) {
           return bad(buffer_label + ": derived row count is outside cudf::size_type");
+        }
+      }
+
+      if (leaf.kind == OpId::StrSplit) {
+        if (tag_to_dtype(leaf.type_tag).id() != cudf::type_id::STRING) {
+          return bad(leaf_label + ": str_split leaf type is not STRING");
+        }
+        if (leaf.buffers.size() != 2 && leaf.buffers.size() != 3) {
+          return bad(leaf_label + ": str_split requires offsets, chars[, null_mask] buffers");
+        }
+
+        auto const& offsets     = leaf.buffers[0];
+        auto const& chars       = leaf.buffers[1];
+        auto const offsets_type = tag_to_dtype(offsets.type_tag).id();
+        auto const chars_type   = tag_to_dtype(chars.type_tag).id();
+        if (offsets.name != "offsets" ||
+            (offsets_type != cudf::type_id::INT32 && offsets_type != cudf::type_id::INT64)) {
+          return bad(leaf_label + ": str_split offsets buffer has an invalid name or type");
+        }
+        if (chars.name != "chars" ||
+            (chars_type != cudf::type_id::UINT8 && chars_type != cudf::type_id::UINT32 &&
+             chars_type != cudf::type_id::UINT64)) {
+          return bad(leaf_label + ": str_split chars buffer has an invalid name or type");
+        }
+        if (offsets.num_rows != leaf.num_rows + 1) {
+          return bad(leaf_label + ": str_split offsets row count disagrees with the leaf");
+        }
+        if (leaf.buffers.size() == 3) {
+          auto const& null_mask = leaf.buffers[2];
+          if (null_mask.name != "null_mask" ||
+              tag_to_dtype(null_mask.type_tag).id() != cudf::type_id::UINT8) {
+            return bad(leaf_label + ": str_split null-mask buffer has an invalid name or type");
+          }
+          auto const required_mask_bytes = static_cast<std::uint64_t>(
+            cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(leaf.num_rows)));
+          if (null_mask.size_bytes < required_mask_bytes) {
+            return bad(leaf_label +
+                       ": str_split null-mask buffer is shorter than the row count requires");
+          }
         }
       }
 
@@ -1095,14 +1145,10 @@ std::string build_compressed_table_header(compressed_table const& table,
 
   // A STRING column is physically split across offsets and chars (plus an
   // optional null mask), so no single parent head() pointer describes its
-  // bytes. Reject identity STRING and any unexpected raw STRING channel before
-  // exposing a fabricated contiguous payload range.
+  // bytes. identity on a STRING column decomposes via str_split; reject any
+  // remaining raw STRING channel before exposing a fabricated payload range.
   for (auto const& descs : all_descs) {
     for (auto const& desc : descs) {
-      if (desc.kind == OpId::Identity &&
-          tag_to_dtype(desc.type_tag).id() == cudf::type_id::STRING) {
-        return "identity STRING leaves are not serializable; use str_split";
-      }
       for (auto const& buffer : desc.buffers) {
         if (tag_to_dtype(buffer.type_tag).id() == cudf::type_id::STRING) {
           return "raw STRING payload channels are not serializable; decompose into offsets and "

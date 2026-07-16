@@ -12,6 +12,7 @@
 #include "codegen/plan/leaf_desc.hpp"
 #include "test_utils.hpp"
 
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -125,6 +126,66 @@ IdentityHeaderFixture make_identity_header_fixture()
   fixture.buffer_type   = append_le(bytes, std::uint8_t{2});
   fixture.buffer_size   = append_le(bytes, std::uint64_t{16});
   fixture.buffer_offset = append_le(bytes, std::uint64_t{0});
+  return fixture;
+}
+struct StrSplitHeaderFixture {
+  std::vector<std::uint8_t> bytes;
+  std::size_t leaf_rows{};
+  std::size_t null_mask_size{};
+  std::uint64_t required_mask_size{};
+};
+StrSplitHeaderFixture make_str_split_header_fixture()
+{
+  StrSplitHeaderFixture fixture;
+  auto& bytes = fixture.bytes;
+
+  bytes.insert(bytes.end(), {'H', 'P', 'L', 'N'});
+  append_le(bytes, std::uint8_t{10});
+  append_le(bytes, std::uint16_t{1});
+
+  append_str16(bytes, "");
+  append_le(bytes, simpatico::dtype_to_tag(cudf::data_type{cudf::type_id::STRING}));
+  append_le(bytes, std::int32_t{0});
+  append_le(bytes, std::int64_t{4});
+
+  append_le(bytes, std::uint16_t{2});
+  append_str16(bytes, "input");
+  append_le(bytes, std::uint8_t{0});
+  append_le(bytes, std::uint16_t{1});
+  append_str16(bytes, "identity");
+  append_le(bytes, std::uint32_t{1});
+  append_le(bytes, std::uint16_t{0});
+
+  append_str16(bytes, "identity");
+  append_le(bytes, std::uint8_t{0});
+  append_le(bytes, std::uint16_t{0});
+  append_le(bytes, std::uint16_t{0});
+
+  append_le(bytes, std::uint16_t{1});
+  append_le(bytes, std::uint32_t{1});
+  append_le(bytes, simpatico::kSelfRepSlot);
+  append_le(bytes, static_cast<std::uint8_t>(simpatico::OpId::StrSplit));
+  append_le(bytes, simpatico::dtype_to_tag(cudf::data_type{cudf::type_id::STRING}));
+  fixture.leaf_rows = append_le(bytes, std::uint64_t{4});
+  append_le(bytes, std::uint8_t{0});
+  append_le(bytes, std::uint8_t{3});
+
+  append_str16(bytes, "offsets");
+  append_le(bytes, simpatico::dtype_to_tag(cudf::data_type{cudf::type_id::INT32}));
+  append_le(bytes, std::uint64_t{20});
+  append_le(bytes, std::uint64_t{0});
+
+  append_str16(bytes, "chars");
+  append_le(bytes, simpatico::dtype_to_tag(cudf::data_type{cudf::type_id::UINT8}));
+  append_le(bytes, std::uint64_t{4});
+  append_le(bytes, std::uint64_t{20});
+
+  fixture.required_mask_size =
+    static_cast<std::uint64_t>(cudf::bitmask_allocation_size_bytes(cudf::size_type{4}));
+  append_str16(bytes, "null_mask");
+  append_le(bytes, simpatico::dtype_to_tag(cudf::data_type{cudf::type_id::UINT8}));
+  fixture.null_mask_size = append_le(bytes, fixture.required_mask_size);
+  append_le(bytes, std::uint64_t{24});
   return fixture;
 }
 
@@ -569,9 +630,13 @@ void test_malformed_headers_fail_before_payload_fetch()
   reject_identity_mutation(
     identity.root_child, std::uint32_t{99}, "invalid child index", "invalid plan edge");
   reject_identity_mutation(identity.leaf_kind,
-                           static_cast<std::uint8_t>(simpatico::OpId::StrSplit),
+                           static_cast<std::uint8_t>(simpatico::OpId::Bitextract),
                            "invalid serialized leaf kind",
                            "structural leaf kind");
+  reject_identity_mutation(identity.leaf_kind,
+                           static_cast<std::uint8_t>(simpatico::OpId::StrSplit),
+                           "leaf kind is inconsistent",
+                           "non-STRING identity str_split substitution");
   reject_identity_mutation(
     identity.leaf_type, std::uint8_t{254}, "invalid leaf type tag", "invalid leaf type");
 
@@ -593,6 +658,19 @@ void test_malformed_headers_fail_before_payload_fetch()
                            std::uint64_t{12},
                            "identity buffer row count",
                            "identity buffer row disagreement");
+  auto const str_split = make_str_split_header_fixture();
+  expect(str_split.required_mask_size > 0, "str_split mask fixture has no required bytes");
+
+  auto zero_length_str_split = str_split.bytes;
+  overwrite_le(zero_length_str_split, str_split.leaf_rows, std::uint64_t{0});
+  expect_memory_header_rejected(
+    zero_length_str_split, "root leaf row count", "zero-length str_split root row disagreement");
+
+  auto short_mask = str_split.bytes;
+  overwrite_le(
+    short_mask, str_split.null_mask_size, str_split.required_mask_size - std::uint64_t{1});
+  expect_memory_header_rejected(
+    short_mask, "str_split null-mask buffer is shorter", "undersized str_split null-mask buffer");
 
   auto oversized_buffer = identity.bytes;
   overwrite_le(oversized_buffer, identity.buffer_type, std::uint8_t{0});
@@ -662,23 +740,24 @@ void test_v10_wire_widths_rejected()
   reject(long_column_name, "name length");
 }
 
-// Error: identity on a STRING column has no single contiguous payload buffer;
-// build_compressed_table_header must reject it loudly and clear its outputs.
-void test_identity_string_header_rejected()
+// STRING identity keeps its {data} channel while routed, and lowers only its
+// stored leaves to str_split so every shape remains serializable.
+void test_identity_string_roundtrip()
 {
   auto stream = cudf::get_default_stream();
   auto input  = make_string_table(128, stream);
-  auto source = simpatico::compress_with_plan(
-    input->view(), "input -> identity\n", stream, rmm::mr::get_current_device_resource_ref());
 
-  std::vector<std::uint8_t> header{1, 2, 3};
-  std::vector<simpatico::payload_buffer_ref> buffers{{7, nullptr, 9}};
-  std::uint64_t payload_bytes = 11;
-  auto const error =
-    simpatico::build_compressed_table_header(source, header, buffers, payload_bytes, stream);
-  expect(!error.empty(), "identity_string_header: expected loud rejection");
-  expect(header.empty() && buffers.empty() && payload_bytes == 0,
-         "identity_string_header: outputs were not cleared on rejection");
+  std::string const explicit_output = "input -> identity -> data\n";
+  std::string const routed_identity =
+    "input -> identity -> data\n"
+    "identity.data -> str_split\n";
+
+  io_roundtrip("identity_string", input->view(), "input -> identity\n");
+  memory_roundtrip("identity_string_mem", input->view(), "input -> identity\n");
+  io_roundtrip("identity_string_output", input->view(), explicit_output);
+  memory_roundtrip("identity_string_output_mem", input->view(), explicit_output);
+  io_roundtrip("identity_string_routed", input->view(), routed_identity);
+  memory_roundtrip("identity_string_routed_mem", input->view(), routed_identity);
 }
 
 // The two production STRING plan shapes from plans/tpch_sf1000 (customer/
@@ -729,6 +808,11 @@ void test_str_split_plan_shapes_roundtrip()
   io_roundtrip("str_split_phone_shape", phone_tbl->view(), phone_dsl);
   memory_roundtrip("str_split_address_shape_mem", addr_tbl->view(), address_dsl);
   memory_roundtrip("str_split_phone_shape_mem", phone_tbl->view(), phone_dsl);
+
+  // Bare terminal: the str_split rep itself is the node's stored leaf.
+  std::string const bare_dsl = "input -> str_split\n";
+  io_roundtrip("str_split_bare_terminal", addr_tbl->view(), bare_dsl);
+  memory_roundtrip("str_split_bare_terminal_mem", addr_tbl->view(), bare_dsl);
 }
 
 void test_memory_reader_selection_fetches_only_requested_columns()
@@ -975,7 +1059,7 @@ int main()
     {"error_bad_version", test_error_bad_version},
     {"malformed_headers", test_malformed_headers_fail_before_payload_fetch},
     {"v10_wire_widths_rejected", test_v10_wire_widths_rejected},
-    {"identity_string_header_rejected", test_identity_string_header_rejected},
+    {"identity_string_roundtrip", test_identity_string_roundtrip},
     {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
   };
 

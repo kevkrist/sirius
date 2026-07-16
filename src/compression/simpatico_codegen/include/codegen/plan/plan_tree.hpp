@@ -20,6 +20,7 @@
 namespace simpatico {
 
 struct compressed_representation;
+struct stream_pool;
 
 using NodeId = std::uint32_t;
 
@@ -114,6 +115,12 @@ struct PlanNode {
 };
 
 struct PlanTree {
+  // Parallel compression allocates representation buffers on worker streams.
+  // Keep an internally-created pool alive until after every node (and therefore
+  // every representation) has been destroyed. Declaration order is deliberate:
+  // members are destroyed in reverse order, so `nodes` releases its buffers
+  // before the final pool owner can destroy the streams.
+  std::shared_ptr<stream_pool> stream_lifetime;
   std::vector<PlanNode> nodes;
 };
 

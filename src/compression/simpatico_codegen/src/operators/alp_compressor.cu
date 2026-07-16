@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <type_traits>
 
@@ -162,11 +163,8 @@ __constant__ uint8_t d_alp_combos_f64[host_consts_f64::kComboCount];
 // One-shot initialisation of both __constant__ table sets. Idempotent.
 // Uploads run async on the caller's stream and are bounded by a single
 // stream sync, avoiding the legacy default stream entirely.
-void ensure_constants_initialized(rmm::cuda_stream_view stream)
+void alp_upload_constants(rmm::cuda_stream_view stream)
 {
-  static bool initialized = false;
-  if (initialized) return;
-
   // Build packed combo tables on the host then upload.
   uint8_t combos_f32[host_consts_f32::kComboCount];
   {
@@ -243,7 +241,13 @@ void ensure_constants_initialized(rmm::cuda_stream_view stream)
   // Constants must be visible before any kernel that reads them runs; the
   // upload is host-side one-time work so a bounded sync here is acceptable.
   cudaStreamSynchronize(s);
-  initialized = true;
+}
+
+// Thread-safe one-shot init: safe under concurrent multi-stream compression.
+void ensure_constants_initialized(rmm::cuda_stream_view stream)
+{
+  static std::once_flag flag;
+  std::call_once(flag, alp_upload_constants, stream);
 }
 
 // -----------------------------------------------------------------------------
@@ -600,17 +604,17 @@ std::unique_ptr<cudf::column> alp_decompress_impl(alp_compressed_representation 
 
   const int block = 256;
   int grid        = (repr.num_rows + block - 1) / block;
-  alp_decode_kernel<T><<<grid, block, 0, stream.value()>>>(repr.integers->view().data<int_t>(),
-                                                           repr.metadata->view().data<uint16_t>(),
+  alp_decode_kernel<T><<<grid, block, 0, stream.value()>>>(repr.integers()->view().data<int_t>(),
+                                                           repr.metadata()->view().data<uint16_t>(),
                                                            repr.num_rows,
                                                            out->mutable_view().data<T>());
 
-  cudf::size_type exc_n = repr.exceptions ? repr.exceptions->size() : 0;
+  cudf::size_type exc_n = repr.exceptions() ? repr.exceptions()->size() : 0;
   if (exc_n > 0) {
     int egrid = (exc_n + block - 1) / block;
     alp_scatter_exceptions_kernel<T>
-      <<<egrid, block, 0, stream.value()>>>(repr.exceptions->view().data<T>(),
-                                            repr.exception_positions->view().data<int32_t>(),
+      <<<egrid, block, 0, stream.value()>>>(repr.exceptions()->view().data<T>(),
+                                            repr.exception_positions()->view().data<int32_t>(),
                                             exc_n,
                                             out->mutable_view().data<T>());
   }
@@ -633,13 +637,12 @@ alp_compressed_representation::alp_compressed_representation(
   std::unique_ptr<cudf::column> exceptions_in,
   std::unique_ptr<cudf::column> exception_positions_in,
   std::unique_ptr<cudf::column> metadata_in)
-  : compressed_representation(type, n_rows),
-    num_vectors(n_vectors),
-    integers(std::move(integers_in)),
-    exceptions(std::move(exceptions_in)),
-    exception_positions(std::move(exception_positions_in)),
-    metadata(std::move(metadata_in))
+  : compressed_representation(type, n_rows), num_vectors(n_vectors)
 {
+  channels_.push_back(std::move(integers_in));
+  channels_.push_back(std::move(exceptions_in));
+  channels_.push_back(std::move(exception_positions_in));
+  channels_.push_back(std::move(metadata_in));
 }
 
 std::unique_ptr<cudf::column> alp_compressed_representation::decompress(
