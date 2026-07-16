@@ -6,6 +6,7 @@
 //   benchmark  Timed compress+decompress over a Parquet/binary/CSV input
 //   explore    BFS cascade search for a single column
 //   compress   Compress input to a .hpln file (--verify round-trips it)
+//   stage      Drive the staged owning-compress transaction with an accept/reject ratio gate
 //   decompress Decompress a .hpln file to Parquet (--verify checks vs source)
 //   plan       Print each column's compression plan (DSL) from a .hpln file
 //
@@ -686,6 +687,8 @@ void usage_top()
                "  benchmark   Timed compress+decompress (Parquet/binary/CSV input, plan file)\n"
                "  explore     BFS cascade search for the best plan for a single column\n"
                "  compress    Compress input to a .hpln file (--verify round-trips it)\n"
+               "  stage       Drive the staged owning-compress transaction with an accept/reject\n"
+               "              ratio gate, reporting each phase (evaluate the staged API)\n"
                "  decompress  Decompress a .hpln file to Parquet (--verify checks vs source)\n"
                "  plan        Print each column's compression plan (DSL) from a .hpln file\n"
                "\n"
@@ -1084,6 +1087,149 @@ int run_compress(int argc, char** argv)
   return 0;
 }
 
+// ── STAGE mode ────────────────────────────────────────────────────────────────
+//
+// Exercises the staged owning-compress transaction (try_compress_with_plan) so it can be
+// evaluated end to end: compress into a reversible stage, size the candidate WITHOUT
+// committing, then either accept() it (owning candidate -> optional .hpln) or reject() it
+// (exact original handed back) according to a --min-ratio gate. Each phase is printed so the
+// reversible stage / candidate inspection / accept-or-reject decision are all observable.
+
+void usage_stage()
+{
+  std::fprintf(
+    stderr,
+    "Usage: simpatico stage --input PATH --plan PATH [--min-ratio R] [--out FILE.hpln] "
+    "[--verify]\n"
+    "\n"
+    "Drive the staged owning-compress transaction and report each phase.\n"
+    "\n"
+    "  --input PATH              Parquet, CSV/.tbl, or binary file (required)\n"
+    "  --plan PATH               Plan DSL file (required)\n"
+    "  --min-ratio R             Keep the candidate only if input/compressed >= R\n"
+    "                            (default 1.0: keep only when it does not grow). Use 0 to\n"
+    "                            always accept, a large value to force the reject path.\n"
+    "  --out PATH                On accept, write the .hpln here (optional; sizes only if omitted)\n"
+    "  --format {parquet|csv|binary}\n"
+    "  --dtype {i32|i64|...}     Element type for binary input\n"
+    "  --verify                  On accept, decompress and check it round-trips; on reject,\n"
+    "                            check the returned table equals the source\n"
+    "\n"
+    "Exit status is 0 for both an accept and a reject (each is a valid decision); non-zero\n"
+    "only on a staging failure or a failed --verify.\n");
+}
+
+int run_stage(int argc, char** argv)
+{
+  std::string input_path, plan_path, out_path;
+  std::optional<input_format> fmt;
+  std::optional<std::string> dtype;
+  double min_ratio = 1.0;
+  bool verify      = false;
+
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    auto need       = [&](char const* flag) -> std::string {
+      if (i + 1 >= argc) die(std::string(flag) + " requires a value");
+      return argv[++i];
+    };
+    if (arg == "--help" || arg == "-h") {
+      usage_stage();
+      return 0;
+    } else if (parse_input_flag(arg, need, input_path, fmt, dtype)) {
+      // handled: --input / --format / --dtype
+    } else if (arg == "--plan") {
+      plan_path = need("--plan");
+    } else if (arg == "--out") {
+      out_path = need("--out");
+    } else if (arg == "--min-ratio") {
+      min_ratio = std::stod(need("--min-ratio"));
+    } else if (arg == "--verify") {
+      verify = true;
+    } else {
+      die("stage: unknown flag '" + arg + "'");
+    }
+  }
+
+  if (input_path.empty()) die("stage: --input required");
+  if (plan_path.empty()) die("stage: --plan required");
+  if (!fmt) fmt = infer_format(input_path);
+
+  init_gpu();
+  auto loaded   = load_input(input_path, *fmt, dtype);
+  auto plan_dsl = read_file(plan_path);
+
+  auto stream = driver_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+
+  // try_compress_with_plan consumes the table, so measure the source before staging.
+  std::size_t const input_b = table_input_bytes(loaded.table->view(), stream);
+  int const ncols           = loaded.table->num_columns();
+  std::printf("[stage]   compressing %d column(s), %zu input bytes\n", ncols, input_b);
+
+  auto stage = simpatico::try_compress_with_plan(
+    std::move(loaded.table), plan_dsl, stream, mr, loaded.column_names);
+  if (!stage.ok()) {
+    // Failed stage: the original is intact and reject() returns it (proving quiescence).
+    std::printf("[stage]   FAILED: %s\n", stage.error().c_str());
+    (void)std::move(stage).reject();
+    return 1;
+  }
+
+  // Inspect the candidate WITHOUT committing: the .hpln size is header + payload. The
+  // inspection facade hides the columns vector, so size through the header builder.
+  std::size_t comp_b = 0;
+  {
+    auto inspection = stage.table();
+    std::vector<std::uint8_t> header;
+    std::vector<simpatico::payload_buffer_ref> buffers;
+    std::uint64_t payload_bytes = 0;
+    auto herr = simpatico::build_compressed_table_header(inspection, header, buffers, payload_bytes);
+    if (!herr.empty()) die("stage: candidate sizing failed: " + herr);
+    comp_b = header.size() + static_cast<std::size_t>(payload_bytes);
+  }
+  double const ratio = compression_ratio(input_b, comp_b);
+  std::printf("[inspect] candidate %zu bytes, ratio %.3fx (threshold %.3fx)\n",
+              comp_b,
+              ratio,
+              min_ratio);
+
+  if (ratio >= min_ratio) {
+    // accept() proves GPU completion, discards the original, and returns the owning candidate.
+    auto ct = std::move(stage).accept();
+    std::printf("[decide]  ACCEPT (%.3fx >= %.3fx)\n", ratio, min_ratio);
+
+    if (!out_path.empty()) {
+      auto werr = simpatico::write_compressed_table(ct, out_path, stream);
+      if (!werr.empty()) die("stage: write failed: " + werr);
+      std::printf("[write]   %zu bytes -> %s\n", comp_b, out_path.c_str());
+    } else {
+      std::printf("[write]   sized only (no --out)\n");
+    }
+
+    if (verify) {
+      // The source was consumed by staging; reload it to compare the round-trip.
+      auto source = load_input(input_path, *fmt, dtype);
+      bool ok     = verify_roundtrip(source.table->view(), ct);
+      std::printf("[verify]  round-trip %s\n", ok ? "PASS" : "FAIL");
+      if (!ok) return 1;
+    }
+    return 0;
+  }
+
+  // reject() proves GPU completion and returns the original with its exact allocations.
+  auto original = std::move(stage).reject();
+  std::printf("[decide]  REJECT (%.3fx < %.3fx) -> original recovered\n", ratio, min_ratio);
+  if (verify) {
+    // Demonstrate the reject handed back the exact original, byte for byte.
+    auto source = load_input(input_path, *fmt, dtype);
+    bool ok     = original && tables_equal(original->view(), source.table->view());
+    std::printf("[verify]  original preserved %s\n", ok ? "PASS" : "FAIL");
+    if (!ok) return 1;
+  }
+  return 0;
+}
+
 // ── DECOMPRESS mode ───────────────────────────────────────────────────────────
 
 void usage_decompress()
@@ -1257,6 +1403,7 @@ int main(int argc, char** argv)
     if (mode == "benchmark") return run_benchmark(argc - 1, argv + 1);
     if (mode == "explore") return run_explore(argc - 1, argv + 1);
     if (mode == "compress") return run_compress(argc - 1, argv + 1);
+    if (mode == "stage") return run_stage(argc - 1, argv + 1);
     if (mode == "decompress") return run_decompress(argc - 1, argv + 1);
     if (mode == "plan") return run_plan(argc - 1, argv + 1);
 

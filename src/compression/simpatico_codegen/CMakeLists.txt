@@ -147,6 +147,13 @@ target_link_libraries(
           dl)
 target_link_options(simpatico_cli PRIVATE "-Wl,-rpath,${CONDA_PREFIX}/lib")
 
+# End-to-end smoke test that runs the built `simpatico` binary (stage mode). It shells out
+# rather than linking the library, so it only needs the binary's path and to be rebuilt after it.
+add_executable(test_stage_cli tests/test_stage_cli.cpp)
+target_compile_definitions(
+  test_stage_cli PRIVATE "SIMPATICO_CLI=\"$<TARGET_FILE:simpatico_cli>\"")
+add_dependencies(test_stage_cli simpatico_cli)
+
 enable_testing()
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
@@ -160,3 +167,4 @@ add_test(NAME jit_kernel_cache_plain COMMAND test_jit_kernel_cache_plain)
 add_test(NAME jit_kernel_cache COMMAND test_jit_kernel_cache)
 add_test(NAME fused_operator_sweep COMMAND test_fused_operator_sweep)
 add_test(NAME operator_sweep COMMAND test_operator_sweep)
+add_test(NAME stage_cli COMMAND test_stage_cli)
