@@ -97,3 +97,83 @@ No open cap-specific finding remains.
 ## Verdict
 
 **Accepted.** The cap is correct for one-shot and multi-partition publication, overflow-safe at policy and constructor boundaries, consistently wired and observable, fail-open on rejection, and covered by focused and end-to-end single-GPU tests. No cap-specific correctness, ownership, race, documentation, style, or test blocker remains. Physical multi-GPU validation is still required before claiming multi-GPU production validation or enabling the multi-partition feature by default.
+
+---
+
+# Prototype QA review: partition-specific multi-build-batch dynamic filter
+
+Reviewed baseline `13e0eb4078451f4b9a666e0bcf4a1d90dfb805f8` plus the settled implementation, documentation, and test change set (diff SHA-256 `db4638981a1dbecdf4430fd07628ca82c322733e588975a145d60ea2ad2b93bf`). This section is scoped to the partition-specific prototype and preserves the two preceding reviews unchanged. The unrelated dirty `.claude/claude-tools` submodule is excluded. Physical multi-GPU execution remains deliberately deferred.
+
+## Findings
+
+### [Medium, non-blocking] Build-CONCAT completion versus bank sealing lacks a deterministic cross-layer regression
+
+**Defect.** Bank tests exercise contribution and sealing, and pipeline tests exercise scheduling, but no test holds a real build-CONCAT task inside contribution while the pipeline attempts finalization. Static inspection finds the production ordering sound: task creation is counted before the pipeline status lock is released, contribution completes synchronously in the task's operator path, task destruction records completion afterward, and pipeline finalization requires created and completed counts to match (`src/pipeline/sirius_pipeline.cpp:406-484`; `src/pipeline/gpu_pipeline_task.cpp:328-339`; `src/op/sirius_physical_concat.cpp:301-308`). A retry also creates its replacement while the original remains counted. Nevertheless, a future refactor could violate this whole-build publication invariant without failing the current tests.
+
+**Required property.** The bank must remain unsealed while any build-CONCAT task is alive or executing its sink path, and it must seal exactly after the last such task completes.
+
+**Cheapest remedy.** Add one narrow pipeline-level test with a synchronized build-CONCAT sink seam: hold a contribution, show that finalization cannot seal, release it, destroy the task, then show that finalization seals and the resulting filter contains the held rows. No physical multi-GPU hardware is required.
+
+**Release impact.** No production race was found, so this is non-blocking for a default-off prototype. Add the regression before enabling the feature by default.
+
+### [Low, non-blocking] The bank concurrency test can hang instead of reporting a bounded failure
+
+**Defect.** The same-partition serialization test uses an uncancellable `std::barrier` and then blocking `future::get()` calls (`test/cpp/operator/test_partition_dynamic_filter_bank.cpp:346-395`). If async task creation fails, or a worker throws before reaching the barrier, the remaining workers can wait until the outer CI timeout.
+
+**Required property.** Every failed test setup or worker exit must release and join all workers within a bounded interval.
+
+**Cheapest remedy.** Replace the barrier with a bounded, cancellable rendezvous whose owner releases waiters during stack unwinding, or use an equivalent harness primitive that provides bounded failure and guaranteed joins.
+
+**Release impact.** Non-blocking; this affects test diagnostics and CI latency, not production behavior or the validity of a passing run.
+
+### [Low, non-blocking] Admitted RIGHT and SEMI joins lack execution-parity coverage
+
+**Defect.** Constructor-level tests verify that INNER, RIGHT, and SEMI are admitted and unsafe join types are rejected (`test/cpp/operator/test_physical_concat.cpp:666-692`), but the end-to-end filtering case executes only INNER (`test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp:443-493`). Static semantics are correct: filtering a probe row absent from the complete build cannot change INNER, RIGHT, or SEMI output, and the RIGHT path retains the complete build side for unmatched-build emission. The two additional admitted paths are nevertheless not protected against integration regressions.
+
+**Required property.** With the local filter on and off, RIGHT and SEMI must match CPU results, remain fail-open, and preserve unmatched-build output when the probe is wholly filtered.
+
+**Cheapest remedy.** Add compact parameterized execution cases for RIGHT and SEMI, including an all-pruned probe case for RIGHT, reusing the existing result- and statistics-delta helpers.
+
+**Release impact.** Non-blocking for this prototype; add before a default-on or production-readiness claim.
+
+### [Low, non-blocking] Active-executor GPU-count precedence is not pinned by a regression test
+
+**Defect.** The converter correctly treats a nonempty active-GPU ID list as authoritative and falls back to the explicit heuristic count only when that list is empty (`src/pipeline/sirius_pipeline_converter.cpp:484-510`). No focused test supplies deliberately different values, such as `num_gpus = 8` with active IDs `{2, 5}`, to prove that sizing, cap multiplication, and routing all retain `G = 2`.
+
+**Required property.** Every downstream partition consumer and partition-specific cap calculation must use the same active executor set that task routing uses, including sparse device IDs.
+
+**Cheapest remedy.** Add a converter/build-context regression with mismatched raw and active counts and assert the propagated count and sparse ID mapping. Hardware execution is unnecessary for this structural test.
+
+**Release impact.** Non-blocking while multi-GPU validation is deferred and the feature is default-off; include it in the multi-GPU readiness gate.
+
+## Findings resolved during this review
+
+- **Probe-CONCAT cold-start reservation:** local filtering now saturatingly reserves `3 x stats.bytes` for one input and `4 x stats.bytes` for multiple inputs, covering old/new filtered tables, a BOOL8 mask bound, and merge storage. Zero-, one-, multi-input, build-side, and overflow cases are pinned (`test/cpp/operator/test_no_history_peak_memory_estimate.cpp:146-162`).
+- **CUDA device context and failure drain:** contribution selects its recorded device internally, and exceptional stream draining re-establishes that device before synchronization (`src/op/dynamic_filter/partition_dynamic_filter_bank.cpp:250-338`). Bloom replicas retain their allocation device and release device-local storage under the appropriate device guard; arbitrary caller current-device state does not control destruction.
+- **Configured versus active GPU count:** the active executor list now determines `G` whenever present, so routing, per-partition sizing, and the worst-case per-GPU cap use one topology. Empty-list construction remains available to no-engine unit tests.
+- **End-to-end shape and multi-batch proof:** the integration case now forces STANDARD/nonbroadcast partitioned execution and tiny scan/CONCAT batches. It proves local filters were constructed, successful build fragments exceed filter/partition count, probe rows are reduced, GPU on/off and CPU results agree, and neither ordinary global Bloom construction nor scan fan-out occurred (`test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp:443-493`).
+- **Cap boundary:** focused coverage admits the exact worst-case per-GPU footprint and rejects one byte below it for multiple keys, uneven partitions, and multiple GPUs (`test/cpp/operator/test_partition_dynamic_filter_bank.cpp:238-266`).
+
+## Acceptance checks
+
+- Each nonempty build fragment contributes synchronously to exactly its hash partition on its actual GPU. A per-entry mutex serializes fragments for the same partition while the lifecycle shared lock permits different partitions to progress independently. Successful contribution statistics are committed only after insertion and stream synchronization.
+- Sealing cannot expose an incomplete filter. Any contribution, device, ordinal/type, allocation, or insertion failure clears partial state and transitions the bank to fail-open behavior; missing filters and probe-device mismatches pass rows through.
+- Probe CONCAT waits on its sibling build CONCAT only while the bank is pending or accumulating. Existing recursive readiness propagation and build-first dependencies provide a wakeup path; no task-readiness cycle or lost-wakeup deadlock was found. Delim-join inner hash joins are excluded from local-bank planning.
+- Partition routing uses sorted active GPU IDs, and retry preserves the preferred device. Probe lookup requires the same `(partition index, device ID)` pair; there is no implicit cross-device merge, replication, or dereference.
+- Multiple build batches accumulate bits into the partition entry rather than retaining input batches. Geometry uses the blocking partition row count; skew can increase false positives but cannot create false negatives.
+- The policy cap is overflow-safe and accounts for active keys, estimated rows per partition, and the maximum number of local partitions on any active GPU. Durable Bloom allocations use the allocator-accounted memory resource and fail open on allocation failure.
+- Planner and physical checks admit only ordinary equality keys with supported exact storage types and probe-filter-safe INNER, RIGHT, and SEMI joins. Null-equal and cast-shaped conditions are rejected; composite matches cannot be falsely rejected because each admitted component filter is complete for its partition.
+- Ownership is explicit: the bank owns partition entries, entries own mutable/shared Bloom handles, selections share immutable sealed filter sets, and sibling/statistics pointers are documented non-owning references with enclosing-plan lifetime. No raw owning pointer, leak, use-after-free, or production data race was found.
+- The master and partition-specific switches are consistently subordinate and mutually exclusive, and the new strategy remains off by default. API/Doxygen and prototype documentation describe lifecycle, topology, cap scope, fail-open behavior, statistics, and the deferred multi-GPU boundary consistently.
+
+## Validation
+
+- Final post-documentation release build: 196/196 targets passed in 71.7 seconds. Earlier remediation builds also passed completely.
+- Forced STANDARD/nonbroadcast, partitioned, multi-fragment end-to-end case: 85 assertions in 1 case passed, including CPU parity, master-off parity, row reduction, fragment completeness, and zero failures/global pushes.
+- Combined focused selection `[partition_dynamic_filter_bank],[partition_dynamic_filter],[config_opt][dynamic_filter],[accumulator],[bloom_reduction],[publication_claim]`: 313 assertions in 28 cases passed.
+- `clang-format --dry-run --Werror` passed over every changed or new C++ file. `git diff --check` passed, and no source/test/documentation `.orig` or `.rej` artifact remains.
+- Physical multi-GPU execution and performance comparison were not run, as requested. Static topology, device-lifetime, and reservation review is not a substitute for that hardware matrix.
+
+## Verdict
+
+**Accepted as a default-off prototype.** No functional-correctness, ownership, race, deadlock, cap-accounting, eligibility, API, documentation, or style blocker remains. Before enabling the strategy by default or claiming production multi-GPU readiness, run the physical multi-GPU correctness/performance matrix and close the cross-layer seal-ordering regression; the three low-severity test gaps should be included in that readiness work.

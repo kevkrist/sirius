@@ -217,6 +217,13 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("mark_join_build_switch_ratio", opt.mark_join_build_switch_ratio);
   r.optional("enable_dynamic_filter", opt.enable_dynamic_filter);
   r.optional("enable_dynamic_filter_multi_partition", opt.enable_dynamic_filter_multi_partition);
+  r.optional("enable_dynamic_filter_partition_specific",
+             opt.enable_dynamic_filter_partition_specific);
+  if (opt.enable_dynamic_filter_multi_partition && opt.enable_dynamic_filter_partition_specific) {
+    throw std::runtime_error(
+      "enable_dynamic_filter_multi_partition and "
+      "enable_dynamic_filter_partition_specific are mutually exclusive");
+  }
   r.optional("max_dynamic_filter_bloom_bytes_per_gpu",
              yaml::bytes(opt.max_dynamic_filter_bloom_bytes_per_gpu));
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);

@@ -47,6 +47,23 @@ struct dynamic_filter_stats_snapshot {
   std::uint64_t publications_skipped_build_not_whole     = 0;
   std::uint64_t publications_skipped_targets_drained     = 0;
   std::uint64_t filters_pushed                           = 0;
+
+  std::uint64_t partition_dynamic_filter_keys_considered            = 0;
+  std::uint64_t partition_dynamic_filter_keys_with_known_domain     = 0;
+  std::uint64_t partition_dynamic_filter_keys_skipped_domain_gate   = 0;
+  std::uint64_t partition_dynamic_filter_keys_build_exceeded_domain = 0;
+  std::uint64_t partition_dynamic_filter_partitions_built           = 0;
+  std::uint64_t partition_dynamic_filter_filters_built              = 0;
+  std::uint64_t partition_dynamic_filter_build_fragments            = 0;
+  std::uint64_t partition_dynamic_filter_build_rows                 = 0;
+  std::uint64_t partition_dynamic_filter_probe_batches              = 0;
+  std::uint64_t partition_dynamic_filter_probe_rows_in              = 0;
+  std::uint64_t partition_dynamic_filter_probe_rows_out             = 0;
+  std::uint64_t partition_dynamic_filter_readiness_waits            = 0;
+  std::uint64_t partition_dynamic_filter_failures                   = 0;
+  std::uint64_t partition_dynamic_filter_device_mismatches          = 0;
+  std::uint64_t partition_dynamic_filter_budget_skips               = 0;
+  std::uint64_t partition_dynamic_filter_skewed_partitions          = 0;
 };
 
 /**
@@ -60,10 +77,11 @@ struct dynamic_filter_stats_snapshot {
  * The fields have three timing classes.
  *
  * `producers_enabled` is a plan-time fact. `sirius_physical_hash_join` increments it when
- * constructed with an enabled `dynamic_filter_publish_plan`, before execution begins. It counts
- * plan constructions, not executed producers: the transparent path builds the physical plan once at
- * prepare and again at execution, so a single query contributes twice per producing join. Compare
- * it across runs or use it as a direction, never as the left side of an accounting identity.
+ * constructed with an enabled publication plan or an installed partition-local bank, before
+ * execution begins. It counts plan constructions, not executed producers: the transparent path
+ * builds the physical plan once at prepare and again at execution, so a single query contributes
+ * twice per producing join. Compare it across runs or use it as a direction, never as the left side
+ * of an accounting identity.
  *
  * The key and filter counters record policy decisions for attempts that reach per-key processing. A
  * source-residency or all-targets-drained return occurs earlier and does not increment them.
@@ -79,10 +97,14 @@ struct dynamic_filter_stats_snapshot {
  * non-claiming deliveries are counted nowhere, and neither is a delivery arriving after the window
  * has closed. Only the not-whole counter is latched -- the others can fire repeatedly for one join,
  * because a broadcast build delivers one batch per GPU.
+ *
+ * The `partition_dynamic_filter_` counters describe only hash-join-local partition filters and do
+ * not contribute to `filters_pushed`.
  */
 struct dynamic_filter_stats {
   // Plan-time fact
-  std::atomic<std::uint64_t> producers_enabled{0};  ///< Joins constructed with an enabled plan
+  std::atomic<std::uint64_t> producers_enabled{
+    0};  ///< Joins with an enabled publication plan or installed partition-local bank
 
   // Deterministic policy decisions
   std::atomic<std::uint64_t> keys_considered{0};  ///< Bound admitted keys walked by publication
@@ -110,6 +132,24 @@ struct dynamic_filter_stats {
   std::atomic<std::uint64_t> publications_skipped_targets_drained{0};
   std::atomic<std::uint64_t> filters_pushed{0};  ///< Accepted pushes; drain-dependent
 
+  // Partition-specific hash-join-local filtering
+  std::atomic<std::uint64_t> partition_dynamic_filter_keys_considered{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_keys_with_known_domain{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_keys_skipped_domain_gate{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_keys_build_exceeded_domain{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_partitions_built{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_filters_built{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_build_fragments{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_build_rows{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_probe_batches{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_probe_rows_in{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_probe_rows_out{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_readiness_waits{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_failures{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_device_mismatches{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_budget_skips{0};
+  std::atomic<std::uint64_t> partition_dynamic_filter_skewed_partitions{0};
+
   /**
    * @brief Read every counter with relaxed ordering
    *
@@ -136,7 +176,39 @@ struct dynamic_filter_stats {
         publications_skipped_build_not_whole.load(std::memory_order_relaxed),
       .publications_skipped_targets_drained =
         publications_skipped_targets_drained.load(std::memory_order_relaxed),
-      .filters_pushed = filters_pushed.load(std::memory_order_relaxed)};
+      .filters_pushed = filters_pushed.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_keys_considered =
+        partition_dynamic_filter_keys_considered.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_keys_with_known_domain =
+        partition_dynamic_filter_keys_with_known_domain.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_keys_skipped_domain_gate =
+        partition_dynamic_filter_keys_skipped_domain_gate.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_keys_build_exceeded_domain =
+        partition_dynamic_filter_keys_build_exceeded_domain.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_partitions_built =
+        partition_dynamic_filter_partitions_built.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_filters_built =
+        partition_dynamic_filter_filters_built.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_build_fragments =
+        partition_dynamic_filter_build_fragments.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_build_rows =
+        partition_dynamic_filter_build_rows.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_probe_batches =
+        partition_dynamic_filter_probe_batches.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_probe_rows_in =
+        partition_dynamic_filter_probe_rows_in.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_probe_rows_out =
+        partition_dynamic_filter_probe_rows_out.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_readiness_waits =
+        partition_dynamic_filter_readiness_waits.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_failures =
+        partition_dynamic_filter_failures.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_device_mismatches =
+        partition_dynamic_filter_device_mismatches.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_budget_skips =
+        partition_dynamic_filter_budget_skips.load(std::memory_order_relaxed),
+      .partition_dynamic_filter_skewed_partitions =
+        partition_dynamic_filter_skewed_partitions.load(std::memory_order_relaxed)};
   }
 };
 

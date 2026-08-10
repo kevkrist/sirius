@@ -447,9 +447,13 @@ void sirius_pipeline_converter::link_join_partition_siblings()
       // Positional roles are guaranteed by finalize_pipeline_structure() (tree path) /
       // emission order (legacy). A swap here mislinks sibling partitions and, for
       // right-family joins, drives_partition_count.
-      D_ASSERT(
-        build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
-        build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>().is_build_concat());
+      D_ASSERT(build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT);
+      D_ASSERT(probe_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT);
+      auto& build_concat_op = build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>();
+      auto& probe_concat_op = probe_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>();
+      D_ASSERT(build_concat_op.is_build_concat());
+      build_concat_op.set_sibling_concat(&probe_concat_op);
+      probe_concat_op.set_sibling_concat(&build_concat_op);
       // A RIGHT_DELIM_JOIN's inner join bootstraps its probe subtree from build-side (distinct)
       // data, so the build side drives the partition count. Detect it off the join's tree parent
       // (the same predicate resolve_barrier uses), since the build partition is a plain PARTITION
@@ -480,13 +484,16 @@ void sirius_pipeline_converter::link_join_partition_siblings()
 
 void sirius_pipeline_converter::configure_partition_min_partitions()
 {
-  // Pull num_gpus from the build context (populated from sirius_engine's hardware topology at
-  // convert time). Single-GPU runs keep the consumer default of 1 (no-op). For multi-GPU we hand
+  // The active id list is the executor's routing set and therefore the authoritative GPU count.
+  // Tests without an engine leave it empty and retain the explicit heuristic count.
+  auto const& active_gpu_ids = build_ctx_.active_gpu_ids();
+  int const num_gpus =
+    active_gpu_ids.empty() ? build_ctx_.num_gpus() : static_cast<int>(active_gpu_ids.size());
+  // Single-GPU runs keep the consumer default of 1 (no-op). For multi-GPU we hand
   // num_gpus to each partition's downstream sizing consumer, which derives the partition floor and
   // small-table threshold internally (see natural_num_partitions / partition_small_table_bytes) and
   // lets joins keep one hash table per partition so BUILD_PROBE is admitted for up to num_gpus
   // partitions rather than only one.
-  const int num_gpus = build_ctx_.num_gpus();
   if (num_gpus <= 1) return;
 
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
@@ -495,7 +502,7 @@ void sirius_pipeline_converter::configure_partition_min_partitions()
     auto* partition_op = static_cast<op::sirius_physical_partition*>(op);
     // The active GPU id list lets broadcast partitioning map a probe batch's residence GPU to its
     // partition slot (inverse of task_creator's partition_idx -> GPU routing).
-    partition_op->set_active_gpu_ids(build_ctx_.active_gpu_ids());
+    partition_op->set_active_gpu_ids(active_gpu_ids);
     // Inform the downstream sizing consumer (hash join / NLJ / merge) of the GPU count.
     if (auto* consumer = dynamic_cast<op::sirius_physical_partition_consumer_operator*>(
           partition_op->get_downstream_consumer_op())) {

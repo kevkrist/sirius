@@ -92,6 +92,7 @@ sirius:
     max_build_hash_table_bytes: 805306368   # 768 MiB
     enable_dynamic_filter: true    # scan and join-edge runtime filters
     enable_dynamic_filter_multi_partition: false  # global Bloom for partitioned builds
+    enable_dynamic_filter_partition_specific: false  # per-partition Bloom at probe CONCAT
     max_dynamic_filter_bloom_bytes_per_gpu: 268435456  # 256 MiB per join on each GPU
     enable_dynamic_zone_map_filter: false  # optional parquet-read/native-post-decode min/max
     dynamic_filter_domain_coverage_threshold: 0.9  # skip keys the build's domain coverage exceeds
@@ -363,6 +364,7 @@ batch default**. Each can still be overridden individually.
 | `mark_join_build_switch_ratio` | 8.0 | For STANDARD MARK joins, build on the smaller (left) side when `right_rows >= ratio * left_rows` (0 disables) |
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible joins. Targets may be probe scans or join-edge endpoints. |
 | `enable_dynamic_filter_multi_partition` | false | Accumulate a global Bloom for eligible non-broadcast hash-partitioned builds with more than one partition. Requires `enable_dynamic_filter`. |
+| `enable_dynamic_filter_partition_specific` | false | Build one Bloom per hash partition and apply it at the matching probe `CONCAT`. Requires `enable_dynamic_filter` and is mutually exclusive with `enable_dynamic_filter_multi_partition`. |
 | `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Maximum allocator-accounted Bloom bit-array bytes produced by one join on each GPU, summed across its Bloom keys. The full candidate set is skipped when it exceeds the cap. `0` disables Bloom construction but leaves exact IN-lists and zone maps eligible. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's membership filter when the build covers at least this fraction of the key's unfiltered base-table row bound. Fires only for build keys proven unique in their base relation, with evidence from DuckDB-native scans; the zone-map range gate receives no domain and stays inactive. A value above 1.0 is the explicit disabled state (the rollback lever: setting it above 1.0 restores pre-gate publication behavior without disabling dynamic filtering); exactly 1.0 fires only at full coverage. |
@@ -567,6 +569,7 @@ rejected as unknown, and the old `SET` variables no longer exist.
 |----------|---------|-------------|
 | `enable_dynamic_filter` | true | Enable runtime filters for eligible joins. Targets may be probe scans or join-edge endpoints. |
 | `enable_dynamic_filter_multi_partition` | false | Accumulate a global Bloom for eligible non-broadcast hash-partitioned builds with more than one partition. Requires `enable_dynamic_filter`. |
+| `enable_dynamic_filter_partition_specific` | false | Build one Bloom per hash partition and apply it at the matching probe `CONCAT`. Requires `enable_dynamic_filter` and is mutually exclusive with `enable_dynamic_filter_multi_partition`. |
 | `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Maximum allocator-accounted Bloom bit-array bytes produced by one join on each GPU, summed across its Bloom keys. The full candidate set is skipped when it exceeds the cap. `0` disables Bloom construction but leaves exact IN-lists and zone maps eligible. |
 | `enable_dynamic_zone_map_filter` | false | Publish build-key min/max filters in addition to membership filters. Parquet scans use them for row-group pruning; duckdb-native scans apply them post-decode. Requires `enable_dynamic_filter`. |
 | `dynamic_filter_domain_coverage_threshold` | 0.9 | Skip publishing a key's membership filter when the build covers at least this fraction of the key's unfiltered base-table row bound. Fires only for build keys proven unique in their base relation, with evidence from DuckDB-native scans; the zone-map range gate receives no domain and stays inactive. A value above 1.0 is the explicit disabled state (the rollback lever: setting it above 1.0 restores pre-gate publication behavior without disabling dynamic filtering); exactly 1.0 fires only at full coverage. |
@@ -575,6 +578,7 @@ rejected as unknown, and the old `SET` variables no longer exist.
 ```sql
 SET enable_dynamic_filter = true;
 SET enable_dynamic_filter_multi_partition = false;
+SET enable_dynamic_filter_partition_specific = false;
 SET max_dynamic_filter_bloom_bytes_per_gpu = 268435456;
 SET enable_dynamic_zone_map_filter = false;
 ```

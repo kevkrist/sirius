@@ -245,7 +245,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   uint64_t hash_partition_bytes,
   uint64_t max_broadcast_join_size,
   dynamic_filter_stats* dynamic_filter_stats_sink,
-  bool enable_dynamic_filter_multi_partition)
+  bool enable_dynamic_filter_multi_partition,
+  bool enable_dynamic_filter_partition_specific)
   : sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType::HASH_JOIN,
                                                 sirius::from_duckdb_vec(op.types),
                                                 estimated_cardinality),
@@ -287,7 +288,19 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   }
 
   _dynamic_filter_stats = dynamic_filter_stats_sink;
-  if (_dynamic_filter_stats != nullptr && _dynamic_filter_plan.enabled()) {
+  if (enable_dynamic_filter_multi_partition && enable_dynamic_filter_partition_specific) {
+    throw std::invalid_argument(
+      "global and partition-specific multi-partition dynamic filters are mutually exclusive");
+  }
+  bool const partition_specific_join_safe = join_type == duckdb::JoinType::INNER ||
+                                            join_type == duckdb::JoinType::RIGHT ||
+                                            join_type == duckdb::JoinType::SEMI;
+  if (enable_dynamic_filter_partition_specific && partition_specific_join_safe) {
+    _partition_dynamic_filters =
+      std::make_unique<partition_dynamic_filter_bank>(_dynamic_filter_plan, _dynamic_filter_stats);
+  }
+  if (_dynamic_filter_stats != nullptr &&
+      (_dynamic_filter_plan.enabled() || _partition_dynamic_filters != nullptr)) {
     _dynamic_filter_stats->producers_enabled.fetch_add(1, std::memory_order_relaxed);
   }
 
@@ -680,8 +693,8 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                                                         HASH_JOIN_MODE join_mode,
                                                         double estimated_probe_to_build_ratio)
 {
-  // Invariant: num_gpus defaults to 1 and is only ever set to a hardware GPU count >= 1. A value
-  // < 1 is a programming error (it makes the per-partition division below ill-defined).
+  // Invariant: num_gpus defaults to 1 and is only ever set to an active executor GPU count >= 1. A
+  // value < 1 is a programming error (it makes the per-partition division below ill-defined).
   if (num_gpus < 1) {
     throw std::invalid_argument("compute_hash_join_partition_strategy: num_gpus (" +
                                 std::to_string(num_gpus) + ") must be >= 1");
@@ -781,6 +794,10 @@ partition_strategy sirius_physical_hash_join::get_partition_strategy(
       partition_small_table_bytes(_num_gpus));
   }
 
+  if (_partition_dynamic_filters != nullptr &&
+      (strategy.broadcast || strategy.num_partitions <= 1)) {
+    _partition_dynamic_filters->disable();
+  }
   if (strategy.build_probe) {
     _join_mode = HASH_JOIN_MODE::BUILD_PROBE;
     // One hash-table slot per partition. Elements are non-movable (atomic build_state), so build a
@@ -833,6 +850,65 @@ bool sirius_physical_hash_join::publishes_dynamic_filters() const
   // Fixed at construction, so this needs no lock. An enabled plan means probe targets are
   // wired; DuckDB's pushdown metadata is consumed at plan time and never reaches the operator.
   return _dynamic_filter_plan.enabled();
+}
+
+bool sirius_physical_hash_join::wants_partition_specific_dynamic_filters() const noexcept
+{
+  return _partition_dynamic_filters != nullptr;
+}
+
+bool sirius_physical_hash_join::wants_any_multi_partition_dynamic_filters() const noexcept
+{
+  return wants_multi_partition_dynamic_filters() || wants_partition_specific_dynamic_filters();
+}
+
+bool sirius_physical_hash_join::arm_partition_specific_dynamic_filters(uint64_t build_rows,
+                                                                       int num_partitions) noexcept
+{
+  if (_partition_dynamic_filters == nullptr || num_partitions <= 1) { return false; }
+  return _partition_dynamic_filters->arm(build_rows,
+                                         static_cast<std::size_t>(num_partitions),
+                                         static_cast<std::size_t>(std::max(_num_gpus, 1)));
+}
+
+void sirius_physical_hash_join::finalize_partition_specific_dynamic_filters() noexcept
+{
+  if (_partition_dynamic_filters != nullptr) { _partition_dynamic_filters->seal(); }
+}
+
+bool sirius_physical_hash_join::partition_specific_probe_may_proceed() const noexcept
+{
+  return _partition_dynamic_filters == nullptr || _partition_dynamic_filters->probe_may_proceed();
+}
+
+void sirius_physical_hash_join::record_partition_specific_readiness_wait() noexcept
+{
+  if (_partition_dynamic_filters != nullptr) {
+    _partition_dynamic_filters->record_readiness_wait();
+  }
+}
+
+partition_dynamic_filter_bank::selection
+sirius_physical_hash_join::select_partition_dynamic_filters(std::size_t partition_idx,
+                                                            int device_id) const noexcept
+{
+  if (_partition_dynamic_filters == nullptr) {
+    return {.result = partition_dynamic_filter_bank::selection::status::missing};
+  }
+  return _partition_dynamic_filters->select(partition_idx, device_id);
+}
+
+void sirius_physical_hash_join::record_partition_specific_probe(uint64_t rows_in,
+                                                                uint64_t rows_out) noexcept
+{
+  if (_partition_dynamic_filters != nullptr) {
+    _partition_dynamic_filters->record_probe(rows_in, rows_out);
+  }
+}
+
+void sirius_physical_hash_join::record_partition_specific_probe_failure() noexcept
+{
+  if (_partition_dynamic_filters != nullptr) { _partition_dynamic_filters->record_probe_failure(); }
 }
 
 bool sirius_physical_hash_join::arm_multi_partition_dynamic_filters(
@@ -2136,7 +2212,25 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   // `set_build_arrives_whole`. The join mode is deliberately not part of the condition: a
   // single-partition STANDARD / MIXED_JOIN build publishes on the same terms as BUILD_PROBE.
   std::optional<::cucascade::read_only_data_batch> build_ro;
+  bool partition_specific_fragment = false;
   if (port_id == "build" && batch) {
+    if (_partition_dynamic_filters != nullptr) {
+      auto const state = _partition_dynamic_filters->current_state();
+      if (state == partition_dynamic_filter_bank::state::pending_arm ||
+          state == partition_dynamic_filter_bank::state::accumulating) {
+        partition_specific_fragment = true;
+        try {
+          build_ro.emplace(batch->to_read_only());
+        } catch (std::exception const& error) {
+          _partition_dynamic_filters->abandon_partition(partition_idx, error.what());
+          partition_specific_fragment = false;
+        } catch (...) {
+          _partition_dynamic_filters->abandon_partition(partition_idx,
+                                                        "failed to acquire the build fragment");
+          partition_specific_fragment = false;
+        }
+      }
+    }
     bool claim              = false;
     bool wired_but_unusable = false;
     HASH_JOIN_MODE mode     = HASH_JOIN_MODE::STANDARD;
@@ -2180,6 +2274,50 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     port_id, batch, partition_idx);
 
   if (!build_ro) { return; }
+
+  if (partition_specific_fragment) {
+    auto abandon = [this, partition_idx](std::string_view reason) noexcept {
+      _partition_dynamic_filters->abandon_partition(partition_idx, reason);
+    };
+    try {
+      if (_partition_dynamic_filters->current_state() !=
+          partition_dynamic_filter_bank::state::accumulating) {
+        abandon("build fragment arrived before the local filter bank was armed");
+        return;
+      }
+      auto* local_space = build_ro->get_data() ? build_ro->get_memory_space() : nullptr;
+      if (local_space == nullptr ||
+          build_ro->get_current_tier() != ::cucascade::memory::Tier::GPU) {
+        abandon("build fragment is not GPU resident");
+        return;
+      }
+      rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{local_space->get_device_id()}};
+      auto local_stream = local_space->acquire_stream();
+      if (auto const writer_event = build_ro->get_writer_event(); writer_event != nullptr) {
+        auto const status = cudaStreamWaitEvent(local_stream.value(), writer_event, 0);
+        if (status != cudaSuccess) {
+          abandon(cudaGetErrorString(status));
+          return;
+        }
+      } else {
+        auto const status = cudaDeviceSynchronize();
+        if (status != cudaSuccess) {
+          abandon(cudaGetErrorString(status));
+          return;
+        }
+      }
+      _partition_dynamic_filters->contribute(partition_idx,
+                                             sirius::get_cudf_table_view(*build_ro),
+                                             local_space->get_device_id(),
+                                             *local_space,
+                                             local_stream);
+    } catch (std::exception const& error) {
+      abandon(error.what());
+    } catch (...) {
+      abandon("unknown local Bloom contribution failure");
+    }
+    return;
+  }
 
   nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
   auto* ms = build_ro->get_data() ? build_ro->get_memory_space() : nullptr;

@@ -595,11 +595,13 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
            "  operator_params:\n"
            "    enable_dynamic_filter: false\n"
            "    enable_dynamic_filter_multi_partition: true\n"
+           "    enable_dynamic_filter_partition_specific: false\n"
            "    max_dynamic_filter_bloom_bytes_per_gpu: 64MiB\n";
   }
 
   CHECK(operator_params{}.enable_dynamic_filter);
   CHECK_FALSE(operator_params{}.enable_dynamic_filter_multi_partition);
+  CHECK_FALSE(operator_params{}.enable_dynamic_filter_partition_specific);
   CHECK(operator_params{}.max_dynamic_filter_bloom_bytes_per_gpu ==
         config::DEFAULT_MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU);
 
@@ -607,7 +609,40 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
   cfg.load_from_file(path);
   CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter);
   CHECK(cfg.get_operator_params().enable_dynamic_filter_multi_partition);
+  CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter_partition_specific);
   CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == 64ULL * 1024 * 1024);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("partition-specific YAML mode is parsed and conflicts with global mode",
+          "[config_opt][dynamic_filter]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_partition_filter.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    enable_dynamic_filter_multi_partition: false\n"
+           "    enable_dynamic_filter_partition_specific: true\n";
+  }
+
+  sirius_config local_cfg;
+  local_cfg.load_from_file(path);
+  CHECK_FALSE(local_cfg.get_operator_params().enable_dynamic_filter_multi_partition);
+  CHECK(local_cfg.get_operator_params().enable_dynamic_filter_partition_specific);
+
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    enable_dynamic_filter_multi_partition: true\n"
+           "    enable_dynamic_filter_partition_specific: true\n";
+  }
+
+  sirius_config conflict_cfg;
+  REQUIRE_THROWS_AS(conflict_cfg.load_from_file(path), std::runtime_error);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

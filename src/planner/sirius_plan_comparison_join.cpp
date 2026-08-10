@@ -471,6 +471,13 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     sirius::op::sirius_physical_hash_join::are_conditions_supported(conditions);
   if (is_supported_by_hash_join && !prefer_range_joins) {
     const auto& op_params = sirius_context->get_config().get_operator_params();
+    if (op_params.enable_dynamic_filter_multi_partition &&
+        op_params.enable_dynamic_filter_partition_specific) {
+      throw duckdb::InvalidInputException(
+        "enable_dynamic_filter_multi_partition and "
+        "enable_dynamic_filter_partition_specific are mutually exclusive");
+    }
+    bool const partition_specific_requested = op_params.enable_dynamic_filter_partition_specific;
 
     // Device placement is resolved before discovery attaches or mints any channel: a producer
     // must not register on channels it would then abandon for want of a replica placement.
@@ -488,14 +495,20 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto admitted_keys = admit_dynamic_filter_keys(
       conditions, condition_key_shapes, condition_domains, build_side_unique_column);
 
+    bool const partition_specific_join_safe = scan_route_join_type_admissible(op.join_type);
+    bool const partition_specific_plan_enabled =
+      dynamic_filter_enabled && partition_specific_requested && build_evidence &&
+      op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+      partition_specific_join_safe && !admitted_keys.empty();
+
     // Trace each admitted key through the built probe subtree. Scan bindings take precedence over
     // join-edge endpoints, so one key never publishes through both routes. Delim joins share this
     // planner entry point but are not dynamic-filter producers.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
-    bool const discovery_runs     = build_evidence &&
-                                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-                                !gpu_spaces.empty() && !host_spaces.empty();
+    bool const discovery_runs =
+      build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+      !partition_specific_requested && !gpu_spaces.empty() && !host_spaces.empty();
     if (discovery_runs) {
       // Scan binding additionally requires a producer join type that may pre-filter its probe side.
       bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
@@ -674,7 +687,8 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       op_params.hash_partition_bytes,
       op_params.max_broadcast_join_size,
       &sirius_context->get_dynamic_filter_stats(),
-      dynamic_filter_enabled && op_params.enable_dynamic_filter_multi_partition);
+      dynamic_filter_enabled && op_params.enable_dynamic_filter_multi_partition,
+      partition_specific_plan_enabled);
     auto& hj                        = join->Cast<sirius::op::sirius_physical_hash_join>();
     hj.join_stats                   = std::move(op.join_stats);
     hj.mark_join_build_switch_ratio = op_params.mark_join_build_switch_ratio;

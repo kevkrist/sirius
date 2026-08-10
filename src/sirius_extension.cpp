@@ -2037,10 +2037,33 @@ static void SetEnableDynamicFilterMultiPartition(ClientContext& context,
 {
   auto* params = get_operator_params(context);
   if (!params) { return; }
-  auto slot                                     = lock_operator_params_slot(context);
-  params->enable_dynamic_filter_multi_partition = BooleanValue::Get(parameter);
+  auto slot          = lock_operator_params_slot(context);
+  bool const enabled = BooleanValue::Get(parameter);
+  if (enabled && params->enable_dynamic_filter_partition_specific) {
+    throw InvalidInputException(
+      "enable_dynamic_filter_multi_partition and "
+      "enable_dynamic_filter_partition_specific are mutually exclusive");
+  }
+  params->enable_dynamic_filter_multi_partition = enabled;
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_MULTI_PARTITION to {}",
                    params->enable_dynamic_filter_multi_partition);
+}
+
+static void SetEnableDynamicFilterPartitionSpecific(ClientContext& context,
+                                                    SetScope scope,
+                                                    Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot         = lock_operator_params_slot(context);
+  bool const enable = BooleanValue::Get(parameter);
+  if (enable && params->enable_dynamic_filter_multi_partition) {
+    throw InvalidInputException(
+      "enable_dynamic_filter_partition_specific and "
+      "enable_dynamic_filter_multi_partition are mutually exclusive");
+  }
+  params->enable_dynamic_filter_partition_specific = enable;
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DYNAMIC_FILTER_PARTITION_SPECIFIC to {}", enable);
 }
 
 static void SetMaxDynamicFilterBloomBytesPerGpu(ClientContext& context,
@@ -2367,6 +2390,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::operator
     LogicalType::BOOLEAN,
     Value::BOOLEAN(sirius::operator_params{}.enable_dynamic_filter),
     SetEnableDynamicFilter);
+
+  config.AddExtensionOption(
+    "enable_dynamic_filter_partition_specific",
+    "Build one Bloom filter per non-broadcast hash partition and apply it at the matching probe "
+    "CONCAT; requires enable_dynamic_filter and is mutually exclusive with "
+    "enable_dynamic_filter_multi_partition (off by default)",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(defaults.enable_dynamic_filter_partition_specific),
+    SetEnableDynamicFilterPartitionSpecific);
 
   config.AddExtensionOption(
     "enable_dynamic_filter_multi_partition",

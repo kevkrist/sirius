@@ -78,7 +78,8 @@ void number_operator_tree(sirius_physical_operator& op, size_t& next_id)
 hash_join_test_fixture create_test_hash_join(
   duckdb::JoinType join_type,
   duckdb::vector<duckdb::LogicalType> output_types,
-  uint64_t hash_partition_bytes = sirius::config::DEFAULT_HASH_PARTITION_BYTES)
+  uint64_t hash_partition_bytes  = sirius::config::DEFAULT_HASH_PARTITION_BYTES,
+  bool enable_partition_specific = false)
 {
   hash_join_test_fixture fixture;
 
@@ -117,7 +118,11 @@ hash_join_test_fixture create_test_hash_join(
     1000,                                                            // estimated_cardinality
     sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
     sirius::op::dynamic_filter_publish_plan{},  // dynamic_filter_plan
-    hash_partition_bytes);
+    hash_partition_bytes,
+    sirius::config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
+    nullptr,
+    false,
+    enable_partition_specific);
 
   // These fixtures build a bare operator tree with no pipelines, so the converter's
   // assign_operator_ids never runs over it. Number it here — operator code reads
@@ -656,6 +661,59 @@ TEST_CASE("sirius_physical_hash_join identifies right-family joins", "[physical_
     auto fixture = create_test_hash_join(join_type, {duckdb::LogicalType::INTEGER});
     REQUIRE_FALSE(fixture.hash_join->is_right_family());
   }
+}
+
+TEST_CASE("partition-specific dynamic filters admit only probe-filter-safe joins",
+          "[physical_concat][partition_dynamic_filter]")
+{
+  for (auto join_type :
+       {duckdb::JoinType::INNER, duckdb::JoinType::RIGHT, duckdb::JoinType::SEMI}) {
+    INFO("join_type=" << duckdb::JoinTypeToString(join_type));
+    auto fixture = create_test_hash_join(join_type,
+                                         {duckdb::LogicalType::INTEGER},
+                                         sirius::config::DEFAULT_HASH_PARTITION_BYTES,
+                                         true);
+    REQUIRE(fixture.hash_join->wants_partition_specific_dynamic_filters());
+  }
+
+  for (auto join_type : {duckdb::JoinType::LEFT,
+                         duckdb::JoinType::ANTI,
+                         duckdb::JoinType::MARK,
+                         duckdb::JoinType::OUTER,
+                         duckdb::JoinType::RIGHT_SEMI,
+                         duckdb::JoinType::RIGHT_ANTI}) {
+    INFO("join_type=" << duckdb::JoinTypeToString(join_type));
+    auto fixture = create_test_hash_join(join_type,
+                                         {duckdb::LogicalType::INTEGER},
+                                         sirius::config::DEFAULT_HASH_PARTITION_BYTES,
+                                         true);
+    REQUIRE_FALSE(fixture.hash_join->wants_partition_specific_dynamic_filters());
+  }
+}
+
+TEST_CASE("probe CONCAT waits on its build peer until the local bank is terminal",
+          "[physical_concat][partition_dynamic_filter][scheduler]")
+{
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER,
+                                       {duckdb::LogicalType::INTEGER},
+                                       sirius::config::DEFAULT_HASH_PARTITION_BYTES,
+                                       true);
+  auto types =
+    sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+  sirius_physical_concat build_concat(types, 1000, fixture.hash_join.get(), true);
+  sirius_physical_concat probe_concat(types, 1000, fixture.hash_join.get(), false);
+
+  build_concat.set_sibling_concat(&probe_concat);
+  probe_concat.set_sibling_concat(&build_concat);
+
+  REQUIRE_FALSE(fixture.hash_join->partition_specific_probe_may_proceed());
+  auto const hint = probe_concat.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  REQUIRE(hint->producer == &build_concat);
+
+  build_concat.on_finalize_operator();
+  REQUIRE(fixture.hash_join->partition_specific_probe_may_proceed());
 }
 
 TEST_CASE("right-family sibling partitions round up from the probe input", "[physical_partition]")

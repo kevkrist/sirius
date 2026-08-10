@@ -17,14 +17,28 @@
 #include "op/sirius_physical_concat.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+#include "op/scan/dynamic_filter_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <limits>
+
 namespace sirius {
 namespace op {
+
+namespace {
+
+constexpr std::size_t saturating_multiply(std::size_t value, std::size_t factor) noexcept
+{
+  auto const maximum = std::numeric_limits<std::size_t>::max();
+  return value != 0 && factor > maximum / value ? maximum : value * factor;
+}
+
+}  // namespace
 
 sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_type> types,
                                                std::size_t estimated_cardinality,
@@ -70,6 +84,16 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<sirius::logical_ty
 
 std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
 {
+  if (!_is_build && _sibling_concat != nullptr &&
+      _downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN) {
+    auto& hash_join = _downstream_join->Cast<sirius_physical_hash_join>();
+    if (hash_join.wants_partition_specific_dynamic_filters() &&
+        !hash_join.partition_specific_probe_may_proceed()) {
+      hash_join.record_partition_specific_readiness_wait();
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, _sibling_concat};
+    }
+  }
+
   std::lock_guard<std::mutex> lg(lock);
 
   if (ports.size() != 1) {
@@ -198,6 +222,44 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
     auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry());
     output_batches.push_back(std::move(merged_batch));
   }
+  if (!_is_build && _downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN) {
+    auto& hash_join = _downstream_join->Cast<sirius_physical_hash_join>();
+    if (hash_join.wants_partition_specific_dynamic_filters()) {
+      try {
+        auto output_ro = output_batches.front()->to_read_only();
+        auto const rows_in =
+          static_cast<uint64_t>(sirius::get_cudf_table_view(output_ro).num_rows());
+        uint64_t rows_out    = rows_in;
+        auto const device_id = space->get_device_id();
+        auto const selection = hash_join.select_partition_dynamic_filters(partition_idx, device_id);
+        if (selection.result == partition_dynamic_filter_bank::selection::status::available &&
+            selection.filters != nullptr) {
+          auto filtered = scan::apply_dynamic_filters_to_view(
+            sirius::get_cudf_table_view(output_ro),
+            *selection.filters,
+            stream,
+            scan::dynamic_filter_apply_mode::membership_masks_only,
+            nullptr,
+            device_id);
+          if (filtered != nullptr) {
+            rows_out = static_cast<uint64_t>(filtered->num_rows());
+            output_batches.front() =
+              sirius::make_data_batch(std::move(filtered), *space, stream, batch_telemetry());
+          }
+        }
+        hash_join.record_partition_specific_probe(rows_in, rows_out);
+      } catch (std::exception const& error) {
+        hash_join.record_partition_specific_probe_failure();
+        SIRIUS_LOG_WARN("sirius_physical_concat: partition-local filter apply failed open: {}",
+                        error.what());
+      } catch (...) {
+        hash_join.record_partition_specific_probe_failure();
+        SIRIUS_LOG_WARN(
+          "sirius_physical_concat: partition-local filter apply failed open: unknown error");
+      }
+    }
+  }
+
   return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);
 }
 
@@ -236,11 +298,26 @@ void sirius_physical_concat::set_concat_all(bool concat_all)
   _concat_all = concat_all;
 }
 
+void sirius_physical_concat::on_finalize_operator()
+{
+  if (!_is_build || _downstream_join->type != SiriusPhysicalOperatorType::HASH_JOIN) { return; }
+  _downstream_join->Cast<sirius_physical_hash_join>().finalize_partition_specific_dynamic_filters();
+}
+
 std::size_t sirius_physical_concat::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
-  if (stats.num_batches <= 1) { return 0; }
-  return stats.bytes;
+  if (stats.num_batches == 0) { return 0; }
+
+  bool const applies_partition_filter =
+    !_is_build && _downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN &&
+    _downstream_join->Cast<sirius_physical_hash_join>().wants_partition_specific_dynamic_filters();
+  if (!applies_partition_filter) { return stats.num_batches == 1 ? 0 : stats.bytes; }
+
+  // Filtering can transiently retain two cascade outputs and a BOOL8 mask. A multi-batch input
+  // additionally retains the merged table through its read-only accessor.
+  auto const allocation_factor = stats.num_batches == 1 ? std::size_t{3} : std::size_t{4};
+  return saturating_multiply(stats.bytes, allocation_factor);
 }
 
 }  // namespace op

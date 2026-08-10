@@ -61,7 +61,7 @@ class pipeline_build_context {
 
   //! Sorted, deduped device ids of the GPUs the query runs on — the same list task_creator routes
   //! partitions across. Used by broadcast join partitioning to map a probe batch's residence GPU
-  //! back to its partition slot. Empty when built without an engine (tests / single-GPU).
+  //! back to its partition slot. Empty only when no executor device list was supplied.
   [[nodiscard]] const std::vector<int>& active_gpu_ids() const { return _active_gpu_ids; }
 
   [[nodiscard]] const std::shared_ptr<const telemetry::telemetry_context>& telemetry_context() const

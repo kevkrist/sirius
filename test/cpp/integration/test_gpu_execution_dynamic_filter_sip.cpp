@@ -81,6 +81,32 @@ struct dynamic_filter_multi_partition_switch_guard {
   bool original;
 };
 
+struct partition_filter_strategy_guard {
+  explicit partition_filter_strategy_guard(duckdb::Connection& c) : con(c)
+  {
+    auto const& params =
+      sirius::test::get_registered_sirius_context(c)->get_config().get_operator_params();
+    global = params.enable_dynamic_filter_multi_partition;
+    local  = params.enable_dynamic_filter_partition_specific;
+    con.Query("SET enable_dynamic_filter_multi_partition = false;");
+    con.Query("SET enable_dynamic_filter_partition_specific = false;");
+  }
+  ~partition_filter_strategy_guard()
+  {
+    con.Query("SET enable_dynamic_filter_partition_specific = false;");
+    con.Query("SET enable_dynamic_filter_multi_partition = false;");
+    if (global) {
+      con.Query("SET enable_dynamic_filter_multi_partition = true;");
+    } else if (local) {
+      con.Query("SET enable_dynamic_filter_partition_specific = true;");
+    }
+  }
+
+  duckdb::Connection& con;
+  bool global = false;
+  bool local  = false;
+};
+
 // Verify GPU execution and return the result as a sorted bag.
 std::vector<std::vector<std::string>> run_on_gpu(duckdb::Connection& con, const std::string& query)
 {
@@ -106,6 +132,13 @@ struct publication_deltas {
   std::uint64_t publications_finished                = 0;
   std::uint64_t publications_skipped_build_not_whole = 0;
   std::uint64_t filters_pushed                       = 0;
+  std::uint64_t partition_filters_built              = 0;
+  std::uint64_t partition_build_fragments            = 0;
+  std::uint64_t partition_build_rows                 = 0;
+  std::uint64_t partition_probe_batches              = 0;
+  std::uint64_t partition_probe_rows_in              = 0;
+  std::uint64_t partition_probe_rows_out             = 0;
+  std::uint64_t partition_failures                   = 0;
 };
 
 struct switch_comparison {
@@ -128,13 +161,29 @@ publication_deltas run_and_measure(duckdb::Connection& con,
     .publications_finished = after.publications_finished - before.publications_finished,
     .publications_skipped_build_not_whole =
       after.publications_skipped_build_not_whole - before.publications_skipped_build_not_whole,
-    .filters_pushed = after.filters_pushed - before.filters_pushed};
+    .filters_pushed = after.filters_pushed - before.filters_pushed,
+    .partition_filters_built =
+      after.partition_dynamic_filter_filters_built - before.partition_dynamic_filter_filters_built,
+    .partition_build_fragments = after.partition_dynamic_filter_build_fragments -
+                                 before.partition_dynamic_filter_build_fragments,
+    .partition_build_rows =
+      after.partition_dynamic_filter_build_rows - before.partition_dynamic_filter_build_rows,
+    .partition_probe_batches =
+      after.partition_dynamic_filter_probe_batches - before.partition_dynamic_filter_probe_batches,
+    .partition_probe_rows_in =
+      after.partition_dynamic_filter_probe_rows_in - before.partition_dynamic_filter_probe_rows_in,
+    .partition_probe_rows_out = after.partition_dynamic_filter_probe_rows_out -
+                                before.partition_dynamic_filter_probe_rows_out,
+    .partition_failures =
+      after.partition_dynamic_filter_failures - before.partition_dynamic_filter_failures};
 }
 
 // Publication completes before these probes, making the enabled/disabled counter deltas
 // deterministic.
-switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
-                                                    const std::string& query)
+switch_comparison require_switch_result_equivalence(
+  duckdb::Connection& con,
+  const std::string& query,
+  std::vector<std::vector<std::string>>* on_rows_out = nullptr)
 {
   con.Query("SET gpu_execution = true;");
 
@@ -152,6 +201,7 @@ switch_comparison require_switch_result_equivalence(duckdb::Connection& con,
   }
 
   REQUIRE(on_rows == off_rows);
+  if (on_rows_out != nullptr) { *on_rows_out = std::move(on_rows); }
   return deltas;
 }
 
@@ -186,6 +236,34 @@ TEST_CASE("the multi-partition dynamic-filter switch is exposed through SQL",
   REQUIRE(restored);
   REQUIRE_FALSE(restored->HasError());
   REQUIRE(restored->GetValue(0, 0).GetValue<bool>() == original);
+
+  {
+    partition_filter_strategy_guard strategies(con);
+    auto global_on = con.Query("SET enable_dynamic_filter_multi_partition = true;");
+    REQUIRE(global_on);
+    REQUIRE_FALSE(global_on->HasError());
+
+    auto local_blocked = con.Query("SET enable_dynamic_filter_partition_specific = true;");
+    REQUIRE(local_blocked);
+    REQUIRE(local_blocked->HasError());
+
+    auto global_off = con.Query("SET enable_dynamic_filter_multi_partition = false;");
+    REQUIRE(global_off);
+    REQUIRE_FALSE(global_off->HasError());
+    auto local_on = con.Query("SET enable_dynamic_filter_partition_specific = true;");
+    REQUIRE(local_on);
+    REQUIRE_FALSE(local_on->HasError());
+
+    auto local_value =
+      con.Query("SELECT current_setting('enable_dynamic_filter_partition_specific')::BOOLEAN;");
+    REQUIRE(local_value);
+    REQUIRE_FALSE(local_value->HasError());
+    REQUIRE(local_value->GetValue(0, 0).GetValue<bool>());
+
+    auto global_blocked = con.Query("SET enable_dynamic_filter_multi_partition = true;");
+    REQUIRE(global_blocked);
+    REQUIRE(global_blocked->HasError());
+  }
 }
 
 TEST_CASE("the dynamic-filter Bloom cap is exposed through SQL",
@@ -360,6 +438,58 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
       REQUIRE(deltas.on.publications_finished > 0);
       REQUIRE(deltas.on.filters_pushed > 0);
       REQUIRE(deltas.on.publications_skipped_build_not_whole == 0);
+    }
+
+    SECTION("partition-specific mode filters matching probe partitions and preserves CPU results")
+    {
+      partition_filter_strategy_guard strategies(con);
+      auto local_on = con.Query("SET enable_dynamic_filter_partition_specific = true;");
+      REQUIRE(local_on);
+      REQUIRE_FALSE(local_on->HasError());
+      sirius::test::scoped_setting local_partitions(
+        con, "hash_partition_bytes", 1ULL * 1024 * 1024);
+      sirius::test::scoped_setting standard_join(con, "max_build_hash_table_bytes", 1);
+      sirius::test::scoped_setting small_scans(con, "scan_task_batch_size", 256ULL * 1024);
+
+      sirius::test::scoped_setting tiny_concat(con, "concat_batch_bytes", 1);
+
+      auto const local_query =
+        "select count(*), sum(l.l_partkey), sum(l.l_suppkey), sum(l.l_linenumber) "
+        "from orders o join lineitem l on o.o_orderkey = l.l_orderkey "
+        "where l.l_shipdate < date '1993-01-01'";
+      std::vector<std::vector<std::string>> filtered_rows;
+      auto const deltas = require_switch_result_equivalence(con, local_query, &filtered_rows);
+
+      con.Query("SET gpu_execution = false;");
+      auto cpu_result = con.Query(local_query);
+      con.Query("SET gpu_execution = true;");
+      REQUIRE(cpu_result);
+      if (cpu_result->HasError()) {
+        UNSCOPED_INFO("CPU execution error: " << cpu_result->GetError());
+      }
+      REQUIRE_FALSE(cpu_result->HasError());
+      auto cpu_rows =
+        sirius::test::collect_rows(cpu_result->Cast<duckdb::MaterializedQueryResult>());
+      REQUIRE(filtered_rows == cpu_rows);
+
+      REQUIRE(deltas.off.producers_enabled == 0);
+      REQUIRE(deltas.off.partition_filters_built == 0);
+      REQUIRE(deltas.off.partition_build_fragments == 0);
+      REQUIRE(deltas.off.partition_probe_batches == 0);
+      REQUIRE(deltas.off.partition_probe_rows_in == 0);
+      REQUIRE(deltas.off.partition_probe_rows_out == 0);
+      REQUIRE(deltas.off.partition_failures == 0);
+
+      REQUIRE(deltas.on.producers_enabled > 0);
+      REQUIRE(deltas.on.membership_filters_built == 0);
+      REQUIRE(deltas.on.filters_pushed == 0);
+      REQUIRE(deltas.on.partition_filters_built > 0);
+      REQUIRE(deltas.on.partition_build_fragments > deltas.on.partition_filters_built);
+      REQUIRE(deltas.on.partition_build_rows > 0);
+      REQUIRE(deltas.on.partition_probe_batches > 0);
+      REQUIRE(deltas.on.partition_probe_rows_in > 0);
+      REQUIRE(deltas.on.partition_probe_rows_out < deltas.on.partition_probe_rows_in);
+      REQUIRE(deltas.on.partition_failures == 0);
     }
 
     SECTION("a zero Bloom cap skips Bloom construction through the planned policy")

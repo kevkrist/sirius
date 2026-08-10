@@ -154,7 +154,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   bool _drives_partition_count{false};
   bool _has_sibling_partition_op;
   PartitionType _partition_type;
-  /// Sorted, deduped active GPU device ids (see set_active_gpu_ids). Empty when unset / single-GPU.
+  /// Sorted, deduped active GPU device ids (see set_active_gpu_ids). Empty only when unset.
   std::vector<int> _active_gpu_ids;
   /// Broadcast mode: the build table is small enough to replicate to every GPU instead of
   /// hash-partitioning. Set on BOTH sibling partition ops when the join accepts BUILD_PROBE at

@@ -56,6 +56,9 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
     return _downstream_join;
   }
 
+  /// Link the build/probe CONCAT pair for partition-local readiness scheduling.
+  void set_sibling_concat(sirius_physical_concat* sibling) noexcept { _sibling_concat = sibling; }
+
   std::optional<task_creation_hint> get_next_task_hint() override;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
@@ -69,6 +72,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   //! before the join so the hash join sees a single build batch.
   void set_concat_all(bool concat_all);
 
+  void on_finalize_operator() override;
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
@@ -78,6 +83,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   uint64_t _concat_batch_bytes;
   //! Non-owning. Captured at construction from the `downstream_join` ctor argument.
   sirius_physical_operator* _downstream_join = nullptr;
+  //! Non-owning build/probe peer, linked by the pipeline converter before execution.
+  sirius_physical_concat* _sibling_concat = nullptr;
 };
 
 }  // namespace op

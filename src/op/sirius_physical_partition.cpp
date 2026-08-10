@@ -534,7 +534,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
 
   if (_is_build && _partition_type == PartitionType::HASH) {
     auto* hash_join = dynamic_cast<sirius_physical_hash_join*>(consumer);
-    if (hash_join != nullptr && hash_join->wants_multi_partition_dynamic_filters()) {
+    if (hash_join != nullptr && hash_join->wants_any_multi_partition_dynamic_filters()) {
       std::lock_guard<std::mutex> guard(lock);
       if (_num_partitions.has_value() && *_num_partitions > 1 && !_broadcast &&
           !_dynamic_filter_snapshot_attempted) {
@@ -553,12 +553,17 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
         bool exact_snapshot = false;
         compute_total_bytes(&build_batch_ids, &build_rows, &exact_snapshot);
         if (source_finished && exact_snapshot && !build_batch_ids.empty()) {
-          static_cast<void>(hash_join->arm_multi_partition_dynamic_filters(
-            build_rows, std::move(build_batch_ids), *_num_partitions));
+          if (hash_join->wants_partition_specific_dynamic_filters()) {
+            static_cast<void>(
+              hash_join->arm_partition_specific_dynamic_filters(build_rows, *_num_partitions));
+          } else {
+            static_cast<void>(hash_join->arm_multi_partition_dynamic_filters(
+              build_rows, std::move(build_batch_ids), *_num_partitions));
+          }
         } else if (!source_finished || !exact_snapshot) {
           SIRIUS_LOG_WARN(
-            "sirius_physical_partition id {} could not freeze an exact build snapshot; global "
-            "dynamic Bloom publication is disabled for this join.",
+            "sirius_physical_partition id {} could not freeze an exact build snapshot; "
+            "multi-partition dynamic Bloom publication is disabled for this join.",
             this->get_operator_id());
         }
       }

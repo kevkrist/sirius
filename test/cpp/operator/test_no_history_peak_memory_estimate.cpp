@@ -46,7 +46,7 @@ struct hash_join_fixture {
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 };
 
-hash_join_fixture make_hash_join()
+hash_join_fixture make_hash_join(bool enable_partition_specific = false)
 {
   hash_join_fixture f;
   f.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(duckdb::JoinType::INNER);
@@ -77,7 +77,14 @@ hash_join_fixture make_hash_join()
     duckdb::vector<duckdb::idx_t>{},
     duckdb::vector<duckdb::idx_t>{},
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
-    0);
+    0,
+    sirius::config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
+    dynamic_filter_publish_plan{},
+    sirius::config::DEFAULT_HASH_PARTITION_BYTES,
+    sirius::config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
+    nullptr,
+    false,
+    enable_partition_specific);
   return f;
 }
 
@@ -134,6 +141,24 @@ TEST_CASE("concat no_history_peak_memory_estimate: many batches returns bytes",
   sirius_physical_concat concat{
     sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
   REQUIRE(concat.no_history_peak_memory_estimate({10, 1024}) == 1024);
+}
+TEST_CASE("partition-filter probe CONCAT reserves for merge and filter cascade",
+          "[no_history_peak_memory_estimate][concat][partition_dynamic_filter]")
+{
+  auto f = make_hash_join(true);
+  sirius_physical_concat probe{
+    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
+
+  REQUIRE(probe.no_history_peak_memory_estimate({0, 500}) == 0);
+  REQUIRE(probe.no_history_peak_memory_estimate({1, 500}) == 1500);
+  REQUIRE(probe.no_history_peak_memory_estimate({2, 500}) == 2000);
+  REQUIRE(probe.no_history_peak_memory_estimate({1, std::numeric_limits<std::size_t>::max()}) ==
+          std::numeric_limits<std::size_t>::max());
+
+  sirius_physical_concat build{
+    sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), true};
+  REQUIRE(build.no_history_peak_memory_estimate({1, 500}) == 0);
+  REQUIRE(build.no_history_peak_memory_estimate({2, 500}) == 500);
 }
 
 // ---------------------------------------------------------------------------

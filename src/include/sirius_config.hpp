@@ -143,6 +143,11 @@ struct operator_params {
   /// enabled.
   bool enable_dynamic_filter_multi_partition = false;
 
+  /// Build one Bloom filter per hash partition and apply it at the matching probe-side CONCAT.
+  /// This prototype is mutually exclusive with enable_dynamic_filter_multi_partition and is
+  /// effective only when enable_dynamic_filter is enabled.
+  bool enable_dynamic_filter_partition_specific = false;
+
   /// Maximum allocator-accounted Bloom bit-array bytes produced by one join on each GPU, summed
   /// across its Bloom keys. 0 disables Bloom construction without disabling exact membership or
   /// zone-map filters.

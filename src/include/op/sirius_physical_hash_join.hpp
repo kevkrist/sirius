@@ -30,6 +30,7 @@
 #include "expression/join_condition.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/dynamic_filter/partition_dynamic_filter_bank.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -253,7 +254,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES,
     uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
     dynamic_filter_stats* dynamic_filter_stats_sink = {},
-    bool enable_dynamic_filter_multi_partition      = false);
+    bool enable_dynamic_filter_multi_partition      = false,
+    bool enable_dynamic_filter_partition_specific   = false);
 
   sirius_physical_hash_join(
     duckdb::LogicalOperator& op,
@@ -334,6 +336,31 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   {
     return _enable_dynamic_filter_multi_partition && _dynamic_filter_plan.enabled();
   }
+
+  /// True when plan construction installed the partition-specific prototype bank.
+  [[nodiscard]] bool wants_partition_specific_dynamic_filters() const noexcept;
+  /// True when either supported multi-partition publication strategy is installed.
+  [[nodiscard]] bool wants_any_multi_partition_dynamic_filters() const noexcept;
+
+  /// Arm partition-local geometry from the complete pre-scatter build row count.
+  [[nodiscard]] bool arm_partition_specific_dynamic_filters(uint64_t build_rows,
+                                                            int num_partitions) noexcept;
+
+  /// Seal completed build contributions, or disable a bank that was never armed.
+  void finalize_partition_specific_dynamic_filters() noexcept;
+
+  /// False only while an installed bank still needs build arming or contributions.
+  [[nodiscard]] bool partition_specific_probe_may_proceed() const noexcept;
+
+  void record_partition_specific_readiness_wait() noexcept;
+
+  /// Select a sealed filter set for one exact partition and probe device.
+  [[nodiscard]] partition_dynamic_filter_bank::selection select_partition_dynamic_filters(
+    std::size_t partition_idx, int device_id) const noexcept;
+
+  void record_partition_specific_probe(uint64_t rows_in, uint64_t rows_out) noexcept;
+
+  void record_partition_specific_probe_failure() noexcept;
 
   /**
    * @brief Attempt to arm accumulation from a complete pre-scatter build snapshot
@@ -519,6 +546,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   dynamic_filter_publish_plan _dynamic_filter_plan;
   bool _enable_dynamic_filter_multi_partition = false;
   std::shared_ptr<class dynamic_filter_accumulator> _dynamic_filter_accumulator;
+  std::unique_ptr<partition_dynamic_filter_bank> _partition_dynamic_filters;
   // Optional non-owning counter sink. SiriusContext owns it and outlives the plan.
   dynamic_filter_stats* _dynamic_filter_stats = nullptr;
   /// Exactly-once arbitration between the publication hook and finalization.
@@ -527,18 +555,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //===----------------------------------------------------------------------===//
 
  public:
-  /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch.
+  /// @brief Route a partitioned batch and service eligible build-side dynamic filters.
   ///
-  /// For the @c build port of a wired @c BUILD_PROBE join, the single concat-folded batch is the
-  /// publication point. Its read-only accessor is acquired BEFORE the batch is routed: once
-  /// deposited into a repository the batch becomes a downgrade candidate, and holding the shared
-  /// lock across the deposit pins its GPU representation until publication completes. A stream
-  /// borrowed from the build memory space then waits on the batch writer event and builds and
-  /// replicates filters from the build keys without requiring a probe batch or a built hash table.
+  /// A qualifying build delivery acquires its read-only accessor before routing, pinning the GPU
+  /// representation after repository insertion. The one-shot path then builds and replicates from a
+  /// complete concat-folded build batch. The partition-local path instead contributes every
+  /// build-CONCAT fragment after routing to its exact partition on the actual GPU.
   ///
-  /// Other ports and join modes only route. This synchronous hook completes before this join's
-  /// immediate probe producer is scheduled. A scan target reached through an intervening join is
-  /// not gated by that edge.
+  /// Both paths order a durable memory-space stream after the batch writer event. Local
+  /// construction failures abandon the affected partition and remain fail-open; build-CONCAT
+  /// finalization, not this hook, seals the bank and releases probe readiness. Other ports only
+  /// route.
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
