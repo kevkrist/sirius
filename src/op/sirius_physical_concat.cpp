@@ -87,7 +87,7 @@ std::optional<task_creation_hint> sirius_physical_concat::get_next_task_hint()
   if (!_is_build && _sibling_concat != nullptr &&
       _downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto& hash_join = _downstream_join->Cast<sirius_physical_hash_join>();
-    if (hash_join.wants_partition_specific_dynamic_filters() &&
+    if (hash_join.partition_specific_dynamic_filters_may_apply() &&
         !hash_join.partition_specific_probe_may_proceed()) {
       hash_join.record_partition_specific_readiness_wait();
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, _sibling_concat};
@@ -224,7 +224,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   }
   if (!_is_build && _downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto& hash_join = _downstream_join->Cast<sirius_physical_hash_join>();
-    if (hash_join.wants_partition_specific_dynamic_filters()) {
+    if (hash_join.partition_specific_dynamic_filters_may_apply()) {
       try {
         auto output_ro = output_batches.front()->to_read_only();
         auto const rows_in =
@@ -311,7 +311,8 @@ std::size_t sirius_physical_concat::no_history_peak_memory_estimate(
 
   bool const applies_partition_filter =
     !_is_build && _downstream_join->type == SiriusPhysicalOperatorType::HASH_JOIN &&
-    _downstream_join->Cast<sirius_physical_hash_join>().wants_partition_specific_dynamic_filters();
+    _downstream_join->Cast<sirius_physical_hash_join>()
+      .partition_specific_dynamic_filters_may_apply();
   if (!applies_partition_filter) { return stats.num_batches == 1 ? 0 : stats.bytes; }
 
   // Filtering can transiently retain two cascade outputs and a BOOL8 mask. A multi-batch input

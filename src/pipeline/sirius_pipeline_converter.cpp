@@ -489,12 +489,9 @@ void sirius_pipeline_converter::configure_partition_min_partitions()
   auto const& active_gpu_ids = build_ctx_.active_gpu_ids();
   int const num_gpus =
     active_gpu_ids.empty() ? build_ctx_.num_gpus() : static_cast<int>(active_gpu_ids.size());
-  // Single-GPU runs keep the consumer default of 1 (no-op). For multi-GPU we hand
-  // num_gpus to each partition's downstream sizing consumer, which derives the partition floor and
-  // small-table threshold internally (see natural_num_partitions / partition_small_table_bytes) and
-  // lets joins keep one hash table per partition so BUILD_PROBE is admitted for up to num_gpus
-  // partitions rather than only one.
-  if (num_gpus <= 1) return;
+  // Every partition needs the executor's routing set, including a single-GPU query. Multi-GPU runs
+  // additionally hand the count to the downstream sizing consumer, which derives the partition
+  // floor and small-table threshold internally.
 
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
     if (!op) return;
@@ -504,9 +501,11 @@ void sirius_pipeline_converter::configure_partition_min_partitions()
     // partition slot (inverse of task_creator's partition_idx -> GPU routing).
     partition_op->set_active_gpu_ids(active_gpu_ids);
     // Inform the downstream sizing consumer (hash join / NLJ / merge) of the GPU count.
-    if (auto* consumer = dynamic_cast<op::sirius_physical_partition_consumer_operator*>(
-          partition_op->get_downstream_consumer_op())) {
-      consumer->set_num_gpus(num_gpus);
+    if (num_gpus > 1) {
+      if (auto* consumer = dynamic_cast<op::sirius_physical_partition_consumer_operator*>(
+            partition_op->get_downstream_consumer_op())) {
+        consumer->set_num_gpus(num_gpus);
+      }
     }
   };
   for (auto& pipe : scheduled_) {

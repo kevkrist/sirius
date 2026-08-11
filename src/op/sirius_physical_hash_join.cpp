@@ -857,6 +857,11 @@ bool sirius_physical_hash_join::wants_partition_specific_dynamic_filters() const
   return _partition_dynamic_filters != nullptr;
 }
 
+bool sirius_physical_hash_join::partition_specific_dynamic_filters_may_apply() const noexcept
+{
+  return _partition_dynamic_filters != nullptr && _partition_dynamic_filters->may_apply_to_probe();
+}
+
 bool sirius_physical_hash_join::wants_any_multi_partition_dynamic_filters() const noexcept
 {
   return wants_multi_partition_dynamic_filters() || wants_partition_specific_dynamic_filters();
@@ -2214,23 +2219,6 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
   std::optional<::cucascade::read_only_data_batch> build_ro;
   bool partition_specific_fragment = false;
   if (port_id == "build" && batch) {
-    if (_partition_dynamic_filters != nullptr) {
-      auto const state = _partition_dynamic_filters->current_state();
-      if (state == partition_dynamic_filter_bank::state::pending_arm ||
-          state == partition_dynamic_filter_bank::state::accumulating) {
-        partition_specific_fragment = true;
-        try {
-          build_ro.emplace(batch->to_read_only());
-        } catch (std::exception const& error) {
-          _partition_dynamic_filters->abandon_partition(partition_idx, error.what());
-          partition_specific_fragment = false;
-        } catch (...) {
-          _partition_dynamic_filters->abandon_partition(partition_idx,
-                                                        "failed to acquire the build fragment");
-          partition_specific_fragment = false;
-        }
-      }
-    }
     bool claim              = false;
     bool wired_but_unusable = false;
     HASH_JOIN_MODE mode     = HASH_JOIN_MODE::STANDARD;
@@ -2247,6 +2235,23 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       wired_but_unusable = open && wired && !claim && !_build_not_whole_reported;
       if (wired_but_unusable) { _build_not_whole_reported = true; }
       mode = _join_mode;
+    }
+    if (!claim && _partition_dynamic_filters != nullptr) {
+      auto const state = _partition_dynamic_filters->current_state();
+      if (state == partition_dynamic_filter_bank::state::pending_arm ||
+          state == partition_dynamic_filter_bank::state::accumulating) {
+        partition_specific_fragment = true;
+        try {
+          build_ro.emplace(batch->to_read_only());
+        } catch (std::exception const& error) {
+          _partition_dynamic_filters->abandon_partition(partition_idx, error.what());
+          partition_specific_fragment = false;
+        } catch (...) {
+          _partition_dynamic_filters->abandon_partition(partition_idx,
+                                                        "failed to acquire the build fragment");
+          partition_specific_fragment = false;
+        }
+      }
     }
     if (wired_but_unusable) {
       SIRIUS_LOG_DEBUG(

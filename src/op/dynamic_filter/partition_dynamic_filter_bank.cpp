@@ -502,6 +502,13 @@ bool partition_dynamic_filter_bank::probe_may_proceed() const noexcept
   return observed != state::pending_arm && observed != state::accumulating;
 }
 
+bool partition_dynamic_filter_bank::may_apply_to_probe() const noexcept
+{
+  auto const observed = current_state();
+  return observed == state::pending_arm || observed == state::accumulating ||
+         observed == state::sealed;
+}
+
 partition_dynamic_filter_bank::selection partition_dynamic_filter_bank::select(
   std::size_t partition_idx, int device_id) const noexcept
 {

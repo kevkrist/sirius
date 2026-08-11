@@ -149,11 +149,22 @@ TEST_CASE("partition-filter probe CONCAT reserves for merge and filter cascade",
   sirius_physical_concat probe{
     sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), false};
 
+  REQUIRE(f.hash_join->partition_specific_dynamic_filters_may_apply());
   REQUIRE(probe.no_history_peak_memory_estimate({0, 500}) == 0);
   REQUIRE(probe.no_history_peak_memory_estimate({1, 500}) == 1500);
   REQUIRE(probe.no_history_peak_memory_estimate({2, 500}) == 2000);
   REQUIRE(probe.no_history_peak_memory_estimate({1, std::numeric_limits<std::size_t>::max()}) ==
           std::numeric_limits<std::size_t>::max());
+
+  f.hash_join->operator_id = 0;
+  auto const strategy      = f.hash_join->get_partition_strategy(
+    partition_sizing_input{.total_bytes = 1024, .is_build_side = true, .build_foldable = true});
+  REQUIRE(strategy.num_partitions == 1);
+  REQUIRE(f.hash_join->wants_partition_specific_dynamic_filters());
+  REQUIRE_FALSE(f.hash_join->partition_specific_dynamic_filters_may_apply());
+  REQUIRE(probe.no_history_peak_memory_estimate({0, 500}) == 0);
+  REQUIRE(probe.no_history_peak_memory_estimate({1, 500}) == 0);
+  REQUIRE(probe.no_history_peak_memory_estimate({2, 500}) == 500);
 
   sirius_physical_concat build{
     sirius::from_duckdb_vec(f.logical_join->types), 0, f.hash_join.get(), true};

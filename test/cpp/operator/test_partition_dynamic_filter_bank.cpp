@@ -151,12 +151,14 @@ TEST_CASE("partition Bloom bank unions every fragment before exposing a skewed p
   partition_dynamic_filter_bank bank{plan, &fixture.stats};
 
   REQUIRE(bank.current_state() == partition_dynamic_filter_bank::state::pending_arm);
+  REQUIRE(bank.may_apply_to_probe());
   REQUIRE(bank.select(0, kDeviceId).result ==
           partition_dynamic_filter_bank::selection::status::not_ready);
   REQUIRE_FALSE(bank.probe_may_proceed());
   bank.record_readiness_wait();
 
   REQUIRE(bank.arm(6, 2, 1));
+  REQUIRE(bank.may_apply_to_probe());
   REQUIRE(bank.rows_per_partition_geometry() == 3);
   auto first  = make_sequence(space, stream, 3, 0);
   auto second = make_sequence(space, stream, 3, 3);
@@ -169,6 +171,7 @@ TEST_CASE("partition Bloom bank unions every fragment before exposing a skewed p
   bank.seal();
 
   REQUIRE(bank.current_state() == partition_dynamic_filter_bank::state::sealed);
+  REQUIRE(bank.may_apply_to_probe());
   REQUIRE(bank.probe_may_proceed());
   auto const selected = bank.select(0, kDeviceId);
   REQUIRE(selected.result == partition_dynamic_filter_bank::selection::status::available);
@@ -232,6 +235,7 @@ TEST_CASE("partition Bloom bank policy gates fail open before allocation",
 
     REQUIRE_FALSE(bank.arm(4, 2, 1));
     REQUIRE(bank.current_state() == partition_dynamic_filter_bank::state::disabled);
+    REQUIRE_FALSE(bank.may_apply_to_probe());
     REQUIRE(bank.probe_may_proceed());
     REQUIRE(bank.select(0, kDeviceId).result ==
             partition_dynamic_filter_bank::selection::status::missing);
@@ -336,6 +340,7 @@ TEST_CASE("pre-arm partition abandonment releases probes fail open",
 
   bank.abandon_partition(0, "build sizing failed");
   REQUIRE(bank.current_state() == partition_dynamic_filter_bank::state::failed);
+  REQUIRE_FALSE(bank.may_apply_to_probe());
   REQUIRE(bank.probe_may_proceed());
   REQUIRE_FALSE(bank.arm(4, 2, 1));
   REQUIRE(bank.select(0, kDeviceId).result ==

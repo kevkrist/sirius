@@ -706,6 +706,7 @@ TEST_CASE("probe CONCAT waits on its build peer until the local bank is terminal
   build_concat.set_sibling_concat(&probe_concat);
   probe_concat.set_sibling_concat(&build_concat);
 
+  REQUIRE(fixture.hash_join->partition_specific_dynamic_filters_may_apply());
   REQUIRE_FALSE(fixture.hash_join->partition_specific_probe_may_proceed());
   auto const hint = probe_concat.get_next_task_hint();
   REQUIRE(hint.has_value());
@@ -713,6 +714,7 @@ TEST_CASE("probe CONCAT waits on its build peer until the local bank is terminal
   REQUIRE(hint->producer == &build_concat);
 
   build_concat.on_finalize_operator();
+  REQUIRE_FALSE(fixture.hash_join->partition_specific_dynamic_filters_may_apply());
   REQUIRE(fixture.hash_join->partition_specific_probe_may_proceed());
 }
 

@@ -2,10 +2,23 @@
 
 ## Conclusion
 
-For a partitioned hash join, the partition-specific Bloom belongs at the probe `CONCAT`, after the
-probe exchange. At that point the operator knows the exact hash partition and device, so it can use
-the corresponding filter without replicating or combining filters. This removes non-members before
-the hash join while leaving partition sizing, scattering, and batching unchanged.
+The global multi-partition Bloom should remain the primary implementation. On the single-GPU
+SF1000 TPC-H queries where a multi-build-batch Bloom was actually published under the default
+256 MiB cap, the global design was neutral on Q8 and 19.8% faster than the one-shot-only control on
+Q10. The partition-specific prototype produced no robust improvement on either query and was 18.6%
+slower than global on Q10.
+
+If a partition-specific Bloom is retained as a fallback or experiment, the probe `CONCAT` is the
+correct local application point. It is the first post-exchange operator that knows the exact hash
+partition and owning device, so it can select the matching filter without cross-GPU merge or
+replication. That correctness result does not make post-exchange filtering the best performance
+design: scan, partition, exchange, repository, and CONCAT work have already been paid before the
+filter runs.
+
+The plan also retains the ordinary scan and direct-filter targets. If runtime sizing selects one
+partition or broadcast, the local bank is disabled and the existing whole-build one-shot publisher
+may use those targets. The probe `CONCAT` then follows its ordinary scheduling, accounting, and
+merge-only memory estimate.
 
 The build-side `CONCAT` is the matching publication boundary. Every post-exchange build fragment
 for partition `p` contributes to filter `p`; finalizing that `CONCAT` proves that all fragments have
@@ -15,9 +28,10 @@ arrived and seals the bank. Applying earlier would risk false negatives from an 
 
 1. The planner admits supported equality keys only when dynamic filtering is enabled, the build
    subtree carries evidence, and the join is `INNER`, `RIGHT`, or `SEMI`. Partition-specific mode
-   retains those admitted keys but creates no scan or direct-filter targets.
+   retains both those admitted keys and their ordinary scan or direct-filter targets.
 2. The hash join creates a pending filter bank. Runtime eligibility requires a non-broadcast `HASH`
-   strategy with more than one partition; all other strategies disable the bank and pass through.
+   strategy with more than one partition. All other strategies disable the bank, allowing the
+   whole-build one-shot path where applicable and making probe `CONCAT` a true local-filter bypass.
 3. The blocking build `PARTITION` uses its exact whole-build snapshot to arm the bank with global
    build rows, partition count, and GPU count. This determines Bloom geometry without retaining or
    coalescing input batches.
@@ -63,8 +77,9 @@ conservative and models the worst partition count assigned to one GPU.
 
 ## Single- and multi-GPU behavior
 
-On one GPU, all partition-local Blooms live in that device's allocator and each probe partition
-uses only its identically numbered Bloom.
+On one GPU, a multi-partition join keeps all partition-local Blooms in that device's allocator and
+each probe partition uses only its identically numbered Bloom. A one-partition join disables the
+local bank and retains the ordinary one-shot behavior.
 
 On multiple GPUs, the design remains local after the exchange: a Bloom is built in the actual
 device memory that receives partition `p`, and the matching probe partition must arrive on that
@@ -77,18 +92,24 @@ placement stress, and performance evaluation are intentionally deferred to a mul
 
 ## A/B measurement
 
-Use identical partition settings and compare these modes:
+Use identical partition settings and compare four modes. The one-shot-only mode is the control for
+isolating either multi-partition extension:
 
 ```sql
--- Baseline
+-- Master-off baseline
 SET enable_dynamic_filter = false;
 
--- Existing global post-scan filter
+-- Existing one-shot filters only
+SET enable_dynamic_filter = true;
+SET enable_dynamic_filter_multi_partition = false;
+SET enable_dynamic_filter_partition_specific = false;
+
+-- One-shot plus global multi-partition post-scan filter
 SET enable_dynamic_filter = true;
 SET enable_dynamic_filter_partition_specific = false;
 SET enable_dynamic_filter_multi_partition = true;
 
--- Partition-specific post-exchange filter
+-- One-shot plus partition-specific post-exchange filter
 SET enable_dynamic_filter_multi_partition = false;
 SET enable_dynamic_filter_partition_specific = true;
 ```
@@ -107,10 +128,43 @@ Compare wall-clock time together with `probe_rows_out / probe_rows_in`; a low ro
 execution gain indicates that post-exchange filtering cost outweighs avoided hash probes for that
 workload.
 
+### SF1000 single-GPU result
+
+The comparison used one NVIDIA GB300, host-pinned Parquet SF1000, 1 GiB scan/hash/CONCAT batches,
+`max_build_hash_table_bytes = 900 MiB`, the default 256 MiB Bloom cap, grouped execution, and seven
+iterations per mode. Iteration zero was discarded, leaving six warm samples. Timing used
+error-only logging to avoid making the amount of pruned task-level warning traffic part of the
+result. All four modes returned byte-identical results.
+
+Q8 and Q10 were the complete qualifying set under that cap. Separate info-logged activation and
+validation runs under the same host-pinned settings showed Q8 publish its global Bloom from three
+exact build contributions (91,139,462 rows), while Q10 published from 3--10 contributions
+(114,709,814 rows). Other candidate queries either used only the existing one-shot path or reached
+multi-partition accumulation but skipped Bloom construction at the cap.
+
+| Query | Master off | One-shot only | Global multi | Partition local |
+|---|---:|---:|---:|---:|
+| Q8 | 2.759 s | 1.196 s | 1.211 s | 1.199 s |
+| Q10 | 2.101 s | 1.953 s | 1.567 s | 1.924 s |
+
+The enabled-mode Q8 ranges overlap; the 0.2--1.2% median differences are smaller than observed
+variation. On Q10, global was 19.8% faster than one-shot-only and 18.6% faster than local, with no
+overlap between the global range (1.512--1.577 s) and the local range (1.888--1.987 s). Local's
+1.5% Q10 improvement over one-shot-only was within overlapping run variance.
+
+This result supports shipping the global design behind its existing flag and not replacing it with
+the current CONCAT-local design. On multi-GPU, local filtering may still be useful when a replicated
+global Bloom exceeds the per-GPU cap but distributed local banks fit, or when reduction and
+replication dominate; that requires physical multi-GPU measurement. A future local experiment
+should filter received fragments before CONCAT materialization, or fuse filtering into
+receive/merge, rather than adding a second materialization after merge.
+
 ## Prototype limits
 
 - Bloom membership filters only; no zone-map or adaptive profitability gate.
-- Post-exchange filtering only, and only for eligible multi-partition hash joins.
+- The partition-local path filters post-exchange and only for eligible multi-partition hash joins;
+  single-partition and broadcast strategies retain the existing whole-build scan/direct-target
+  path.
 - Planner admission and the existing domain-coverage policy are reused; unsafe join types are
   rejected defensively again by the physical operator.
 - Optional failures never fail the query, so telemetry must be checked when interpreting a run.

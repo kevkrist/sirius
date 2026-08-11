@@ -506,9 +506,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     // planner entry point but are not dynamic-filter producers.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
-    bool const discovery_runs =
-      build_evidence && op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
-      !partition_specific_requested && !gpu_spaces.empty() && !host_spaces.empty();
+    bool const discovery_runs     = build_evidence &&
+                                op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+                                !gpu_spaces.empty() && !host_spaces.empty();
     if (discovery_runs) {
       // Scan binding additionally requires a producer join type that may pre-filter its probe side.
       bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);

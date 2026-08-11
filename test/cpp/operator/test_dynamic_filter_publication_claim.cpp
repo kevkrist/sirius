@@ -77,8 +77,9 @@ struct claim_fixture {
   duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
   duckdb::unique_ptr<sirius_physical_hash_join> hash_join;
 
-  explicit claim_fixture(duckdb::JoinType join_type  = duckdb::JoinType::INNER,
-                         bool enable_multi_partition = false)
+  explicit claim_fixture(duckdb::JoinType join_type     = duckdb::JoinType::INNER,
+                         bool enable_multi_partition    = false,
+                         bool enable_partition_specific = false)
   {
     channel->register_producer();
 
@@ -142,7 +143,8 @@ struct claim_fixture {
       sirius::config::DEFAULT_HASH_PARTITION_BYTES,
       sirius::config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
       &stats,
-      enable_multi_partition);
+      enable_multi_partition,
+      enable_partition_specific);
 
     // This is a bare operator tree with no pipelines, so the converter's assign_operator_ids never
     // runs over it; operator code rejects the unassigned sentinel.
@@ -208,6 +210,24 @@ TEST_CASE("hash join claims a whole build for publication in any join mode",
   CHECK(fixture.stats.publication_attempts.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 1);
   CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 0);
+  CHECK_FALSE(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+}
+
+TEST_CASE("a whole build takes priority over a pending partition-specific bank",
+          "[dynamic_filter][publication_claim][partition_specific][gpu_execution]")
+{
+  claim_fixture fixture(
+    duckdb::JoinType::INNER, /*enable_multi_partition=*/false, /*enable_partition_specific=*/true);
+  REQUIRE(fixture.hash_join->wants_partition_specific_dynamic_filters());
+
+  fixture.hash_join->set_build_arrives_whole(true);
+  fixture.push_build_batch();
+
+  CHECK(fixture.stats.publication_attempts.load() == 1);
+  CHECK(fixture.stats.membership_filters_built.load() > 0);
+  CHECK(fixture.stats.publications_finished.load() == 1);
+  CHECK(fixture.stats.filters_pushed.load() > 0);
+  CHECK(fixture.stats.partition_dynamic_filter_build_fragments.load() == 0);
   CHECK_FALSE(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
 }
 

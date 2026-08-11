@@ -390,6 +390,10 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
     // compute_hash_join_partition_strategy excludes from BUILD_PROBE. Such a join could not
     // publish at all until the PARTITION started folding a single-partition build for any
     // publishing join.
+    partition_filter_strategy_guard strategies(con);
+    auto local_on = con.Query("SET enable_dynamic_filter_partition_specific = true;");
+    REQUIRE(local_on);
+    REQUIRE_FALSE(local_on->HasError());
     sirius::test::coverage_gate_disable_guard gate_off(con);
     auto const deltas = require_switch_result_equivalence(
       con,
@@ -399,8 +403,16 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
       "on o.o_orderkey = l.l_orderkey and o.o_orderdate < l.l_shipdate");
 
     REQUIRE(deltas.on.producers_enabled > deltas.off.producers_enabled);
+    REQUIRE(deltas.on.membership_filters_built > deltas.off.membership_filters_built);
     REQUIRE(deltas.on.publications_finished > deltas.off.publications_finished);
     REQUIRE(deltas.on.filters_pushed > deltas.off.filters_pushed);
+    REQUIRE(deltas.on.partition_filters_built == 0);
+    REQUIRE(deltas.on.partition_build_fragments == 0);
+    REQUIRE(deltas.on.partition_build_rows == 0);
+    REQUIRE(deltas.on.partition_probe_batches == 0);
+    REQUIRE(deltas.on.partition_probe_rows_in == 0);
+    REQUIRE(deltas.on.partition_probe_rows_out == 0);
+    REQUIRE(deltas.on.partition_failures == 0);
   }
 
   SECTION("a multi-partition build obeys the subordinate switch")
@@ -483,6 +495,7 @@ TEST_CASE("gpu_execution - derived-build and build-block routes preserve results
       REQUIRE(deltas.on.producers_enabled > 0);
       REQUIRE(deltas.on.membership_filters_built == 0);
       REQUIRE(deltas.on.filters_pushed == 0);
+      REQUIRE(deltas.on.publications_finished == 0);
       REQUIRE(deltas.on.partition_filters_built > 0);
       REQUIRE(deltas.on.partition_build_fragments > deltas.on.partition_filters_built);
       REQUIRE(deltas.on.partition_build_rows > 0);

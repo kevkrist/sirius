@@ -167,6 +167,14 @@ class partition_dynamic_filter_bank final {
   [[nodiscard]] bool probe_may_proceed() const noexcept;
 
   /**
+   * @brief Whether the bank may participate in probe CONCAT processing
+   *
+   * Pending, accumulating, and sealed banks remain applicable. A bank-level failure or runtime
+   * disable is terminal and restores the ordinary CONCAT path.
+   */
+  [[nodiscard]] bool may_apply_to_probe() const noexcept;
+
+  /**
    * @brief Select one immutable partition set for an actual probe GPU
    */
   [[nodiscard]] selection select(std::size_t partition_idx, int device_id) const noexcept;

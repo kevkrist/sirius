@@ -339,6 +339,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   /// True when plan construction installed the partition-specific prototype bank.
   [[nodiscard]] bool wants_partition_specific_dynamic_filters() const noexcept;
+  /// True while the installed bank may still apply to probe CONCAT batches.
+  [[nodiscard]] bool partition_specific_dynamic_filters_may_apply() const noexcept;
   /// True when either supported multi-partition publication strategy is installed.
   [[nodiscard]] bool wants_any_multi_partition_dynamic_filters() const noexcept;
 
