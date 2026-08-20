@@ -142,9 +142,12 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
 //! Build a `parquet_ingestible_table_info` from a TABLE_SCAN. Destructive: `table_filters`
 //! is moved out of the scan.
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
-  sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
+  sirius::op::sirius_physical_table_scan& scan_op,
+  const sirius::operator_params& op_params,
+  const sirius::filter_cascade_policy& filter_policy)
 {
   auto info                = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  info->filter_policy      = filter_policy;
   info->returned_types     = scan_op.returned_types;
   info->column_ids         = scan_op.column_ids;
   info->projection_ids     = scan_op.projection_ids;
@@ -181,7 +184,8 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
 std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info>
 build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
                                const sirius::operator_params& op_params,
-                               duckdb::ClientContext& context)
+                               duckdb::ClientContext& context,
+                               const sirius::filter_cascade_policy& filter_policy)
 {
   if (!scan_op.bind_data) {
     throw std::runtime_error(
@@ -197,10 +201,11 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   auto& bind_data = *table_scan_bind;
   auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
 
-  auto info     = std::make_unique<sirius::op::scan::duckdb_native_ingestible_table_info>();
-  info->storage = &table.GetStorage();
-  info->context = &context;
-  info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
+  auto info           = std::make_unique<sirius::op::scan::duckdb_native_ingestible_table_info>();
+  info->filter_policy = filter_policy;
+  info->storage       = &table.GetStorage();
+  info->context       = &context;
+  info->db_path       = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
   // Qualified-name identity for the pin cache — derived from the resolved
   // DuckTableEntry so it matches the pin-side derivation (build_duckdb_pin_info)
   // exactly. Without these a pin_table(format='duckdb', ...) query silently misses
@@ -329,7 +334,8 @@ void require_complete_native_scan_schema(const sirius::op::sirius_physical_table
 void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& table_scan_slot,
   const sirius::operator_params& op_params,
-  duckdb::ClientContext& context)
+  duckdb::ClientContext& context,
+  const sirius::filter_cascade_policy& filter_policy)
 {
   // Table-in-out functions wear a TABLE_SCAN with children — skip them; wrapping would change
   // a child layout the converter and downstream operators don't expect.
@@ -349,17 +355,18 @@ void wrap_table_scan_source(
   if (fn == "seq_scan") {
     // The duckdb-native scan has no read-time dynamic-filter path, so its wrapped DYNAMIC_FILTER
     // also evaluates AST-capable filters (zone maps) row-wise, not membership masks alone.
-    leaf = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
-                              scan,
-                              op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
-                              sirius_ctx.get());
+    leaf =
+      make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context, filter_policy),
+                         scan,
+                         op_params,
+                         sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
+                         sirius_ctx.get());
     // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
     // The parquet ingestible consumes AST filters for read-time row-group pruning, so its wrapped
     // DYNAMIC_FILTER applies membership masks only.
-    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
+    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params, filter_policy),
                               scan,
                               op_params,
                               sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
@@ -621,6 +628,7 @@ void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const sirius::operator_params& op_params,
   duckdb::ClientContext& context,
+  const sirius::filter_cascade_policy& filter_policy,
   duckdb::SiriusContext* compressed_materialization_observer);
 
 //! Replace a DELIM JOIN's `distinct_root` (the bare DISTINCT) with `DISTINCT_MERGE ->
@@ -667,19 +675,20 @@ void wrap_delim_distinct(sirius::op::sirius_physical_delim_join& delim_base,
 void wrap_delim_join(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
                      const sirius::operator_params& op_params,
                      duckdb::ClientContext& context,
+                     const sirius::filter_cascade_policy& filter_policy,
                      duckdb::SiriusContext* compressed_materialization_observer)
 {
   auto& delim_base = slot->Cast<sirius::op::sirius_physical_delim_join>();
 
   if (delim_base.join) {
     insert_gpu_pipeline_operators_recursive(
-      delim_base.join, op_params, context, compressed_materialization_observer);
+      delim_base.join, op_params, context, filter_policy, compressed_materialization_observer);
   }
   if (delim_base.distinct_root) {
     // `distinct_root` still holds the bare DISTINCT: wrap below it first, then above.
     for (auto& child_slot : delim_base.distinct_root->children) {
       insert_gpu_pipeline_operators_recursive(
-        child_slot, op_params, context, compressed_materialization_observer);
+        child_slot, op_params, context, filter_policy, compressed_materialization_observer);
     }
     wrap_delim_distinct(delim_base, op_params);
   }
@@ -711,18 +720,19 @@ void insert_gpu_pipeline_operators_recursive(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
   const sirius::operator_params& op_params,
   duckdb::ClientContext& context,
+  const sirius::filter_cascade_policy& filter_policy,
   duckdb::SiriusContext* compressed_materialization_observer)
 {
   if (!slot) { return; }
 
   for (auto& child_slot : slot->children) {
     insert_gpu_pipeline_operators_recursive(
-      child_slot, op_params, context, compressed_materialization_observer);
+      child_slot, op_params, context, filter_policy, compressed_materialization_observer);
   }
 
   switch (slot->type) {
     case sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN:
-      wrap_table_scan_source(slot, op_params, context);
+      wrap_table_scan_source(slot, op_params, context, filter_policy);
       break;
     case sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN:
     case sirius::op::SiriusPhysicalOperatorType::EMPTY_RESULT:
@@ -758,7 +768,7 @@ void insert_gpu_pipeline_operators_recursive(
       break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
-      wrap_delim_join(slot, op_params, context, compressed_materialization_observer);
+      wrap_delim_join(slot, op_params, context, filter_policy, compressed_materialization_observer);
       break;
     default: break;
   }
@@ -819,7 +829,7 @@ void sirius_physical_plan_generator::reject_nested_column_type(duckdb::LogicalTy
 }
 
 sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context)
-  : context(context)
+  : context(context), cascade_policy(sirius::filter_cascade_policy_from_context(context))
 {
 }
 
@@ -969,7 +979,8 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
   if (sirius_ctx) { op_params = sirius_ctx->get_config().get_operator_params(); }
-  insert_gpu_pipeline_operators_recursive(plan, op_params, context, sirius_ctx.get());
+  insert_gpu_pipeline_operators_recursive(
+    plan, op_params, context, cascade_policy, sirius_ctx.get());
 }
 
 sirius::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(

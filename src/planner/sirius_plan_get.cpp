@@ -536,7 +536,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       filter =
         duckdb::make_uniq<sirius::op::sirius_physical_filter>(sirius::from_duckdb_vec(filter_types),
                                                               sirius::ast::from_duckdb(*combined),
-                                                              op.estimated_cardinality);
+                                                              op.estimated_cardinality,
+                                                              cascade_policy);
     }
   }
   op.ResolveOperatorTypes();
@@ -555,7 +556,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       op.estimated_cardinality,
       std::move(op.extra_info),
       std::move(op.parameters),
-      std::move(op.virtual_columns));
+      std::move(op.virtual_columns),
+      cascade_policy);
     node->named_parameters = std::move(op.named_parameters);
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
@@ -620,7 +622,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     op.estimated_cardinality,
     std::move(op.extra_info),
     std::move(op.parameters),
-    std::move(op.virtual_columns));
+    std::move(op.virtual_columns),
+    cascade_policy);
   if (!physical_types.empty() && physical_types.size() == node->types.size()) {
     node->set_physical_types(std::move(physical_types));
     node->sidecar_from_gpu_tier_pin =

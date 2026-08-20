@@ -26,8 +26,8 @@
 // The conjunct classifier is additionally exercised arm-by-arm through
 // filter_cascade_internal.hpp.
 //
-// Config knobs are process-global; config_guard saves/restores them so these
-// tests cannot leak thresholds into other test files.
+// Each evaluator receives an explicit immutable test policy; policy_guard restores the local
+// fixture between sections.
 
 // test
 #include "ast_test_support.hpp"
@@ -35,7 +35,6 @@
 #include <catch.hpp>
 
 // sirius
-#include <config.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -43,6 +42,7 @@
 #include <expression/value.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/filter_cascade_internal.hpp>
+#include <expression_evaluator/filter_cascade_policy.hpp>
 #include <helper/logical_type.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 
@@ -61,6 +61,7 @@
 #include <cuda_runtime_api.h>
 
 // standard library
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -108,17 +109,12 @@ rmm::device_async_resource_ref get_resource_ref(memory_space& space)
   return space.get_default_allocator();
 }
 
-/// Save/restore the cascade Config knobs around each test.
-struct config_guard {
-  bool enabled           = duckdb::Config::FILTER_CASCADE_CHEAP_CONJUNCTS;
-  std::uint64_t min_rows = duckdb::Config::FILTER_CASCADE_MIN_ROWS;
-  double max_pass_rate   = duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE;
-  ~config_guard()
-  {
-    duckdb::Config::FILTER_CASCADE_CHEAP_CONJUNCTS = enabled;
-    duckdb::Config::FILTER_CASCADE_MIN_ROWS        = min_rows;
-    duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE   = max_pass_rate;
-  }
+auto active_filter_cascade_policy = ::sirius::default_filter_cascade_policy();
+
+/// Save/restore the explicitly injected cascade policy around each test.
+struct policy_guard {
+  ::sirius::filter_cascade_policy saved = active_filter_cascade_policy;
+  ~policy_guard() { active_filter_cascade_policy = saved; }
 };
 
 /// Null out exactly the given rows of @p col (explicit rows, not stride coincidence).
@@ -138,12 +134,13 @@ void set_nulls_at(cudf::column& col,
 /// What make_mixed_table appends after its two predicate columns.
 enum class extra_column : std::uint8_t {
   none,
-  string_payload,  ///< col2 STRING "payload-<i>" — expensive to gather, referenced by nothing
-  int_payload,     ///< col2 INT32 — fixed-width, referenceable by a cheap conjunct
+  string_payload,    ///< col2 STRING "payload-<i>" — expensive to gather, referenced by nothing
+  int_payload,       ///< col2 INT32 — fixed-width, referenceable by a cheap conjunct
+  wide_int_payload,  ///< col2..10 INT32 — projected width above the conservative gather cap
 };
 
 /// Input fixture: col0 INT32 = 0..n-1 (optionally with nulls), col1 STRING cycling
-/// {"AIR", "TRUCK", "MAIL", "SHIP"} (optionally with nulls), plus an optional payload column
+/// {"AIR", "TRUCK", "MAIL", "SHIP"} (optionally with nulls), plus optional payload columns
 /// that no test predicate's residual references — the column the gather-scope guard must not
 /// gather.
 std::unique_ptr<cudf::table> make_mixed_table(memory_space& space,
@@ -192,13 +189,41 @@ std::unique_ptr<cudf::table> make_mixed_table(memory_space& space,
     cols.push_back(
       ::sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::string_tag>>(
         payload, stream, mr));
-  } else if (extra == extra_column::int_payload) {
-    std::vector<int32_t> payload(n);
-    for (cudf::size_type i = 0; i < n; ++i) {
-      payload[i] = n - i;
+  } else if (extra == extra_column::int_payload || extra == extra_column::wide_int_payload) {
+    auto const payload_columns = extra == extra_column::int_payload ? 1 : 9;
+    for (int32_t payload_column = 0; payload_column < payload_columns; ++payload_column) {
+      std::vector<int32_t> payload(n);
+      for (cudf::size_type i = 0; i < n; ++i) {
+        payload[i] = n - i + payload_column;
+      }
+      cols.push_back(::sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
+        payload, stream, mr));
     }
-    cols.push_back(::sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
-      payload, stream, mr));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+/// Input fixture with col0 INT32 = 0..n-1 and one constant-width STRING column per entry.
+std::unique_ptr<cudf::table> make_sized_residual_string_table(
+  memory_space& space, cudf::size_type n, std::vector<cudf::size_type> const& string_widths)
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = cudf::get_default_stream();
+
+  std::vector<int32_t> ints(n);
+  for (cudf::size_type i = 0; i < n; ++i) {
+    ints[i] = i;
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(
+    ::sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(ints, stream, mr));
+  for (auto const width : string_widths) {
+    std::vector<std::string> strings(static_cast<std::size_t>(n),
+                                     std::string(static_cast<std::size_t>(width), 'x'));
+    cols.push_back(
+      ::sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::string_tag>>(
+        strings, stream, mr));
   }
   return std::make_unique<cudf::table>(std::move(cols));
 }
@@ -218,6 +243,24 @@ std::unique_ptr<ast_node> make_mixed_and(int32_t int_bound)
   return make_conj(sirius::ast::conjunction::kind::op_and, std::move(conjuncts));
 }
 
+/// AND[col0 < int_bound, each STRING column = 'match'].
+std::unique_ptr<ast_node> make_string_residual_and(int32_t int_bound,
+                                                   cudf::size_type string_columns)
+{
+  std::vector<std::unique_ptr<ast_node>> conjuncts;
+  conjuncts.push_back(
+    make_cmp(sirius::comparison_type::lt,
+             make_ref_typed(0, sirius::logical_type::make(sirius::type_id::INTEGER)),
+             make_int_const(int_bound)));
+  auto const varchar = sirius::logical_type::make(sirius::type_id::VARCHAR);
+  for (cudf::size_type column_index = 1; column_index <= string_columns; ++column_index) {
+    conjuncts.push_back(make_cmp(sirius::comparison_type::equal,
+                                 make_ref_typed(static_cast<uint32_t>(column_index), varchar),
+                                 make_str_const("match")));
+  }
+  return make_conj(sirius::ast::conjunction::kind::op_and, std::move(conjuncts));
+}
+
 struct select_run {
   std::unique_ptr<cudf::table> result;
   decision taken;
@@ -229,8 +272,12 @@ select_run run_select(memory_space& space,
                       ::sirius::expression_evaluator_strategy strategy,
                       std::vector<cudf::size_type> const& output_indices = {})
 {
-  ::sirius::expression_evaluator evaluator(
-    expr, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  ::sirius::expression_evaluator evaluator(expr,
+                                           get_resource_ref(space),
+                                           cudf::get_default_stream(),
+                                           strategy,
+                                           /*min_ast_size=*/2,
+                                           active_filter_cascade_policy);
   auto result =
     output_indices.empty() ? evaluator.select(input) : evaluator.select(input, output_indices);
   return {std::move(result), evaluator.last_filter_cascade_decision_for_testing()};
@@ -264,16 +311,16 @@ select_run expect_decision_and_baseline_equality(
   decision expected,
   std::vector<cudf::size_type> const& output_indices = {})
 {
-  duckdb::Config::FILTER_CASCADE_CHEAP_CONJUNCTS = true;
-  auto enabled = run_select(space, expr, input, strategy, output_indices);
+  active_filter_cascade_policy.enabled = true;
+  auto enabled                         = run_select(space, expr, input, strategy, output_indices);
   REQUIRE(enabled.taken == expected);
 
-  duckdb::Config::FILTER_CASCADE_CHEAP_CONJUNCTS = false;
-  auto baseline = run_select(space, expr, input, strategy, output_indices);
+  active_filter_cascade_policy.enabled = false;
+  auto baseline                        = run_select(space, expr, input, strategy, output_indices);
   REQUIRE(baseline.taken == decision::not_applicable);
   expect_tables_equal(baseline.result->view(), enabled.result->view());
 
-  duckdb::Config::FILTER_CASCADE_CHEAP_CONJUNCTS = true;
+  active_filter_cascade_policy.enabled = true;
   return enabled;
 }
 
@@ -303,10 +350,10 @@ TEMPLATE_TEST_CASE("filter cascade selects the same rows as the monolithic path"
 {
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS      = 1;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
+  active_filter_cascade_policy.min_rows      = 1;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   for (bool with_nulls : {false, true}) {
     auto input = make_mixed_table(*space, 1000, with_nulls);
@@ -323,10 +370,10 @@ TEST_CASE("filter cascade honors output_indices projection",
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS      = 1;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
+  active_filter_cascade_policy.min_rows      = 1;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   auto input = make_mixed_table(*space, 1000, /*with_nulls=*/true);
   auto expr  = make_mixed_and(300);
@@ -345,10 +392,10 @@ TEMPLATE_TEST_CASE("unselective cheap prefilter combines masks without a gather"
 {
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS      = 1;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
+  active_filter_cascade_policy.min_rows      = 1;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   auto input = make_mixed_table(*space, 1000, /*with_nulls=*/true);
   // col0 < 990 passes ~99% -> above the 0.75 cap -> combined_masks.
@@ -366,10 +413,10 @@ TEMPLATE_TEST_CASE("cheap prefilter that drops every row short-circuits the resi
 {
   constexpr auto strategy = TestType::value;
   auto* space             = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS      = 1;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
+  active_filter_cascade_policy.min_rows      = 1;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   auto input = make_mixed_table(*space, 1000, /*with_nulls=*/false);
   auto expr  = make_mixed_and(-1);  // col0 < -1 passes nothing
@@ -385,10 +432,10 @@ TEST_CASE("short-circuit under projection synthesizes a typed empty table",
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS      = 1;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
+  active_filter_cascade_policy.min_rows      = 1;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   auto input = make_mixed_table(*space, 1000, /*with_nulls=*/false);
   auto expr  = make_mixed_and(-1);  // col0 < -1 passes nothing
@@ -411,11 +458,11 @@ TEST_CASE("cascade does not engage without a mixed AND or above min rows",
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_CHEAP_CONJUNCTS = true;
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS        = 1;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE   = 0.75;
+  active_filter_cascade_policy.enabled       = true;
+  active_filter_cascade_policy.min_rows      = 1;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   auto input = make_mixed_table(*space, 1000, /*with_nulls=*/false);
 
@@ -444,17 +491,17 @@ TEST_CASE("cascade does not engage without a mixed AND or above min rows",
 
   SECTION("below min rows")
   {
-    duckdb::Config::FILTER_CASCADE_MIN_ROWS = 100000;
-    auto expr                               = make_mixed_and(300);
-    auto run                                = run_select(*space, *expr, input->view(), kInterpret);
+    active_filter_cascade_policy.min_rows = 100000;
+    auto expr                             = make_mixed_and(300);
+    auto run                              = run_select(*space, *expr, input->view(), kInterpret);
     REQUIRE(run.taken == decision::not_applicable);
   }
 
   SECTION("disabled by knob")
   {
-    duckdb::Config::FILTER_CASCADE_CHEAP_CONJUNCTS = false;
-    auto expr                                      = make_mixed_and(300);
-    auto run = run_select(*space, *expr, input->view(), kInterpret);
+    active_filter_cascade_policy.enabled = false;
+    auto expr                            = make_mixed_and(300);
+    auto run                             = run_select(*space, *expr, input->view(), kInterpret);
     REQUIRE(run.taken == decision::not_applicable);
   }
 }
@@ -463,12 +510,12 @@ TEST_CASE("empty input refuses the cascade without throwing",
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_CHEAP_CONJUNCTS = true;
+  active_filter_cascade_policy.enabled = true;
   // A zero-row batch must refuse on the num_rows > 0 guard even when the row floor is 0.
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS      = 0;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
+  active_filter_cascade_policy.min_rows      = 0;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   auto input = make_mixed_table(*space, 0, /*with_nulls=*/false);
   auto expr  = make_mixed_and(300);
@@ -483,10 +530,10 @@ TEST_CASE("min rows boundary: equal row count engages, one fewer refuses",
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS      = 1000;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
+  active_filter_cascade_policy.min_rows      = 1000;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   auto expr = make_mixed_and(300);
 
@@ -499,9 +546,9 @@ TEST_CASE("min rows boundary: equal row count engages, one fewer refuses",
 
   SECTION("num_rows == min_rows - 1 refuses")
   {
-    auto input = make_mixed_table(*space, 999, /*with_nulls=*/false);
-    duckdb::Config::FILTER_CASCADE_CHEAP_CONJUNCTS = true;
-    auto run = run_select(*space, *expr, input->view(), kInterpret);
+    auto input                           = make_mixed_table(*space, 999, /*with_nulls=*/false);
+    active_filter_cascade_policy.enabled = true;
+    auto run                             = run_select(*space, *expr, input->view(), kInterpret);
     REQUIRE(run.taken == decision::not_applicable);
   }
 }
@@ -510,10 +557,10 @@ TEST_CASE("pass rate exactly at the knob gathers; one row above combines masks",
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS      = 1;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
+  active_filter_cascade_policy.min_rows      = 1;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   // No nulls, n = 1000: col0 < bound passes exactly `bound` rows.
   auto input = make_mixed_table(*space, 1000, /*with_nulls=*/false);
@@ -537,32 +584,32 @@ TEST_CASE("all-pass prefilter and the pass-rate knob's degenerate ends",
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS = 1;
+  active_filter_cascade_policy.min_rows = 1;
 
   auto input = make_mixed_table(*space, 1000, /*with_nulls=*/false);
 
   SECTION("100% cheap pass rate under the default cap combines masks")
   {
-    duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
-    auto expr                                    = make_mixed_and(2000);  // passes every row
+    active_filter_cascade_policy.max_pass_rate = 0.75;
+    auto expr                                  = make_mixed_and(2000);  // passes every row
     expect_decision_and_baseline_equality(
       *space, *expr, input->view(), kInterpret, decision::combined_masks);
   }
 
   SECTION("max_pass_rate = 1.0 always gathers, even at a 100% pass rate")
   {
-    duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 1.0;
-    auto expr                                    = make_mixed_and(2000);
+    active_filter_cascade_policy.max_pass_rate = 1.0;
+    auto expr                                  = make_mixed_and(2000);
     expect_decision_and_baseline_equality(
       *space, *expr, input->view(), kInterpret, decision::cascaded);
   }
 
   SECTION("max_pass_rate = 0.0 never gathers")
   {
-    duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.0;
-    auto expr                                    = make_mixed_and(300);  // selective: 30%
+    active_filter_cascade_policy.max_pass_rate = 0.0;
+    auto expr                                  = make_mixed_and(300);  // selective: 30%
     expect_decision_and_baseline_equality(
       *space, *expr, input->view(), kInterpret, decision::combined_masks);
   }
@@ -576,9 +623,9 @@ TEST_CASE("Kleene partition invariance: the 3VL matrix selects identical rows on
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS = 1;
+  active_filter_cascade_policy.min_rows = 1;
 
   // Nine explicit rows covering all of {TRUE, FALSE, NULL}^2 for the (cheap, expensive) pair:
   // cheap is col0 = 1 and expensive is col1 = 'AIR', so row i encodes the pair
@@ -617,16 +664,16 @@ TEST_CASE("Kleene partition invariance: the 3VL matrix selects identical rows on
   SECTION("cascaded branch")
   {
     // The cheap conjunct passes 3 of 9 rows (rate 0.333) -> gathered.
-    duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
-    auto run                                     = expect_decision_and_baseline_equality(
+    active_filter_cascade_policy.max_pass_rate = 0.75;
+    auto run                                   = expect_decision_and_baseline_equality(
       *space, *expr, input.view(), kInterpret, decision::cascaded);
     REQUIRE(run.result->num_rows() == 1);
   }
 
   SECTION("combined_masks branch")
   {
-    duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.0;
-    auto run                                     = expect_decision_and_baseline_equality(
+    active_filter_cascade_policy.max_pass_rate = 0.0;
+    auto run                                   = expect_decision_and_baseline_equality(
       *space, *expr, input.view(), kInterpret, decision::combined_masks);
     REQUIRE(run.result->num_rows() == 1);
   }
@@ -636,10 +683,10 @@ TEST_CASE("cascade groups multiple cheap and expensive conjuncts",
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS      = 1;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
+  active_filter_cascade_policy.min_rows      = 1;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   auto input = make_mixed_table(*space, 1000, /*with_nulls=*/true);
 
@@ -665,19 +712,83 @@ TEST_CASE("cascade groups multiple cheap and expensive conjuncts",
     *space, *expr, input->view(), kInterpret, decision::cascaded);
 }
 
-// ---------------------------------------------------------------------------
-// Gather-scope refusal: needed set = output_indices union referenced(residual)
-// ---------------------------------------------------------------------------
-
-TEST_CASE("out-of-scope survivor gather refuses the cascade",
+TEST_CASE("cascade refuses fallible functions and unmeasured numeric AST breakers",
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
-  config_guard guard;
+  policy_guard guard;
 
-  duckdb::Config::FILTER_CASCADE_CHEAP_CONJUNCTS = true;
-  duckdb::Config::FILTER_CASCADE_MIN_ROWS        = 1;
-  duckdb::Config::FILTER_CASCADE_MAX_PASS_RATE   = 0.75;
+  active_filter_cascade_policy.enabled       = true;
+  active_filter_cascade_policy.min_rows      = 1;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
+
+  auto input   = make_mixed_table(*space, 1000, /*with_nulls=*/false);
+  auto integer = sirius::logical_type::make(sirius::type_id::INTEGER);
+  auto bigint  = sirius::logical_type::make(sirius::type_id::BIGINT);
+  auto boolean = sirius::logical_type::make(sirius::type_id::BOOLEAN);
+
+  auto make_with_residual = [](int32_t cheap_bound, std::unique_ptr<ast_node> residual) {
+    std::vector<std::unique_ptr<ast_node>> conjuncts;
+    conjuncts.push_back(
+      make_cmp(sirius::comparison_type::lt,
+               make_ref_typed(0, sirius::logical_type::make(sirius::type_id::INTEGER)),
+               make_int_const(cheap_bound)));
+    conjuncts.push_back(std::move(residual));
+    return make_conj(sirius::ast::conjunction::kind::op_and, std::move(conjuncts));
+  };
+
+  SECTION("fixed-width cast is not treated as an expensive residual")
+  {
+    auto cast = make_cast(make_ref_typed(0, integer), bigint, /*try_cast=*/false);
+    auto expr = make_with_residual(
+      300, make_cmp(sirius::comparison_type::gt, std::move(cast), make_bigint_const(0)));
+    expect_decision_and_baseline_equality(
+      *space, *expr, input->view(), kInterpret, decision::not_applicable);
+  }
+
+  SECTION("AST-fusible numeric function is not treated as an expensive residual")
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_ref_typed(0, integer));
+    args.push_back(make_int_const(1));
+    auto add  = make_func(sirius::function_id::add, std::move(args), integer);
+    auto expr = make_with_residual(
+      300, make_cmp(sirius::comparison_type::gt, std::move(add), make_int_const(0)));
+    expect_decision_and_baseline_equality(
+      *space, *expr, input->view(), kInterpret, decision::not_applicable);
+  }
+
+  SECTION("error function is never suppressed by a zero-survivor cheap predicate")
+  {
+    std::vector<std::unique_ptr<ast_node>> args;
+    args.push_back(make_str_const("boom"));
+    auto error = make_func(sirius::function_id::error, std::move(args), boolean);
+    auto expr  = make_with_residual(-1, std::move(error));
+
+    ::sirius::expression_evaluator evaluator(*expr,
+                                             get_resource_ref(*space),
+                                             cudf::get_default_stream(),
+                                             kInterpret,
+                                             /*min_ast_size=*/2,
+                                             active_filter_cascade_policy);
+    REQUIRE_THROWS(evaluator.select(input->view()));
+    REQUIRE(evaluator.last_filter_cascade_decision_for_testing() == decision::not_applicable);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gather scope: refuse wide waste, permit a bounded cheap-only scan carrier
+// ---------------------------------------------------------------------------
+
+TEST_CASE("survivor gather scope is conservative without blocking scan composition",
+          "[expression_evaluator][filter_cascade]")
+{
+  auto* space = get_default_gpu_space();
+  policy_guard guard;
+
+  active_filter_cascade_policy.enabled       = true;
+  active_filter_cascade_policy.min_rows      = 1;
+  active_filter_cascade_policy.max_pass_rate = 0.75;
 
   // col2 ("payload-<i>" strings) is neither projected nor referenced by the residual: the
   // cascaded gather would materialize it pointlessly, and a cascade that may never gather can
@@ -694,25 +805,61 @@ TEST_CASE("out-of-scope survivor gather refuses the cascade",
     REQUIRE(refused.result->num_columns() == 2);
   }
 
-  SECTION("projection covers every column -> gather stays in scope")
+  SECTION("projected variable-width payload not used by residual still refuses")
   {
     std::vector<cudf::size_type> const project_all{0, 1, 2};
     expect_decision_and_baseline_equality(
-      *space, *expr, input->view(), kInterpret, decision::cascaded, project_all);
+      *space, *expr, input->view(), kInterpret, decision::not_applicable, project_all);
   }
 
-  SECTION("all-columns select overload is always in scope")
+  SECTION("all-columns select also refuses an unrelated variable-width payload")
   {
     expect_decision_and_baseline_equality(
-      *space, *expr, input->view(), kInterpret, decision::cascaded);
+      *space, *expr, input->view(), kInterpret, decision::not_applicable);
   }
 
-  SECTION("a column referenced only by the cheap group does not extend the scope")
+  SECTION("wide projected fixed-width payload refuses the row-rate heuristic")
   {
-    // col2 is INT32 here and referenced by a cheap conjunct, but it is dead after the prefilter
-    // (neither projected nor residual-referenced), so gathering it would be waste: the needed
-    // set is output_indices union referenced(residual) — deliberately excluding cheap
-    // references — and the guard must refuse.
+    auto wide_input =
+      make_mixed_table(*space, 1000, /*with_nulls=*/false, extra_column::wide_int_payload);
+    auto wide_expr = make_mixed_and(300);
+    std::vector<cudf::size_type> project_all;
+    for (cudf::size_type column_index = 0; column_index < wide_input->num_columns();
+         ++column_index) {
+      project_all.push_back(column_index);
+    }
+    expect_decision_and_baseline_equality(
+      *space, *wide_expr, wide_input->view(), kInterpret, decision::not_applicable, project_all);
+  }
+
+  SECTION("Q19-sized residual strings remain gather eligible")
+  {
+    // Q19's two string carriers average below this deliberately near-cap fixture: 16-byte
+    // instructions plus 7-byte modes and two 4-byte offsets occupy about 31 encoded bytes per
+    // row in aggregate, so the selective numeric prefilter may still trigger survivor gather.
+    auto q19_input = make_sized_residual_string_table(*space, 1000, {16, 7});
+    auto q19_expr  = make_string_residual_and(300, 2);
+    auto run       = expect_decision_and_baseline_equality(
+      *space, *q19_expr, q19_input->view(), kInterpret, decision::cascaded);
+    REQUIRE(run.result->num_rows() == 0);
+  }
+
+  SECTION("oversized residual strings keep the mask stages but skip survivor gather")
+  {
+    // A 64-byte value plus its offset is well above the 32 encoded-byte budget. The cheap mask
+    // is already computed, so retain it and combine masks on the original input without a gather.
+    auto oversized_input = make_sized_residual_string_table(*space, 1000, {64});
+    auto oversized_expr  = make_string_residual_and(300, 1);
+    auto run             = expect_decision_and_baseline_equality(
+      *space, *oversized_expr, oversized_input->view(), kInterpret, decision::combined_masks);
+    REQUIRE(run.result->num_rows() == 0);
+  }
+
+  SECTION("a bounded cheap-only fixed-width scan column remains eligible")
+  {
+    // This mirrors scan pushdown: col2 supplies only a cheap predicate and is not projected.
+    // Its four bytes per row fit the bounded gather allowance, so the string residual still runs
+    // only on survivors without any AST reference remapping.
     auto cheap_ref_input =
       make_mixed_table(*space, 1000, /*with_nulls=*/true, extra_column::int_payload);
     std::vector<std::unique_ptr<ast_node>> conjuncts;
@@ -735,16 +882,16 @@ TEST_CASE("out-of-scope survivor gather refuses the cascade",
                                           *cheap_ref_expr,
                                           cheap_ref_input->view(),
                                           kInterpret,
-                                          decision::not_applicable,
+                                          decision::cascaded,
                                           project_first_two);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Classifier arms (sirius::detail::is_cheap_prefilter_conjunct)
+// Tri-state classifier arms (cheap / cascade-worthy expensive / refuse)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("classifier arms: cheap means an elementwise fixed-width-carried subtree",
+TEST_CASE("classifier admits only cheap prefilters and safe measured string residuals",
           "[expression_evaluator][filter_cascade]")
 {
   auto* space = get_default_gpu_space();
@@ -767,43 +914,54 @@ TEST_CASE("classifier arms: cheap means an elementwise fixed-width-carried subtr
   auto integer = sirius::logical_type::make(sirius::type_id::INTEGER);
   auto varchar = sirius::logical_type::make(sirius::type_id::VARCHAR);
 
-  auto is_cheap = [&](std::unique_ptr<ast_node> const& n) {
-    return sirius::detail::is_cheap_prefilter_conjunct(*n, input);
+  using classification = sirius::detail::filter_cascade_conjunct_class;
+  auto classify        = [&](std::unique_ptr<ast_node> const& n) {
+    return sirius::detail::classify_filter_cascade_conjunct(*n, input);
   };
 
   SECTION("references classify by runtime carrier and bounds")
   {
-    CHECK(is_cheap(make_ref(0)));    // INT32 carrier
-    CHECK(!is_cheap(make_ref(1)));   // STRING carrier
-    CHECK(is_cheap(make_ref(2)));    // BOOL8 carrier — the tier-2 composition guarantee
-    CHECK(!is_cheap(make_ref(99)));  // out-of-bounds column index
+    CHECK(classify(make_ref(0)) == classification::cheap);                     // INT32 carrier
+    CHECK(classify(make_ref(1)) == classification::cascade_worthy_expensive);  // STRING carrier
+    CHECK(classify(make_ref(2)) == classification::cheap);    // decode-pushdown BOOL8 carrier
+    CHECK(classify(make_ref(99)) == classification::refuse);  // out-of-bounds index
   }
 
   SECTION("constants classify by payload type")
   {
-    CHECK(is_cheap(make_int_const(5)));
-    CHECK(!is_cheap(make_str_const("x")));
+    CHECK(classify(make_int_const(5)) == classification::cheap);
+    CHECK(classify(make_str_const("x")) == classification::cascade_worthy_expensive);
   }
 
-  SECTION("elementwise interior nodes are cheap over cheap operands")
+  SECTION("comparisons, BETWEEN, and IN distinguish fixed-width from string work")
   {
-    CHECK(is_cheap(make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(5))));
-    CHECK(!is_cheap(
-      make_cmp(sirius::comparison_type::equal, make_ref_typed(1, varchar), make_str_const("A"))));
+    CHECK(classify(make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(5))) ==
+          classification::cheap);
+    CHECK(classify(make_cmp(
+            sirius::comparison_type::equal, make_ref_typed(1, varchar), make_str_const("A"))) ==
+          classification::cascade_worthy_expensive);
+    CHECK(classify(make_cmp(
+            sirius::comparison_type::equal, make_ref_typed(1, varchar), make_int_const(1))) ==
+          classification::refuse);
 
-    CHECK(is_cheap(make_between(make_ref(0), make_int_const(1), make_int_const(5), true, true)));
+    CHECK(classify(make_between(make_ref(0), make_int_const(1), make_int_const(5), true, true)) ==
+          classification::cheap);
+    CHECK(classify(make_between(
+            make_ref_typed(1, varchar), make_str_const("A"), make_str_const("Z"), true, true)) ==
+          classification::cascade_worthy_expensive);
 
     std::vector<std::unique_ptr<ast_node>> int_values;
     int_values.push_back(make_int_const(1));
     int_values.push_back(make_int_const(2));
-    CHECK(is_cheap(make_in(make_ref(0), std::move(int_values), false)));
+    CHECK(classify(make_in(make_ref(0), std::move(int_values), false)) == classification::cheap);
 
     std::vector<std::unique_ptr<ast_node>> str_values;
     str_values.push_back(make_str_const("A"));
-    CHECK(!is_cheap(make_in(make_ref_typed(1, varchar), std::move(str_values), false)));
+    CHECK(classify(make_in(make_ref_typed(1, varchar), std::move(str_values), false)) ==
+          classification::cascade_worthy_expensive);
   }
 
-  SECTION("nested conjunctions are cheap iff every child is")
+  SECTION("nested logical composition propagates expensive and refuse outcomes")
   {
     auto cheap_or = [&] {
       std::vector<std::unique_ptr<ast_node>> children;
@@ -811,44 +969,75 @@ TEST_CASE("classifier arms: cheap means an elementwise fixed-width-carried subtr
       children.push_back(make_cmp(sirius::comparison_type::ge, make_ref(0), make_int_const(7)));
       return make_conj(sirius::ast::conjunction::kind::op_or, std::move(children));
     };
-    CHECK(is_cheap(cheap_or()));
+    CHECK(classify(cheap_or()) == classification::cheap);
 
     std::vector<std::unique_ptr<ast_node>> and_children;
     and_children.push_back(make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(5)));
     and_children.push_back(
       make_between(make_ref(0), make_int_const(1), make_int_const(3), true, true));
-    CHECK(is_cheap(make_conj(sirius::ast::conjunction::kind::op_and, std::move(and_children))));
+    CHECK(classify(make_conj(sirius::ast::conjunction::kind::op_and, std::move(and_children))) ==
+          classification::cheap);
 
     std::vector<std::unique_ptr<ast_node>> mixed_children;
     mixed_children.push_back(make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(5)));
     mixed_children.push_back(
       make_cmp(sirius::comparison_type::equal, make_ref_typed(1, varchar), make_str_const("A")));
-    CHECK(!is_cheap(make_conj(sirius::ast::conjunction::kind::op_or, std::move(mixed_children))));
+    CHECK(classify(make_conj(sirius::ast::conjunction::kind::op_or, std::move(mixed_children))) ==
+          classification::cascade_worthy_expensive);
+
+    std::vector<std::unique_ptr<ast_node>> no_children;
+    CHECK(classify(make_conj(sirius::ast::conjunction::kind::op_and, std::move(no_children))) ==
+          classification::refuse);
   }
 
-  SECTION("unary operators: NOT / IS NULL / IS NOT NULL only, over cheap children")
+  SECTION("logical unary operators preserve cost; null checks and TRY stay conservative")
   {
     CHECK(
-      is_cheap(make_unary(sirius::ast::unary_op::kind::op_not,
-                          make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(5)))));
-    CHECK(is_cheap(make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref(0))));
-    CHECK(is_cheap(make_unary(sirius::ast::unary_op::kind::op_is_not_null, make_ref(0))));
-    CHECK(!is_cheap(make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref(1))));
-    CHECK(!is_cheap(make_unary(
-      sirius::ast::unary_op::kind::op_not,
-      make_cmp(sirius::comparison_type::equal, make_ref_typed(1, varchar), make_str_const("A")))));
-    // Any other unary kind is expensive regardless of its child.
+      classify(make_unary(sirius::ast::unary_op::kind::op_not,
+                          make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(5)))) ==
+      classification::cheap);
+    CHECK(classify(make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref(0))) ==
+          classification::cheap);
+    CHECK(classify(make_unary(sirius::ast::unary_op::kind::op_is_not_null, make_ref(0))) ==
+          classification::cheap);
+    CHECK(classify(make_unary(sirius::ast::unary_op::kind::op_is_null, make_ref(1))) ==
+          classification::refuse);
+    CHECK(classify(make_unary(
+            sirius::ast::unary_op::kind::op_not,
+            make_cmp(
+              sirius::comparison_type::equal, make_ref_typed(1, varchar), make_str_const("A")))) ==
+          classification::cascade_worthy_expensive);
     CHECK(
-      !is_cheap(make_unary(sirius::ast::unary_op::kind::op_try,
-                           make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(5)))));
+      classify(make_unary(sirius::ast::unary_op::kind::op_try,
+                          make_cmp(sirius::comparison_type::lt, make_ref(0), make_int_const(5)))) ==
+      classification::refuse);
   }
 
-  SECTION("AST breakers are unconditionally expensive")
+  SECTION("casts and functions refuse regardless of carrier or apparent cost")
   {
-    // A fixed-width cast is elementwise-cheap in principle; classifying it expensive is the
-    // documented conservatism (widen only with measured evidence).
-    CHECK(!is_cheap(make_cast(make_ref_typed(0, integer),
-                              sirius::logical_type::make(sirius::type_id::BIGINT),
-                              /*try_cast=*/false)));
+    CHECK(classify(make_cast(make_ref_typed(0, integer),
+                             sirius::logical_type::make(sirius::type_id::BIGINT),
+                             /*try_cast=*/false)) == classification::refuse);
+
+    std::vector<std::unique_ptr<ast_node>> add_args;
+    add_args.push_back(make_ref_typed(0, integer));
+    add_args.push_back(make_int_const(1));
+    CHECK(classify(make_func(sirius::function_id::add, std::move(add_args), integer)) ==
+          classification::refuse);
+
+    std::vector<std::unique_ptr<ast_node>> contains_args;
+    contains_args.push_back(make_ref_typed(1, varchar));
+    contains_args.push_back(make_str_const("A"));
+    CHECK(classify(make_func(sirius::function_id::contains,
+                             std::move(contains_args),
+                             sirius::logical_type::make(sirius::type_id::BOOLEAN))) ==
+          classification::refuse);
+
+    std::vector<std::unique_ptr<ast_node>> error_args;
+    error_args.push_back(make_str_const("boom"));
+    CHECK(classify(make_func(sirius::function_id::error,
+                             std::move(error_args),
+                             sirius::logical_type::make(sirius::type_id::BOOLEAN))) ==
+          classification::refuse);
   }
 }

@@ -233,13 +233,15 @@ class expression_evaluator {
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
    * (in MATERIALIZE mode). Otherwise, the executor will try to evaluate the expression subtree by
    * adding nodes to the AST tree.
+   * @param cascade_policy Immutable select-only cascade policy; disabled by default.
    */
   expression_evaluator(
     duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
-    std::size_t min_ast_size                    = 2);
+    std::size_t min_ast_size                    = 2,
+    filter_cascade_policy cascade_policy        = {});
 
   /**
    * @brief Construct a expression_evaluator with the given expression (for FILTER operators).
@@ -254,26 +256,31 @@ class expression_evaluator {
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
    * (in MATERIALIZE mode). Otherwise, the executor will try to evaluate the expression subtree by
    * adding nodes to the AST tree.
+   * @param cascade_policy Immutable select-only cascade policy; disabled by default.
    */
   expression_evaluator(
     sirius::ast::node const& expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
-    std::size_t min_ast_size                    = 2);
+    std::size_t min_ast_size                    = 2,
+    filter_cascade_policy cascade_policy        = {});
 
   /**
    * @brief Non-owning ctor for call sites that hold a raw sirius::ast::node pointer
    * (e.g., NLJ lambda over cuDF expressions, parquet scan filter pushdown).
    *
    * The caller retains ownership; the executor only reads from the node tree.
+   *
+   * @param cascade_policy Immutable select-only cascade policy; disabled by default.
    */
   expression_evaluator(
     sirius::ast::node const* expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
-    std::size_t min_ast_size                    = 2);
+    std::size_t min_ast_size                    = 2,
+    filter_cascade_policy cascade_policy        = {});
 
   /**
    * @brief Non-owning ctor for a pre-filtered list of expressions (e.g. the projection operator's
@@ -283,13 +290,16 @@ class expression_evaluator {
    * The caller retains ownership of the nodes; the executor only reads from them. The output
    * table produced by evaluate() contains one column per entry in @p expressions, in the same
    * order.
+   *
+   * @param cascade_policy Immutable select-only cascade policy; disabled by default.
    */
   expression_evaluator(
     std::vector<sirius::ast::node const*> expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
-    std::size_t min_ast_size                    = 2);
+    std::size_t min_ast_size                    = 2,
+    filter_cascade_policy cascade_policy        = {});
 
   /**
    * @brief Executes the current set of expressions against the given input batch and emits a new
@@ -361,14 +371,13 @@ class expression_evaluator {
   /**
    * @brief Which path the most recent select() took through the cheap-conjunct filter cascade.
    *
-   * The cascade (see Config::FILTER_CASCADE_CHEAP_CONJUNCTS) splits a top-level AND into cheap
-   * fixed-width prefilter conjuncts and an expensive residual: `cascaded` means the residual ran
-   * only on gathered prefilter survivors, `combined_masks` means the prefilter was too
-   * unselective to justify the gather so the residual ran in place and the masks were ANDed,
-   * `short_circuited` means the prefilter dropped every row and the residual never ran, and
-   * `not_applicable` means the cascade did not engage (disabled, below the row threshold, the
-   * predicate is not an AND mixing both conjunct classes, or the survivor gather is out of scope
-   * for the caller's projection).
+   * When the immutable policy enables the cascade, it splits a top-level AND into cheap
+   * fixed-width prefilter conjuncts and an explicitly supported string residual: `cascaded` means
+   * the residual ran only on gathered prefilter survivors, `combined_masks` means the prefilter
+   * was too unselective to justify the gather so the residual ran in place and the masks were
+   * ANDed, `short_circuited` means the prefilter dropped every row and the residual never ran, and
+   * `not_applicable` means the cascade did not engage (disabled, below the policy row threshold,
+   * unsupported or potentially observable expression shape, or an out-of-scope gather).
    */
   enum class filter_cascade_decision : std::uint8_t {
     not_applicable,
@@ -391,6 +400,8 @@ class expression_evaluator {
   rmm::cuda_stream_view _stream;       ///< The stream in which to evaluate any cuDF operations
   std::size_t _min_ast_size;  ///< The minimum number of nodes in an AST tree before we switch from
                               ///< MATERIALIZE mode to AST mode
+  const filter_cascade_policy
+    _filter_cascade_policy;  ///< Immutable query/session policy captured by the owning operator
   cudf::table_view _input_table;  ///< The input table for expression evaluation
   std::vector<std::unique_ptr<cudf::column>>
     _output_columns;  ///< The output columns generated by expression evaluation (one per
@@ -428,18 +439,13 @@ class expression_evaluator {
   std::unique_ptr<cudf::table> select_impl(cudf::table_view input,
                                            std::span<cudf::size_type const> output_indices);
 
-  // Cheap-conjunct filter cascade (Config::FILTER_CASCADE_CHEAP_CONJUNCTS), defined in
-  // filter_cascade.cpp: when the predicate is a top-level AND mixing cheap fixed-width conjuncts
-  // with expensive (string-carried or AST-breaking) ones, the batch clears
-  // Config::FILTER_CASCADE_MIN_ROWS, and the survivor gather is in scope — every input column is
-  // projected or referenced by the expensive residual — evaluate the cheap conjuncts first and
-  // run the expensive residual only on surviving rows. The gather happens when the prefilter
-  // pass rate is at most Config::FILTER_CASCADE_MAX_PASS_RATE (see config.cpp for the break-even
-  // reasoning); above that the residual runs over all rows and the two masks are ANDed. Any
-  // split of a conjunction selects the same rows under Kleene AND, so this is purely a
-  // performance decision. Returns nullopt when the cascade does not apply (including an
-  // out-of-scope gather, where splitting could never beat the monolithic kernel); the caller
-  // then falls through to the monolithic single-mask path.
+  // Cheap-conjunct filter cascade, defined in filter_cascade.cpp. The immutable policy is
+  // captured at planning/bind time. Eligibility is deliberately narrow: a top-level AND must
+  // contain both safe fixed-width work and measured-expensive direct string predicates; casts,
+  // functions, AST breakers, malformed nodes, and future alternatives refuse the optimization.
+  // Projection-aware gather guards bound pure-filter materialization and reject unrelated
+  // variable-width payloads. Returns nullopt whenever any policy, safety, shape, or cost gate
+  // refuses, so select_impl falls through to the original monolithic mask path.
   std::optional<std::unique_ptr<cudf::table>> try_select_cascade(
     cudf::table_view input, std::span<cudf::size_type const> output_indices);
 

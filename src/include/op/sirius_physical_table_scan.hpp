@@ -22,6 +22,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
+#include "expression_evaluator/filter_cascade_policy.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
@@ -74,7 +75,8 @@ class sirius_physical_table_scan : public sirius_physical_operator {
                              std::size_t estimated_cardinality,
                              duckdb::ExtraOperatorInfo extra_info,
                              duckdb::vector<duckdb::Value> parameters,
-                             duckdb::virtual_column_map_t virtual_columns);
+                             duckdb::virtual_column_map_t virtual_columns,
+                             filter_cascade_policy cascade_policy = {});
 
   //! The table function
   duckdb::TableFunction function;
@@ -104,6 +106,9 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   //! Virtual columns
   duckdb::virtual_column_map_t virtual_columns;
+
+  //! Immutable filter-cascade policy captured from the owning query session.
+  const filter_cascade_policy cascade_policy;
 
   duckdb::PhysicalTableScan* physical_table_scan;
 

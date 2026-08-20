@@ -100,7 +100,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
     auto filter = duckdb::make_uniq<sirius::op::sirius_physical_filter>(std::move(filter_types),
                                                                         std::move(predicate),
                                                                         op.estimated_cardinality,
-                                                                        std::move(output_indices));
+                                                                        std::move(output_indices),
+                                                                        cascade_policy);
     filter->children.push_back(std::move(plan));
     plan = std::move(filter);
   } else if (op.HasProjectionMap()) {

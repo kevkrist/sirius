@@ -112,32 +112,53 @@ SET expression_evaluator_strategy = 'ast_jit';   -- or 'ast_interpret', 'materia
 
 ## Filter cascade in select()
 
-**Files:** `src/expression_evaluator/filter_cascade.cpp`, `src/include/expression_evaluator/filter_cascade_internal.hpp`
+**Files:** `src/expression_evaluator/filter_cascade.cpp`, `src/include/expression_evaluator/filter_cascade_internal.hpp`, `src/include/expression_evaluator/filter_cascade_policy.hpp`
 
-`select()` — the universal filter route used by `sirius_physical_filter`, `sirius_physical_table_scan`, and the scan ingestibles' predicate pushdown — can split a filter whose predicate is a top-level AND mixing cheap fixed-width conjuncts with expensive (string-carried) ones: it evaluates the cheap group first and runs the expensive residual only on rows surviving that prefilter. On TPC-H q19's part scan this avoids most of a 116-register JIT string kernel's work. The cascade is an internal execution strategy: callers see the exact same signature, result contract, and byte-identical rows.
+`select()` is the filter route used by physical filters, table scans, and scan-ingestible predicate
+pushdown. It can split a top-level `AND` into a cheap fixed-width prefilter and a supported
+string-carried residual, then evaluate the residual only for prefilter survivors. The optimization
+is opt-in through `filter_cascade_cheap_conjuncts`. Physical planning copies that session setting
+into an immutable policy carried by the query's filter and scan operators; worker threads never
+read mutable process configuration.
 
-Per `select()` call (one knob snapshot at entry):
+The decision procedure is:
 
-1. Refuse (`not_applicable`, monolithic path) unless `filter_cascade_cheap_conjuncts` is set, the batch has at least `filter_cascade_min_rows` rows, the single predicate's root is a top-level AND, the classifier splits its children into non-empty cheap and expensive groups, and the survivor gather is *in scope*: every input column is in the union of `output_indices` and the columns referenced by the expensive residual. An out-of-scope gather refuses outright — a cascade that may never gather only adds launches and a sync over the monolithic kernel.
-2. Evaluate the cheap group's mask; count survivors via `cudf::bools_to_mask` (one 4-byte device-to-host sync).
-3. Zero survivors → `short_circuited`: return `cudf::empty_like` of the projection without running the residual.
-4. Pass rate ≤ `filter_cascade_max_pass_rate` → `cascaded`: gather survivors with `cudf::apply_boolean_mask`, evaluate the residual on them, apply its mask.
-5. Otherwise → `combined_masks`: evaluate the residual over all rows and Kleene-AND the two masks (the cheap mask is a sunk cost at this point; ANDing beats recomputing the monolithic predicate).
+1. Use the monolithic path unless the policy is enabled, the input meets the internal row
+   threshold, the predicate is one top-level `AND`, every child is explicitly classified as
+   `cheap` or `cascade_worthy_expensive`, and both classes are present. A `refuse` child rejects the
+   entire optimization.
+2. Check the intermediate gather's scope. Unrelated omitted columns and variable-width payloads
+   that the residual does not need reject the cascade. A gather may carry at most 32 bytes of
+   fixed-width input per row and, within that budget, at most 8 bytes of omitted fixed-width
+   carriers used only by the cheap predicate. A selective cascade gathers residual STRING columns
+   only when their aggregate characters-and-offsets footprint is at most 32 bytes per input row;
+   wider batches retain the cheap mask and evaluate both masks without survivor compaction. This
+   lets scan/decompression filters compose without permitting an unbounded payload copy.
+3. Evaluate the cheap mask and count survivors with one device-to-host count synchronization.
+4. If no rows survive, return an empty projection without evaluating the residual.
+5. At or below the policy's internal pass-rate threshold, gather survivors, evaluate the residual
+   on them, and apply its mask. Above the threshold, evaluate the residual over the original rows
+   and Kleene-AND the masks, avoiding an unselective intermediate gather.
 
-The classifier (`sirius::detail::is_cheap_prefilter_conjunct`) marks a conjunct cheap iff every node in its subtree is an elementwise, fixed-width-carried operation:
+The conservative classifier is:
 
-| `ast::node` alternative | Cheap when |
+| `ast::node` alternative | Classification |
 |---|---|
-| `reference` | column index in bounds and the *runtime carrier* satisfies `cudf::is_fixed_width` (a decode-time predicate substitution's BOOL8 mask reference classifies cheap) |
-| `constant` | not VARCHAR |
-| `comparison`, `between`, `in_list` | all operands cheap |
-| `conjunction` (AND or OR) | non-empty and all children cheap |
-| `unary_op` | NOT / IS NULL / IS NOT NULL over a cheap child |
-| `cast`, `case_expr`, `coalesce`, `function_call`, `aggregate`, any future alternative | never (deliberately conservative default arm) |
+| fixed-width `reference` or fixed-width non-VARCHAR `constant` | `cheap` |
+| VARCHAR `reference` or `constant` | `cascade_worthy_expensive` |
+| `comparison`, `between`, `in_list` | the common operand class; mixed or malformed operands `refuse` |
+| non-empty `conjunction` (`AND`/`OR`) | `cheap` if every child is cheap; expensive if any child is expensive; any refused child `refuse` |
+| `unary_op` | `NOT` preserves its child's class; `IS NULL` / `IS NOT NULL` accept only a cheap child |
+| `cast`, `case_expr`, `coalesce`, `function_call`, `aggregate`, malformed nodes, future alternatives | `refuse` |
 
-Correctness is Kleene partition invariance: a top-level AND selects a row iff every partition of its conjuncts evaluates to TRUE for it, so any split — including the mask AND and the short-circuit — produces the identical row set, and misclassification can only move cost, never change results.
+Row-set correctness uses Kleene-AND partition invariance, but that alone does not make expression
+reordering safe: a skipped residual could otherwise suppress an exception or observable function.
+The whitelist therefore admits only known non-observable operations. Fallible, volatile,
+unsupported, or merely unmeasured shapes stay on the original monolithic path.
 
-The knobs are documented in [configuration.md](configuration.md) → Expression Evaluation; the break-even reasoning behind the defaults lives in `src/config.cpp`.
+The minimum-row and maximum-pass-rate values (currently 1,048,576 rows and 0.75) are fields of
+the injected C++ policy. They are kept internal so benchmark/test code can vary them without exposing unstable tuning knobs as SQL
+configuration.
 
 ## Supported Expression Types
 
@@ -232,7 +253,8 @@ This is used by `sirius_physical_hash_join` in MIXED_JOIN mode to pass the condi
 | `src/include/expression_evaluator/expression_evaluator.hpp` | Main evaluator class |
 | `src/expression_evaluator/expression_evaluator.cpp` | Driver: strategy dispatch, AST tree management, temp lifetimes |
 | `src/expression_evaluator/filter_cascade.cpp` | Cheap-conjunct filter cascade policy for `select()` (classifier + `try_select_cascade`) |
-| `src/include/expression_evaluator/filter_cascade_internal.hpp` | `sirius::detail::is_cheap_prefilter_conjunct` classifier contract (exposed for tests) |
+| `src/include/expression_evaluator/filter_cascade_internal.hpp` | Tri-state `classify_filter_cascade_conjunct` contract (exposed for tests) |
+| `src/include/expression_evaluator/filter_cascade_policy.hpp` | Immutable per-query cascade policy and production defaults |
 | `src/expression_evaluator/specializations/*.cpp` | Per-Sirius-AST-alternative dispatch (comparison, case, function, …) |
 | `src/include/expression_evaluator/expression_evaluator_strategy.hpp` | `expression_evaluator_strategy` enum + string conversions |
 | `src/include/expression_evaluator/ast_supported_types.hpp` | AST-eligible cast targets and functions (`supported_ast_cast_types`, `supported_ast_functions`) |

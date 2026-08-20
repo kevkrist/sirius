@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "config.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/contiguous_split.hpp>
@@ -143,11 +144,12 @@ constexpr std::array<setting_assignment, 10> legacy_only_settings{{
   {"modified_pipeline", "true"},
 }};
 
-constexpr std::array<const char*, 4> super_sirius_settings{{
+constexpr std::array<const char*, 5> super_sirius_settings{{
   "expression_evaluator_strategy",
   "enable_regex_jit_impl",
   "enable_duckdb_fallback",
   "fuse_merge_pipelines",
+  "filter_cascade_cheap_conjuncts",
 }};
 }  // namespace
 
@@ -193,6 +195,56 @@ TEST_CASE("Legacy-only settings follow the build surface",
     CAPTURE(name);
     REQUIRE(setting_count(name) == 1);
   }
+}
+
+TEST_CASE("Filter cascade setting is session-scoped, snapshot-safe, and NULL-safe",
+          "[sirius][config][filter-cascade][isolated_context]")
+{
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
+  setenv("SIRIUS_DISABLE", "1", 1);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection first(db);
+  duckdb::Connection second(db);
+
+  auto const registered_default =
+    sirius::filter_cascade_policy_from_context(*first.context).enabled;
+  REQUIRE(registered_default == sirius::default_filter_cascade_policy().enabled);
+  auto const snapshot = sirius::filter_cascade_policy_from_context(*first.context);
+  auto const opposite = !registered_default;
+
+  auto global_set = first.Query(std::string("SET GLOBAL filter_cascade_cheap_conjuncts = ") +
+                                (opposite ? "true" : "false"));
+  REQUIRE(global_set != nullptr);
+  REQUIRE(global_set->HasError());
+  REQUIRE_THAT(global_set->GetError(), Catch::Contains("GLOBAL scope is not supported"));
+  REQUIRE(sirius::filter_cascade_policy_from_context(*first.context).enabled == registered_default);
+  REQUIRE(sirius::filter_cascade_policy_from_context(*second.context).enabled ==
+          registered_default);
+
+  auto global_reset = first.Query("RESET GLOBAL filter_cascade_cheap_conjuncts");
+  REQUIRE(global_reset != nullptr);
+  REQUIRE(global_reset->HasError());
+  REQUIRE_THAT(global_reset->GetError(), Catch::Contains("GLOBAL scope is not supported"));
+
+  auto set_result = first.Query(std::string("SET filter_cascade_cheap_conjuncts = ") +
+                                (opposite ? "true" : "false"));
+  REQUIRE(set_result != nullptr);
+  REQUIRE_FALSE(set_result->HasError());
+  REQUIRE(sirius::filter_cascade_policy_from_context(*first.context).enabled == opposite);
+  REQUIRE(sirius::filter_cascade_policy_from_context(*second.context).enabled ==
+          registered_default);
+  REQUIRE(snapshot.enabled == registered_default);
+
+  auto null_result = first.Query("SET filter_cascade_cheap_conjuncts = NULL");
+  REQUIRE(null_result != nullptr);
+  REQUIRE(null_result->HasError());
+  REQUIRE(sirius::filter_cascade_policy_from_context(*first.context).enabled == opposite);
+
+  auto reset_result = first.Query("RESET filter_cascade_cheap_conjuncts");
+  REQUIRE(reset_result != nullptr);
+  REQUIRE_FALSE(reset_result->HasError());
+  REQUIRE(sirius::filter_cascade_policy_from_context(*first.context).enabled == registered_default);
 }
 
 TEST_CASE("Test-only settings require explicit process opt-in",

@@ -18,6 +18,9 @@
 
 #include "log/logging.hpp"
 
+#include <duckdb/common/types/value.hpp>
+#include <duckdb/main/client_context.hpp>
+
 namespace duckdb {
 
 bool Config::USE_PIN_MEM_FOR_CPU_PROCESSING = true;
@@ -26,18 +29,6 @@ bool Config::USE_PIN_MEM_FOR_CACHING        = false;
 bool Config::USE_CUDF_EXPR = true;
 sirius::expression_evaluator_strategy Config::EXPRESSION_EVALUATOR_STRATEGY =
   sirius::expression_evaluator_strategy::AST_INTERPRET;
-
-bool Config::FILTER_CASCADE_CHEAP_CONJUNCTS = true;
-// Below ~1M rows a predicate kernel is launch-latency-bound (tens of microseconds) while the
-// cascade adds a handful of launches plus a 4-byte device-to-host count sync of the same order,
-// so the crossover sits near this size; above it the saving scales with rows and the overhead
-// stays fixed.
-uint64_t Config::FILTER_CASCADE_MIN_ROWS = 1ULL << 20;
-// Break-even between gathering survivors before the residual (~55 ps per surviving row for a
-// ~50 B row at the ~890 GB/s device-to-device gather rate) and the residual string evaluation
-// the gather avoids (~180 ps per dropped row, measured JIT string-compare rate):
-// 55*s = 180*(1-s) -> s ~ 0.77, rounded down.
-double Config::FILTER_CASCADE_MAX_PASS_RATE = 0.75;
 
 bool Config::USE_CUSTOM_TOP_N = true;
 
@@ -63,3 +54,18 @@ std::string Config::LOG_DIR     = "log";
 int Config::LOG_FLUSH_SECONDS   = 3;
 
 }  // namespace duckdb
+
+namespace sirius {
+
+filter_cascade_policy filter_cascade_policy_from_context(duckdb::ClientContext& context)
+{
+  auto policy = default_filter_cascade_policy();
+  duckdb::Value setting;
+  if (context.TryGetCurrentSetting("filter_cascade_cheap_conjuncts", setting) &&
+      !setting.IsNull()) {
+    policy.enabled = setting.GetValue<bool>();
+  }
+  return policy;
+}
+
+}  // namespace sirius

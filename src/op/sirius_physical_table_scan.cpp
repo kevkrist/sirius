@@ -54,7 +54,8 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   std::size_t estimated_cardinality,
   duckdb::ExtraOperatorInfo extra_info,
   duckdb::vector<duckdb::Value> parameters_p,
-  duckdb::virtual_column_map_t virtual_columns_p)
+  duckdb::virtual_column_map_t virtual_columns_p,
+  filter_cascade_policy cascade_policy_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
     function(std::move(function_p)),
@@ -66,7 +67,8 @@ sirius_physical_table_scan::sirius_physical_table_scan(
     table_filters(std::move(table_filters_p)),
     extra_info(std::move(extra_info)),
     parameters(std::move(parameters_p)),
-    virtual_columns(std::move(virtual_columns_p))
+    virtual_columns(std::move(virtual_columns_p)),
+    cascade_policy(cascade_policy_p)
 {
 }
 
@@ -172,8 +174,12 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   }
 
   if (local_filter_expr != nullptr) {
-    sirius::expression_evaluator evaluator(
-      *local_filter_expr, cudf::get_current_device_resource_ref(), stream);
+    sirius::expression_evaluator evaluator(*local_filter_expr,
+                                           cudf::get_current_device_resource_ref(),
+                                           stream,
+                                           sirius::strategy_from_config(),
+                                           2,
+                                           cascade_policy);
     auto filtered_table = evaluator.select(
       batch_ref.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
     output_batch = sirius::make_data_batch(

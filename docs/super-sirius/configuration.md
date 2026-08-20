@@ -551,21 +551,21 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 
 ### Expression Evaluation
 
-**File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
+**Files:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`, `src/include/expression_evaluator/filter_cascade_policy.hpp`, `src/sirius_extension.cpp`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `expression_evaluator_strategy` | `ast_interpret` | Expression evaluator strategy: `materialize`, `ast_interpret`, or `ast_jit` |
-| `filter_cascade_cheap_conjuncts` | `true` | Evaluate cheap fixed-width conjuncts of a filter's top-level AND first; run the expensive (string-carried) residual only on surviving rows |
-| `filter_cascade_min_rows` | `1048576` | Minimum batch rows before the filter cascade engages (below this, kernel-launch latency dominates any saving) |
-| `filter_cascade_max_pass_rate` | `0.75` | Highest cheap-prefilter pass rate at which survivors are gathered before the residual; above it the two masks are combined without a gather. Domain [0, 1] |
+| `filter_cascade_cheap_conjuncts` | `false` | Opt in to evaluating safe fixed-width conjuncts first and running supported expensive string residuals only on surviving rows |
 
 `expression_executor_strategy` remains registered as a deprecated compatibility alias for
 `expression_evaluator_strategy`; new configuration should use the evaluator name.
 
-The three `filter_cascade_*` knobs govern the filter cascade in
-`expression_evaluator::select()`; see
-[expression-executor.md](expression-executor.md) → Filter cascade in select().
+`filter_cascade_cheap_conjuncts` is session-scoped; explicit `SET GLOBAL` and `RESET GLOBAL`
+are rejected. Its value is copied into each physical plan before worker execution. The minimum-row
+and maximum-pass-rate thresholds are internal policy fields, not public SQL settings. See
+[Filter cascade in select()](expression-executor.md#filter-cascade-in-select).
+
 
 ### Scan
 

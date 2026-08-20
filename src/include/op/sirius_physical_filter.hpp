@@ -17,6 +17,7 @@
 #pragma once
 
 #include "expression/ast/node.hpp"
+#include "expression_evaluator/filter_cascade_policy.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cudf/types.hpp>
@@ -49,15 +50,19 @@ class sirius_physical_filter : public sirius_physical_operator {
   sirius_physical_filter(duckdb::vector<sirius::logical_type> types,
                          std::unique_ptr<sirius::ast::node> expression,
                          std::size_t estimated_cardinality,
-                         std::vector<cudf::size_type> output_indices);
+                         std::vector<cudf::size_type> output_indices,
+                         filter_cascade_policy cascade_policy = {});
   sirius_physical_filter(duckdb::vector<sirius::logical_type> types,
                          std::unique_ptr<sirius::ast::node> expression,
-                         std::size_t estimated_cardinality);
+                         std::size_t estimated_cardinality,
+                         filter_cascade_policy cascade_policy = {});
 
   /// @brief The filter expression
   std::unique_ptr<sirius::ast::node> expression;
   /// @brief See @ref output_mask.
   output_mask output_columns;
+  /// Immutable cascade policy captured from the planning connection.
+  const filter_cascade_policy cascade_policy;
 
   /// @brief Execute the filter operator on the given input data.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,

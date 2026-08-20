@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "expression_evaluator/filter_cascade_policy.hpp"
 #include "op/scan/owning_table_view.hpp"
 
 #include <io/sirius_datasource.hpp>
@@ -44,6 +45,9 @@ class ingestible_table_info {
 
   ingestible_table_info(ingestible_table_info const&)            = delete;
   ingestible_table_info& operator=(ingestible_table_info const&) = delete;
+
+  // Immutable cascade policy captured from the planning connection.
+  filter_cascade_policy filter_policy{};
 
   [[nodiscard]] virtual std::span<std::string const> column_names() const = 0;
 

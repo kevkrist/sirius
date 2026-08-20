@@ -1760,32 +1760,16 @@ static void SetExpressionExecutorStrategyDeprecated(ClientContext& context,
   ApplyExpressionEvaluatorStrategy(StringValue::Get(parameter));
 }
 
-static void SetFilterCascadeCheapConjuncts(ClientContext& context, SetScope scope, Value& parameter)
+static void SetFilterCascadeCheapConjuncts(ClientContext&, SetScope scope, Value& parameter)
 {
-  throw_if_sirius_runtime_unavailable(context);
-  Config::FILTER_CASCADE_CHEAP_CONJUNCTS = BooleanValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config FILTER_CASCADE_CHEAP_CONJUNCTS to {}",
-                   Config::FILTER_CASCADE_CHEAP_CONJUNCTS);
-}
-
-static void SetFilterCascadeMinRows(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  Config::FILTER_CASCADE_MIN_ROWS = UBigIntValue::Get(parameter);
-  SIRIUS_LOG_DEBUG("Updated config FILTER_CASCADE_MIN_ROWS to {}", Config::FILTER_CASCADE_MIN_ROWS);
-}
-
-static void SetFilterCascadeMaxPassRate(ClientContext& context, SetScope scope, Value& parameter)
-{
-  throw_if_sirius_runtime_unavailable(context);
-  auto const rate = DoubleValue::Get(parameter);
-  // Negated form rejects NaN as well as out-of-range values.
-  if (!(rate >= 0.0 && rate <= 1.0)) {
-    throw InvalidInputException("filter_cascade_max_pass_rate must be in [0, 1], got %f", rate);
+  if (scope == SetScope::GLOBAL) {
+    throw InvalidInputException(
+      "filter_cascade_cheap_conjuncts is session-scoped; GLOBAL scope is not supported");
   }
-  Config::FILTER_CASCADE_MAX_PASS_RATE = rate;
-  SIRIUS_LOG_DEBUG("Updated config FILTER_CASCADE_MAX_PASS_RATE to {}",
-                   Config::FILTER_CASCADE_MAX_PASS_RATE);
+  if (parameter.IsNull()) {
+    throw InvalidInputException(
+      "filter_cascade_cheap_conjuncts does not accept NULL; use RESET to restore its default");
+  }
 }
 
 #ifdef SIRIUS_ENABLE_LEGACY
@@ -2263,26 +2247,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
 
   config.AddExtensionOption(
     "filter_cascade_cheap_conjuncts",
-    "Evaluate cheap fixed-width conjuncts of a filter's top-level AND first and run the "
-    "expensive (string / AST-breaker) residual only on surviving rows",
+    "Evaluate cheap fixed-width conjuncts first and run supported expensive string residuals "
+    "only on surviving rows",
     LogicalType::BOOLEAN,
-    Value::BOOLEAN(Config::FILTER_CASCADE_CHEAP_CONJUNCTS),
-    SetFilterCascadeCheapConjuncts);
-
-  config.AddExtensionOption("filter_cascade_min_rows",
-                            "Minimum input rows before the filter cascade engages (below this, "
-                            "kernel-launch latency dominates the possible saving)",
-                            LogicalType::UBIGINT,
-                            Value::UBIGINT(Config::FILTER_CASCADE_MIN_ROWS),
-                            SetFilterCascadeMinRows);
-
-  config.AddExtensionOption(
-    "filter_cascade_max_pass_rate",
-    "Highest cheap-prefilter pass rate at which the cascade gathers survivors before the "
-    "expensive residual; above it the residual runs over all rows and the masks are combined",
-    LogicalType::DOUBLE,
-    Value::DOUBLE(Config::FILTER_CASCADE_MAX_PASS_RATE),
-    SetFilterCascadeMaxPassRate);
+    Value::BOOLEAN(sirius::default_filter_cascade_policy().enabled),
+    SetFilterCascadeCheapConjuncts,
+    SetScope::SESSION);
 
 #ifdef SIRIUS_ENABLE_LEGACY
   // Add in config option for top-N

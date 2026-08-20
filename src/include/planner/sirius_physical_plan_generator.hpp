@@ -20,6 +20,7 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "expression_evaluator/filter_cascade_policy.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <memory>
@@ -229,6 +230,7 @@ class sirius_physical_plan_generator {
 
  public:
   duckdb::ClientContext& context;
+  const sirius::filter_cascade_policy cascade_policy;
   // duckdb::GPUContext& gpu_context;
 
  public:

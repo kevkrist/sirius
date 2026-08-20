@@ -32,10 +32,12 @@ namespace op {
 sirius_physical_filter::sirius_physical_filter(duckdb::vector<sirius::logical_type> types,
                                                std::unique_ptr<sirius::ast::node> expression_p,
                                                std::size_t estimated_cardinality,
-                                               std::vector<cudf::size_type> output_indices_p)
+                                               std::vector<cudf::size_type> output_indices_p,
+                                               filter_cascade_policy cascade_policy_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality),
-    expression(std::move(expression_p))
+    expression(std::move(expression_p)),
+    cascade_policy(cascade_policy_p)
 {
   D_ASSERT(expression != nullptr);
   if (output_indices_p.empty()) {
@@ -47,11 +49,13 @@ sirius_physical_filter::sirius_physical_filter(duckdb::vector<sirius::logical_ty
 
 sirius_physical_filter::sirius_physical_filter(duckdb::vector<sirius::logical_type> types,
                                                std::unique_ptr<sirius::ast::node> expression_p,
-                                               std::size_t estimated_cardinality)
+                                               std::size_t estimated_cardinality,
+                                               filter_cascade_policy cascade_policy_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality),
     expression(std::move(expression_p)),
-    output_columns(passthrough{})
+    output_columns(passthrough{}),
+    cascade_policy(cascade_policy_p)
 {
   D_ASSERT(expression != nullptr);
 }
@@ -63,8 +67,12 @@ std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_da
   const auto& input         = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
-  sirius::expression_evaluator evaluator(
-    *expression, cudf::get_current_device_resource_ref(), stream);
+  sirius::expression_evaluator evaluator(*expression,
+                                         cudf::get_current_device_resource_ref(),
+                                         stream,
+                                         sirius::strategy_from_config(),
+                                         2,
+                                         cascade_policy);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
