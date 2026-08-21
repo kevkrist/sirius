@@ -292,6 +292,12 @@ class pipelineable_operator_data : public operator_data {
    * Iterates over all idle batches and locks (or converts then locks) each one,
    * storing the results in _read_only_data_batches. Throws sirius::internal_exception
    * if any batch pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
+   * For a GPU target, the caller must make that device current and pass a stream owned by the
+   * same device; gpu_pipeline_executor supplies this pairing from its device-bound stream pool
+   * and reservation space.
+   *
+   * @param requested_memory_space Target space for every prepared input batch.
+   * @param stream Device-affine execution stream; must belong to a GPU target when one is given.
    */
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
                               rmm::cuda_stream_view stream) override;
