@@ -2338,6 +2338,20 @@ static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Va
                    params->dense_count_join_max_bytes);
 }
 
+static void SetGroupJoinMaxStateBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) {
+    throw InvalidInputException("group_join_max_state_bytes must be greater than zero");
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                          = lock_operator_params_slot(context);
+  params->group_join_max_state_bytes = bytes;
+  SIRIUS_LOG_DEBUG("Updated config GROUP_JOIN_MAX_STATE_BYTES to {}",
+                   params->group_join_max_state_bytes);
+}
+
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2615,6 +2629,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.dense_count_join_max_bytes),
                     SetDenseCountJoinMaxBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "group_join_max_state_bytes",
+                    "internal test hook for the GROUP_JOIN value-form state budget",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.group_join_max_state_bytes),
+                    SetGroupJoinMaxStateBytes);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",

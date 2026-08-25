@@ -102,6 +102,11 @@ constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
 constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
+/// Default GROUP_JOIN value-form state budget: min(16 GiB, smallest device memory / 16).
+/// Device-fraction-capped so small-HBM devices decline dense state they could not reserve; falls
+/// back to the 2 GiB count-form budget when no device is visible.
+uint64_t derived_group_join_max_state_bytes();
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
@@ -187,6 +192,11 @@ struct operator_params {
 
   /// Engine-owned GROUP_JOIN count-state budget; declined ranges use exact sparse aggregation.
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
+
+  /// Engine-owned GROUP_JOIN value-form (INNER/DIRECT) state budget, consumed by the planner
+  /// rungs that emit those forms; declined ranges use exact sparse aggregation. See
+  /// derived_group_join_max_state_bytes.
+  uint64_t group_join_max_state_bytes = config::derived_group_join_max_state_bytes();
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's

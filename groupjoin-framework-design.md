@@ -290,7 +290,7 @@ instantiations (explicit-instantiation list in the `.cu`; no combinatorial templ
 |---|---|---|
 | COUNT  | `matched:CountT`                                           | 1 atomicAdd — **today's kernel** |
 | SUM    | `matched:CountT`, `sum:int64`                              | 2 atomics |
-| MIN/MAX| `matched:CountT`, `extreme:int64/int32`                    | 1 atomicAdd + 1 atomicMin/Max |
+| MIN/MAX| `matched:CountT`, `extreme:int64`                          | 1 atomicAdd + 1 atomicMin/Max |
 | AVG    | `matched:CountT`, `sum:int64`                              | 2 atomics |
 
 plus `presence:CountT` for the two-input forms (preserved pass — identical kernel for every
@@ -430,9 +430,14 @@ budget remains bounded by gates (b), (d), (e); the dead-slot waste is the correc
 forms it is additionally the **NULL-argument-exact** path (the target of the argument-validity
 gate, §4.2): cudf aggregations exclude NULL arguments and produce NULL for all-NULL groups, and
 the emitted aggregate columns carry their validity masks through merge and ⊗ (NULL ⊗ c = NULL).
-Two spec deltas beyond the value analogues: (i) INNER with a nullable argument computes **two**
-counted-side aggregates in the one groupby pass — COUNT(arg) (the value / AVG divisor) and
-COUNT(*) (M11's `c2`, the emit filter) — because valid-arg count ≠ key-match count there;
+Two spec deltas beyond the value analogues: (i) INNER realizes M11's `c2 > 0` emit filter
+**structurally**: a key appears in the counted distinct-key partials iff at least one key-match
+row exists (cudf groupby emits a group for every non-NULL key with rows, even when every
+argument is NULL), so the distinct-key **inner** join of the two sides *is* the σ_{c2>0} — no
+COUNT(*) column is materialized. This is sound because `c2`'s value (as opposed to its
+positivity) is only ever emitted for COUNT(*) itself, which takes no argument and therefore
+never coexists with a nullable argument; COUNT(arg) (the value / AVG divisor) is still computed
+per key, and valid-arg count ≠ key-match count remains true but immaterial;
 (ii) DIRECT includes NULL keys as a real group (groupby NULL-inclusive keys), whereas the join
 forms keep today's `null_equality::UNEQUAL` distinct-key join. This is the correctness
 backstop — once planned, the operator must never be wrong, only slower — same stance as today
@@ -544,7 +549,7 @@ Every pathway emits a `group_join_spec` (§4.2); construction mirrors today's
 |---|---|---|---|
 | `operator_params.enable_dense_count_join` | YAML bool (existing, `sirius_config.cpp:298`) | true | P0 count pathway — semantics unchanged |
 | `operator_params.enable_group_join` | YAML bool (new) | **false** until Phase-3 measurement gate, then true | P1 + P2 value pathways |
-| `group_join_max_state_bytes` | engine-owned, internal test hook only (pattern: `sirius_config.cpp:299-303` + `SIRIUS_ENABLE_TEST_OPTIONS` SQL setting) | `min(16 GiB, device memory / 16)` — device-fraction-capped so small-HBM devices decline dense instead of planning unreservable state; derived from the corrected per-array widths (§4.4): q17-class 200 M-slot AVG state = 3.2–4.0 GB (SF1000), 6.4–8.0 GB (SF2000), 9.6–12 GB (SF3000), all ≤ 16 GiB on GB300-class devices | value-form gate (b) |
+| `group_join_max_state_bytes` | engine-owned, internal test hook only (pattern: `sirius_config.cpp:299-303` + `SIRIUS_ENABLE_TEST_OPTIONS` SQL setting) | `min(16 GiB, smallest visible device's memory / 16)`, falling back to the 2 GiB count-form budget when no device is visible — device-fraction-capped so small-HBM devices decline dense instead of planning unreservable state; derived from the corrected per-array widths (§4.4): q17-class 200 M-slot AVG state = 3.2–4.0 GB (SF1000), 6.4–8.0 GB (SF2000), 9.6–12 GB (SF3000), all ≤ 16 GiB on GB300-class devices | value-form gate (b) |
 | `dense_count_join_max_bytes` | engine-owned (existing) | 2 GiB | count-form gate (b), untouched |
 
 One new public knob total; no per-pathway knob sprawl. With `enable_group_join = false` the
@@ -614,9 +619,24 @@ checks once per row, then 1–3 atomics). Emit: `count_if`/`copy_if` with the fo
 functor, then one `emit_kernel<KeyT, Bundle>` writing keys and raw/⊗-scaled values, then
 host-side finalize (AVG DIV, decimal casts) on the group-sized columns.
 
+*Realized shape (PR-2):* the count bundle keeps the `group_join_state` class verbatim (R1); the
+value forms are two per-form dense drivers — `group_join_dense_inner<KeyT, PresenceT, MatchedT,
+ArgT>` and `group_join_dense_direct<KeyT, MatchedT, ArgT>` — sharing one counted-pass launcher
+(`accumulate_counted_form`, parameterized by `null_slot`/`bounds_check`, which is how INNER's
+skip-NULL-keys and DIRECT's NULL-group slot are the same kernel) and the slot-policy structs. The
+aggregate op is a host-side `dense_value_op` switch *inside* the monomorphized driver rather than
+a compile-time `Bundle` parameter: this keeps the explicit-instantiation whitelist at
+16 INNER + 8 DIRECT type combinations instead of multiplying by op, while every device kernel
+remains statically dispatched (`accumulate_value_kernel<…, Payload>`), preserving §4.1's
+no-dynamic-dispatch-on-device invariant. The drivers are internally phased
+(allocate → accumulate-per-batch → emit), so PR-5's BUILD_STREAM split into a state object is a
+mechanical refactor, not a redesign.
+
 **Memory estimate.** `no_history_peak_memory_estimate` generalizes :365-409 formula-for-formula:
 `state_bytes = min(budget, 4 × input_bytes)` with the bundle's Σ-slot width; dense peak = floor
-+ state + selected + outputs (+ finalize temporaries for AVG: one extra group-sized column) +
++ state + selected + outputs (+ finalize temporaries for AVG: the divisor column plus the
+FLOAT64 branch's cast temporaries — charged as 3 group-sized INT64 columns plus the
+declared-type output) +
 mask + state-again (CUB workspace proxy, kept); minmax peak gains the value-extrema scalar
 charges per batch; sparse peak stays `16 × input` — charged on **actual materialized bytes** at
 task creation (the estimate feeds `max(per-operator estimates) + bytes_to_materialize`,
@@ -1089,4 +1109,9 @@ and exactly one sync on the new pathways.
 - [semantics/major] `matched` conflates c2 with the valid-arg count; no handling for all-NULL-argument groups -> fixed: the same argument-validity gate makes valid ≡ matched ≡ c2 provably equal on the dense path (also deleting AVG's valid_cnt array); the sparse path computes both COUNT(arg) and COUNT(*) per key for nullable-argument INNER and carries output validity masks through merge and ⊗; §4.5 gains the missing "key matches, zero valid arguments" row; separate-c2 dense state stays a named seam, §4.2/§4.4/§4.5.
 - [architecture/blocker] Delim-fed preserved-side wiring refuted by source -> fixed: new "wiring by input provenance" subsection (§4.8) — routing-only DELIM_SCAN child gets `build_pipelines` invoked in place (dependency registration, no producer pipeline); `input_port_for` gains an owning-delim distinct-chain-root arm mapping to "preserved" (hash-join CONCAT precedent), fail-closed otherwise; hint semantics restated for the MERGE_GROUP_BY src_pipeline; §4.9's delim row corrected from "unmodified" and a fused-under-delim conversion test added to PR-3's gate, §4.8/§4.9/§9/§10.
 - [architecture/major] DIRECT cannot reuse today's build_pipelines or 2-child-guarded arms -> fixed: DIRECT specified as the standard single-child sink pattern (base-class shape, operator.cpp:167-181) in §4.8 provenance class 3; §4.9's narrowing/compressed-schema rows now specify per-form arms including the single-child variant; PR-4's scope updated, §4.8/§4.9/§5.2/§9.
+- [mechanism/minor, PR-2 audit] §4.4's sparse delta (i) prescribed materializing COUNT(*) as c2 for nullable-argument INNER -> amended: the implementation realizes σ_{c2>0} structurally through the distinct-key inner join (a counted-partial key exists iff ≥1 key-match row), which is exactly equivalent because c2's value is emitted only for COUNT(*), an op that takes no argument and thus never meets the nullable-argument regime; §4.5's last-row semantics verified cell-for-cell against this mechanism (row kept, COUNT(col)=0, value aggs NULL through merge and ⊗), §4.4.
+- [mechanism/minor, PR-2 audit] §4.8's sketch extended `group_join_state<KeyT, Bundle>` to the value bundles -> amended: value forms ship as two per-form dense drivers with a host-side `dense_value_op` switch over monomorphized kernels (16+8 instantiation whitelist instead of ×5 op multiplication; shared `accumulate_counted_form` unifies INNER's NULL-skip and DIRECT's NULL-group slot as one kernel via `null_slot`); the device hot path stays statically dispatched per §4.1, the count-bundle state class is untouched per R1, and the drivers' internal allocate→accumulate→emit phasing keeps the PR-5 BUILD_STREAM split mechanical, §4.8.
+- [consistency/minor, PR-2 audit] §4.2's bundle table listed the MIN/MAX extreme array as int64/int32, contradicting §4.4's payloads-always-64-bit width rule -> amended: always int64 (the implementation follows §4.4; a 32-bit extreme array is a possible future footprint optimization, not a shipped width), §4.2.
+- [estimate/minor, PR-2 audit] §4.8's AVG finalize charge said "one extra group-sized column" -> amended: the implementation charges the divisor plus the FLOAT64 branch's two cast temporaries (3 group-sized INT64 columns + the declared-type output), validated by the per-bundle estimate ≥ observed-allocation property test, §4.8.
+- [config/minor, PR-2 audit] §4.7's `min(16 GiB, device memory / 16)` default left multi-device and no-device behavior unspecified -> amended: minimum over all visible devices' total memory (conservative for heterogeneous rigs), falling back to the 2 GiB count-form budget when no device is visible; YAML key rejected and SQL setting internal, exactly per the `dense_count_join_max_bytes` pattern, §4.7.
 - [process/minor, PR-1 audit] PR-1's SQLLogic merge gate targeted a harness the build cannot run -> amended: `test/sql/*.test` drives only the legacy `gpu_processing` engine (both table functions registered under `SIRIUS_ENABLE_LEGACY`, OFF in the build and in CI), so the PR-1 gate substitutes Super-Sirius SQL coverage (Catch2 integration suite via transparent interception + kit A/B result parity; waiver evidence in `scratchpad/pr1/sqllogic-waiver.md`), and §10's per-pathway SQL tests are re-homed from extending `test/sql/` to the `test_gpu_execution_*` Catch2 integration pattern, §9/§10. All other PR-1 deviations from this doc: none found (P0 detection verbatim under rename per working-tree diff; §4.2 spec/concept/bundle realized as written; §6's host dispatch realized as a monomorphized switch — the one-bundle degenerate of the whitelist table).

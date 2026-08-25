@@ -18,9 +18,15 @@
 
 #include "op/sirius_physical_operator.hpp"
 
+#include <cudf/table/table.hpp>
+
+#include <rmm/resource_ref.hpp>
+
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace sirius::op {
 
@@ -30,9 +36,12 @@ namespace sirius::op {
  * The detection ladder in `sirius_plan_aggregate.cpp` (entry point `try_plan_group_join`) emits a
  * `group_join_spec` describing which fused join+group-by shape it recognized;
  * `sirius_physical_group_join` stores the spec and maps it onto the monomorphized kernels in
- * `src/cuda/group_join_impl.cu`. Only the COUNT pathway (`OUTER_PRESERVING` with one
- * COUNT_STAR/COUNT_VALID slot) is wired today; the remaining enumerators name the forms and
- * aggregate operations later planner rungs emit.
+ * `src/cuda/group_join_impl.cu`. The executor accepts the COUNT pathway (`OUTER_PRESERVING` with
+ * one COUNT_STAR/COUNT_VALID slot) plus the INNER and DIRECT forms with any one
+ * COUNT/SUM/MIN/MAX/AVG slot; value bundles over `OUTER_PRESERVING` fail closed (they would need
+ * aggregate-output null masks the dense emit does not have). The planner ladder still emits only
+ * count specs -- the INNER/DIRECT rungs arrive with later planner work, so those forms are
+ * currently reachable only by constructing the operator directly (as the Catch2 suites do).
  */
 namespace groupjoin {
 
@@ -91,9 +100,13 @@ class group_join_input : public pipelineable_operator_data {
 /**
  * @brief Fused join+group-by (GROUPJOIN) operator.
  *
- * Wired pathway today: an eligible preserved-side outer equi-join with a grouped COUNT. Children
- * are [preserved, counted] and output is [key, BIGINT]. Runtime selects direct-address or exact
- * sparse aggregation while preserving outer-join NULL semantics.
+ * Planner-wired pathway today: an eligible preserved-side outer equi-join with a grouped COUNT.
+ * Children are [preserved, counted] and output is `[key, aggregate]`. Runtime selects
+ * direct-address or exact sparse aggregation while preserving SQL NULL semantics; value bundles
+ * (SUM/MIN/MAX/AVG) additionally require NULL-free argument columns for the dense strategy and
+ * fall back to the mask-preserving sparse strategy otherwise. The DIRECT form consumes a single
+ * "counted" input at the execute level; its pipeline construction is later planner work, so
+ * `build_pipelines` still requires two children.
  */
 class sirius_physical_group_join : public sirius_physical_operator {
  public:
@@ -102,7 +115,7 @@ class sirius_physical_group_join : public sirius_physical_operator {
   static constexpr std::string_view PRESERVED_PORT = "preserved";
   static constexpr std::string_view COUNTED_PORT   = "counted";
 
-  /// Throws on any @p spec beyond the wired COUNT pathway.
+  /// Throws on any @p spec outside the whitelisted (form, bundle) combinations.
   sirius_physical_group_join(duckdb::vector<sirius::logical_type> types,
                              std::size_t estimated_cardinality,
                              groupjoin::group_join_spec spec);
@@ -132,7 +145,7 @@ class sirius_physical_group_join : public sirius_physical_operator {
   [[nodiscard]] groupjoin::group_join_spec const& spec() const noexcept { return _spec; }
   [[nodiscard]] std::size_t preserved_key_idx() const noexcept { return _spec.preserved_key_idx; }
   [[nodiscard]] std::size_t counted_key_idx() const noexcept { return _spec.counted_key_idx; }
-  /// COUNT(col) argument column on the counted child; std::nullopt means COUNT(*).
+  /// Aggregate argument column on the counted child; std::nullopt means COUNT(*).
   [[nodiscard]] std::optional<std::size_t> counted_value_idx() const noexcept
   {
     return _spec.slots[0].arg_idx;
@@ -143,6 +156,20 @@ class sirius_physical_group_join : public sirius_physical_operator {
   [[nodiscard]] strategy last_strategy() const noexcept { return _last_strategy; }
 
  private:
+  /// COUNT-over-outer-join execution (the OUTER_PRESERVING form).
+  std::unique_ptr<cudf::table> execute_count_outer(
+    std::vector<::cucascade::read_only_data_batch> const& ro_batches,
+    std::vector<group_join_input::input_side> const& input_sides,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+  /// INNER/DIRECT execution over the count and value bundles.
+  std::unique_ptr<cudf::table> execute_inner_direct(
+    std::vector<::cucascade::read_only_data_batch> const& ro_batches,
+    std::vector<group_join_input::input_side> const& input_sides,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
   groupjoin::group_join_spec _spec;
   strategy _last_strategy = strategy::NOT_RUN;
 };

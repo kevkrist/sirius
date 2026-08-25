@@ -127,6 +127,23 @@ TEST_CASE_METHOD(GroupJoinFixture,
 }
 
 TEST_CASE_METHOD(GroupJoinFixture,
+                 "gpu_execution group join: value-form state budget test hook round-trips",
+                 "[integration][gpu_execution][group_join]")
+{
+  // The knob is engine-owned and consumed by later planner rungs; this pins the SQL test-hook
+  // plumbing (set, engine-visible value, scope restore).
+  auto sirius_ctx = sirius::test::get_registered_sirius_context(*con);
+  auto const budget_before =
+    sirius_ctx->get_config().get_operator_params().group_join_max_state_bytes;
+  {
+    sirius::test::scoped_sirius_setting budget{
+      *con, "group_join_max_state_bytes", std::uint64_t{12345}};
+    CHECK(sirius_ctx->get_config().get_operator_params().group_join_max_state_bytes == 12345);
+  }
+  CHECK(sirius_ctx->get_config().get_operator_params().group_join_max_state_bytes == budget_before);
+}
+
+TEST_CASE_METHOD(GroupJoinFixture,
                  "gpu_execution group join: runtime-empty sides",
                  "[integration][gpu_execution][group_join]")
 {

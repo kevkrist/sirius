@@ -51,6 +51,12 @@ struct count_bundle {
   using count_type = CountT;
 };
 
+/// Aggregate selector for the INNER/DIRECT dense drivers. COUNT covers both COUNT(*) and
+/// COUNT(col): the argument-validity gate admits only NULL-free argument columns to the dense
+/// strategy, under which the two are identical. AVG shares SUM's accumulator arrays and differs
+/// only at emit, where it produces the raw per-key sum and match count for a host-side divide.
+enum class dense_value_op : uint8_t { COUNT, SUM, MIN, MAX, AVG };
+
 }  // namespace groupjoin
 
 /** @brief Find global non-NULL extrema across INT32 or INT64 key batches.
@@ -61,6 +67,72 @@ std::optional<std::pair<int64_t, int64_t>> group_join_global_minmax(
   std::vector<cudf::column_view> const& keys,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
+
+/// Key extrema plus, when a SUM/AVG bundle supplied argument batches, the argument extrema that
+/// feed the host-side int64 accumulation-overflow bound.
+struct group_join_extrema {
+  int64_t key_min;
+  int64_t key_max;
+  bool has_value_extrema;  ///< False when @p values held no non-NULL row.
+  int64_t value_min;
+  int64_t value_max;
+};
+
+/** @brief Find key and aggregate-argument extrema in one device pass with a single sync.
+ *
+ * The SUM/AVG counterpart of `group_join_global_minmax`: @p values are the argument columns
+ * viewed as their INT32/INT64 representations, reduced into the same device extrema array and
+ * read back in the same memcpy. Returns std::nullopt when @p keys hold no non-NULL row.
+ */
+std::optional<group_join_extrema> group_join_global_minmax_with_values(
+  std::vector<cudf::column_view> const& keys,
+  std::vector<cudf::column_view> const& values,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/** @brief Dense INNER-form drive: accumulate both sides and emit groups with presence and
+ * matches.
+ *
+ * Array widths follow the per-array rule: PresenceT from preserved rows, MatchedT from counted
+ * rows; the aggregate payload is always int64. @p counted_args are the argument columns viewed as
+ * ArgT (their integer representation), batch-aligned with @p counted_keys; pass an empty vector
+ * for COUNT. Emits `[key, value:int64]` for COUNT (presence x matched, optionally
+ * overflow-checked), SUM (presence x sum), and MIN/MAX (raw extreme), and
+ * `[key, sum:int64, matched:int64]` for AVG. The argument-validity gate must hold: argument
+ * columns must have no NULLs.
+ */
+template <typename KeyT, typename PresenceT, typename MatchedT, typename ArgT>
+std::unique_ptr<cudf::table> group_join_dense_inner(
+  groupjoin::dense_value_op op,
+  int64_t min_key,
+  int64_t range,
+  std::vector<cudf::column_view> const& preserved_keys,
+  std::vector<cudf::column_view> const& counted_keys,
+  std::vector<cudf::column_view> const& counted_args,
+  cudf::data_type key_type,
+  bool check_count_product_overflow,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/** @brief Dense DIRECT-form drive: plain GROUP BY over one input.
+ *
+ * No presence array or preserved pass exists; NULL keys accumulate into one extra slot at index
+ * @p range and, when @p has_null_group is set, emit as a final NULL-masked key row. The caller
+ * supplies @p has_null_group from its host-side NULL-key row count so this driver never reads
+ * the slot back (it would cost a second unconditional stream sync). Output layout matches
+ * `group_join_dense_inner` with COUNT emitting the raw match count and SUM the raw sum (no
+ * presence scaling exists on this form).
+ */
+template <typename KeyT, typename MatchedT, typename ArgT>
+std::unique_ptr<cudf::table> group_join_dense_direct(groupjoin::dense_value_op op,
+                                                     int64_t min_key,
+                                                     int64_t range,
+                                                     std::vector<cudf::column_view> const& keys,
+                                                     std::vector<cudf::column_view> const& args,
+                                                     cudf::data_type key_type,
+                                                     bool has_null_group,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr);
 
 /** @brief Accumulate preserved-key multiplicities and per-key bundle slots in direct-address
  * arrays.

@@ -62,6 +62,28 @@ uint64_t derived_default_batch_size()
   return value;
 }
 
+uint64_t derived_group_join_max_state_bytes()
+{
+  // cudaGetDeviceCount/Properties honor CUDA_VISIBLE_DEVICES and do not create a context.
+  static uint64_t const value = [] {
+    constexpr uint64_t ceiling = 16ULL * 1024 * 1024 * 1024;  // 16 GiB
+    int device_count           = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+      return DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
+    }
+    uint64_t min_total = 0;
+    for (int id = 0; id < device_count; ++id) {
+      cudaDeviceProp prop{};
+      if (cudaGetDeviceProperties(&prop, id) != cudaSuccess) { continue; }
+      auto const total = static_cast<uint64_t>(prop.totalGlobalMem);
+      min_total        = min_total == 0 ? total : std::min(min_total, total);
+    }
+    if (min_total == 0) { return DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES; }
+    return std::min(ceiling, min_total / 16);
+  }();
+  return value;
+}
+
 }  // namespace config
 
 static void reject_mutually_exclusive(yaml::reader& reader,
@@ -300,6 +322,11 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     throw std::runtime_error(
       "'sirius.operator_params.dense_count_join_max_bytes': removed; GROUP_JOIN count-state "
       "sizing is an internal engine policy; remove this key");
+  }
+  if (r.has("group_join_max_state_bytes")) {
+    throw std::runtime_error(
+      "'sirius.operator_params.group_join_max_state_bytes': GROUP_JOIN value-form state sizing "
+      "is an internal engine policy; remove this key");
   }
   // 0 is meaningful here: it turns the estimate off and leaves sizing to gpus_per_query.
   r.optional("admission_bytes_per_gpu", yaml::bytes(opt.admission_bytes_per_gpu));

@@ -47,6 +47,24 @@ inline op::groupjoin::group_join_spec make_count_group_join_spec(
   return spec;
 }
 
+/// Spec for the INNER/DIRECT forms; @p arg_idx is required for every op except COUNT_STAR.
+inline op::groupjoin::group_join_spec make_group_join_spec(op::groupjoin::join_form form,
+                                                           op::groupjoin::agg_op op,
+                                                           std::size_t preserved_key_idx,
+                                                           std::size_t counted_key_idx,
+                                                           std::optional<std::size_t> arg_idx,
+                                                           sirius::logical_type output_type,
+                                                           std::uint64_t max_state_bytes)
+{
+  op::groupjoin::group_join_spec spec;
+  spec.form              = form;
+  spec.preserved_key_idx = preserved_key_idx;
+  spec.counted_key_idx   = counted_key_idx;
+  spec.slots.push_back(op::groupjoin::slot_spec{op, arg_idx, std::move(output_type)});
+  spec.max_state_bytes = max_state_bytes;
+  return spec;
+}
+
 inline duckdb::unique_ptr<op::sirius_physical_group_join> make_group_join(
   std::size_t preserved_key_idx,
   std::size_t counted_key_idx,
