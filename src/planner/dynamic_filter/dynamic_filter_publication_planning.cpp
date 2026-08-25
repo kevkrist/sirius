@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -70,39 +71,21 @@ std::vector<op::dynamic_filter_replica_space> collect_replica_spaces(
 
 }  // namespace
 
-op::dynamic_filter_publish_plan plan_single_key_membership_publication(
-  duckdb::SiriusContext& sirius_context,
+membership_target_discovery discover_membership_publication_targets(
+  duckdb::vector<sirius::join_condition> const& conditions,
+  std::vector<op::dynamic_filter_publish_plan::admitted_key> const& admitted_keys,
+  duckdb::JoinType join_type,
   sirius::operator_params const& op_params,
-  membership_publication_request request,
   duckdb::unique_ptr<op::sirius_physical_operator>& probe_subtree,
   std::string_view log_context)
 {
-  auto& memory_manager   = sirius_context.get_memory_manager();
-  auto const gpu_spaces  = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  auto const host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  membership_target_discovery discovery;
+  auto& targets = discovery.targets;
 
-  duckdb::vector<sirius::join_condition> conditions;
-  conditions.push_back(std::move(request.condition));
-  auto admitted_keys = admit_dynamic_filter_keys(conditions,
-                                                 {request.shape},
-                                                 {request.build_key_domain_cardinality},
-                                                 request.build_side_unique_column);
-
-  if (gpu_spaces.empty() || host_spaces.empty()) {
-    if (!admitted_keys.empty()) {
-      SIRIUS_LOG_INFO(
-        "[{}] Not wiring dynamic filter(s): a GPU and HOST memory space are required for "
-        "device-local replicas.",
-        log_context);
-    }
-    return {};
-  }
-
-  // Prefer scan binding; the key uses one route.
-  std::vector<op::dynamic_filter_publish_plan::probe_target> targets;
-  std::size_t scan_target_count = 0;
-  bool const scan_bind_armed    = scan_route_join_type_admissible(request.join_type);
+  // Prefer scan binding; each key uses one route.
+  bool const scan_bind_armed = scan_route_join_type_admissible(join_type);
   descent_policy const policy{.descend_build_blocks = true};
+  std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
   for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
     auto const& key       = admitted_keys[key_index];
     auto const& condition = conditions[key.planner_condition_index];
@@ -127,25 +110,28 @@ op::dynamic_filter_publish_plan plan_single_key_membership_publication(
           scan.types.size());
         continue;
       }
-      // Reuse the scan channel so multiple producers share the consumer.
-      if (!scan.sirius_dynamic_filters) {
-        scan.sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+      auto const [entry, inserted] = target_by_scan.try_emplace(terminal.node, targets.size());
+      if (inserted) {
+        // Reuse the scan channel so multiple producers share the consumer.
+        if (!scan.sirius_dynamic_filters) {
+          scan.sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+        }
+        targets.push_back({.filter_set               = scan.sirius_dynamic_filters,
+                           .route_class              = sirius::op::dynamic_filter_route_class::scan,
+                           .accepts_zone_map_filters = true,
+                           .key_bindings             = {}});
+        ++discovery.scan_target_count;
       }
-      // One key: every scan terminal opens its own target.
-      targets.push_back({.filter_set               = scan.sirius_dynamic_filters,
-                         .route_class              = sirius::op::dynamic_filter_route_class::scan,
-                         .accepts_zone_map_filters = true,
-                         .key_bindings             = {{.admitted_key_index   = key_index,
-                                                       .channel_push_ordinal = terminal.ordinal,
-                                                       .probe_storage_type =
-                                                         sirius::try_get_cudf_type(scan.types[terminal.ordinal])
-                                                           .value_or(cudf::data_type{cudf::type_id::EMPTY})}}});
-      ++scan_target_count;
+      targets[entry->second].key_bindings.push_back(
+        {.admitted_key_index   = key_index,
+         .channel_push_ordinal = terminal.ordinal,
+         .probe_storage_type   = sirius::try_get_cudf_type(scan.types[terminal.ordinal])
+                                 .value_or(cudf::data_type{cudf::type_id::EMPTY})});
       scan_bound = true;
     }
     if (scan_bound) { continue; }
     // Admission proves build-block safety; placement preserves the reported site ordinal.
-    if (!direct_route_admissible(request.join_type,
+    if (!direct_route_admissible(join_type,
                                  condition.comparison,
                                  key.key_shape,
                                  key.probe_storage_type,
@@ -189,7 +175,6 @@ op::dynamic_filter_publish_plan plan_single_key_membership_publication(
                                                        .probe_storage_type   = key.probe_storage_type}}});
     }
   }
-  if (targets.empty()) { return {}; }
 
   // Register after all keys bind so each declaration covers every planned push.
   for (auto const& target : targets) {
@@ -200,6 +185,40 @@ op::dynamic_filter_publish_plan plan_single_key_membership_publication(
     }
     target.filter_set->register_producer(std::move(planned_columns));
   }
+  return discovery;
+}
+
+op::dynamic_filter_publish_plan plan_single_key_membership_publication(
+  duckdb::SiriusContext& sirius_context,
+  sirius::operator_params const& op_params,
+  membership_publication_request request,
+  duckdb::unique_ptr<op::sirius_physical_operator>& probe_subtree,
+  std::string_view log_context)
+{
+  auto& memory_manager   = sirius_context.get_memory_manager();
+  auto const gpu_spaces  = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  auto const host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+
+  duckdb::vector<sirius::join_condition> conditions;
+  conditions.push_back(std::move(request.condition));
+  auto admitted_keys = admit_dynamic_filter_keys(conditions,
+                                                 {request.shape},
+                                                 {request.build_key_domain_cardinality},
+                                                 request.build_side_unique_column);
+
+  if (gpu_spaces.empty() || host_spaces.empty()) {
+    if (!admitted_keys.empty()) {
+      SIRIUS_LOG_INFO(
+        "[{}] Not wiring dynamic filter(s): a GPU and HOST memory space are required for "
+        "device-local replicas.",
+        log_context);
+    }
+    return {};
+  }
+
+  auto [targets, scan_target_count] = discover_membership_publication_targets(
+    conditions, admitted_keys, request.join_type, op_params, probe_subtree, log_context);
+  if (targets.empty()) { return {}; }
 
   SIRIUS_LOG_INFO(
     "[{}] Wired GROUP_JOIN with {} dynamic-filter probe target(s) ({} scan-bound, {} join-edge; "

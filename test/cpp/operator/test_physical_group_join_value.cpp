@@ -692,6 +692,71 @@ TEST_CASE("group_join value: DIRECT forms group NULL keys as a real group", "[gr
   }
 }
 
+TEST_CASE("group_join value: COUNT accepts narrow argument carriers as validity-only input",
+          "[group_join]")
+{
+  // The narrowing policy may leave a COUNT argument on a narrow carrier (INT8 here): COUNT reads
+  // only the validity mask, so both strategies must accept the column untouched.
+  auto* space = get_default_gpu_space();
+  REQUIRE(space);
+
+  auto make_narrow_arg_batch = [&](const std::vector<int32_t>& keys,
+                                   const std::vector<int8_t>& args,
+                                   const std::vector<bool>& arg_valids) {
+    auto key_batch = make_numeric_batch<int32_t>(*space, keys, cudf::type_id::INT32);
+    auto arg_batch =
+      make_numeric_batch_with_nulls<int8_t>(*space, args, arg_valids, cudf::type_id::INT8);
+    return concatenate_batches_horizontal({key_batch, arg_batch}, *space);
+  };
+
+  SECTION("DIRECT: NULL-free narrow arguments stay dense; a NULL argument routes to sparse")
+  {
+    std::vector<std::shared_ptr<cucascade::data_batch>> dense_input{
+      make_narrow_arg_batch({1, 2, 1, 2, 2}, {1, 2, 3, 4, 5}, {true, true, true, true, true})};
+    auto rows = run_value_group_join<int32_t, int64_t>({},
+                                                       dense_input,
+                                                       {groupjoin::join_form::DIRECT,
+                                                        groupjoin::agg_op::COUNT_VALID,
+                                                        bigint_type(),
+                                                        std::size_t{1},
+                                                        k_default_max_bytes},
+                                                       cudf::type_id::INT64,
+                                                       DENSE);
+    require_rows_match(rows, {{1, 2}, {2, 3}});
+
+    std::vector<std::shared_ptr<cucascade::data_batch>> nullable_input{
+      make_narrow_arg_batch({1, 2, 1, 2, 2}, {1, 2, 3, 4, 5}, {true, false, true, true, false})};
+    auto sparse_rows = run_value_group_join<int32_t, int64_t>({},
+                                                              nullable_input,
+                                                              {groupjoin::join_form::DIRECT,
+                                                               groupjoin::agg_op::COUNT_VALID,
+                                                               bigint_type(),
+                                                               std::size_t{1},
+                                                               k_default_max_bytes},
+                                                              cudf::type_id::INT64,
+                                                              SPARSE);
+    require_rows_match(sparse_rows, {{1, 2}, {2, 1}});
+  }
+
+  SECTION("INNER: the narrow argument multiplies through the Yan-Larson scaling")
+  {
+    std::vector<std::shared_ptr<cucascade::data_batch>> preserved{
+      make_kv_batch(*space, {1, 2, 2}, {0, 0, 0})};
+    std::vector<std::shared_ptr<cucascade::data_batch>> counted{
+      make_narrow_arg_batch({1, 2, 1, 3}, {7, 8, 9, 1}, {true, true, true, true})};
+    auto rows = run_value_group_join<int32_t, int64_t>(preserved,
+                                                       counted,
+                                                       {groupjoin::join_form::INNER,
+                                                        groupjoin::agg_op::COUNT_VALID,
+                                                        bigint_type(),
+                                                        std::size_t{1},
+                                                        k_default_max_bytes},
+                                                       cudf::type_id::INT64,
+                                                       DENSE);
+    require_rows_match(rows, {{1, 2}, {2, 2}});
+  }
+}
+
 TEST_CASE("group_join value: argument-validity gate routes NULL arguments to sparse",
           "[group_join]")
 {

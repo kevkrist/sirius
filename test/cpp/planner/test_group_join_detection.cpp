@@ -18,6 +18,7 @@
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_group_join.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
@@ -32,6 +33,7 @@
 #include <duckdb/main/config.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
+#include <duckdb/planner/bound_result_modifier.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/operator/logical_aggregate.hpp>
 #include <duckdb/planner/planner.hpp>
@@ -47,6 +49,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -170,6 +173,48 @@ bool assign_non_system_count_provenance(duckdb::LogicalOperator& op)
   if (bound == nullptr) { return false; }
   bound->function.catalog_name = "user_catalog";
   bound->function.schema_name  = "main";
+  return true;
+}
+
+duckdb::BoundAggregateExpression* find_first_value_aggregate(duckdb::LogicalOperator& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+    auto& aggregate = op.Cast<duckdb::LogicalAggregate>();
+    for (auto& expression : aggregate.expressions) {
+      if (expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) {
+        continue;
+      }
+      auto& bound      = expression->Cast<duckdb::BoundAggregateExpression>();
+      auto const& name = bound.function.name;
+      if (name == "min" || name == "max" || name == "sum" || name == "avg") { return &bound; }
+    }
+  }
+  for (auto& child : op.children) {
+    if (auto* bound = find_first_value_aggregate(*child)) { return bound; }
+  }
+  return nullptr;
+}
+
+// A user aggregate reusing a builtin value-aggregate name differs from the catalog entry in its
+// callbacks; swapping one callback models that collision.
+bool spoof_first_value_aggregate_callback(duckdb::LogicalOperator& op)
+{
+  auto* bound = find_first_value_aggregate(op);
+  if (bound == nullptr) { return false; }
+  bound->function.update = spoof_count_update;
+  return true;
+}
+
+// DuckDB's binder erases ORDER BY from order-agnostic builtins at bind time, so an ordered
+// value aggregate cannot reach detection from SQL; attach one directly to exercise the screen.
+bool attach_order_by_to_first_value_aggregate(duckdb::LogicalOperator& op)
+{
+  auto* bound = find_first_value_aggregate(op);
+  if (bound == nullptr || bound->children.empty()) { return false; }
+  auto modifier = duckdb::make_uniq<duckdb::BoundOrderModifier>();
+  modifier->orders.emplace_back(
+    duckdb::OrderType::ASCENDING, duckdb::OrderByNullType::NULLS_LAST, bound->children[0]->Copy());
+  bound->order_bys = std::move(modifier);
   return true;
 }
 
@@ -304,6 +349,12 @@ struct group_join_fixture {
     auto enabled = con->Query("SET enable_dense_count_join = true");
     REQUIRE(enabled != nullptr);
     REQUIRE_FALSE(enabled->HasError());
+    // Isolate rung P0: with the value rungs live (enable_group_join defaults true), many of this
+    // fixture's off-P0 shapes would legitimately fuse as DIRECT. The value rungs get their own
+    // fixtures below.
+    auto value_rungs_off = con->Query("SET enable_group_join = false");
+    REQUIRE(value_rungs_off != nullptr);
+    REQUIRE_FALSE(value_rungs_off->HasError());
 
     con->Query("CREATE TABLE cust (c_id INTEGER, c_grp INTEGER)");
     con->Query("INSERT INTO cust SELECT range, range % 3 FROM range(20)");
@@ -592,18 +643,37 @@ struct inner_group_join_fixture : group_join_fixture {
       "concat('t', range % 9) FROM range(200)");
   }
 
-  // Finds the fused INNER-form operator anywhere in the plan (including under delim joins) and
-  // returns it, or nullptr when the plan did not fuse.
-  sirius::op::sirius_physical_group_join* find_inner_group_join(
+  // Finds the single fused operator of any form anywhere in the plan (including under delim
+  // joins), or nullptr when the plan did not fuse.
+  sirius::op::sirius_physical_group_join* find_group_join(
     sirius::op::sirius_physical_operator* root)
   {
     auto const fused = collect_deep(root, sirius::op::SiriusPhysicalOperatorType::GROUP_JOIN);
     if (fused.empty()) { return nullptr; }
     REQUIRE(fused.size() == 1);
-    auto& op = fused[0]->Cast<sirius::op::sirius_physical_group_join>();
-    REQUIRE(op.spec().form == sirius::op::groupjoin::join_form::INNER);
-    REQUIRE(op.children.size() == 2);
-    return &op;
+    return &fused[0]->Cast<sirius::op::sirius_physical_group_join>();
+  }
+
+  // Which rung (if any) fused the query, reported as the spec's join form.
+  std::optional<sirius::op::groupjoin::join_form> fused_form(const std::string& query)
+  {
+    auto plan = generate_sirius_plan(*con, query);
+    REQUIRE(plan);
+    auto* op = find_group_join(plan.get());
+    if (op == nullptr) { return std::nullopt; }
+    return op->spec().form;
+  }
+
+  // Finds the fused INNER-form operator and validates its shape, or nullptr when the plan did
+  // not fuse at all. Use only where INNER-or-nothing is the expectation.
+  sirius::op::sirius_physical_group_join* find_inner_group_join(
+    sirius::op::sirius_physical_operator* root)
+  {
+    auto* op = find_group_join(root);
+    if (op == nullptr) { return nullptr; }
+    REQUIRE(op->spec().form == sirius::op::groupjoin::join_form::INNER);
+    REQUIRE(op->children.size() == 2);
+    return op;
   }
 
   bool has_inner_group_join(const std::string& query)
@@ -680,37 +750,44 @@ TEST_CASE_METHOD(inner_group_join_fixture,
                  "group_join rung P1 declines off-shape aggregates and joins",
                  "[group_join][plan]")
 {
+  using sirius::op::groupjoin::join_form;
+
+  // The first five shapes miss rung P1 but stay valid plain-GROUP-BY-over-a-join fragments, so
+  // rung P2 legitimately picks them up as DIRECT -- which is itself the ladder-ordering evidence
+  // that P1 declined them.
   // Preserved side neither DELIM_GET nor provably unique.
-  CHECK_FALSE(has_inner_group_join(
-    "SELECT dp_id, sum(f_v) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY dp_id"));
+  CHECK(fused_form("SELECT dp_id, sum(f_v) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY "
+                   "dp_id") == join_form::DIRECT);
   // Group key on the counted side: the optimizer canonicalizes an INNER-equality group ref onto
-  // either side, so the shape that stays declined is the one where the group side is neither a
+  // either side, so the shape that stays P1-declined is the one where the group side is neither a
   // DELIM_GET nor provably unique on either binding.
-  CHECK_FALSE(has_inner_group_join(
-    "SELECT f_d, sum(f_v) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_d"));
-  // Expression key: the INTEGER = BIGINT comparison inserts a cast.
-  CHECK_FALSE(
-    has_inner_group_join("SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_big GROUP BY d_id"));
-  // Multi-condition join.
-  CHECK_FALSE(has_inner_group_join(
-    "SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_d AND d_pad = f_v GROUP BY d_id"));
-  // Null-safe key.
-  CHECK_FALSE(has_inner_group_join(
-    "SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id IS NOT DISTINCT FROM f_d GROUP BY d_id"));
+  CHECK(fused_form("SELECT f_d, sum(f_v) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_d") ==
+        join_form::DIRECT);
+  // Expression key: the INTEGER = BIGINT comparison inserts a cast (opaque to rung P2).
+  CHECK(fused_form("SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_big GROUP BY d_id") ==
+        join_form::DIRECT);
+  // Multi-condition join (opaque to rung P2).
+  CHECK(fused_form("SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_d AND d_pad = f_v "
+                   "GROUP BY d_id") == join_form::DIRECT);
+  // Null-safe key (opaque to rung P2).
+  CHECK(fused_form("SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id IS NOT DISTINCT FROM f_d "
+                   "GROUP BY d_id") == join_form::DIRECT);
+
+  // These miss every rung.
   // Non-integer keys.
-  CHECK_FALSE(has_inner_group_join(
-    "SELECT d_txt, min(f_v) FROM dim JOIN fact ON d_txt = f_txt GROUP BY d_txt"));
+  CHECK_FALSE(
+    fused_form("SELECT d_txt, min(f_v) FROM dim JOIN fact ON d_txt = f_txt GROUP BY d_txt"));
   // DISTINCT and FILTER modifiers.
-  CHECK_FALSE(has_inner_group_join(
-    "SELECT d_id, sum(DISTINCT f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
-  CHECK_FALSE(has_inner_group_join(
+  CHECK_FALSE(
+    fused_form("SELECT d_id, sum(DISTINCT f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
+  CHECK_FALSE(fused_form(
     "SELECT d_id, sum(f_v) FILTER (WHERE f_v > 2) FROM dim JOIN fact ON d_id = f_d GROUP BY "
     "d_id"));
   // Multiple groups and multiple aggregates.
-  CHECK_FALSE(has_inner_group_join(
+  CHECK_FALSE(fused_form(
     "SELECT d_id, d_pad, sum(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id, d_pad"));
-  CHECK_FALSE(has_inner_group_join(
-    "SELECT d_id, sum(f_v), min(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
+  CHECK_FALSE(
+    fused_form("SELECT d_id, sum(f_v), min(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
 }
 
 TEST_CASE_METHOD(inner_group_join_fixture,
@@ -733,16 +810,30 @@ TEST_CASE_METHOD(inner_group_join_fixture,
                  "are off",
                  "[group_join][plan]")
 {
+  using sirius::op::groupjoin::join_form;
+
   // The filtered fact is the smaller relation, so it becomes the replaced hash join's build side
   // (children[1]) and carries filter evidence, while the preserved (group-key) side is
   // children[0]: the replaced join would publish fact-key filters onto the dim_big scan, which
-  // the fused operator cannot reproduce -- fusion must decline.
+  // the fused operator cannot reproduce -- rung P1 must decline. Rung P2 then fuses only the
+  // aggregate as DIRECT, which is not a downgrade: the hash join stays in the plan with its own
+  // publication.
   auto const query =
     "SELECT b_id, sum(f.f_v) FROM dim_big JOIN (SELECT * FROM fact WHERE f_v > 3) f "
     "ON b_id = f.f_d GROUP BY b_id";
-  CHECK_FALSE(has_inner_group_join(query));
+  {
+    auto plan = generate_sirius_plan(*con, query);
+    REQUIRE(plan);
+    auto* fused = find_group_join(plan.get());
+    REQUIRE(fused != nullptr);
+    REQUIRE(fused->spec().form == join_form::DIRECT);
+    CHECK_FALSE(fused->dynamic_filter_plan().enabled());
+    auto const joins = collect_deep(plan.get(), sirius::op::SiriusPhysicalOperatorType::HASH_JOIN);
+    REQUIRE(joins.size() == 1);
+    CHECK(joins[0]->Cast<sirius::op::sirius_physical_hash_join>().dynamic_filter_plan().enabled());
+  }
 
-  // With dynamic filters disabled there is nothing to drop, so the same shape fuses.
+  // With dynamic filters disabled there is nothing to drop, so the same shape fuses as INNER.
   auto off = con->Query("SET enable_dynamic_filter = false");
   REQUIRE_FALSE(off->HasError());
   CHECK(has_inner_group_join(query));
@@ -825,6 +916,212 @@ TEST_CASE_METHOD(inner_group_join_fixture,
       };
       CHECK(depends_on(preserved->source_pipeline.get()));
       CHECK(depends_on(counted->source_pipeline.get()));
+    });
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join value rungs decline hostile aggregate mutations",
+                 "[group_join][plan]")
+{
+  using T          = sirius::op::SiriusPhysicalOperatorType;
+  auto const query = "SELECT d_id, min(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id";
+  REQUIRE(fused_form(query) == sirius::op::groupjoin::join_form::INNER);
+
+  // A callback spoofed on a value aggregate fails the re-bind identity check on both rungs.
+  {
+    auto plan = generate_sirius_plan(
+      *con, query, plan_generation_options{.mutate = spoof_first_value_aggregate_callback});
+    REQUIRE(plan);
+    CHECK(collect_deep(plan.get(), T::GROUP_JOIN).empty());
+    CHECK(collect_deep(plan.get(), T::HASH_JOIN).size() == 1);
+  }
+
+  // A synthetic ordered value aggregate (unbuildable from SQL: the binder erases ORDER BY on
+  // order-agnostic builtins) trips the order_bys screen on both rungs. Generic planning may
+  // subsequently reject the sorted-aggregate rewrite entirely (a CPU fallback throw); either
+  // outcome proves no rung fused it.
+  try {
+    auto plan = generate_sirius_plan(
+      *con, query, plan_generation_options{.mutate = attach_order_by_to_first_value_aggregate});
+    REQUIRE(plan);
+    CHECK(collect_deep(plan.get(), T::GROUP_JOIN).empty());
+  } catch (std::exception const&) {
+    SUCCEED("generic planning rejected the synthetic ordered aggregate without fusing it");
+  }
+
+  // ORDER BY written in SQL on an order-agnostic builtin is erased by the binder before
+  // detection, so the plain INNER fusion still applies with unchanged (order-free) semantics.
+  CHECK(fused_form("SELECT d_id, sum(f_v ORDER BY f_v) FROM dim JOIN fact ON d_id = f_d "
+                   "GROUP BY d_id") == sirius::op::groupjoin::join_form::INNER);
+
+  // A non-equality residual in the ON clause is planned as FILTER nodes above the join, which
+  // both rungs refuse (the child is no longer a comparison-join root).
+  CHECK_FALSE(
+    fused_form("SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_d AND (d_pad + f_v) % 3 = 0 "
+               "GROUP BY d_id"));
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P2 fuses aggregates over opaque join children as DIRECT",
+                 "[group_join][plan]")
+{
+  using T = sirius::op::SiriusPhysicalOperatorType;
+  using sirius::op::groupjoin::agg_op;
+  using sirius::op::groupjoin::join_form;
+
+  // The q2 shape: the group key is NOT a join key of the child, so rung P1 misses and rung P2
+  // fuses only the aggregate, leaving the join subtree planned unchanged beneath it.
+  auto const query = "SELECT f_v, min(f_dec) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_v";
+  auto plan        = generate_sirius_plan(*con, query);
+  REQUIRE(plan);
+  auto* fused = find_group_join(plan.get());
+  REQUIRE(fused != nullptr);
+  REQUIRE(fused->spec().form == join_form::DIRECT);
+  REQUIRE(fused->children.size() == 1);
+  CHECK(fused->spec().slots[0].op == agg_op::MIN);
+  CHECK(fused->spec().slots[0].arg_idx.has_value());
+  CHECK(fused->counted_key_idx() == fused->preserved_key_idx());
+  CHECK_FALSE(fused->dynamic_filter_plan().enabled());
+  CHECK(collect_deep(fused->children[0].get(), T::HASH_JOIN).size() == 1);
+  CHECK(collect_deep(plan.get(), T::HASH_GROUP_BY).empty());
+
+  // Aggregate variants over the same opaque child.
+  auto const variant = [](std::string_view aggregate) {
+    return "SELECT f_v, " + std::string(aggregate) +
+           " FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_v";
+  };
+  CHECK(fused_form(variant("sum(f_big)")) == join_form::DIRECT);
+  CHECK(fused_form(variant("avg(f_dec)")) == join_form::DIRECT);
+  CHECK(fused_form(variant("count(f_dec)")) == join_form::DIRECT);
+  CHECK(fused_form(variant("count(*)")) == join_form::DIRECT);
+
+  // Any join type: the child is opaque, so an outer join fuses too (its padding NULLs are the
+  // executor's argument-validity-gate concern, not the planner's).
+  CHECK(fused_form("SELECT f_v, sum(f_big) FROM dim_plain LEFT JOIN fact ON dp_id = f_d "
+                   "GROUP BY f_v") == join_form::DIRECT);
+  // BIGINT group key.
+  CHECK(fused_form("SELECT f_big, min(f_v) FROM dim_plain JOIN fact ON dp_id = f_d "
+                   "GROUP BY f_big") == join_form::DIRECT);
+  // Ladder ordering: a rung-P1-eligible shape stays INNER; P2 never sees it.
+  CHECK(fused_form("SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id") ==
+        join_form::INNER);
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P2 fails closed on off-shape children and aggregates",
+                 "[group_join][plan]")
+{
+  // Non-join children: the join-root requirement is the anti-overlap guard against generic
+  // aggregate planning -- a plain scan, an aggregate, or a computing projection must never fuse.
+  CHECK_FALSE(fused_form("SELECT c_grp, min(c_id) FROM cust GROUP BY c_grp"));
+  CHECK_FALSE(fused_form(
+    "SELECT g, min(n) FROM (SELECT c_grp AS g, count(*) AS n FROM cust GROUP BY c_grp) t "
+    "GROUP BY g"));
+  CHECK_FALSE(fused_form(
+    "SELECT k, min(fv) FROM (SELECT dp_pad + f_v AS k, f_v AS fv FROM dim_plain JOIN fact "
+    "ON dp_id = f_d) t GROUP BY k"));
+
+  // Off-shape groups and aggregates over an otherwise eligible opaque join child.
+  CHECK_FALSE(
+    fused_form("SELECT f_txt, min(f_v) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_txt"));
+  CHECK_FALSE(
+    fused_form("SELECT f_dec, min(f_v) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_dec"));
+  CHECK_FALSE(
+    fused_form("SELECT f_v, dp_pad, min(f_dec) FROM dim_plain JOIN fact ON dp_id = f_d "
+               "GROUP BY f_v, dp_pad"));
+  // DISTINCT on a distinct-sensitive aggregate is a miss; the optimizer erases DISTINCT from
+  // min/max (distinct-agnostic), so those still fuse with unchanged semantics.
+  CHECK_FALSE(fused_form(
+    "SELECT f_v, sum(DISTINCT f_big) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_v"));
+  CHECK(fused_form("SELECT f_v, min(DISTINCT f_dec) FROM dim_plain JOIN fact ON dp_id = f_d "
+                   "GROUP BY f_v") == sirius::op::groupjoin::join_form::DIRECT);
+  CHECK_FALSE(fused_form(
+    "SELECT f_v, min(f_dec) FILTER (WHERE f_big > 2) FROM dim_plain JOIN fact ON dp_id = f_d "
+    "GROUP BY f_v"));
+  CHECK_FALSE(
+    fused_form("SELECT f_v, min(f_big + 1) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_v"));
+  CHECK_FALSE(
+    fused_form("SELECT f_v, min(f_txt) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_v"));
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P2 is gated by enable_group_join and the child byte gate",
+                 "[group_join][plan]")
+{
+  using sirius::op::groupjoin::join_form;
+  auto const query = "SELECT f_v, min(f_dec) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_v";
+  REQUIRE(fused_form(query) == join_form::DIRECT);
+
+  auto off = con->Query("SET enable_group_join = false");
+  REQUIRE_FALSE(off->HasError());
+  CHECK_FALSE(fused_form(query));
+  auto on = con->Query("SET enable_group_join = true");
+  REQUIRE_FALSE(on->HasError());
+
+  auto tiny = con->Query("SET group_join_counted_bytes_gate = 1");
+  REQUIRE_FALSE(tiny->HasError());
+  CHECK_FALSE(fused_form(query));
+  auto reset = con->Query("RESET group_join_counted_bytes_gate");
+  REQUIRE_FALSE(reset->HasError());
+  CHECK(fused_form(query) == join_form::DIRECT);
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P2 conversion wires the single-child sink shape",
+                 "[group_join][pipeline]")
+{
+  auto const query = "SELECT f_v, min(f_dec) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_v";
+  REQUIRE(fused_form(query) == sirius::op::groupjoin::join_form::DIRECT);
+
+  sirius::test::with_conversion_result(
+    *con, query, [](sirius::pipeline::pipeline_conversion_result& result) {
+      using sirius::op::MemoryBarrierType;
+      using sirius::op::SiriusPhysicalOperatorType;
+      using sirius::op::sirius_physical_group_join;
+      using sirius::pipeline::repository_wiring;
+      using sirius::pipeline::sirius_pipeline;
+
+      // The fused operator forms its own one-task source+sink pipeline; every pipeline has a
+      // real source (no sourceless pipeline exists).
+      sirius_pipeline* fused_pipeline   = nullptr;
+      sirius_physical_group_join* fused = nullptr;
+      for (auto const& pipeline : result.scheduled_pipelines) {
+        REQUIRE(pipeline->get_source() != nullptr);
+        for (auto const& op_ref : pipeline->get_operators()) {
+          if (op_ref.get().type != SiriusPhysicalOperatorType::GROUP_JOIN) { continue; }
+          REQUIRE(fused_pipeline == nullptr);
+          fused_pipeline = pipeline.get();
+          fused          = &op_ref.get().Cast<sirius_physical_group_join>();
+        }
+      }
+      REQUIRE(fused_pipeline != nullptr);
+      REQUIRE(fused != nullptr);
+      auto const operators = fused_pipeline->get_operators();
+      REQUIRE(operators.size() == 1);
+      CHECK(fused_pipeline->get_source().get() == fused);
+      CHECK(fused_pipeline->get_sink().get() == fused);
+      REQUIRE(fused->children.size() == 1);
+
+      // Exactly one FULL input wiring exists: the opaque child subtree onto "counted".
+      repository_wiring const* counted = nullptr;
+      for (auto const& wiring : result.repository_wirings) {
+        if (wiring.dest_pipeline.get() != fused_pipeline) { continue; }
+        REQUIRE(wiring.port_id == sirius_physical_group_join::COUNTED_PORT);
+        REQUIRE(counted == nullptr);
+        counted = &wiring;
+      }
+      REQUIRE(counted != nullptr);
+      CHECK(counted->barrier_type == MemoryBarrierType::FULL);
+      CHECK(counted->source_op == fused->children[0].get());
+      REQUIRE(counted->source_pipeline);
+      CHECK(counted->source_pipeline->get_sink().get() == fused->children[0].get());
+
+      // The single task fires only after the child producer pipeline finishes.
+      bool depends_on_counted = false;
+      for (auto const& dependency : fused_pipeline->dependencies) {
+        if (dependency.get() == counted->source_pipeline.get()) { depends_on_counted = true; }
+      }
+      CHECK(depends_on_counted);
     });
 }
 

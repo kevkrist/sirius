@@ -390,8 +390,33 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
     }
 
     case sirius::op::SiriusPhysicalOperatorType::GROUP_JOIN: {
+      auto const& join = slot->Cast<sirius::op::sirius_physical_group_join>();
+      // Keys require native values, as do SUM/MIN/MAX/AVG arguments (the fused accumulation is
+      // value-sensitive); a COUNT argument uses only its validity mask and may stay narrow.
+      // Output is native [key, aggregate] with no physical sidecar.
+      auto const slot_op             = join.spec().slots[0].op;
+      bool const value_sensitive_arg = slot_op != sirius::op::groupjoin::agg_op::COUNT_STAR &&
+                                       slot_op != sirius::op::groupjoin::agg_op::COUNT_VALID;
+
+      if (join.spec().form == sirius::op::groupjoin::join_form::DIRECT) {
+        // Single-child arm: the sole child carries both the group key and the argument.
+        if (slot->children.size() != 1) { break; }
+        auto const group_key_idx = join.counted_key_idx();
+        if (group_key_idx >= slot->children[0]->types.size() ||
+            (join.counted_value_idx() &&
+             *join.counted_value_idx() >= slot->children[0]->types.size())) {
+          break;
+        }
+        std::unordered_set<std::size_t> child_native{group_key_idx};
+        if (value_sensitive_arg && join.counted_value_idx()) {
+          child_native.insert(*join.counted_value_idx());
+        }
+        restore_native_columns(slot->children[0], child_native);
+        slot->set_physical_types({});
+        return;
+      }
+
       if (slot->children.size() != 2) { break; }
-      auto const& join             = slot->Cast<sirius::op::sirius_physical_group_join>();
       auto const preserved_key_idx = join.preserved_key_idx();
       auto const counted_key_idx   = join.counted_key_idx();
       if (preserved_key_idx >= slot->children[0]->types.size() ||
@@ -400,13 +425,6 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
            *join.counted_value_idx() >= slot->children[1]->types.size())) {
         break;
       }
-
-      // Keys require native values, as do SUM/MIN/MAX/AVG arguments (the fused accumulation is
-      // value-sensitive); a COUNT argument uses only its validity mask and may stay narrow.
-      // Output is native [key, aggregate] with no physical sidecar.
-      auto const slot_op             = join.spec().slots[0].op;
-      bool const value_sensitive_arg = slot_op != sirius::op::groupjoin::agg_op::COUNT_STAR &&
-                                       slot_op != sirius::op::groupjoin::agg_op::COUNT_VALID;
       std::unordered_set<std::size_t> counted_native{counted_key_idx};
       if (value_sensitive_arg && join.counted_value_idx()) {
         counted_native.insert(*join.counted_value_idx());

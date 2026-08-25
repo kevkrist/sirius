@@ -672,6 +672,10 @@ sirius_physical_group_join::sirius_physical_group_join(
     _dynamic_filter_stats(dynamic_filter_stats_sink)
 {
   validate_group_join_spec(_spec, this->types);
+  if (_spec.form == groupjoin::join_form::DIRECT && _dynamic_filter_plan.enabled()) {
+    throw sirius::internal_exception(
+      "group_join: the DIRECT form has no preserved side to publish dynamic filters from");
+  }
 }
 
 std::string sirius_physical_group_join::params_to_string() const
@@ -682,6 +686,13 @@ std::string sirius_physical_group_join::params_to_string() const
     return " (preserved_key=" + std::to_string(_spec.preserved_key_idx) +
            ", counted_key=" + std::to_string(_spec.counted_key_idx) +
            (counted_value_idx() ? ", count_col=" + std::to_string(*counted_value_idx())
+                                : std::string(", count_star")) +
+           ", max_state_bytes=" + std::to_string(_spec.max_state_bytes) + ")";
+  }
+  if (_spec.form == groupjoin::join_form::DIRECT) {
+    return " (form=DIRECT, op=" + std::string(agg_op_name(_spec.slots[0].op)) +
+           ", group_key=" + std::to_string(_spec.counted_key_idx) +
+           (counted_value_idx() ? ", arg_col=" + std::to_string(*counted_value_idx())
                                 : std::string(", count_star")) +
            ", max_state_bytes=" + std::to_string(_spec.max_state_bytes) + ")";
   }
@@ -697,6 +708,14 @@ std::string sirius_physical_group_join::params_to_string() const
 std::string_view sirius_physical_group_join::input_port_for(
   sirius_physical_operator const& producer) const
 {
+  if (_spec.form == groupjoin::join_form::DIRECT) {
+    if (children.size() != 1) {
+      throw sirius::internal_exception(
+        "GROUP_JOIN DIRECT repository wiring requires exactly one child");
+    }
+    if (children[0].get() == &producer) { return COUNTED_PORT; }
+    throw sirius::internal_exception("GROUP_JOIN repository wiring source is not a direct child");
+  }
   if (children.size() != 2) {
     throw sirius::internal_exception("GROUP_JOIN repository wiring requires exactly two children");
   }
@@ -723,7 +742,23 @@ MemoryBarrierType sirius_physical_group_join::input_barrier_for(
 void sirius_physical_group_join::build_pipelines(pipeline::sirius_pipeline& current,
                                                  pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // FULL-barrier sink with one input port per child.
+  if (_spec.form == groupjoin::join_form::DIRECT) {
+    // Provenance class 3, the standard single-child sink pattern: this operator keeps its own
+    // one-task pipeline, and the opaque child subtree externalizes as the sink of its own
+    // producer pipeline through its own build_pipelines (its tree parent is a GROUP_JOIN, so
+    // sirius_physical_operator::is_sink makes it self-organize exactly as it would under a
+    // PARTITION). The converter's tree-parent lookup then wires that producer onto the FULL
+    // "counted" port.
+    if (children.size() != 1) {
+      throw sirius::internal_exception("group_join: the DIRECT form expects 1 child, got {}",
+                                       children.size());
+    }
+    auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
+    child_meta_pipeline.build(*children[0]);
+    return;
+  }
+
+  // Two-child forms: FULL-barrier sink with one input port per child.
   if (children.size() != 2) {
     throw sirius::internal_exception("group_join: expected 2 children, got {}", children.size());
   }
@@ -782,7 +817,10 @@ std::unique_ptr<operator_data> sirius_physical_group_join::get_next_task_input_d
       destination.push_back(std::move(batch));
     }
   };
-  drain(get_port(PRESERVED_PORT), preserved_batches);
+  // The DIRECT form registers only the "counted" port.
+  if (_spec.form != groupjoin::join_form::DIRECT) {
+    drain(get_port(PRESERVED_PORT), preserved_batches);
+  }
   drain(get_port(COUNTED_PORT), counted_batches);
 
   if (preserved_batches.empty() && counted_batches.empty()) { return nullptr; }
@@ -1407,7 +1445,10 @@ std::unique_ptr<cudf::table> sirius_physical_group_join::execute_inner_direct(
         // Metadata-only argument-validity gate accounting (checked before state allocation).
         argument_null_values =
           checked_add_rows(argument_null_values, checked_null_count(arg, i), "argument NULL");
-        counted_rep_args.push_back(arg_rep_view(arg));
+        // Value-sensitive ops accumulate or compare the argument, so it must arrive as its
+        // INT32/INT64 representation. COUNT reads only the validity mask, so any carrier --
+        // including one the narrowing policy left narrow -- passes through untouched.
+        counted_rep_args.push_back(is_count_op(slot.op) ? arg : arg_rep_view(arg));
       }
     }
   }

@@ -396,6 +396,50 @@ TEST_CASE("compressed_schema_propagation - group join restores only keys and emi
   require_restore_projection_at(*plan->children[1], 0, {k_int32, k_int16, k_int8});
 }
 
+TEST_CASE(
+  "compressed_schema_propagation - DIRECT group join restores key and value arg on its "
+  "sole child",
+  "[compressed_schema_propagation]")
+{
+  SECTION("SUM: group key and argument restore to native; the payload column stays narrow")
+  {
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      sirius::test::make_direct_group_join(sirius::op::groupjoin::agg_op::SUM,
+                                           /*group_key_idx=*/0,
+                                           /*arg_idx=*/std::size_t{1},
+                                           sirius::logical_type::make(sirius::type_id::BIGINT),
+                                           make_scan(3, {k_int8, k_int16, k_int8}));
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    REQUIRE(!plan->has_physical_overrides());
+    auto const& restored = *plan->children[0];
+    REQUIRE(restored.type == SiriusPhysicalOperatorType::PROJECTION);
+    auto const& projection = restored.Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(projection.select_list.size() == 3);
+    REQUIRE(projection.select_list[0]->holds<sirius::ast::cast>());
+    REQUIRE(projection.select_list[1]->holds<sirius::ast::cast>());
+    REQUIRE(projection.select_list[2]->holds<sirius::ast::reference>());
+    REQUIRE(restored.get_physical_types() ==
+            std::vector<cudf::data_type>{k_int32, k_int32, k_int8});
+  }
+
+  SECTION("COUNT: the argument is validity-only and keeps its narrow carrier")
+  {
+    duckdb::unique_ptr<sirius_physical_operator> plan =
+      sirius::test::make_direct_group_join(sirius::op::groupjoin::agg_op::COUNT_VALID,
+                                           /*group_key_idx=*/0,
+                                           /*arg_idx=*/std::size_t{1},
+                                           sirius::logical_type::make(sirius::type_id::BIGINT),
+                                           make_scan(3, {k_int8, k_int16, k_int8}));
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    REQUIRE(!plan->has_physical_overrides());
+    require_restore_projection_at(*plan->children[0], 0, {k_int32, k_int16, k_int8});
+  }
+}
+
 TEST_CASE("compressed_schema_propagation - native boundaries restore children fully",
           "[compressed_schema_propagation]")
 {

@@ -600,7 +600,7 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the GROUP_JOIN operator's fused count-over-outer-join pathway; accepted only as a strict boolean under `sirius.operator_params`. |
-| `enable_group_join` | true | Enable the GROUP_JOIN operator's INNER value pathways (SUM/MIN/MAX/AVG/COUNT grouped by an INNER join's preserved key, the q17 shape); accepted only as a strict boolean under `sirius.operator_params`. |
+| `enable_group_join` | true | Enable the GROUP_JOIN operator's value pathways: INNER (SUM/MIN/MAX/AVG/COUNT grouped by an INNER join's preserved key, the q17 shape) and DIRECT (a single integer-keyed aggregate fused over an opaque comparison-join child, the q2 shape); accepted only as a strict boolean under `sirius.operator_params`. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see
@@ -613,12 +613,12 @@ under `sirius.operator_params`, but it is not a normal session setting.
 Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
 
 GROUP_JOIN's count pathway is enabled by default and can be disabled with
-`sirius.operator_params.enable_dense_count_join: false`; the INNER value pathways are gated
-independently by `sirius.operator_params.enable_group_join`. Both inputs are FULL barriers, so
-the inputs and workspace must fit one GPU task; the INNER pathways additionally decline at plan
-time when the counted child's estimated bytes exceed an engine-owned device-memory fraction,
-because the single fused task must colocate the whole counted side. The dense-state budgets and
-the counted-side byte gate are engine-owned.
+`sirius.operator_params.enable_dense_count_join: false`; the INNER and DIRECT value pathways are
+gated independently by `sirius.operator_params.enable_group_join`. All inputs are FULL barriers,
+so the inputs and workspace must fit one GPU task; the value pathways additionally decline at
+plan time when the counted (or, for DIRECT, sole) child's estimated bytes exceed an engine-owned
+device-memory fraction, because the single fused task must colocate that whole input. The
+dense-state budgets and the byte gate are engine-owned.
 
 ### GPU Admission
 

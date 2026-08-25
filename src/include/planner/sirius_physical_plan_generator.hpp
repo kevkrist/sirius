@@ -202,6 +202,13 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_inner_group_join(
     duckdb::LogicalAggregate& op);
 
+  // Ladder rung P2: a single INT32/INT64-keyed aggregate over an opaque comparison-join child
+  // (the q2 MIN-per-partkey shape). The child is planned unchanged and becomes the fused
+  // operator's sole input; the group key need not be a join key. Returns null on any detection
+  // miss or on the child byte gate.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_direct_group_join(
+    duckdb::LogicalAggregate& op);
+
   // Sirius reads and projects nested (STRUCT/LIST/MAP) columns but cannot operate
   // on them yet: WHERE / GROUP BY / JOIN ON over a nested column must fail with a
   // clear error naming the column instead of crashing or returning wrong results.

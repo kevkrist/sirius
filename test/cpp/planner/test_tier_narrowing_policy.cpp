@@ -450,6 +450,44 @@ TEST_CASE("tier_narrowing_policy - group join restores only the two join keys",
   REQUIRE(!plan->has_physical_overrides());
 }
 
+TEST_CASE("tier_narrowing_policy - DIRECT group join restores its key and value-sensitive arg",
+          "[tier_narrowing_policy]")
+{
+  SECTION("SUM: group key and argument both retract to native")
+  {
+    auto plan =
+      sirius::test::make_direct_group_join(sirius::op::groupjoin::agg_op::SUM,
+                                           /*group_key_idx=*/0,
+                                           /*arg_idx=*/std::size_t{1},
+                                           sirius::logical_type::make(sirius::type_id::BIGINT),
+                                           make_integer_scan(3, {k_int8, k_int16, k_int8}));
+
+    auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(retracted == 2);
+    REQUIRE(plan->children[0]->get_physical_types() ==
+            std::vector<cudf::data_type>{k_int32, k_int32, k_int8});
+    REQUIRE(!plan->has_physical_overrides());
+  }
+
+  SECTION("COUNT: the argument is validity-only and keeps its narrow carrier")
+  {
+    auto plan =
+      sirius::test::make_direct_group_join(sirius::op::groupjoin::agg_op::COUNT_VALID,
+                                           /*group_key_idx=*/0,
+                                           /*arg_idx=*/std::size_t{1},
+                                           sirius::logical_type::make(sirius::type_id::BIGINT),
+                                           make_integer_scan(3, {k_int8, k_int16, k_int8}));
+
+    auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(retracted == 1);
+    REQUIRE(plan->children[0]->get_physical_types() ==
+            std::vector<cudf::data_type>{k_int32, k_int16, k_int8});
+    REQUIRE(!plan->has_physical_overrides());
+  }
+}
+
 TEST_CASE("tier_narrowing_policy - grouped-aggregate keys keep narrow only when eligible",
           "[tier_narrowing_policy]")
 {

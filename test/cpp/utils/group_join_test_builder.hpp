@@ -65,6 +65,31 @@ inline op::groupjoin::group_join_spec make_group_join_spec(op::groupjoin::join_f
   return spec;
 }
 
+/// A DIRECT-form operator over one child; the output schema is [INTEGER key, @p output_type].
+inline duckdb::unique_ptr<op::sirius_physical_group_join> make_direct_group_join(
+  op::groupjoin::agg_op agg,
+  std::size_t group_key_idx,
+  std::optional<std::size_t> arg_idx,
+  sirius::logical_type output_type,
+  duckdb::unique_ptr<op::sirius_physical_operator> child)
+{
+  duckdb::vector<sirius::logical_type> output_types;
+  output_types.push_back(sirius::logical_type::make(type_id::INTEGER));
+  output_types.push_back(output_type);
+  auto join = duckdb::make_uniq<op::sirius_physical_group_join>(
+    std::move(output_types),
+    /*estimated_cardinality=*/1,
+    make_group_join_spec(op::groupjoin::join_form::DIRECT,
+                         agg,
+                         group_key_idx,
+                         group_key_idx,
+                         arg_idx,
+                         std::move(output_type),
+                         std::uint64_t{1} << 20));
+  join->children.push_back(std::move(child));
+  return join;
+}
+
 inline duckdb::unique_ptr<op::sirius_physical_group_join> make_group_join(
   std::size_t preserved_key_idx,
   std::size_t counted_key_idx,

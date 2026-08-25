@@ -44,6 +44,7 @@
 #include "planner/dynamic_filter/build_filter_evidence.hpp"
 #include "planner/dynamic_filter/build_key_domain.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
+#include "planner/dynamic_filter/dynamic_filter_publication_planning.hpp"
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
@@ -517,114 +518,20 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     auto admitted_keys = admit_dynamic_filter_keys(
       conditions, condition_key_shapes, condition_domains, build_side_unique_column);
 
-    // Prefer scan binding; each key uses one route.
+    // Prefer scan binding; each key uses one route. The walk itself is the shared
+    // discover_membership_publication_targets (also used by the GROUP_JOIN planner's
+    // plan_single_key_membership_publication); it may re-root `left` with direct-route
+    // endpoint operators.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;
     std::size_t scan_target_count = 0;
     bool const discovery_runs     = build_evidence &&
                                 op.type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
                                 !gpu_spaces.empty() && !host_spaces.empty();
     if (discovery_runs) {
-      bool const scan_bind_armed = scan_route_join_type_admissible(op.join_type);
-      descent_policy const policy{.descend_build_blocks = true};
-      std::unordered_map<sirius::op::sirius_physical_operator const*, std::size_t> target_by_scan;
-      for (std::size_t key_index = 0; key_index < admitted_keys.size(); ++key_index) {
-        auto const& key       = admitted_keys[key_index];
-        auto const& condition = conditions[key.planner_condition_index];
-        // Terminal ordinals are local to each terminal, not the probe entry schema.
-        auto const terminals =
-          trace_probe_key(*left, static_cast<std::size_t>(key.probe_key_ordinal), policy);
-        bool scan_bound = false;
-        for (auto const& terminal : terminals) {
-          if (!scan_bind_armed ||
-              terminal.node->type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-            continue;
-          }
-          auto& scan = terminal.node->Cast<sirius::op::sirius_physical_table_scan>();
-          if (terminal.ordinal >= scan.types.size()) {
-            SIRIUS_LOG_WARN(
-              "[sirius_plan_comparison_join] dynamic filter key {}: scan-route terminal at scan "
-              "'{}' carries exit ordinal {} outside the scan's {} output columns; skipping this "
-              "binding.",
-              key_index,
-              scan.function.name,
-              terminal.ordinal,
-              scan.types.size());
-            continue;
-          }
-          auto const [entry, inserted] = target_by_scan.try_emplace(terminal.node, targets.size());
-          if (inserted) {
-            // Reuse the scan channel so multiple producers share the consumer.
-            if (!scan.sirius_dynamic_filters) {
-              scan.sirius_dynamic_filters =
-                std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-            }
-            targets.push_back({.filter_set  = scan.sirius_dynamic_filters,
-                               .route_class = sirius::op::dynamic_filter_route_class::scan,
-                               .accepts_zone_map_filters = true,
-                               .key_bindings             = {}});
-            ++scan_target_count;
-          }
-          targets[entry->second].key_bindings.push_back(
-            {.admitted_key_index   = key_index,
-             .channel_push_ordinal = terminal.ordinal,
-             .probe_storage_type   = sirius::try_get_cudf_type(scan.types[terminal.ordinal])
-                                     .value_or(cudf::data_type{cudf::type_id::EMPTY})});
-          scan_bound = true;
-        }
-        if (scan_bound) { continue; }
-        // Admission proves build-block safety; placement preserves the reported site ordinal.
-        if (!direct_route_admissible(op.join_type,
-                                     condition.comparison,
-                                     key.key_shape,
-                                     key.probe_storage_type,
-                                     key.storage_type)) {
-          continue;
-        }
-        std::vector<std::shared_ptr<sirius::op::sirius_dynamic_filter_set>> site_channels;
-        auto placed = place_endpoint(
-          std::move(left),
-          static_cast<std::size_t>(key.probe_key_ordinal),
-          policy,
-          [&site_channels, &op_params](sirius::op::sirius_physical_operator const& site)
-            -> duckdb::unique_ptr<sirius::op::sirius_physical_operator> {
-            auto channel  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-            auto endpoint = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
-              site.types,
-              site.estimated_cardinality,
-              channel,
-              op_params.dynamic_filter_keep_threshold,
-              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only);
-            site_channels.push_back(std::move(channel));
-            return endpoint;
-          });
-        left = std::move(placed.subtree);
-        if (site_channels.size() != placed.site_ordinals.size()) {
-          SIRIUS_LOG_WARN(
-            "[sirius_plan_comparison_join] dynamic filter key {}: direct-route walk placed {} "
-            "endpoints but recorded {} site ordinals; skipping this key's bindings.",
-            key_index,
-            site_channels.size(),
-            placed.site_ordinals.size());
-          continue;
-        }
-        for (std::size_t site = 0; site < site_channels.size(); ++site) {
-          targets.push_back({.filter_set  = std::move(site_channels[site]),
-                             .route_class = sirius::op::dynamic_filter_route_class::direct,
-                             .accepts_zone_map_filters = false,
-                             .key_bindings             = {{.admitted_key_index   = key_index,
-                                                           .channel_push_ordinal = placed.site_ordinals[site],
-                                                           .probe_storage_type   = key.probe_storage_type}}});
-        }
-      }
-      // Register after all keys bind so each declaration covers every planned push.
-      for (auto const& target : targets) {
-        std::vector<std::size_t> planned_columns;
-        planned_columns.reserve(target.key_bindings.size());
-        for (auto const& binding : target.key_bindings) {
-          planned_columns.push_back(binding.channel_push_ordinal);
-        }
-        target.filter_set->register_producer(std::move(planned_columns));
-      }
+      auto discovery = discover_membership_publication_targets(
+        conditions, admitted_keys, op.join_type, op_params, left, "sirius_plan_comparison_join");
+      targets           = std::move(discovery.targets);
+      scan_target_count = discovery.scan_target_count;
     }
     if (!targets.empty()) {
       SIRIUS_LOG_INFO(

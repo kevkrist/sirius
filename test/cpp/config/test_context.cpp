@@ -1882,10 +1882,12 @@ TEST_CASE("Sirius configuration gates the GROUP_JOIN value rungs behind enable_g
   REQUIRE(defaults.get_operator_params().enable_group_join ==
           sirius::config::DEFAULT_ENABLE_GROUP_JOIN);
 
-  sirius::sirius_config enabled;
-  REQUIRE_NOTHROW(enabled.load_from_file(data_dir / "valid_group_join_enable.yaml"));
-  REQUIRE(enabled.get_operator_params().enable_group_join);
-  REQUIRE(enabled.get_operator_params().group_join_counted_bytes_gate ==
+  // The YAML sets the NON-default value; asserting `false` proves the key is actually parsed
+  // rather than silently ignored.
+  sirius::sirius_config disabled;
+  REQUIRE_NOTHROW(disabled.load_from_file(data_dir / "valid_group_join_enable.yaml"));
+  REQUIRE_FALSE(disabled.get_operator_params().enable_group_join);
+  REQUIRE(disabled.get_operator_params().group_join_counted_bytes_gate ==
           sirius::config::derived_group_join_counted_bytes_gate());
 
   sirius::sirius_config invalid_gate;

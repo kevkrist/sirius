@@ -43,9 +43,8 @@ namespace sirius::op {
  * one COUNT_STAR/COUNT_VALID slot) plus the INNER and DIRECT forms with any one
  * COUNT/SUM/MIN/MAX/AVG slot; value bundles over `OUTER_PRESERVING` fail closed (they would need
  * aggregate-output null masks the dense emit does not have). The planner ladder emits count specs
- * (rung P0) and two-child INNER specs (rung P1, behind `operator_params.enable_group_join`); the
- * DIRECT form arrives with later planner work, so it is currently reachable only by constructing
- * the operator directly (as the Catch2 suites do).
+ * (rung P0), two-child INNER specs (rung P1), and single-child DIRECT specs (rung P2); rungs P1
+ * and P2 sit behind `operator_params.enable_group_join`.
  */
 namespace groupjoin {
 
@@ -71,7 +70,7 @@ struct slot_spec {
 struct group_join_spec {
   join_form form;                   ///< Join semantics; DIRECT ignores the preserved side.
   std::size_t preserved_key_idx;    ///< Group/join key column on the preserved child.
-  std::size_t counted_key_idx;      ///< Join key column on the counted child.
+  std::size_t counted_key_idx;      ///< Join key column on the counted child; DIRECT's group key.
   duckdb::vector<slot_spec> slots;  ///< Detection emits exactly one; the mechanism takes N.
   uint64_t max_state_bytes;         ///< Engine-owned dense-state budget for this form.
 };
@@ -105,12 +104,16 @@ class group_join_input : public pipelineable_operator_data {
  * @brief Fused join+group-by (GROUPJOIN) operator.
  *
  * Planner-wired pathways today: an eligible preserved-side outer equi-join with a grouped COUNT
- * (rung P0), and an eligible INNER equi-join under a single value or count aggregate whose group
- * key is the preserved side's join key (rung P1, the q17 shape). Children are
- * [preserved, counted] and output is `[key, aggregate]`. Runtime selects direct-address or exact
- * sparse aggregation while preserving SQL NULL semantics; value bundles (SUM/MIN/MAX/AVG)
- * additionally require NULL-free argument columns for the dense strategy and fall back to the
- * mask-preserving sparse strategy otherwise.
+ * (rung P0), an eligible INNER equi-join under a single value or count aggregate whose group key
+ * is the preserved side's join key (rung P1, the q17 shape), and a single integer-keyed aggregate
+ * whose child is an opaque comparison-join subtree (rung P2, the q2 DIRECT shape). Two-child
+ * forms take children [preserved, counted]; the DIRECT form takes the single opaque child on the
+ * "counted" port. Output is `[key, aggregate]`. Runtime selects direct-address or exact sparse
+ * aggregation while preserving SQL NULL semantics; value bundles (SUM/MIN/MAX/AVG) additionally
+ * require NULL-free argument columns for the dense strategy and fall back to the mask-preserving
+ * sparse strategy otherwise -- which is also what makes DIRECT's opaque child sound: padding
+ * NULLs from an outer join inside the child route to the sparse path, which emits the correct
+ * NULL aggregates.
  *
  * The preserved child may be a routing-only `DELIM_SCAN` (rung P1's delim provenance): that child
  * produces no data itself -- its `build_pipelines` registers a scheduling dependency on the
@@ -124,8 +127,9 @@ class group_join_input : public pipelineable_operator_data {
  * keys as membership filters to the counted-side scan, with the same best-effort timing and
  * skip semantics as `sirius_physical_hash_join`'s build-side publication.
  *
- * The DIRECT form consumes a single "counted" input at the execute level; its pipeline
- * construction is later planner work, so `build_pipelines` still requires two children.
+ * The DIRECT form carries exactly one child and never a publication plan (there is no preserved
+ * side); `build_pipelines` and `input_port_for` fail closed on any child count that does not
+ * match the spec's form.
  */
 class sirius_physical_group_join : public sirius_physical_operator {
  public:
@@ -134,7 +138,8 @@ class sirius_physical_group_join : public sirius_physical_operator {
   static constexpr std::string_view PRESERVED_PORT = "preserved";
   static constexpr std::string_view COUNTED_PORT   = "counted";
 
-  /// Throws on any @p spec outside the whitelisted (form, bundle) combinations.
+  /// Throws on any @p spec outside the whitelisted (form, bundle) combinations, and on a DIRECT
+  /// spec carrying a publication plan.
   sirius_physical_group_join(duckdb::vector<sirius::logical_type> types,
                              std::size_t estimated_cardinality,
                              groupjoin::group_join_spec spec,

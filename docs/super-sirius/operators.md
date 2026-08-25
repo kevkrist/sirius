@@ -351,12 +351,15 @@ Hash-based GROUP BY.
 
 The fused join+group-by (GROUPJOIN) operator. A fail-closed detection ladder in the aggregate
 planner (`try_plan_group_join`) emits a `group_join_spec` naming the join form and aggregate
-slots. Two pathways are wired today: rung P0 fuses eligible `COUNT(col | *) GROUP BY key` over a
-preserved-side outer equi-join (gated by `enable_dense_count_join`), and rung P1 fuses a single
+slots. Three pathways are wired today: rung P0 fuses eligible `COUNT(col | *) GROUP BY key` over
+a preserved-side outer equi-join (gated by `enable_dense_count_join`); rung P1 fuses a single
 `COUNT/SUM/MIN/MAX/AVG` grouped by the preserved-side key of an INNER equi-join whose preserved
 side is a `DELIM_GET` or a proven-unique scan chain -- the TPC-H q17 correlated-AVG shape (gated
 by `enable_group_join`, plus a plan-time counted-side byte gate because the single fused task
-colocates the whole counted side). Children are normalized as [preserved, counted]; a
+colocates the whole counted side); and rung P2 fuses a single supported aggregate grouped over
+an opaque join-rooted child as the single-input DIRECT form -- the TPC-H q2 correlated-MIN shape
+(same knob and byte gate; no publication, since no join is replaced). Children are normalized as
+[preserved, counted] (DIRECT registers only [counted]); a
 `DELIM_SCAN` preserved child is routing-only, with the preserved data arriving from the owning
 delim join's distinct chain. When rung P1 replaces a hash join that would have published
 membership dynamic filters, the fused operator carries the equivalent publication plan and

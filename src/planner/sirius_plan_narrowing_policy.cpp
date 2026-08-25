@@ -437,26 +437,41 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
     }
 
     case sirius::op::SiriusPhysicalOperatorType::GROUP_JOIN: {
-      if (op.children.size() != 2) { break; }
-      auto const& join             = op.Cast<sirius::op::sirius_physical_group_join>();
-      auto const preserved_key_idx = join.preserved_key_idx();
-      auto const counted_key_idx   = join.counted_key_idx();
-      if (preserved_key_idx >= child_maps[0].size() || counted_key_idx >= child_maps[1].size() ||
-          (join.counted_value_idx() && *join.counted_value_idx() >= child_maps[1].size())) {
-        break;
-      }
-
+      auto const& join = op.Cast<sirius::op::sirius_physical_group_join>();
       // Keys require native values, as do SUM/MIN/MAX/AVG arguments (the fused accumulation is
       // value-sensitive); a COUNT argument uses only its validity mask and may stay narrow.
       // Output is native [key, aggregate] with no forwarded carrier.
       auto mark_native = [&state](carried_columns const& side, std::size_t column_idx) {
         if (side[column_idx]) { state.candidates[*side[column_idx]].boundary_restore = true; }
       };
-      mark_native(child_maps[0], preserved_key_idx);
-      mark_native(child_maps[1], counted_key_idx);
       auto const slot_op             = join.spec().slots[0].op;
       bool const value_sensitive_arg = slot_op != sirius::op::groupjoin::agg_op::COUNT_STAR &&
                                        slot_op != sirius::op::groupjoin::agg_op::COUNT_VALID;
+
+      if (join.spec().form == sirius::op::groupjoin::join_form::DIRECT) {
+        // Single-child arm: the sole child carries both the group key and the argument.
+        if (op.children.size() != 1) { break; }
+        auto const group_key_idx = join.counted_key_idx();
+        if (group_key_idx >= child_maps[0].size() ||
+            (join.counted_value_idx() && *join.counted_value_idx() >= child_maps[0].size())) {
+          break;
+        }
+        mark_native(child_maps[0], group_key_idx);
+        if (value_sensitive_arg && join.counted_value_idx()) {
+          mark_native(child_maps[0], *join.counted_value_idx());
+        }
+        return carried_columns(op.types.size());
+      }
+
+      if (op.children.size() != 2) { break; }
+      auto const preserved_key_idx = join.preserved_key_idx();
+      auto const counted_key_idx   = join.counted_key_idx();
+      if (preserved_key_idx >= child_maps[0].size() || counted_key_idx >= child_maps[1].size() ||
+          (join.counted_value_idx() && *join.counted_value_idx() >= child_maps[1].size())) {
+        break;
+      }
+      mark_native(child_maps[0], preserved_key_idx);
+      mark_native(child_maps[1], counted_key_idx);
       if (value_sensitive_arg && join.counted_value_idx()) {
         mark_native(child_maps[1], *join.counted_value_idx());
       }

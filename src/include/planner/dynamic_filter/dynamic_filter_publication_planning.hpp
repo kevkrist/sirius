@@ -21,10 +21,12 @@
 
 #include <duckdb/common/enums/join_type.hpp>
 #include <duckdb/common/unique_ptr.hpp>
+#include <duckdb/common/vector.hpp>
 
 #include <cstddef>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace duckdb {
 class SiriusContext;
@@ -58,6 +60,37 @@ struct membership_publication_request {
   /// Build-side estimated rows, used only for logging.
   std::size_t build_estimated_rows = 0;
 };
+
+/// Probe-side publication targets discovered for a set of admitted keys, plus how many of them
+/// bound to a scan channel (the rest are spliced direct-route endpoints).
+struct membership_target_discovery {
+  std::vector<op::dynamic_filter_publish_plan::probe_target> targets;
+  std::size_t scan_target_count = 0;
+};
+
+/**
+ * @brief Walks each admitted key through @p probe_subtree and builds its publication targets.
+ *
+ * The single target-discovery implementation shared by `plan_comparison_join` (hash joins, any
+ * number of admitted keys) and `plan_single_key_membership_publication` (the GROUP_JOIN planner).
+ * Each key prefers scan binding: every reachable `sirius_physical_table_scan` terminal joins that
+ * scan's shared filter channel (one target per scan node, deduplicated across keys). A key that
+ * binds no scan and passes `direct_route_admissible` instead splices membership-only
+ * `sirius_physical_dynamic_filter` endpoints into @p probe_subtree, which may re-root it. After
+ * all keys bind, every target's planned columns are registered with its filter set, so each
+ * producer declaration covers every planned push.
+ *
+ * The caller owns everything around the walk: evidence gating, replica-space resolution, and the
+ * decision to attach the resulting targets to a publish plan. @p log_context tags the discovery
+ * warnings, e.g. "sirius_plan_comparison_join".
+ */
+[[nodiscard]] membership_target_discovery discover_membership_publication_targets(
+  duckdb::vector<sirius::join_condition> const& conditions,
+  std::vector<op::dynamic_filter_publish_plan::admitted_key> const& admitted_keys,
+  duckdb::JoinType join_type,
+  sirius::operator_params const& op_params,
+  duckdb::unique_ptr<op::sirius_physical_operator>& probe_subtree,
+  std::string_view log_context);
 
 /**
  * @brief Builds the dynamic-filter publication plan for one membership key, mirroring the target

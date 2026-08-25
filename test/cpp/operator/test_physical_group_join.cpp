@@ -537,6 +537,47 @@ TEST_CASE("group_join owns direct child port and barrier wiring", "[group_join][
   CHECK(op.input_barrier_for(*counted_ptr) == MemoryBarrierType::FULL);
 }
 
+TEST_CASE("group_join wiring fails closed on a form/child-count mismatch",
+          "[group_join][pipeline][validation]")
+{
+  duckdb::vector<sirius::logical_type> child_types;
+  child_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
+  auto make_child = [&] {
+    return duckdb::make_uniq<sirius_physical_operator>(
+      SiriusPhysicalOperatorType::FILTER, child_types, 1);
+  };
+
+  SECTION("a DIRECT spec with two children throws")
+  {
+    auto op =
+      sirius::test::make_direct_group_join(groupjoin::agg_op::MIN,
+                                           /*group_key_idx=*/0,
+                                           /*arg_idx=*/std::size_t{0},
+                                           sirius::logical_type::make(sirius::type_id::INTEGER),
+                                           make_child());
+    op->children.push_back(make_child());
+    CHECK_THROWS_WITH(op->input_port_for(*op->children[0]),
+                      Catch::Contains("requires exactly one child"));
+  }
+
+  SECTION("a two-child spec with one child throws")
+  {
+    duckdb::vector<duckdb::LogicalType> output_types;
+    output_types.push_back(duckdb::LogicalType::INTEGER);
+    output_types.push_back(duckdb::LogicalType::BIGINT);
+    sirius_physical_group_join op(sirius::from_duckdb_vec(output_types),
+                                  /*estimated_cardinality=*/1,
+                                  sirius::test::make_count_group_join_spec(
+                                    /*preserved_key_idx=*/0,
+                                    /*counted_key_idx=*/0,
+                                    /*counted_value_idx=*/std::nullopt,
+                                    k_default_max_bytes));
+    op.children.push_back(make_child());
+    CHECK_THROWS_WITH(op.input_port_for(*op.children[0]),
+                      Catch::Contains("requires exactly two children"));
+  }
+}
+
 TEST_CASE("group_join first-run estimate is proportional and saturates",
           "[group_join][no_history_peak_memory_estimate]")
 {
