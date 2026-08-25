@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_dense_count_join.hpp"
+#include "op/sirius_physical_group_join.hpp"
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
-#include "op/aggregate/dense_count_join_impl.hpp"
+#include "op/aggregate/group_join_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -60,7 +60,7 @@ namespace {
   auto const max = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
   if (value > max) {
     throw sirius::invalid_input_exception(
-      "dense_count_join: {} {} exceeds cudf::size_type max {}", what, value, max);
+      "group_join: {} {} exceeds cudf::size_type max {}", what, value, max);
   }
   return static_cast<cudf::size_type>(value);
 }
@@ -73,7 +73,7 @@ namespace {
   auto const num_columns = batch.num_columns();
   if (num_columns < 0 || index >= static_cast<std::size_t>(num_columns)) {
     throw sirius::internal_exception(
-      "dense_count_join: input batch {} has {} columns; {} column index {} is out of range",
+      "group_join: input batch {} has {} columns; {} column index {} is out of range",
       batch_index,
       num_columns,
       role,
@@ -87,7 +87,7 @@ namespace {
   auto const nulls = column.null_count();
   if (nulls < 0 || nulls > column.size()) {
     throw sirius::internal_exception(
-      "dense_count_join: preserved batch {} has invalid null count {} for {} rows",
+      "group_join: preserved batch {} has invalid null count {} for {} rows",
       batch_index,
       nulls,
       column.size());
@@ -99,7 +99,7 @@ namespace {
 {
   if (rows < 0 || total > std::numeric_limits<int64_t>::max() - rows) {
     throw sirius::invalid_input_exception(
-      "dense_count_join: {} row count exceeds BIGINT accounting capacity", side);
+      "group_join: {} row count exceeds BIGINT accounting capacity", side);
   }
   return total + rows;
 }
@@ -208,14 +208,76 @@ cudf::column_view gather_map_view(rmm::device_uvector<cudf::size_type> const& in
                            {});
 }
 
+// Monomorphized dense pathway: build the count-bundle state, run both accumulate passes, emit.
+template <typename KeyT, typename CountT>
+std::unique_ptr<cudf::table> run_dense_count(
+  int64_t min_key,
+  int64_t range,
+  std::vector<cudf::column_view> const& preserved_keys,
+  std::vector<cudf::column_view> const& counted_keys,
+  std::vector<std::optional<cudf::column_view>> const& counted_values,
+  cudf::data_type key_type,
+  bool count_star,
+  int64_t null_group_rows,
+  bool check_product_overflow,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  group_join_state<KeyT, groupjoin::count_bundle<CountT>> state(min_key, range, stream, mr);
+  for (auto const& col : preserved_keys) {
+    state.accumulate_preserved(col, stream);
+  }
+  for (std::size_t i = 0; i < counted_keys.size(); ++i) {
+    state.accumulate_counted(
+      counted_keys[i], counted_values[i] ? &*counted_values[i] : nullptr, stream);
+  }
+  return state.emit(key_type, count_star, null_group_rows, stream, mr, check_product_overflow);
+}
+
+[[nodiscard]] std::string_view to_string(groupjoin::join_form form)
+{
+  switch (form) {
+    case groupjoin::join_form::OUTER_PRESERVING: return "OUTER_PRESERVING";
+    case groupjoin::join_form::INNER: return "INNER";
+    case groupjoin::join_form::DIRECT: return "DIRECT";
+  }
+  return "UNKNOWN";
+}
+
+// Only the COUNT pathway is wired; reject any other spec until its bundle lands.
+void validate_count_pathway_spec(groupjoin::group_join_spec const& spec,
+                                 duckdb::vector<sirius::logical_type> const& types)
+{
+  if (spec.form != groupjoin::join_form::OUTER_PRESERVING) {
+    throw sirius::internal_exception("group_join: join form {} is not implemented",
+                                     to_string(spec.form));
+  }
+  if (spec.slots.size() != 1) {
+    throw sirius::internal_exception("group_join: expected exactly 1 aggregate slot, got {}",
+                                     spec.slots.size());
+  }
+  auto const& slot = spec.slots[0];
+  if (slot.op != groupjoin::agg_op::COUNT_STAR && slot.op != groupjoin::agg_op::COUNT_VALID) {
+    throw sirius::internal_exception("group_join: only the COUNT bundle is implemented");
+  }
+  if (slot.arg_idx.has_value() != (slot.op == groupjoin::agg_op::COUNT_VALID)) {
+    throw sirius::internal_exception(
+      "group_join: COUNT(col) requires an argument column and COUNT(*) forbids one");
+  }
+  if (types.size() != 2) {
+    throw sirius::internal_exception(
+      "group_join: expected [key, count] output schema, got {} columns", types.size());
+  }
+}
+
 }  // namespace
 
-dense_count_join_input::tagged_batches dense_count_join_input::tag_batches(
+group_join_input::tagged_batches group_join_input::tag_batches(
   std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
   std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches)
 {
   if (preserved_batches.size() > std::numeric_limits<std::size_t>::max() - counted_batches.size()) {
-    throw sirius::internal_exception("dense_count_join: input batch count overflow");
+    throw sirius::internal_exception("group_join: input batch count overflow");
   }
 
   tagged_batches result;
@@ -228,8 +290,7 @@ dense_count_join_input::tagged_batches dense_count_join_input::tag_batches(
                     std::string_view side_name) {
     for (std::size_t i = 0; i < batches.size(); ++i) {
       if (!batches[i]) {
-        throw sirius::internal_exception(
-          "dense_count_join: null {} batch at index {}", side_name, i);
+        throw sirius::internal_exception("group_join: null {} batch at index {}", side_name, i);
       }
       result.batches.push_back(std::move(batches[i]));
       result.sides.push_back(side);
@@ -240,76 +301,63 @@ dense_count_join_input::tagged_batches dense_count_join_input::tag_batches(
   return result;
 }
 
-dense_count_join_input::dense_count_join_input(
+group_join_input::group_join_input(
   std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
   std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches)
-  : dense_count_join_input(tag_batches(std::move(preserved_batches), std::move(counted_batches)))
+  : group_join_input(tag_batches(std::move(preserved_batches), std::move(counted_batches)))
 {
 }
 
-dense_count_join_input::dense_count_join_input(tagged_batches input)
+group_join_input::group_join_input(tagged_batches input)
   : pipelineable_operator_data(std::move(input.batches)), _input_sides(std::move(input.sides))
 {
   if (_input_sides.size() != get_data_batches().size()) {
-    throw sirius::internal_exception("dense_count_join: input side metadata is not batch-aligned");
+    throw sirius::internal_exception("group_join: input side metadata is not batch-aligned");
   }
 }
 
-sirius_physical_dense_count_join::sirius_physical_dense_count_join(
-  duckdb::vector<sirius::logical_type> types,
-  std::size_t estimated_cardinality,
-  std::size_t preserved_key_idx,
-  std::size_t counted_key_idx,
-  std::optional<std::size_t> counted_value_idx,
-  uint64_t max_bins_bytes)
+sirius_physical_group_join::sirius_physical_group_join(duckdb::vector<sirius::logical_type> types,
+                                                       std::size_t estimated_cardinality,
+                                                       groupjoin::group_join_spec spec)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::DENSE_COUNT_JOIN, std::move(types), estimated_cardinality),
-    _preserved_key_idx(preserved_key_idx),
-    _counted_key_idx(counted_key_idx),
-    _counted_value_idx(counted_value_idx),
-    _max_bins_bytes(max_bins_bytes)
+      SiriusPhysicalOperatorType::GROUP_JOIN, std::move(types), estimated_cardinality),
+    _spec(std::move(spec))
 {
-  if (this->types.size() != 2) {
-    throw sirius::internal_exception(
-      "dense_count_join: expected [key, count] output schema, got {} columns", this->types.size());
-  }
+  validate_count_pathway_spec(_spec, this->types);
 }
 
-std::string sirius_physical_dense_count_join::params_to_string() const
+std::string sirius_physical_group_join::params_to_string() const
 {
-  return " (preserved_key=" + std::to_string(_preserved_key_idx) +
-         ", counted_key=" + std::to_string(_counted_key_idx) +
-         (_counted_value_idx ? ", count_col=" + std::to_string(*_counted_value_idx)
-                             : std::string(", count_star")) +
-         ", max_bins_bytes=" + std::to_string(_max_bins_bytes) + ")";
+  return " (preserved_key=" + std::to_string(_spec.preserved_key_idx) +
+         ", counted_key=" + std::to_string(_spec.counted_key_idx) +
+         (counted_value_idx() ? ", count_col=" + std::to_string(*counted_value_idx())
+                              : std::string(", count_star")) +
+         ", max_state_bytes=" + std::to_string(_spec.max_state_bytes) + ")";
 }
 
-std::string_view sirius_physical_dense_count_join::input_port_for(
+std::string_view sirius_physical_group_join::input_port_for(
   sirius_physical_operator const& producer) const
 {
   if (children.size() != 2) {
-    throw sirius::internal_exception(
-      "DENSE_COUNT_JOIN repository wiring requires exactly two children");
+    throw sirius::internal_exception("GROUP_JOIN repository wiring requires exactly two children");
   }
   if (children[0].get() == &producer) { return PRESERVED_PORT; }
   if (children[1].get() == &producer) { return COUNTED_PORT; }
-  throw sirius::internal_exception(
-    "DENSE_COUNT_JOIN repository wiring source is not a direct child");
+  throw sirius::internal_exception("GROUP_JOIN repository wiring source is not a direct child");
 }
 
-MemoryBarrierType sirius_physical_dense_count_join::input_barrier_for(
+MemoryBarrierType sirius_physical_group_join::input_barrier_for(
   sirius_physical_operator const& /*producer*/) const
 {
   return MemoryBarrierType::FULL;
 }
 
-void sirius_physical_dense_count_join::build_pipelines(
-  pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
+void sirius_physical_group_join::build_pipelines(pipeline::sirius_pipeline& current,
+                                                 pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   // FULL-barrier sink with one input port per child.
   if (children.size() != 2) {
-    throw sirius::internal_exception("dense_count_join: expected 2 children, got {}",
-                                     children.size());
+    throw sirius::internal_exception("group_join: expected 2 children, got {}", children.size());
   }
   auto& sink_meta    = meta_pipeline.create_child_meta_pipeline(current, *this);
   auto& host_current = *sink_meta.get_base_pipeline();
@@ -318,8 +366,7 @@ void sirius_physical_dense_count_join::build_pipelines(
     auto& child_meta = sink_meta.create_child_meta_pipeline(host_current, child);
     if (child.children.empty()) { return; }
     if (child.children.size() != 1) {
-      throw sirius::internal_exception(
-        "dense_count_join: child subtree root must be unary or a leaf");
+      throw sirius::internal_exception("group_join: child subtree root must be unary or a leaf");
     }
     child_meta.build(*child.children[0]);
   };
@@ -327,7 +374,7 @@ void sirius_physical_dense_count_join::build_pipelines(
   build_child_side(*children[0]);
 }
 
-std::optional<task_creation_hint> sirius_physical_dense_count_join::get_next_task_hint()
+std::optional<task_creation_hint> sirius_physical_group_join::get_next_task_hint()
 {
   if (ports.empty()) { return std::nullopt; }
 
@@ -342,7 +389,7 @@ std::optional<task_creation_hint> sirius_physical_dense_count_join::get_next_tas
   return std::nullopt;
 }
 
-std::unique_ptr<operator_data> sirius_physical_dense_count_join::get_next_task_input_data()
+std::unique_ptr<operator_data> sirius_physical_group_join::get_next_task_input_data()
 {
   std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches;
   std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches;
@@ -358,11 +405,11 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::get_next_task_i
   drain(get_port(COUNTED_PORT), counted_batches);
 
   if (preserved_batches.empty() && counted_batches.empty()) { return nullptr; }
-  return std::make_unique<dense_count_join_input>(std::move(preserved_batches),
-                                                  std::move(counted_batches));
+  return std::make_unique<group_join_input>(std::move(preserved_batches),
+                                            std::move(counted_batches));
 }
 
-std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
+std::size_t sirius_physical_group_join::no_history_peak_memory_estimate(
   const input_stats& stats) const
 {
   using sirius::memory::saturating_add;
@@ -377,8 +424,8 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
     return (padded / allocation_alignment) * allocation_alignment;
   };
 
-  // Dense histogram bytes are capped at min(max_bins_bytes, 4 * input bytes).
-  auto const histogram_cap   = static_cast<std::size_t>(_max_bins_bytes);
+  // Dense state bytes are capped at min(max_state_bytes, 4 * input bytes).
+  auto const histogram_cap   = static_cast<std::size_t>(_spec.max_state_bytes);
   auto const histogram_bytes = std::min(histogram_cap, saturating_mul(4, stats.bytes));
 
   auto const key_width      = sirius::get_cudf_type(types[0]).id() == cudf::type_id::INT32
@@ -408,19 +455,19 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   return std::max({dense_peak, sparse_peak, minmax_peak});
 }
 
-std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_group_join::execute(const operator_data& input_data,
+                                                                   rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_dense_count_join::execute"};
-  auto const* input = dynamic_cast<const dense_count_join_input*>(&input_data);
+  nvtx3::scoped_range nvtx_range{"sirius_physical_group_join::execute"};
+  auto const* input = dynamic_cast<const group_join_input*>(&input_data);
   if (input == nullptr) {
-    throw sirius::internal_exception("dense_count_join: unexpected input data type");
+    throw sirius::internal_exception("group_join: unexpected input data type");
   }
   auto const ro_batches   = input->get_read_only_batches();
   auto const& input_sides = input->input_sides();
   if (input_sides.size() != ro_batches.size()) {
     throw sirius::internal_exception(
-      "dense_count_join: {} side tags are not aligned with {} materialized batches",
+      "group_join: {} side tags are not aligned with {} materialized batches",
       input_sides.size(),
       ro_batches.size());
   }
@@ -435,7 +482,7 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
     }
   }
   if (space == nullptr) {
-    throw sirius::internal_exception("dense_count_join: no memory space on input batches");
+    throw sirius::internal_exception("group_join: no memory space on input batches");
   }
   auto mr = space->get_default_allocator();
 
@@ -443,13 +490,14 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   auto require_key_type = [&](cudf::column_view const& col, char const* side) {
     if (col.type().id() != key_type.id()) {
       throw sirius::internal_exception(
-        "dense_count_join: {} key column carrier {} does not match declared key type {}",
+        "group_join: {} key column carrier {} does not match declared key type {}",
         side,
         static_cast<int32_t>(col.type().id()),
         static_cast<int32_t>(key_type.id()));
     }
   };
 
+  auto const counted_value_index = counted_value_idx();
   std::vector<cudf::column_view> preserved_keys;
   std::vector<cudf::column_view> counted_keys;
   std::vector<std::optional<cudf::column_view>> counted_values;
@@ -460,13 +508,13 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   for (std::size_t i = 0; i < ro_batches.size(); ++i) {
     auto const* representation = ro_batches[i].get_data();
     if (representation == nullptr) {
-      throw sirius::internal_exception("dense_count_join: input batch {} has no representation", i);
+      throw sirius::internal_exception("group_join: input batch {} has no representation", i);
     }
     input_logical_bytes = sirius::memory::saturating_add(
       input_logical_bytes, representation->get_uncompressed_data_size_in_bytes());
     auto const batch_view = sirius::get_cudf_table_view(ro_batches[i]);
-    if (input_sides[i] == dense_count_join_input::input_side::PRESERVED) {
-      auto const col = checked_column(batch_view, _preserved_key_idx, i, "preserved key");
+    if (input_sides[i] == group_join_input::input_side::PRESERVED) {
+      auto const col = checked_column(batch_view, _spec.preserved_key_idx, i, "preserved key");
       require_key_type(col, "preserved");
       preserved_rows =
         checked_add_rows(preserved_rows, static_cast<int64_t>(col.size()), "preserved");
@@ -474,20 +522,20 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
         checked_add_rows(preserved_null_keys, checked_null_count(col, i), "preserved NULL-key");
       preserved_keys.push_back(col);
     } else {
-      auto const col = checked_column(batch_view, _counted_key_idx, i, "counted key");
+      auto const col = checked_column(batch_view, _spec.counted_key_idx, i, "counted key");
       require_key_type(col, "counted");
       counted_rows = checked_add_rows(counted_rows, static_cast<int64_t>(col.size()), "counted");
       counted_keys.push_back(col);
-      if (_counted_value_idx) {
+      if (counted_value_index) {
         counted_values.emplace_back(
-          checked_column(batch_view, *_counted_value_idx, i, "COUNT argument"));
+          checked_column(batch_view, *counted_value_index, i, "COUNT argument"));
       } else {
         counted_values.emplace_back(std::nullopt);
       }
     }
   }
 
-  bool const count_star = !_counted_value_idx.has_value();
+  bool const count_star = !counted_value_index.has_value();
   bool const check_product_overflow =
     count_product_needs_validation(preserved_rows, counted_rows, count_star);
   int64_t const non_null_keys = preserved_rows - preserved_null_keys;
@@ -495,18 +543,19 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   std::unique_ptr<cudf::table> output;
   if (non_null_keys == 0) {
     _last_strategy = strategy::DENSE;
-    output = dense_count_empty_output(key_type, count_star, preserved_null_keys, stream, mr);
+    output         = group_join_empty_output(key_type, count_star, preserved_null_keys, stream, mr);
   } else {
-    auto const min_max = dense_count_global_minmax(preserved_keys, stream, mr);
+    auto const min_max = group_join_global_minmax(preserved_keys, stream, mr);
     if (!min_max) {
       throw sirius::internal_exception(
-        "dense_count_join: minmax reported no valid keys but null accounting found {}",
-        non_null_keys);
+        "group_join: minmax reported no valid keys but null accounting found {}", non_null_keys);
     }
 
     // A zero unsigned range denotes the full 64-bit domain and forces the sparse path.
     uint64_t const range_u =
       static_cast<uint64_t>(min_max->second) - static_cast<uint64_t>(min_max->first) + 1;
+    // The count bundle keeps the joint promotion rule: either side at 2^32 rows widens both
+    // count arrays.
     bool const wide = preserved_rows >= std::numeric_limits<uint32_t>::max() ||
                       counted_rows >= std::numeric_limits<uint32_t>::max();
     uint64_t const slot_bytes          = wide ? sizeof(uint64_t) : sizeof(uint32_t);
@@ -519,7 +568,7 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
     auto const non_null_rows = static_cast<std::size_t>(non_null_keys);
     auto const total_rows = sirius::memory::saturating_add(static_cast<std::size_t>(preserved_rows),
                                                            static_cast<std::size_t>(counted_rows));
-    bool const dense_ok   = layout_valid && range_u <= _max_bins_bytes / combined_slot_bytes &&
+    bool const dense_ok = layout_valid && range_u <= _spec.max_state_bytes / combined_slot_bytes &&
                           range_u <= sirius::memory::saturating_mul(8, non_null_rows) &&
                           range_u <= sirius::memory::saturating_mul(2, total_rows) &&
                           histogram_bytes <= sirius::memory::saturating_mul(4, input_logical_bytes);
@@ -528,7 +577,7 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
       _last_strategy   = strategy::DENSE;
       auto const range = static_cast<int64_t>(range_u);
       SIRIUS_LOG_INFO(
-        "[dense_count_join] dense path: keys in [{}, {}] (range {}, {}-bit slots), preserved "
+        "[group_join] dense path: keys in [{}, {}] (range {}, {}-bit slots), preserved "
         "rows {} (null keys {}), counted rows {}",
         min_max->first,
         min_max->second,
@@ -537,27 +586,50 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
         preserved_rows,
         preserved_null_keys,
         counted_rows);
-      dense_count_state state(min_max->first, range, wide, stream, mr);
-      for (auto const& col : preserved_keys) {
-        state.accumulate_preserved(col, stream);
+      auto const dispatch_key = [&](auto key_tag) {
+        using KeyT = decltype(key_tag);
+        return wide ? run_dense_count<KeyT, uint64_t>(min_max->first,
+                                                      range,
+                                                      preserved_keys,
+                                                      counted_keys,
+                                                      counted_values,
+                                                      key_type,
+                                                      count_star,
+                                                      preserved_null_keys,
+                                                      check_product_overflow,
+                                                      stream,
+                                                      mr)
+                    : run_dense_count<KeyT, uint32_t>(min_max->first,
+                                                      range,
+                                                      preserved_keys,
+                                                      counted_keys,
+                                                      counted_values,
+                                                      key_type,
+                                                      count_star,
+                                                      preserved_null_keys,
+                                                      check_product_overflow,
+                                                      stream,
+                                                      mr);
+      };
+      switch (key_type.id()) {
+        case cudf::type_id::INT32: output = dispatch_key(int32_t{}); break;
+        case cudf::type_id::INT64: output = dispatch_key(int64_t{}); break;
+        default:
+          throw sirius::internal_exception(
+            "group_join: unsupported key column type {} (expected INT32/INT64)",
+            static_cast<int32_t>(key_type.id()));
       }
-      for (std::size_t i = 0; i < counted_keys.size(); ++i) {
-        state.accumulate_counted(
-          counted_keys[i], counted_values[i] ? &*counted_values[i] : nullptr, stream);
-      }
-      output =
-        state.emit(key_type, count_star, preserved_null_keys, stream, mr, check_product_overflow);
     } else {
       _last_strategy = strategy::SPARSE;
       SIRIUS_LOG_INFO(
-        "[dense_count_join] sparse path: keys in [{}, {}], range {}, histogram bytes {}, "
+        "[group_join] sparse path: keys in [{}, {}], range {}, histogram bytes {}, "
         "input bytes {}, budget {}",
         min_max->first,
         min_max->second,
         range_u,
         histogram_bytes,
         input_logical_bytes,
-        _max_bins_bytes);
+        _spec.max_state_bytes);
 
       std::vector<std::unique_ptr<cudf::table>> counted_partials;
       for (std::size_t i = 0; i < counted_keys.size(); ++i) {
@@ -640,18 +712,18 @@ std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
       if (preserved_null_keys > 0) {
         if (output->num_rows() == std::numeric_limits<cudf::size_type>::max()) {
           throw sirius::invalid_input_exception(
-            "dense_count_join: adding the NULL group would exceed cudf::size_type max {}",
+            "group_join: adding the NULL group would exceed cudf::size_type max {}",
             std::numeric_limits<cudf::size_type>::max());
         }
         auto null_group =
-          dense_count_empty_output(key_type, count_star, preserved_null_keys, stream, mr);
+          group_join_empty_output(key_type, count_star, preserved_null_keys, stream, mr);
         std::vector<cudf::table_view> parts{output->view(), null_group->view()};
         output = cudf::concatenate(parts, stream, mr);
       }
     }
   }
 
-  SIRIUS_LOG_INFO("[dense_count_join] emitted {} group rows ({} strategy)",
+  SIRIUS_LOG_INFO("[group_join] emitted {} group rows ({} strategy)",
                   output->num_rows(),
                   _last_strategy == strategy::DENSE ? "dense" : "sparse");
 

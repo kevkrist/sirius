@@ -978,7 +978,7 @@ measurement-regimes protocol), and fail-closed by default.
 
 | PR | content | gate to merge |
 |---|---|---|
-| **PR-1** | Mechanical generalization: `GROUP_JOIN` enum + `sirius_physical_group_join` + spec/bundle types; count bundle only; detection restructured into the ladder with P0 verbatim; all integration arms updated; docs updated | SASS parity on count kernels; allocation-set parity; full unit + SQLLogic suites; **SF1000 kit A/B neutral within run noise**; plan-parity check (EXPLAIN comparison, feature config unchanged) on all 22 queries |
+| **PR-1** | Mechanical generalization: `GROUP_JOIN` enum + `sirius_physical_group_join` + spec/bundle types; count bundle only; detection restructured into the ladder with P0 verbatim; all integration arms updated; docs updated | SASS parity on count kernels; allocation-set parity; full unit suite + Super-Sirius SQL coverage (the legacy-only `test/sql/` harness is waived, see §10); **SF1000 kit A/B neutral within run noise**; plan-parity check (EXPLAIN comparison, feature config unchanged) on all 22 queries |
 | **PR-2** | Value slot policies (SUM/MIN/MAX/AVG), INNER + DIRECT forms, value-extrema fold-in, sparse-value fallback, overflow policies, NULL-group slot; **no planner rung enabled** — Catch2 drives the executor directly | Catch2 kernel/operator suites incl. oracle comparisons; kit neutral by construction (plan parity asserted) |
 | **PR-3** | P1 (q17) detection rung behind `enable_group_join` (default off); counted-byte plan gate (device-mem/24, §4.8); **preserved-port membership publication** (§4.9 prerequisite); delim-fed wiring arms + fused-under-delim conversion test (§4.8); SQLLogic + oracle tests | scattered-atomic microbenchmark (§4.4) run and archived; **SF100** kit A/B with the knob on: q17 fuses (verified in the log) and improves or is neutral; **SF1000**: fusion declines by design (byte gate) — assert plan parity and no regression on the 22-query suite (leave-one-out discipline); then flip default on. The SF1000 q17 win is *not* claimable here |
 | **PR-4** | P2 (q2) DIRECT rung; single-child sink build path + per-form narrowing/compressed-schema arms (§4.8/§4.9); dense-forcing DIRECT reachability test (§10) | same protocol; accept neutral for q2 given no suite regressions |
@@ -993,10 +993,14 @@ bit-identical-to-today behavior; PR-1's refactor itself is guarded by its parity
 ## 10. Test plan
 
 **Correctness oracle (every pathway):** the same query with (a) `enable_group_join = false`
-(Sirius generic GPU path) and (b) `gpu_execution = false` (DuckDB CPU). SQLLogic files assert
-identical results; Catch2 operator tests compare tables directly.
+(Sirius generic GPU path) and (b) `gpu_execution = false` (DuckDB CPU). The SQL-level tests
+below assert identical results; Catch2 operator tests compare tables directly.
 
-**SQLLogic per pathway** (extend `test/sql/` alongside `tpch-sirius.test`):
+**SQL-level tests per pathway.** The existing `test/sql/*.test` SQLLogic files drive only the
+legacy `gpu_processing` engine (`gpu_processing`/`gpu_buffer_init` are registered only under
+`SIRIUS_ENABLE_LEGACY`, which is OFF in the build and in CI), so pathway SQL tests land as Catch2
+integration SQL through transparent interception (the `test_gpu_execution_group_join.cpp`
+pattern), covering:
 
 - empty inputs: empty preserved / empty counted / both; empty delim buffer (zero correlation
   keys) for P1;
@@ -1085,3 +1089,4 @@ and exactly one sync on the new pathways.
 - [semantics/major] `matched` conflates c2 with the valid-arg count; no handling for all-NULL-argument groups -> fixed: the same argument-validity gate makes valid ≡ matched ≡ c2 provably equal on the dense path (also deleting AVG's valid_cnt array); the sparse path computes both COUNT(arg) and COUNT(*) per key for nullable-argument INNER and carries output validity masks through merge and ⊗; §4.5 gains the missing "key matches, zero valid arguments" row; separate-c2 dense state stays a named seam, §4.2/§4.4/§4.5.
 - [architecture/blocker] Delim-fed preserved-side wiring refuted by source -> fixed: new "wiring by input provenance" subsection (§4.8) — routing-only DELIM_SCAN child gets `build_pipelines` invoked in place (dependency registration, no producer pipeline); `input_port_for` gains an owning-delim distinct-chain-root arm mapping to "preserved" (hash-join CONCAT precedent), fail-closed otherwise; hint semantics restated for the MERGE_GROUP_BY src_pipeline; §4.9's delim row corrected from "unmodified" and a fused-under-delim conversion test added to PR-3's gate, §4.8/§4.9/§9/§10.
 - [architecture/major] DIRECT cannot reuse today's build_pipelines or 2-child-guarded arms -> fixed: DIRECT specified as the standard single-child sink pattern (base-class shape, operator.cpp:167-181) in §4.8 provenance class 3; §4.9's narrowing/compressed-schema rows now specify per-form arms including the single-child variant; PR-4's scope updated, §4.8/§4.9/§5.2/§9.
+- [process/minor, PR-1 audit] PR-1's SQLLogic merge gate targeted a harness the build cannot run -> amended: `test/sql/*.test` drives only the legacy `gpu_processing` engine (both table functions registered under `SIRIUS_ENABLE_LEGACY`, OFF in the build and in CI), so the PR-1 gate substitutes Super-Sirius SQL coverage (Catch2 integration suite via transparent interception + kit A/B result parity; waiver evidence in `scratchpad/pr1/sqllogic-waiver.md`), and §10's per-pathway SQL tests are re-homed from extending `test/sql/` to the `test_gpu_execution_*` Catch2 integration pattern, §9/§10. All other PR-1 deviations from this doc: none found (P0 detection verbatim under rename per working-tree diff; §4.2 spec/concept/bundle realized as written; §6's host dispatch realized as a monomorphized switch — the one-bundle degenerate of the whitelist table).

@@ -16,7 +16,7 @@
 
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
-#include "op/sirius_physical_dense_count_join.hpp"
+#include "op/sirius_physical_group_join.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
@@ -63,7 +63,7 @@ class scoped_temp_db_path {
  public:
   scoped_temp_db_path()
   {
-    char tmpl[] = "/tmp/sirius_dense_count_join_XXXXXX";
+    char tmpl[] = "/tmp/sirius_group_join_XXXXXX";
     int fd      = ::mkstemp(tmpl);
     REQUIRE(fd >= 0);
     ::close(fd);
@@ -92,7 +92,7 @@ class scoped_temp_directory {
  public:
   scoped_temp_directory()
   {
-    char tmpl[] = "/tmp/sirius_dense_count_join_dso_XXXXXX";
+    char tmpl[] = "/tmp/sirius_group_join_dso_XXXXXX";
     auto* path  = ::mkdtemp(tmpl);
     REQUIRE(path != nullptr);
     _path = path;
@@ -266,8 +266,8 @@ void require_q13_counted_filter(sirius::op::sirius_physical_operator* preserved,
   CHECK(counted_scan.column_ids[column_index].GetPrimaryIndex() == 2);
 }
 
-struct dense_count_join_fixture {
-  dense_count_join_fixture()
+struct group_join_fixture {
+  group_join_fixture()
   {
     auto cfg = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "config" / "data" /
                "minimal.yaml";
@@ -289,14 +289,14 @@ struct dense_count_join_fixture {
       "INSERT INTO ord SELECT range, (range * 7) % 30, concat('n', range) FROM range(200)");
   }
 
-  ~dense_count_join_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
+  ~group_join_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
 
-  bool has_dense_count_join(const std::string& query, plan_generation_options options = {})
+  bool has_group_join(const std::string& query, plan_generation_options options = {})
   {
     auto plan = generate_sirius_plan(*con, query, options);
     REQUIRE(plan);
     using T          = sirius::op::SiriusPhysicalOperatorType;
-    auto const fused = collect(plan.get(), T::DENSE_COUNT_JOIN);
+    auto const fused = collect(plan.get(), T::GROUP_JOIN);
     if (fused.empty()) { return false; }
     REQUIRE(fused.size() == 1);
     REQUIRE(collect(plan.get(), T::HASH_JOIN).empty());
@@ -312,41 +312,41 @@ struct dense_count_join_fixture {
 
 }  // namespace
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join fires on COUNT(col) grouped by the preserved LEFT-join key",
-                 "[dense_count_join][plan]")
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join fires on COUNT(col) grouped by the preserved LEFT-join key",
+                 "[group_join][plan]")
 {
   auto const query =
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id";
-  REQUIRE(has_dense_count_join(query));
+  REQUIRE(has_group_join(query));
   auto plan = generate_sirius_plan(*con, query);
   REQUIRE(collect(plan.get(), sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY).empty());
 }
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join fires on COUNT(*) and on the RIGHT-join orientation",
-                 "[dense_count_join][plan]")
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join fires on COUNT(*) and on the RIGHT-join orientation",
+                 "[group_join][plan]")
 {
-  REQUIRE(has_dense_count_join(
-    "SELECT c_id, count(*) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id"));
-  REQUIRE(has_dense_count_join(
+  REQUIRE(
+    has_group_join("SELECT c_id, count(*) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id"));
+  REQUIRE(has_group_join(
     "SELECT c_id, count(o_id) FROM ord RIGHT JOIN cust ON o_cust = c_id GROUP BY c_id"));
 }
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join fires inside the filtered two-level q13 distribution shape",
-                 "[dense_count_join][plan]")
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join fires inside the filtered two-level q13 distribution shape",
+                 "[group_join][plan]")
 {
   auto const query =
     "SELECT c_count, count(*) AS custdist FROM ("
     "  SELECT c_id, count(o_id) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust "
     "    AND o_note NOT LIKE '%special%requests%' GROUP BY c_id"
     ") t GROUP BY c_count";
-  REQUIRE(has_dense_count_join(query));
+  REQUIRE(has_group_join(query));
 
   auto plan  = generate_sirius_plan(*con, query);
   using T    = sirius::op::SiriusPhysicalOperatorType;
-  auto fused = collect(plan.get(), T::DENSE_COUNT_JOIN);
+  auto fused = collect(plan.get(), T::GROUP_JOIN);
   REQUIRE(fused.size() == 1);
   REQUIRE(fused[0]->children.size() == 2);
   CHECK(collect(fused[0]->children[0].get(), T::FILTER).empty());
@@ -355,48 +355,48 @@ TEST_CASE_METHOD(dense_count_join_fixture,
   REQUIRE(collect(plan.get(), T::HASH_GROUP_BY).size() == 1);
 }
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join conversion preserves its filtered counted input and FULL "
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join conversion preserves its filtered counted input and FULL "
                  "barriers",
-                 "[dense_count_join][pipeline]")
+                 "[group_join][pipeline]")
 {
   auto const query =
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust "
     "  AND o_note NOT LIKE '%special%requests%' GROUP BY c_id";
 
-  REQUIRE(has_dense_count_join(query));
+  REQUIRE(has_group_join(query));
 
   sirius::test::with_conversion_result(
     *con, query, [](sirius::pipeline::pipeline_conversion_result& result) {
       using sirius::op::MemoryBarrierType;
       using sirius::op::SiriusPhysicalOperatorType;
-      using sirius::op::sirius_physical_dense_count_join;
+      using sirius::op::sirius_physical_group_join;
       using sirius::pipeline::repository_wiring;
       using sirius::pipeline::sirius_pipeline;
 
-      sirius_pipeline* dense_pipeline = nullptr;
+      sirius_pipeline* fused_pipeline = nullptr;
       for (auto const& pipeline : result.scheduled_pipelines) {
         for (auto const& op_ref : pipeline->get_operators()) {
-          if (op_ref.get().type != SiriusPhysicalOperatorType::DENSE_COUNT_JOIN) { continue; }
-          REQUIRE(dense_pipeline == nullptr);
-          dense_pipeline = pipeline.get();
+          if (op_ref.get().type != SiriusPhysicalOperatorType::GROUP_JOIN) { continue; }
+          REQUIRE(fused_pipeline == nullptr);
+          fused_pipeline = pipeline.get();
         }
       }
 
-      REQUIRE(dense_pipeline != nullptr);
-      auto const operators = dense_pipeline->get_operators();
+      REQUIRE(fused_pipeline != nullptr);
+      auto const operators = fused_pipeline->get_operators();
       REQUIRE(operators.size() == 1);
-      auto const* dense = &operators[0].get();
-      CHECK(dense_pipeline->get_source().get() == dense);
-      CHECK(dense_pipeline->get_sink().get() == dense);
-      REQUIRE(dense->children.size() == 2);
-      CHECK(collect(dense->children[0].get(), SiriusPhysicalOperatorType::FILTER).empty());
-      CHECK(collect(dense->children[1].get(), SiriusPhysicalOperatorType::FILTER).empty());
-      require_q13_counted_filter(dense->children[0].get(), dense->children[1].get());
+      auto const* fused = &operators[0].get();
+      CHECK(fused_pipeline->get_source().get() == fused);
+      CHECK(fused_pipeline->get_sink().get() == fused);
+      REQUIRE(fused->children.size() == 2);
+      CHECK(collect(fused->children[0].get(), SiriusPhysicalOperatorType::FILTER).empty());
+      CHECK(collect(fused->children[1].get(), SiriusPhysicalOperatorType::FILTER).empty());
+      require_q13_counted_filter(fused->children[0].get(), fused->children[1].get());
 
       std::vector<repository_wiring const*> inputs;
       for (auto const& wiring : result.repository_wirings) {
-        if (wiring.dest_pipeline.get() == dense_pipeline) { inputs.push_back(&wiring); }
+        if (wiring.dest_pipeline.get() == fused_pipeline) { inputs.push_back(&wiring); }
       }
       REQUIRE(inputs.size() == 2);
 
@@ -409,39 +409,39 @@ TEST_CASE_METHOD(dense_count_join_fixture,
         }
         REQUIRE(match != nullptr);
         CHECK(match->barrier_type == MemoryBarrierType::FULL);
-        CHECK(match->source_op == dense->children[child_index].get());
+        CHECK(match->source_op == fused->children[child_index].get());
         REQUIRE(match->source_pipeline);
-        CHECK(match->source_pipeline->get_sink().get() == dense->children[child_index].get());
+        CHECK(match->source_pipeline->get_sink().get() == fused->children[child_index].get());
       };
 
-      require_direct_input(0, sirius_physical_dense_count_join::PRESERVED_PORT);
-      require_direct_input(1, sirius_physical_dense_count_join::COUNTED_PORT);
+      require_direct_input(0, sirius_physical_group_join::PRESERVED_PORT);
+      require_direct_input(1, sirius_physical_group_join::COUNTED_PORT);
     });
 }
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join declines off-shape aggregates and joins",
-                 "[dense_count_join][plan]")
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join declines off-shape aggregates and joins",
+                 "[group_join][plan]")
 {
-  CHECK_FALSE(has_dense_count_join(
-    "SELECT c_id, count(o_id) FROM cust JOIN ord ON c_id = o_cust GROUP BY c_id"));
-  CHECK_FALSE(has_dense_count_join(
+  CHECK_FALSE(
+    has_group_join("SELECT c_id, count(o_id) FROM cust JOIN ord ON c_id = o_cust GROUP BY c_id"));
+  CHECK_FALSE(has_group_join(
     "SELECT c_grp, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_grp"));
-  CHECK_FALSE(has_dense_count_join(
+  CHECK_FALSE(has_group_join(
     "SELECT c_id, count(o_id), max(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY "
     "c_id"));
-  CHECK_FALSE(has_dense_count_join(
+  CHECK_FALSE(has_group_join(
     "SELECT c_id, count(DISTINCT o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id"));
-  CHECK_FALSE(has_dense_count_join(
+  CHECK_FALSE(has_group_join(
     "SELECT c_id, sum(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id"));
   // A nullable preserved-side COUNT has different outer-join NULL semantics.
-  CHECK_FALSE(has_dense_count_join(
+  CHECK_FALSE(has_group_join(
     "SELECT c_id, count(c_grp) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id"));
 }
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join authenticates COUNT callbacks, not its public name",
-                 "[dense_count_join][plan]")
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join authenticates COUNT callbacks, not its public name",
+                 "[group_join][plan]")
 {
   auto const query =
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id";
@@ -449,24 +449,24 @@ TEST_CASE_METHOD(dense_count_join_fixture,
     *con, query, plan_generation_options{.mutate = spoof_first_count_callback});
   REQUIRE(plan);
   using T = sirius::op::SiriusPhysicalOperatorType;
-  CHECK(collect(plan.get(), T::DENSE_COUNT_JOIN).empty());
+  CHECK(collect(plan.get(), T::GROUP_JOIN).empty());
   CHECK(collect(plan.get(), T::HASH_JOIN).size() == 1);
   CHECK(collect(plan.get(), T::HASH_GROUP_BY).size() == 1);
 }
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join accepts optimizer-created COUNT_STAR without provenance",
-                 "[dense_count_join][plan]")
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join accepts optimizer-created COUNT_STAR without provenance",
+                 "[group_join][plan]")
 {
   auto const query =
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id";
-  REQUIRE(has_dense_count_join(
+  REQUIRE(has_group_join(
     query, plan_generation_options{.mutate = replace_first_count_with_internal_count_star}));
 }
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join rejects COUNT with non-system provenance",
-                 "[dense_count_join][plan]")
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join rejects COUNT with non-system provenance",
+                 "[group_join][plan]")
 {
   auto const query =
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id";
@@ -474,75 +474,75 @@ TEST_CASE_METHOD(dense_count_join_fixture,
     *con, query, plan_generation_options{.mutate = assign_non_system_count_provenance});
   REQUIRE(plan);
   using T = sirius::op::SiriusPhysicalOperatorType;
-  CHECK(collect(plan.get(), T::DENSE_COUNT_JOIN).empty());
+  CHECK(collect(plan.get(), T::GROUP_JOIN).empty());
   CHECK(collect(plan.get(), T::HASH_JOIN).size() == 1);
   CHECK(collect(plan.get(), T::HASH_GROUP_BY).size() == 1);
 }
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join defaults to the fused plan and supports an explicit opt-out",
-                 "[dense_count_join][plan]")
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join defaults to the fused plan and supports an explicit opt-out",
+                 "[group_join][plan]")
 {
   auto const query =
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id";
 
   auto reset = con->Query("RESET enable_dense_count_join");
   REQUIRE_FALSE(reset->HasError());
-  REQUIRE(has_dense_count_join(query));
+  REQUIRE(has_group_join(query));
 
   auto off = con->Query("SET enable_dense_count_join = false");
   REQUIRE_FALSE(off->HasError());
   auto disabled_plan = generate_sirius_plan(*con, query);
   REQUIRE(disabled_plan);
   using T = sirius::op::SiriusPhysicalOperatorType;
-  CHECK(collect(disabled_plan.get(), T::DENSE_COUNT_JOIN).empty());
+  CHECK(collect(disabled_plan.get(), T::GROUP_JOIN).empty());
   CHECK(collect(disabled_plan.get(), T::HASH_JOIN).size() == 1);
   CHECK(collect(disabled_plan.get(), T::HASH_GROUP_BY).size() == 1);
 }
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join declines filtered aggregates, extra conditions, and "
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join declines filtered aggregates, extra conditions, and "
                  "non-plain keys",
-                 "[dense_count_join][plan]")
+                 "[group_join][plan]")
 {
-  CHECK_FALSE(has_dense_count_join(
+  CHECK_FALSE(has_group_join(
     "SELECT c_id, count(o_id) FILTER (WHERE o_id > 0) FROM cust LEFT JOIN ord ON c_id = o_cust "
     "GROUP BY c_id"));
-  CHECK_FALSE(has_dense_count_join(
+  CHECK_FALSE(has_group_join(
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust AND c_grp = o_cust "
     "GROUP BY c_id"));
   // A preserved-side ON residual cannot move below LEFT JOIN without dropping retained rows.
   CHECK_THROWS_WITH(
-    has_dense_count_join(
+    has_group_join(
       "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust AND c_grp > 0 "
       "GROUP BY c_id"),
     Catch::Contains("Any join not supported"));
   // INTEGER = BIGINT inserts a CAST, so the plain-reference gate declines.
-  CHECK_FALSE(has_dense_count_join(
+  CHECK_FALSE(has_group_join(
     "SELECT c_id, count(o_cust) FROM cust LEFT JOIN ord ON c_id = o_id GROUP BY c_id"));
-  CHECK_FALSE(has_dense_count_join(
+  CHECK_FALSE(has_group_join(
     "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id IS NOT DISTINCT FROM o_cust "
     "GROUP BY c_id"));
 }
 
-TEST_CASE_METHOD(dense_count_join_fixture,
-                 "dense_count_join declines intervening operators and non-linear join children",
-                 "[dense_count_join][plan]")
+TEST_CASE_METHOD(group_join_fixture,
+                 "group_join declines intervening operators and non-linear join children",
+                 "[group_join][plan]")
 {
   CHECK_FALSE(
-    has_dense_count_join("SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust "
-                         "WHERE (o_id IS NULL OR c_grp = 0) GROUP BY c_id"));
-  CHECK_FALSE(has_dense_count_join(
+    has_group_join("SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust "
+                   "WHERE (o_id IS NULL OR c_grp = 0) GROUP BY c_id"));
+  CHECK_FALSE(has_group_join(
     "SELECT o_cust, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY o_cust"));
   // Identity projection can be elided, exposing the non-linear join child.
   CHECK_FALSE(
-    has_dense_count_join("SELECT c_id, count(o.o_id) FROM cust LEFT JOIN ("
-                         "  SELECT o1.o_id, o1.o_cust FROM ord o1 JOIN ord o2 ON o1.o_id = o2.o_id"
-                         ") o ON c_id = o.o_cust GROUP BY c_id"));
+    has_group_join("SELECT c_id, count(o.o_id) FROM cust LEFT JOIN ("
+                   "  SELECT o1.o_id, o1.o_cust FROM ord o1 JOIN ord o2 ON o1.o_id = o2.o_id"
+                   ") o ON c_id = o.o_cust GROUP BY c_id"));
 }
 
-TEST_CASE("dense_count_join recognizes host COUNT callbacks through a dynamically loaded extension",
-          "[dense_count_join][plan][dynamic_load]")
+TEST_CASE("group_join recognizes host COUNT callbacks through a dynamically loaded extension",
+          "[group_join][plan][dynamic_load]")
 {
   scoped_temp_directory temp;
   auto const executable = std::filesystem::canonical("/proc/self/exe");
@@ -695,7 +695,7 @@ con.close()
     log_text.push_back('\n');
   }
 
-  static constexpr std::string_view marker = "Fusing COUNT-join into DENSE_COUNT_JOIN";
+  static constexpr std::string_view marker = "Fusing COUNT-join into GROUP_JOIN";
   std::vector<std::string> fusion_lines;
   std::istringstream log_lines{log_text};
   for (std::string line; std::getline(log_lines, line);) {

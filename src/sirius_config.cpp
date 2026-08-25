@@ -298,7 +298,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_dense_count_join", opt.enable_dense_count_join);
   if (r.has("dense_count_join_max_bytes")) {
     throw std::runtime_error(
-      "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "
+      "'sirius.operator_params.dense_count_join_max_bytes': removed; GROUP_JOIN count-state "
       "sizing is an internal engine policy; remove this key");
   }
   // 0 is meaningful here: it turns the estimate off and leaves sizing to gpus_per_query.

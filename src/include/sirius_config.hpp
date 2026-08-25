@@ -182,10 +182,10 @@ struct operator_params {
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
 
-  /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
+  /// Enable GROUP_JOIN planning of the fused COUNT pathway for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
-  /// Engine-owned histogram budget; declined ranges use exact sparse aggregation.
+  /// Engine-owned GROUP_JOIN count-state budget; declined ranges use exact sparse aggregation.
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.

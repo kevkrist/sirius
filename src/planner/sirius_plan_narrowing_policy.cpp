@@ -20,8 +20,8 @@
 #include "expression/ast/utils.hpp"
 #include "helper/numeric_narrowing.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
+#include "op/sirius_physical_group_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_projection.hpp"
@@ -436,9 +436,9 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
       return map;
     }
 
-    case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN: {
+    case sirius::op::SiriusPhysicalOperatorType::GROUP_JOIN: {
       if (op.children.size() != 2) { break; }
-      auto const& join             = op.Cast<sirius::op::sirius_physical_dense_count_join>();
+      auto const& join             = op.Cast<sirius::op::sirius_physical_group_join>();
       auto const preserved_key_idx = join.preserved_key_idx();
       auto const counted_key_idx   = join.counted_key_idx();
       if (preserved_key_idx >= child_maps[0].size() || counted_key_idx >= child_maps[1].size() ||

@@ -190,7 +190,9 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
 
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
+  // Fail-closed GROUPJOIN detection ladder; plans a fused sirius_physical_group_join or returns
+  // null so generic join+aggregate planning proceeds.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_group_join(
     duckdb::LogicalAggregate& op);
 
   // Sirius reads and projects nested (STRUCT/LIST/MAP) columns but cannot operate

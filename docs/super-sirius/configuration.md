@@ -599,7 +599,7 @@ SET enable_compressed_materialization = false;
 | `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
-| `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
+| `enable_dense_count_join` | true | Enable the GROUP_JOIN operator's fused count-over-outer-join pathway; accepted only as a strict boolean under `sirius.operator_params`. |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see
@@ -611,9 +611,9 @@ under `sirius.operator_params`, but it is not a normal session setting.
 
 Runtime distinct-build probing is also engine-owned and is temporarily disabled pending #1600.
 
-Dense count-join is enabled by default and can be disabled with
+GROUP_JOIN's count pathway is enabled by default and can be disabled with
 `sirius.operator_params.enable_dense_count_join: false`. Both inputs are FULL barriers, so the
-inputs and workspace must fit one GPU task. Its histogram budget is engine-owned.
+inputs and workspace must fit one GPU task. Its dense-state budget is engine-owned.
 
 ### GPU Admission
 

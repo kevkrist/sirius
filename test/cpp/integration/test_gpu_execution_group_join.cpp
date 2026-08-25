@@ -24,9 +24,9 @@
 
 namespace {
 
-class DenseCountJoinFixture : public sirius::test::GpuExecutionFixture {
+class GroupJoinFixture : public sirius::test::GpuExecutionFixture {
  public:
-  DenseCountJoinFixture()
+  GroupJoinFixture()
   {
     enable_guard.emplace(*con, "enable_dense_count_join", true);
     run_ok("CREATE TABLE cust (c_id INTEGER, c_grp INTEGER);");
@@ -45,17 +45,17 @@ class DenseCountJoinFixture : public sirius::test::GpuExecutionFixture {
 
 }  // namespace
 
-TEST_CASE_METHOD(DenseCountJoinFixture,
-                 "gpu_execution dense count-join: COUNT(col) grouped by the LEFT-join key",
-                 "[integration][gpu_execution][dense_count_join]")
+TEST_CASE_METHOD(GroupJoinFixture,
+                 "gpu_execution group join: COUNT(col) grouped by the LEFT-join key",
+                 "[integration][gpu_execution][group_join]")
 {
   compare_gpu_vs_cpu(
     "SELECT c_id, count(o_id) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
 }
 
-TEST_CASE_METHOD(DenseCountJoinFixture,
-                 "gpu_execution dense count-join: COUNT(*) and nullable COUNT(col) semantics",
-                 "[integration][gpu_execution][dense_count_join]")
+TEST_CASE_METHOD(GroupJoinFixture,
+                 "gpu_execution group join: COUNT(*) and nullable COUNT(col) semantics",
+                 "[integration][gpu_execution][group_join]")
 {
   compare_gpu_vs_cpu(
     "SELECT c_id, count(*) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
@@ -64,18 +64,18 @@ TEST_CASE_METHOD(DenseCountJoinFixture,
     "c_id");
 }
 
-TEST_CASE_METHOD(DenseCountJoinFixture,
-                 "gpu_execution dense count-join: RIGHT-join orientation",
-                 "[integration][gpu_execution][dense_count_join]")
+TEST_CASE_METHOD(GroupJoinFixture,
+                 "gpu_execution group join: RIGHT-join orientation",
+                 "[integration][gpu_execution][group_join]")
 {
   compare_gpu_vs_cpu(
     "SELECT c_id, count(o_id) AS c_count FROM ord RIGHT JOIN cust ON o_cust = c_id GROUP BY "
     "c_id");
 }
 
-TEST_CASE_METHOD(DenseCountJoinFixture,
-                 "gpu_execution dense count-join: full q13 distribution shape with ORDER BY",
-                 "[integration][gpu_execution][dense_count_join]")
+TEST_CASE_METHOD(GroupJoinFixture,
+                 "gpu_execution group join: full q13 distribution shape with ORDER BY",
+                 "[integration][gpu_execution][group_join]")
 {
   compare_gpu_vs_cpu_ordered(
     "SELECT c_count, count(*) AS custdist FROM ("
@@ -84,9 +84,9 @@ TEST_CASE_METHOD(DenseCountJoinFixture,
     ") t GROUP BY c_count ORDER BY custdist DESC, c_count DESC");
 }
 
-TEST_CASE_METHOD(DenseCountJoinFixture,
-                 "gpu_execution dense count-join: sparse strategy under a tiny histogram budget",
-                 "[integration][gpu_execution][dense_count_join]")
+TEST_CASE_METHOD(GroupJoinFixture,
+                 "gpu_execution group join: sparse strategy under a tiny histogram budget",
+                 "[integration][gpu_execution][group_join]")
 {
   sirius::test::scoped_sirius_setting budget{*con, "dense_count_join_max_bytes", std::uint64_t{8}};
   compare_gpu_vs_cpu(
@@ -95,18 +95,18 @@ TEST_CASE_METHOD(DenseCountJoinFixture,
     "SELECT c_id, count(*) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
 }
 
-TEST_CASE_METHOD(DenseCountJoinFixture,
-                 "gpu_execution dense count-join: disabled knob keeps the join plan correct",
-                 "[integration][gpu_execution][dense_count_join]")
+TEST_CASE_METHOD(GroupJoinFixture,
+                 "gpu_execution group join: disabled knob keeps the join plan correct",
+                 "[integration][gpu_execution][group_join]")
 {
   sirius::test::scoped_sirius_setting disabled{*con, "enable_dense_count_join", false};
   compare_gpu_vs_cpu(
     "SELECT c_id, count(o_id) AS c_count FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id");
 }
 
-TEST_CASE_METHOD(DenseCountJoinFixture,
-                 "gpu_execution dense count-join: scoped settings restore during unwinding",
-                 "[integration][gpu_execution][dense_count_join]")
+TEST_CASE_METHOD(GroupJoinFixture,
+                 "gpu_execution group join: scoped settings restore during unwinding",
+                 "[integration][gpu_execution][group_join]")
 {
   auto sirius_ctx          = sirius::test::get_registered_sirius_context(*con);
   auto const enable_before = sirius_ctx->get_config().get_operator_params().enable_dense_count_join;
@@ -126,9 +126,9 @@ TEST_CASE_METHOD(DenseCountJoinFixture,
   CHECK(sirius_ctx->get_config().get_operator_params().dense_count_join_max_bytes == budget_before);
 }
 
-TEST_CASE_METHOD(DenseCountJoinFixture,
-                 "gpu_execution dense count-join: runtime-empty sides",
-                 "[integration][gpu_execution][dense_count_join]")
+TEST_CASE_METHOD(GroupJoinFixture,
+                 "gpu_execution group join: runtime-empty sides",
+                 "[integration][gpu_execution][group_join]")
 {
   // Keep scans nonempty at plan time so filters produce empty inputs at runtime.
   compare_gpu_vs_cpu(

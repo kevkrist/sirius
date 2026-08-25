@@ -855,7 +855,7 @@ bool terminal_sink_supports_fusion(const sirius::op::sirius_physical_operator& s
     case T::CTE:
     case T::LEFT_DELIM_JOIN:
     case T::RIGHT_DELIM_JOIN:
-    case T::DENSE_COUNT_JOIN:
+    case T::GROUP_JOIN:
     case T::HASH_JOIN:
     case T::NESTED_LOOP_JOIN: return false;
     // Partition sinks require complete upstream input in a single task.

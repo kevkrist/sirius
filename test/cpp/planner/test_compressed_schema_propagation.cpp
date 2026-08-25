@@ -36,8 +36,8 @@
 #include "helper/logical_type.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
+#include "op/sirius_physical_group_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -50,7 +50,7 @@
 
 #include <catch.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
-#include <utils/dense_count_join_test_builder.hpp>
+#include <utils/group_join_test_builder.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -65,7 +65,7 @@ using sirius::op::sirius_physical_operator;
 using sirius::op::SiriusPhysicalOperatorType;
 
 namespace {
-using sirius::test::make_dense_count_join;
+using sirius::test::make_group_join;
 
 constexpr cudf::data_type k_int8{cudf::type_id::INT8};
 constexpr cudf::data_type k_int16{cudf::type_id::INT16};
@@ -379,10 +379,10 @@ TEST_CASE("compressed_schema_propagation - hash join restores keys and maps payl
   }
 }
 
-TEST_CASE("compressed_schema_propagation - dense count restores only keys and emits native",
+TEST_CASE("compressed_schema_propagation - group join restores only keys and emits native",
           "[compressed_schema_propagation]")
 {
-  duckdb::unique_ptr<sirius_physical_operator> plan = make_dense_count_join(
+  duckdb::unique_ptr<sirius_physical_operator> plan = make_group_join(
     /*preserved_key_idx=*/1,
     /*counted_key_idx=*/0,
     /*counted_value_idx=*/1,

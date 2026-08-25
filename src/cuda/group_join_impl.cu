@@ -15,7 +15,7 @@
  */
 
 // clang-format off
-#include <op/aggregate/dense_count_join_impl.hpp>
+#include <op/aggregate/group_join_impl.hpp>
 #include <sirius/exception.hpp>
 
 #include <cudf/column/column.hpp>
@@ -36,10 +36,12 @@
 
 #include <algorithm>
 #include <array>
+#include <concepts>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <type_traits>
 #include <utility>
 #include <vector>
 // clang-format on
@@ -51,6 +53,14 @@ namespace {
 constexpr int k_block_size      = 256;
 constexpr int64_t k_max_blocks  = 4096;
 constexpr uint64_t k_bigint_max = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+
+template <typename KeyT>
+[[nodiscard]] constexpr cudf::type_id key_type_id_for()
+{
+  static_assert(std::is_same_v<KeyT, int32_t> || std::is_same_v<KeyT, int64_t>,
+                "group_join keys are INT32 or INT64");
+  return std::is_same_v<KeyT, int32_t> ? cudf::type_id::INT32 : cudf::type_id::INT64;
+}
 
 [[nodiscard]] unsigned grid_size_for(int64_t n)
 {
@@ -64,7 +74,7 @@ constexpr uint64_t k_bigint_max = static_cast<uint64_t>(std::numeric_limits<int6
   auto const extra = append_null_group ? int64_t{1} : int64_t{0};
   if (num_groups < 0 || num_groups > max - extra) {
     throw sirius::invalid_input_exception(
-      "dense_count_join: output row count {} plus NULL-group row {} exceeds "
+      "group_join: output row count {} plus NULL-group row {} exceeds "
       "cudf::size_type max {}",
       num_groups,
       extra,
@@ -81,13 +91,13 @@ struct histogram_layout {
 [[nodiscard]] histogram_layout checked_histogram_layout(int64_t range, std::size_t slot_bytes)
 {
   if (range <= 0) {
-    throw sirius::internal_exception("dense_count_state: non-positive range {}", range);
+    throw sirius::internal_exception("group_join_state: non-positive range {}", range);
   }
   auto const slots    = static_cast<uint64_t>(range);
   auto const size_max = std::numeric_limits<std::size_t>::max();
   if (slot_bytes == 0 || slot_bytes > size_max / 2 || slots > size_max / (2 * slot_bytes)) {
     throw sirius::invalid_input_exception(
-      "dense_count_join: histogram range {} with {}-byte slots exceeds size_t allocation "
+      "group_join: histogram range {} with {}-byte slots exceeds size_t allocation "
       "capacity",
       range,
       slot_bytes);
@@ -123,7 +133,40 @@ __device__ __forceinline__ void histogram_add(uint64_t* slot)
   atomicAdd(reinterpret_cast<unsigned long long*>(slot), 1ULL);
 }
 
-template <typename KeyT, typename CountT>
+// Slot policies: the per-aggregate device accumulators the bundles compose (one policy per
+// agg_op). Whether a slot zero-initializes or fill-initializes is part of the policy.
+enum class slot_init : uint8_t { ZERO_MEMSET, VALUE_FILL };
+
+/// Argument tag for slots that consume no value column; its update folds to a bare count.
+struct no_arg {};
+
+template <class P>
+concept slot_policy = std::is_trivially_copyable_v<typename P::slot_type> &&
+                      requires(typename P::slot_type* s, typename P::arg_type v) {
+                        { P::init_fill } -> std::convertible_to<slot_init>;
+                        { P::update(s, v) } -> std::same_as<void>;
+                      };
+
+template <class CountT>
+struct count_slot {
+  using slot_type                      = CountT;
+  using arg_type                       = no_arg;
+  static constexpr slot_init init_fill = slot_init::ZERO_MEMSET;
+  __device__ __forceinline__ static void update(slot_type* s, no_arg) { histogram_add(s); }
+};
+
+// Maps a host-visible bundle tag to its device-side slot policies. A specialization here plus an
+// entry on the explicit-instantiation whitelist at the end of this file admits a new bundle.
+template <typename Bundle>
+struct bundle_policies;
+
+template <typename CountT>
+struct bundle_policies<groupjoin::count_bundle<CountT>> {
+  using matched_slot = count_slot<CountT>;
+  static_assert(slot_policy<matched_slot>);
+};
+
+template <typename KeyT, typename Bundle>
 __global__ void accumulate_kernel(KeyT const* __restrict__ keys,
                                   cudf::bitmask_type const* __restrict__ key_mask,
                                   cudf::size_type key_mask_offset,
@@ -133,9 +176,10 @@ __global__ void accumulate_kernel(KeyT const* __restrict__ keys,
                                   int64_t min_key,
                                   int64_t range,
                                   bool bounds_check,
-                                  CountT* __restrict__ bins)
+                                  typename Bundle::count_type* __restrict__ bins)
 {
-  auto const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  using matched_slot = typename bundle_policies<Bundle>::matched_slot;
+  auto const stride  = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += stride) {
     if (key_mask != nullptr &&
@@ -150,7 +194,7 @@ __global__ void accumulate_kernel(KeyT const* __restrict__ keys,
     auto const offset =
       static_cast<uint64_t>(static_cast<int64_t>(keys[i])) - static_cast<uint64_t>(min_key);
     if (bounds_check && offset >= static_cast<uint64_t>(range)) { continue; }
-    histogram_add(&bins[offset]);
+    matched_slot::update(&bins[offset], no_arg{});
   }
 }
 
@@ -160,11 +204,11 @@ struct presence_positive {
   __device__ bool operator()(int64_t k) const { return presence[k] != CountT{0}; }
 };
 
-template <typename KeyT, typename CountT>
+template <typename KeyT, typename Bundle>
 __global__ void emit_kernel(int64_t const* __restrict__ selected,
                             int64_t num_selected,
-                            CountT const* __restrict__ presence,
-                            CountT const* __restrict__ counts,
+                            typename Bundle::count_type const* __restrict__ presence,
+                            typename Bundle::count_type const* __restrict__ counts,
                             int64_t min_key,
                             bool count_star,
                             KeyT* __restrict__ out_keys,
@@ -208,20 +252,26 @@ __global__ void validate_product_kernel(int64_t const* __restrict__ lhs,
   }
 }
 
-template <typename CountT>
+template <typename KeyT, typename Bundle>
 void accumulate_impl(cudf::column_view const& keys,
                      cudf::column_view const* count_validity_source,
                      int64_t min_key,
                      int64_t range,
                      bool bounds_check,
-                     CountT* bins,
+                     typename Bundle::count_type* bins,
                      rmm::cuda_stream_view stream)
 {
   if (count_validity_source != nullptr && count_validity_source->size() != keys.size()) {
     throw sirius::internal_exception(
-      "dense_count_join: COUNT argument has {} rows but its key column has {}",
+      "group_join: COUNT argument has {} rows but its key column has {}",
       count_validity_source->size(),
       keys.size());
+  }
+  if (keys.type().id() != key_type_id_for<KeyT>()) {
+    throw sirius::internal_exception(
+      "group_join: key column type {} does not match the state's instantiated key type {}",
+      static_cast<int32_t>(keys.type().id()),
+      static_cast<int32_t>(key_type_id_for<KeyT>()));
   }
   auto const n = static_cast<int64_t>(keys.size());
   if (n == 0) { return; }
@@ -235,28 +285,17 @@ void accumulate_impl(cudf::column_view const& keys,
   }
 
   auto const grid = grid_size_for(n);
-  auto launch     = [&](auto key_tag) {
-    using KeyT = decltype(key_tag);
-    accumulate_kernel<KeyT, CountT>
-      <<<grid, k_block_size, 0, stream.value()>>>(keys.template data<KeyT>(),
-                                                  key_mask,
-                                                  keys.offset(),
-                                                  val_mask,
-                                                  val_mask_offset,
-                                                  n,
-                                                  min_key,
-                                                  range,
-                                                  bounds_check,
-                                                  bins);
-  };
-  switch (keys.type().id()) {
-    case cudf::type_id::INT32: launch(int32_t{}); break;
-    case cudf::type_id::INT64: launch(int64_t{}); break;
-    default:
-      throw sirius::internal_exception(
-        "dense_count_join: unsupported key column type {} (expected INT32/INT64)",
-        static_cast<int32_t>(keys.type().id()));
-  }
+  accumulate_kernel<KeyT, Bundle>
+    <<<grid, k_block_size, 0, stream.value()>>>(keys.template data<KeyT>(),
+                                                key_mask,
+                                                keys.offset(),
+                                                val_mask,
+                                                val_mask_offset,
+                                                n,
+                                                min_key,
+                                                range,
+                                                bounds_check,
+                                                bins);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -281,7 +320,7 @@ void write_null_group_row(cudf::column& key_col,
 {
   if (row_idx < 0 || row_idx >= key_col.size() || row_idx >= value_col.size()) {
     throw sirius::internal_exception(
-      "dense_count_join: NULL-group row {} is outside output column sizes {} and {}",
+      "group_join: NULL-group row {} is outside output column sizes {} and {}",
       row_idx,
       key_col.size(),
       value_col.size());
@@ -301,7 +340,7 @@ void write_null_group_row(cudf::column& key_col,
     case cudf::type_id::INT64: launch(int64_t{}); break;
     default:
       throw sirius::internal_exception(
-        "dense_count_join: unsupported output key type {} (expected INT32/INT64)",
+        "group_join: unsupported output key type {} (expected INT32/INT64)",
         static_cast<int32_t>(key_view.type().id()));
   }
   CUDF_CUDA_TRY(cudaGetLastError());
@@ -312,87 +351,9 @@ void write_null_group_row(cudf::column& key_col,
   key_col.set_null_mask(std::move(mask), 1);
 }
 
-template <typename CountT>
-std::unique_ptr<cudf::table> emit_impl(CountT const* presence,
-                                       CountT const* counts,
-                                       int64_t min_key,
-                                       int64_t range,
-                                       cudf::data_type key_type,
-                                       bool count_star,
-                                       int64_t null_group_rows,
-                                       rmm::cuda_stream_view stream,
-                                       rmm::device_async_resource_ref mr,
-                                       bool check_product_overflow)
-{
-  if (null_group_rows < 0) {
-    throw sirius::internal_exception("dense_count_join: negative NULL-group row count");
-  }
-  // Use this memory space's resource for Thrust/CUB temporaries so reservations account for them.
-  auto const policy = rmm::exec_policy(stream, mr);
-  auto const begin  = thrust::make_counting_iterator<int64_t>(0);
-  auto const end    = thrust::make_counting_iterator<int64_t>(range);
-
-  int64_t const num_groups =
-    thrust::count_if(policy, begin, end, presence_positive<CountT>{presence});
-  auto const group_rows = checked_output_rows(num_groups, false);
-  auto const total_rows = checked_output_rows(num_groups, null_group_rows > 0);
-
-  auto key_col =
-    cudf::make_fixed_width_column(key_type, total_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto value_col = cudf::make_fixed_width_column(
-    cudf::data_type{cudf::type_id::INT64}, total_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  std::optional<cudf::numeric_scalar<int32_t>> overflow_flag;
-  if (check_product_overflow && num_groups > 0) { overflow_flag.emplace(0, true, stream, mr); }
-
-  if (num_groups > 0) {
-    rmm::device_uvector<int64_t> selected(static_cast<std::size_t>(group_rows), stream, mr);
-    thrust::copy_if(policy, begin, end, selected.begin(), presence_positive<CountT>{presence});
-
-    auto const grid = grid_size_for(num_groups);
-    auto key_view   = key_col->mutable_view();
-    auto value_view = value_col->mutable_view();
-    auto launch     = [&](auto key_tag) {
-      using KeyT = decltype(key_tag);
-      emit_kernel<KeyT, CountT><<<grid, k_block_size, 0, stream.value()>>>(
-        selected.data(),
-        num_groups,
-        presence,
-        counts,
-        min_key,
-        count_star,
-        key_view.template data<KeyT>(),
-        value_view.template data<int64_t>(),
-        overflow_flag ? overflow_flag->data() : nullptr);
-    };
-    switch (key_type.id()) {
-      case cudf::type_id::INT32: launch(int32_t{}); break;
-      case cudf::type_id::INT64: launch(int64_t{}); break;
-      default:
-        throw sirius::internal_exception(
-          "dense_count_join: unsupported output key type {} (expected INT32/INT64)",
-          static_cast<int32_t>(key_type.id()));
-    }
-    CUDF_CUDA_TRY(cudaGetLastError());
-    // The scalar read synchronizes only on the rare path whose coarse host bound was inconclusive.
-    if (overflow_flag && overflow_flag->value(stream) != 0) {
-      throw sirius::invalid_input_exception("dense_count_join: COUNT result exceeds BIGINT max {}",
-                                            k_bigint_max);
-    }
-  }
-
-  if (null_group_rows > 0) {
-    write_null_group_row(*key_col, *value_col, group_rows, count_star, null_group_rows, stream, mr);
-  }
-
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(std::move(key_col));
-  columns.push_back(std::move(value_col));
-  return std::make_unique<cudf::table>(std::move(columns));
-}
-
 }  // namespace
 
-std::optional<std::pair<int64_t, int64_t>> dense_count_global_minmax(
+std::optional<std::pair<int64_t, int64_t>> group_join_global_minmax(
   std::vector<cudf::column_view> const& keys,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
@@ -422,7 +383,7 @@ std::optional<std::pair<int64_t, int64_t>> dense_count_global_minmax(
       case cudf::type_id::INT64: launch(int64_t{}); break;
       default:
         throw sirius::internal_exception(
-          "dense_count_join: unsupported minmax key type {} (expected INT32/INT64)",
+          "group_join: unsupported minmax key type {} (expected INT32/INT64)",
           static_cast<int32_t>(column.type().id()));
     }
     CUDF_CUDA_TRY(cudaGetLastError());
@@ -442,98 +403,130 @@ std::optional<std::pair<int64_t, int64_t>> dense_count_global_minmax(
   return std::pair{host_extrema[0], host_extrema[1]};
 }
 
-dense_count_state::dense_count_state(int64_t min_key,
-                                     int64_t range,
-                                     bool wide,
-                                     rmm::cuda_stream_view stream,
-                                     rmm::device_async_resource_ref mr)
-  : _min_key(min_key), _range(range), _wide(wide)
+template <typename KeyT, typename Bundle>
+std::size_t group_join_state<KeyT, Bundle>::checked_slots(int64_t range)
 {
-  auto const slot_bytes = _wide ? sizeof(uint64_t) : sizeof(uint32_t);
-  auto const layout     = checked_histogram_layout(range, slot_bytes);
-  if (_wide) {
-    _presence64.emplace(layout.slots, stream, mr);
-    _counts64.emplace(layout.slots, stream, mr);
-    CUDF_CUDA_TRY(
-      cudaMemsetAsync(_presence64->data(), 0, layout.bytes_per_histogram, stream.value()));
-    CUDF_CUDA_TRY(
-      cudaMemsetAsync(_counts64->data(), 0, layout.bytes_per_histogram, stream.value()));
-  } else {
-    _presence32.emplace(layout.slots, stream, mr);
-    _counts32.emplace(layout.slots, stream, mr);
-    CUDF_CUDA_TRY(
-      cudaMemsetAsync(_presence32->data(), 0, layout.bytes_per_histogram, stream.value()));
-    CUDF_CUDA_TRY(
-      cudaMemsetAsync(_counts32->data(), 0, layout.bytes_per_histogram, stream.value()));
-  }
+  return checked_histogram_layout(range, sizeof(count_type)).slots;
 }
 
-void dense_count_state::accumulate_preserved(cudf::column_view const& keys,
-                                             rmm::cuda_stream_view stream)
+template <typename KeyT, typename Bundle>
+group_join_state<KeyT, Bundle>::group_join_state(int64_t min_key,
+                                                 int64_t range,
+                                                 rmm::cuda_stream_view stream,
+                                                 rmm::device_async_resource_ref mr)
+  : _min_key(min_key),
+    _range(range),
+    _presence(checked_slots(range), stream, mr),
+    _matched(_presence.size(), stream, mr)
 {
-  // No bounds check: the histogram is sized from these columns' global min/max.
-  if (_wide) {
-    accumulate_impl<uint64_t>(
-      keys, nullptr, _min_key, _range, /*bounds_check=*/false, _presence64->data(), stream);
-  } else {
-    accumulate_impl<uint32_t>(
-      keys, nullptr, _min_key, _range, /*bounds_check=*/false, _presence32->data(), stream);
-  }
+  static_assert(bundle_policies<Bundle>::matched_slot::init_fill == slot_init::ZERO_MEMSET,
+                "this constructor zero-initializes; VALUE_FILL slots need a fill pass");
+  auto const bytes_per_histogram = _presence.size() * sizeof(count_type);
+  CUDF_CUDA_TRY(cudaMemsetAsync(_presence.data(), 0, bytes_per_histogram, stream.value()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(_matched.data(), 0, bytes_per_histogram, stream.value()));
 }
 
-void dense_count_state::accumulate_counted(cudf::column_view const& keys,
-                                           cudf::column_view const* count_validity_source,
-                                           rmm::cuda_stream_view stream)
+template <typename KeyT, typename Bundle>
+void group_join_state<KeyT, Bundle>::accumulate_preserved(cudf::column_view const& keys,
+                                                          rmm::cuda_stream_view stream)
 {
-  if (_wide) {
-    accumulate_impl<uint64_t>(keys,
-                              count_validity_source,
-                              _min_key,
-                              _range,
-                              /*bounds_check=*/true,
-                              _counts64->data(),
-                              stream);
-  } else {
-    accumulate_impl<uint32_t>(keys,
-                              count_validity_source,
-                              _min_key,
-                              _range,
-                              /*bounds_check=*/true,
-                              _counts32->data(),
-                              stream);
-  }
+  // No bounds check: the state is sized from these columns' global min/max.
+  accumulate_impl<KeyT, Bundle>(
+    keys, nullptr, _min_key, _range, /*bounds_check=*/false, _presence.data(), stream);
 }
 
-std::unique_ptr<cudf::table> dense_count_state::emit(cudf::data_type key_type,
-                                                     bool count_star,
-                                                     int64_t null_group_rows,
-                                                     rmm::cuda_stream_view stream,
-                                                     rmm::device_async_resource_ref mr,
-                                                     bool check_product_overflow) const
+template <typename KeyT, typename Bundle>
+void group_join_state<KeyT, Bundle>::accumulate_counted(
+  cudf::column_view const& keys,
+  cudf::column_view const* count_validity_source,
+  rmm::cuda_stream_view stream)
 {
-  if (_wide) {
-    return emit_impl<uint64_t>(_presence64->data(),
-                               _counts64->data(),
-                               _min_key,
-                               _range,
-                               key_type,
-                               count_star,
-                               null_group_rows,
-                               stream,
-                               mr,
-                               check_product_overflow);
-  }
-  return emit_impl<uint32_t>(_presence32->data(),
-                             _counts32->data(),
-                             _min_key,
-                             _range,
-                             key_type,
-                             count_star,
-                             null_group_rows,
-                             stream,
-                             mr,
-                             check_product_overflow);
+  accumulate_impl<KeyT, Bundle>(keys,
+                                count_validity_source,
+                                _min_key,
+                                _range,
+                                /*bounds_check=*/true,
+                                _matched.data(),
+                                stream);
 }
+
+template <typename KeyT, typename Bundle>
+std::unique_ptr<cudf::table> group_join_state<KeyT, Bundle>::emit(cudf::data_type key_type,
+                                                                  bool count_star,
+                                                                  int64_t null_group_rows,
+                                                                  rmm::cuda_stream_view stream,
+                                                                  rmm::device_async_resource_ref mr,
+                                                                  bool check_product_overflow) const
+{
+  if (null_group_rows < 0) {
+    throw sirius::internal_exception("group_join: negative NULL-group row count");
+  }
+  if (key_type.id() != key_type_id_for<KeyT>()) {
+    throw sirius::internal_exception(
+      "group_join: output key type {} does not match the state's instantiated key type {}",
+      static_cast<int32_t>(key_type.id()),
+      static_cast<int32_t>(key_type_id_for<KeyT>()));
+  }
+  // Use this memory space's resource for Thrust/CUB temporaries so reservations account for them.
+  auto const policy = rmm::exec_policy(stream, mr);
+  auto const begin  = thrust::make_counting_iterator<int64_t>(0);
+  auto const end    = thrust::make_counting_iterator<int64_t>(_range);
+
+  int64_t const num_groups =
+    thrust::count_if(policy, begin, end, presence_positive<count_type>{_presence.data()});
+  auto const group_rows = checked_output_rows(num_groups, false);
+  auto const total_rows = checked_output_rows(num_groups, null_group_rows > 0);
+
+  auto key_col =
+    cudf::make_fixed_width_column(key_type, total_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto value_col = cudf::make_fixed_width_column(
+    cudf::data_type{cudf::type_id::INT64}, total_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+  std::optional<cudf::numeric_scalar<int32_t>> overflow_flag;
+  if (check_product_overflow && num_groups > 0) { overflow_flag.emplace(0, true, stream, mr); }
+
+  if (num_groups > 0) {
+    rmm::device_uvector<int64_t> selected(static_cast<std::size_t>(group_rows), stream, mr);
+    thrust::copy_if(
+      policy, begin, end, selected.begin(), presence_positive<count_type>{_presence.data()});
+
+    auto const grid = grid_size_for(num_groups);
+    auto key_view   = key_col->mutable_view();
+    auto value_view = value_col->mutable_view();
+    emit_kernel<KeyT, Bundle>
+      <<<grid, k_block_size, 0, stream.value()>>>(selected.data(),
+                                                  num_groups,
+                                                  _presence.data(),
+                                                  _matched.data(),
+                                                  _min_key,
+                                                  count_star,
+                                                  key_view.template data<KeyT>(),
+                                                  value_view.template data<int64_t>(),
+                                                  overflow_flag ? overflow_flag->data() : nullptr);
+    CUDF_CUDA_TRY(cudaGetLastError());
+    // The scalar read synchronizes only on the rare path whose coarse host bound was inconclusive.
+    if (overflow_flag && overflow_flag->value(stream) != 0) {
+      throw sirius::invalid_input_exception("group_join: COUNT result exceeds BIGINT max {}",
+                                            k_bigint_max);
+    }
+  }
+
+  if (null_group_rows > 0) {
+    write_null_group_row(*key_col, *value_col, group_rows, count_star, null_group_rows, stream, mr);
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(key_col));
+  columns.push_back(std::move(value_col));
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+// Instantiation whitelist: the COUNT bundle only. A bundle/key combination absent from this list
+// does not exist; extending the framework means specializing bundle_policies above and adding
+// entries here.
+template class group_join_state<int32_t, groupjoin::count_bundle<uint32_t>>;
+template class group_join_state<int32_t, groupjoin::count_bundle<uint64_t>>;
+template class group_join_state<int64_t, groupjoin::count_bundle<uint32_t>>;
+template class group_join_state<int64_t, groupjoin::count_bundle<uint64_t>>;
 
 void throw_if_count_product_overflows(cudf::column_view const& lhs,
                                       cudf::column_view const& rhs,
@@ -542,19 +535,17 @@ void throw_if_count_product_overflows(cudf::column_view const& lhs,
 {
   if (lhs.type().id() != cudf::type_id::INT64 || rhs.type().id() != cudf::type_id::INT64) {
     throw sirius::internal_exception(
-      "dense_count_join: overflow validation requires two INT64 columns, got {} and {}",
+      "group_join: overflow validation requires two INT64 columns, got {} and {}",
       static_cast<int32_t>(lhs.type().id()),
       static_cast<int32_t>(rhs.type().id()));
   }
   if (lhs.size() != rhs.size()) {
     throw sirius::internal_exception(
-      "dense_count_join: overflow validation column sizes differ ({} versus {})",
-      lhs.size(),
-      rhs.size());
+      "group_join: overflow validation column sizes differ ({} versus {})", lhs.size(), rhs.size());
   }
   if (lhs.null_count() != 0 || rhs.null_count() != 0) {
     throw sirius::internal_exception(
-      "dense_count_join: overflow validation requires non-NULL count columns");
+      "group_join: overflow validation requires non-NULL count columns");
   }
   if (lhs.size() == 0) { return; }
 
@@ -566,23 +557,22 @@ void throw_if_count_product_overflows(cudf::column_view const& lhs,
   // This rare-path validation synchronizes only when the host bound cannot prove safety.
   auto const result = status.value(stream);
   if (result == 2) {
-    throw sirius::internal_exception(
-      "dense_count_join: aggregate multiplicities must be nonnegative");
+    throw sirius::internal_exception("group_join: aggregate multiplicities must be nonnegative");
   }
   if (result == 1) {
-    throw sirius::invalid_input_exception("dense_count_join: COUNT result exceeds BIGINT max {}",
+    throw sirius::invalid_input_exception("group_join: COUNT result exceeds BIGINT max {}",
                                           k_bigint_max);
   }
 }
 
-std::unique_ptr<cudf::table> dense_count_empty_output(cudf::data_type key_type,
-                                                      bool count_star,
-                                                      int64_t null_group_rows,
-                                                      rmm::cuda_stream_view stream,
-                                                      rmm::device_async_resource_ref mr)
+std::unique_ptr<cudf::table> group_join_empty_output(cudf::data_type key_type,
+                                                     bool count_star,
+                                                     int64_t null_group_rows,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr)
 {
   if (null_group_rows < 0) {
-    throw sirius::internal_exception("dense_count_join: negative NULL-group row count");
+    throw sirius::internal_exception("group_join: negative NULL-group row count");
   }
   cudf::size_type const total_rows = null_group_rows > 0 ? 1 : 0;
   auto key_col =

@@ -2604,14 +2604,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   add_sirius_option(config,
                     option_visibility::internal,
                     "enable_dense_count_join",
-                    "runtime override for dense count-join planning",
+                    "runtime override for the fused GROUP_JOIN count pathway",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_dense_count_join),
                     SetEnableDenseCountJoin);
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",
-                    "internal test hook for the dense count-join histogram budget",
+                    "internal test hook for the GROUP_JOIN count-state budget",
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.dense_count_join_max_bytes),
                     SetDenseCountJoinMaxBytes);

@@ -32,7 +32,7 @@
 #include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
-#include "op/sirius_physical_dense_count_join.hpp"
+#include "op/sirius_physical_group_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
@@ -128,12 +128,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
                          estimated_cardinality);
 }
 
-struct dense_count_join_detection {
-  std::size_t preserved_child   = 0;
-  std::size_t preserved_key_idx = 0;
-  std::size_t counted_key_idx   = 0;
-  std::optional<std::size_t> counted_value_idx;
-};
+// Shared detection infrastructure for the GROUPJOIN ladder: projection-map validation, the
+// exact-builtin catalog identity check, and the linear-scan-chain screen. Every rung reuses these
+// and consults no statistics.
 
 struct join_projection_layout {
   std::size_t left_output_count;
@@ -239,7 +236,16 @@ static std::optional<sirius::aggregate_id> exact_builtin_count_id(
   return aggregate_id;
 }
 
-static std::optional<dense_count_join_detection> detect_dense_count_join(
+// Ladder rung P0: grouped COUNT over a preserved-side outer equi-join (the q13 shape). Emits an
+// OUTER_PRESERVING count spec; every check below is fail-closed.
+struct count_pathway_detection {
+  std::size_t preserved_child   = 0;
+  std::size_t preserved_key_idx = 0;
+  std::size_t counted_key_idx   = 0;
+  std::optional<std::size_t> counted_value_idx;
+};
+
+static std::optional<count_pathway_detection> detect_count_group_join(
   duckdb::ClientContext& context, const duckdb::LogicalAggregate& op)
 {
   if (op.groups.size() != 1 || op.grouping_sets.size() != 1 || op.grouping_sets[0].size() != 1 ||
@@ -317,7 +323,7 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
     return std::nullopt;
   }
 
-  dense_count_join_detection det;
+  count_pathway_detection det;
   det.preserved_child             = join.join_type == duckdb::JoinType::LEFT ? 0 : 1;
   const std::size_t counted_child = 1 - det.preserved_child;
 
@@ -361,8 +367,11 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
 
 }  // namespace
 
+// The GROUPJOIN detection ladder: rungs are evaluated cheapest-first, each behind its config
+// gate, and any miss falls through to generic join+aggregate planning. The only rung today is
+// P0, the COUNT pathway.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
-sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggregate& op)
+sirius_physical_plan_generator::try_plan_group_join(duckdb::LogicalAggregate& op)
 {
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
@@ -371,7 +380,7 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
   const auto& op_params = sirius_ctx->get_config().get_operator_params();
   if (!op_params.enable_dense_count_join) { return nullptr; }
 
-  auto detection = detect_dense_count_join(context, op);
+  auto detection = detect_count_group_join(context, op);
   if (!detection) { return nullptr; }
   auto& join                      = op.children[0]->Cast<duckdb::LogicalComparisonJoin>();
   const std::size_t counted_child = 1 - detection->preserved_child;
@@ -388,11 +397,11 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
   counted->estimated_cardinality   = counted_cardinality;
   if (preserved->children.size() > 1 || counted->children.size() > 1) {
     throw sirius::internal_exception(
-      "dense_count_join: eligible logical child produced a non-unary physical root");
+      "group_join: eligible logical child produced a non-unary physical root");
   }
 
   SIRIUS_LOG_INFO(
-    "[sirius_plan_aggregate] Fusing COUNT-join into DENSE_COUNT_JOIN: {} join, preserved child "
+    "[sirius_plan_aggregate] Fusing COUNT-join into GROUP_JOIN: {} join, preserved child "
     "{} (key col {}, est {} rows), counted child {} (key col {}, {}, est {} rows)",
     join.join_type == duckdb::JoinType::LEFT ? "LEFT" : "RIGHT",
     detection->preserved_child,
@@ -405,13 +414,20 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
       : std::string("COUNT(*)"),
     counted_cardinality);
 
-  auto fused = duckdb::make_uniq<sirius::op::sirius_physical_dense_count_join>(
-    sirius::from_duckdb_vec(op.types),
-    op.estimated_cardinality,
-    detection->preserved_key_idx,
-    detection->counted_key_idx,
+  auto types = sirius::from_duckdb_vec(op.types);
+  sirius::op::groupjoin::group_join_spec spec;
+  spec.form              = sirius::op::groupjoin::join_form::OUTER_PRESERVING;
+  spec.preserved_key_idx = detection->preserved_key_idx;
+  spec.counted_key_idx   = detection->counted_key_idx;
+  spec.slots.push_back(sirius::op::groupjoin::slot_spec{
+    detection->counted_value_idx ? sirius::op::groupjoin::agg_op::COUNT_VALID
+                                 : sirius::op::groupjoin::agg_op::COUNT_STAR,
     detection->counted_value_idx,
-    op_params.dense_count_join_max_bytes);
+    types[1]});
+  spec.max_state_bytes = op_params.dense_count_join_max_bytes;
+
+  auto fused = duckdb::make_uniq<sirius::op::sirius_physical_group_join>(
+    std::move(types), op.estimated_cardinality, std::move(spec));
   fused->children.push_back(std::move(preserved));
   fused->children.push_back(std::move(counted));
   return fused;
@@ -637,7 +653,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     reject_nested_column_operation(*group, "GROUP BY");
   }
 
-  if (auto fused = try_plan_dense_count_join(op)) { return fused; }
+  if (auto fused = try_plan_group_join(op)) { return fused; }
 
   auto plan = create_plan(*op.children[0]);
 

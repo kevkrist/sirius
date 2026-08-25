@@ -33,8 +33,8 @@
 #include "helper/logical_type.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
-#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
+#include "op/sirius_physical_group_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -46,7 +46,7 @@
 
 #include <catch.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
-#include <utils/dense_count_join_test_builder.hpp>
+#include <utils/group_join_test_builder.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -60,7 +60,7 @@ using sirius::op::sirius_physical_operator;
 using sirius::op::SiriusPhysicalOperatorType;
 
 namespace {
-using sirius::test::make_dense_count_join;
+using sirius::test::make_group_join;
 
 constexpr cudf::data_type k_int8{cudf::type_id::INT8};
 constexpr cudf::data_type k_int16{cudf::type_id::INT16};
@@ -430,10 +430,10 @@ TEST_CASE("tier_narrowing_policy - join payloads keep narrow, join keys retract"
   }
 }
 
-TEST_CASE("tier_narrowing_policy - dense count restores only the two join keys",
+TEST_CASE("tier_narrowing_policy - group join restores only the two join keys",
           "[tier_narrowing_policy]")
 {
-  auto plan = make_dense_count_join(
+  auto plan = make_group_join(
     /*preserved_key_idx=*/1,
     /*counted_key_idx=*/0,
     /*counted_value_idx=*/1,

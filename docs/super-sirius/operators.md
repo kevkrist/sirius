@@ -346,11 +346,14 @@ Hash-based GROUP BY.
 - **Label-encoded group keys:** when a COLLECT_SET aggregation is present, the input is large (≥ 1M rows), the group key is multi-column and non-nested, and an HLL estimate puts group cardinality below 1% of rows, the key table is collapsed with `cudf::encode` into a single dense INT32 label so cuDF's `stable_sorted_order` takes its single-column radix path; original keys are recovered by a gather at group cardinality. This short-circuits the STRING dictionary-encode path and falls back silently to the plain multi-column sort on failure.
 - **Key members:** `group_idx`, `cudf_aggregates`, `cudf_aggregate_idx`, `aggregate_slots`, `has_avg`, `has_count_distinct`
 
-### `sirius_physical_dense_count_join` — `DENSE_COUNT_JOIN`
-**File:** `src/include/op/sirius_physical_dense_count_join.hpp`, `src/op/sirius_physical_dense_count_join.cpp`, kernels in `src/cuda/dense_count_join_impl.cu`
+### `sirius_physical_group_join` — `GROUP_JOIN`
+**File:** `src/include/op/sirius_physical_group_join.hpp`, `src/op/sirius_physical_group_join.cpp`, kernels in `src/cuda/group_join_impl.cu`
 
-Fuses eligible `COUNT(col | *) GROUP BY key` over a preserved-side outer equi-join, replacing the
-partitioned join and aggregate fragment. Children are normalized as [preserved, counted].
+The fused join+group-by (GROUPJOIN) operator. A fail-closed detection ladder in the aggregate
+planner (`try_plan_group_join`) emits a `group_join_spec` naming the join form and aggregate
+slots; the one pathway wired today fuses eligible `COUNT(col | *) GROUP BY key` over a
+preserved-side outer equi-join, replacing the partitioned join and aggregate fragment. Children
+are normalized as [preserved, counted].
 
 Both inputs are FULL barriers. Execution uses direct-address histograms or exact sparse aggregation;
 ineligible and disabled plans retain the standard path. See [Configuration](configuration.md).
@@ -475,7 +478,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
 | MERGE_GROUP_BY | Agg | Merge grouped partitions |
 | HASH_JOIN | Join | `cudf::{inner,left,right,outer}_join()`, `cudf::distinct_hash_join`, or `cudf::{filtered,mark}_join` (MARK) |
-| DENSE_COUNT_JOIN | Join+Agg | Fused dense/sparse COUNT over an outer join |
+| GROUP_JOIN | Join+Agg | Fused join+group-by; COUNT-over-outer-join pathway wired |
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |
