@@ -1,6 +1,6 @@
 # Dynamic Filters
 
-A **dynamic filter** is a runtime predicate built by one operator and applied by another to avoid work. Sirius currently builds filters from an eligible hash join's complete build side and applies them to:
+A **dynamic filter** is a runtime predicate built by one operator and applied by another to avoid work. Sirius currently builds filters from an eligible hash join's complete build side -- and, when the GROUPJOIN planner rung replaces such a join with a fused `sirius_physical_group_join`, from that operator's complete preserved side -- and applies them to:
 
 - a GPU scan reached through the join's probe subtree; or
 - a join-edge endpoint placed inside that subtree when no scan can consume the key safely.
@@ -142,7 +142,7 @@ The settings live under `sirius.operator_params`:
 
 ## Limitations and future work
 
-- Hash-join builds are the only producers, and publication is a single immutable snapshot.
+- Hash-join builds and the fused GROUP_JOIN's preserved side are the only producers, and publication is a single immutable snapshot. The GROUP_JOIN publishes on its preserved producer pipeline's completion and only from a single whole-preserved GPU-resident delivery, mirroring the hash join's complete-build requirement.
 - Routing is deliberately allowlisted by join type, key shape, and lineage; unsupported shapes lose optimization rather than results.
 - Membership filters currently support `INT32` and `INT64` keys.
 - The publisher emits one global zone map per key; multi-zone publication is not implemented.

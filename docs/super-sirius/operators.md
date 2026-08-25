@@ -351,9 +351,17 @@ Hash-based GROUP BY.
 
 The fused join+group-by (GROUPJOIN) operator. A fail-closed detection ladder in the aggregate
 planner (`try_plan_group_join`) emits a `group_join_spec` naming the join form and aggregate
-slots; the one pathway wired today fuses eligible `COUNT(col | *) GROUP BY key` over a
-preserved-side outer equi-join, replacing the partitioned join and aggregate fragment. Children
-are normalized as [preserved, counted].
+slots. Two pathways are wired today: rung P0 fuses eligible `COUNT(col | *) GROUP BY key` over a
+preserved-side outer equi-join (gated by `enable_dense_count_join`), and rung P1 fuses a single
+`COUNT/SUM/MIN/MAX/AVG` grouped by the preserved-side key of an INNER equi-join whose preserved
+side is a `DELIM_GET` or a proven-unique scan chain -- the TPC-H q17 correlated-AVG shape (gated
+by `enable_group_join`, plus a plan-time counted-side byte gate because the single fused task
+colocates the whole counted side). Children are normalized as [preserved, counted]; a
+`DELIM_SCAN` preserved child is routing-only, with the preserved data arriving from the owning
+delim join's distinct chain. When rung P1 replaces a hash join that would have published
+membership dynamic filters, the fused operator carries the equivalent publication plan and
+publishes the preserved keys on preserved-producer completion (see
+[Dynamic Filters](dynamic-filters.md)); a fusion that would drop such a filter is declined.
 
 Both inputs are FULL barriers. Execution uses direct-address histograms or exact sparse aggregation;
 ineligible and disabled plans retain the standard path. See [Configuration](configuration.md).
@@ -478,7 +486,7 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | MERGE_AGGREGATE | Agg | Merge ungrouped partitions |
 | MERGE_GROUP_BY | Agg | Merge grouped partitions |
 | HASH_JOIN | Join | `cudf::{inner,left,right,outer}_join()`, `cudf::distinct_hash_join`, or `cudf::{filtered,mark}_join` (MARK) |
-| GROUP_JOIN | Join+Agg | Fused join+group-by; COUNT-over-outer-join pathway wired |
+| GROUP_JOIN | Join+Agg | Fused join+group-by; COUNT-over-outer-join and INNER value pathways wired |
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |

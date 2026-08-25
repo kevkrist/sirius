@@ -47,6 +47,7 @@
 #include "planner/dynamic_filter/dynamic_filter_target_discovery.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/sirius_plan_unique_columns.hpp"
 #include "sirius_context.hpp"
 
 #include <algorithm>
@@ -58,9 +59,8 @@
 
 namespace sirius::planner {
 
-/// Returns a set of output column indices proven to form a unique key for the
-/// given logical operator subtree, or an empty set if uniqueness cannot be proven.
-static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOperator& op)
+// Declared in planner/sirius_plan_unique_columns.hpp.
+std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOperator& op)
 {
   switch (op.type) {
     case duckdb::LogicalOperatorType::LOGICAL_GET: {

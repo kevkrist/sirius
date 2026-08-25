@@ -62,6 +62,26 @@ uint64_t derived_default_batch_size()
   return value;
 }
 
+uint64_t derived_group_join_counted_bytes_gate()
+{
+  // cudaGetDeviceCount/Properties honor CUDA_VISIBLE_DEVICES and do not create a context.
+  static uint64_t const value = [] {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+      return uint64_t{0};
+    }
+    uint64_t min_total = 0;
+    for (int id = 0; id < device_count; ++id) {
+      cudaDeviceProp prop{};
+      if (cudaGetDeviceProperties(&prop, id) != cudaSuccess) { continue; }
+      auto const total = static_cast<uint64_t>(prop.totalGlobalMem);
+      min_total        = min_total == 0 ? total : std::min(min_total, total);
+    }
+    return min_total / 24;
+  }();
+  return value;
+}
+
 uint64_t derived_group_join_max_state_bytes()
 {
   // cudaGetDeviceCount/Properties honor CUDA_VISIBLE_DEVICES and do not create a context.
@@ -318,6 +338,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.optional("enable_dense_count_join", opt.enable_dense_count_join);
+  r.optional("enable_group_join", opt.enable_group_join);
   if (r.has("dense_count_join_max_bytes")) {
     throw std::runtime_error(
       "'sirius.operator_params.dense_count_join_max_bytes': removed; GROUP_JOIN count-state "
@@ -327,6 +348,11 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     throw std::runtime_error(
       "'sirius.operator_params.group_join_max_state_bytes': GROUP_JOIN value-form state sizing "
       "is an internal engine policy; remove this key");
+  }
+  if (r.has("group_join_counted_bytes_gate")) {
+    throw std::runtime_error(
+      "'sirius.operator_params.group_join_counted_bytes_gate': GROUP_JOIN counted-side "
+      "admission is an internal engine policy; remove this key");
   }
   // 0 is meaningful here: it turns the estimate off and leaves sizing to gpus_per_query.
   r.optional("admission_bytes_per_gpu", yaml::bytes(opt.admission_bytes_per_gpu));

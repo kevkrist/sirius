@@ -195,6 +195,13 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_group_join(
     duckdb::LogicalAggregate& op);
 
+  // Ladder rung P1: a single value or count aggregate grouped by the preserved-side key of an
+  // INNER equi-join (the q17 correlated-AVG shape). Returns null on any detection miss, on the
+  // counted-side byte gate, or when fusing would drop a dynamic filter the replaced hash join
+  // would have published.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_inner_group_join(
+    duckdb::LogicalAggregate& op);
+
   // Sirius reads and projects nested (STRUCT/LIST/MAP) columns but cannot operate
   // on them yet: WHERE / GROUP BY / JOIN ON over a nested column must fail with a
   // clear error naming the column instead of crashing or returning wrong results.

@@ -407,6 +407,8 @@ void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
     if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(op)) {
       join->restrict_dynamic_filter_replicas(admitted);
+    } else if (auto* group_join = dynamic_cast<op::sirius_physical_group_join*>(op)) {
+      group_join->restrict_dynamic_filter_replicas(admitted);
     }
   };
   for (auto& pipe : scheduled_) {

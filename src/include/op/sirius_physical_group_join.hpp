@@ -16,12 +16,15 @@
 
 #pragma once
 
+#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cudf/table/table.hpp>
 
 #include <rmm/resource_ref.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -39,9 +42,10 @@ namespace sirius::op {
  * `src/cuda/group_join_impl.cu`. The executor accepts the COUNT pathway (`OUTER_PRESERVING` with
  * one COUNT_STAR/COUNT_VALID slot) plus the INNER and DIRECT forms with any one
  * COUNT/SUM/MIN/MAX/AVG slot; value bundles over `OUTER_PRESERVING` fail closed (they would need
- * aggregate-output null masks the dense emit does not have). The planner ladder still emits only
- * count specs -- the INNER/DIRECT rungs arrive with later planner work, so those forms are
- * currently reachable only by constructing the operator directly (as the Catch2 suites do).
+ * aggregate-output null masks the dense emit does not have). The planner ladder emits count specs
+ * (rung P0) and two-child INNER specs (rung P1, behind `operator_params.enable_group_join`); the
+ * DIRECT form arrives with later planner work, so it is currently reachable only by constructing
+ * the operator directly (as the Catch2 suites do).
  */
 namespace groupjoin {
 
@@ -100,13 +104,28 @@ class group_join_input : public pipelineable_operator_data {
 /**
  * @brief Fused join+group-by (GROUPJOIN) operator.
  *
- * Planner-wired pathway today: an eligible preserved-side outer equi-join with a grouped COUNT.
- * Children are [preserved, counted] and output is `[key, aggregate]`. Runtime selects
- * direct-address or exact sparse aggregation while preserving SQL NULL semantics; value bundles
- * (SUM/MIN/MAX/AVG) additionally require NULL-free argument columns for the dense strategy and
- * fall back to the mask-preserving sparse strategy otherwise. The DIRECT form consumes a single
- * "counted" input at the execute level; its pipeline construction is later planner work, so
- * `build_pipelines` still requires two children.
+ * Planner-wired pathways today: an eligible preserved-side outer equi-join with a grouped COUNT
+ * (rung P0), and an eligible INNER equi-join under a single value or count aggregate whose group
+ * key is the preserved side's join key (rung P1, the q17 shape). Children are
+ * [preserved, counted] and output is `[key, aggregate]`. Runtime selects direct-address or exact
+ * sparse aggregation while preserving SQL NULL semantics; value bundles (SUM/MIN/MAX/AVG)
+ * additionally require NULL-free argument columns for the dense strategy and fall back to the
+ * mask-preserving sparse strategy otherwise.
+ *
+ * The preserved child may be a routing-only `DELIM_SCAN` (rung P1's delim provenance): that child
+ * produces no data itself -- its `build_pipelines` registers a scheduling dependency on the
+ * owning delim join's distinct chain, and the preserved batches arrive from the distinct chain's
+ * root pipeline, which `input_port_for` maps onto the "preserved" port.
+ *
+ * When the detection rung replaced a hash join that would have published dynamic filters, the
+ * fused operator carries the equivalent `dynamic_filter_publish_plan`: once the preserved
+ * producer pipeline finishes (observed from `get_next_task_hint`, the first poll after that
+ * pipeline completes), a single whole-preserved GPU-resident delivery publishes the preserved
+ * keys as membership filters to the counted-side scan, with the same best-effort timing and
+ * skip semantics as `sirius_physical_hash_join`'s build-side publication.
+ *
+ * The DIRECT form consumes a single "counted" input at the execute level; its pipeline
+ * construction is later planner work, so `build_pipelines` still requires two children.
  */
 class sirius_physical_group_join : public sirius_physical_operator {
  public:
@@ -118,13 +137,25 @@ class sirius_physical_group_join : public sirius_physical_operator {
   /// Throws on any @p spec outside the whitelisted (form, bundle) combinations.
   sirius_physical_group_join(duckdb::vector<sirius::logical_type> types,
                              std::size_t estimated_cardinality,
-                             groupjoin::group_join_spec spec);
+                             groupjoin::group_join_spec spec,
+                             dynamic_filter_publish_plan dynamic_filter_plan = {},
+                             dynamic_filter_stats* dynamic_filter_stats_sink = nullptr);
 
   std::string params_to_string() const override;
   [[nodiscard]] std::string_view input_port_for(
     sirius_physical_operator const& producer) const override;
   [[nodiscard]] MemoryBarrierType input_barrier_for(
     sirius_physical_operator const& producer) const override;
+
+  void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
+  {
+    _dynamic_filter_plan.restrict_replicas_to(admitted_gpu_ids);
+  }
+
+  [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
+  {
+    return _dynamic_filter_plan;
+  }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
@@ -155,6 +186,9 @@ class sirius_physical_group_join : public sirius_physical_operator {
   enum class strategy : uint8_t { NOT_RUN, DENSE, SPARSE };
   [[nodiscard]] strategy last_strategy() const noexcept { return _last_strategy; }
 
+ protected:
+  void on_finalize_operator() override;
+
  private:
   /// COUNT-over-outer-join execution (the OUTER_PRESERVING form).
   std::unique_ptr<cudf::table> execute_count_outer(
@@ -170,8 +204,32 @@ class sirius_physical_group_join : public sirius_physical_operator {
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
+  /// Claims and runs preserved-key membership publication once the preserved producer pipeline
+  /// has finished. Called from get_next_task_hint; a plan-less operator returns immediately.
+  void maybe_publish_preserved_membership();
+
+  /// Requires PUBLISHING and leaves FINISHED or FAILED. Device OOM is contained; other failures
+  /// propagate.
+  void publish_preserved_membership(cudf::table_view const& preserved_view,
+                                    rmm::cuda_stream_view stream);
+
+  enum class dynamic_filter_publication_state : uint8_t {
+    OPEN,
+    PUBLISHING,
+    FINISHED,
+    FAILED,  ///< Terminal: a failed publication is never retried.
+    CLOSED
+  };
+
   groupjoin::group_join_spec _spec;
   strategy _last_strategy = strategy::NOT_RUN;
+
+  // Narrowed before execution; immutable during execution.
+  dynamic_filter_publish_plan _dynamic_filter_plan;
+  // Non-owning; SiriusContext outlives the plan.
+  dynamic_filter_stats* _dynamic_filter_stats = nullptr;
+  std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
+    dynamic_filter_publication_state::OPEN};
 };
 
 }  // namespace sirius::op

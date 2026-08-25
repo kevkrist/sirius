@@ -23,6 +23,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -30,21 +31,33 @@
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
+#include "expression/join_condition.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/sirius_physical_group_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "planner/dynamic_filter/build_filter_evidence.hpp"
+#include "planner/dynamic_filter/build_key_domain.hpp"
+#include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
+#include "planner/dynamic_filter/dynamic_filter_publication_planning.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
+#include "planner/sirius_plan_unique_columns.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
 
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace sirius::planner {
 
@@ -365,11 +378,430 @@ static std::optional<count_pathway_detection> detect_count_group_join(
   return det;
 }
 
+// The value rungs cannot authenticate min/max/avg/sum by signature comparison alone: DuckDB's
+// binder rewrites those entries per argument type (BindMinMax specializes the ANY entry, and the
+// DECIMAL avg/sum entries are retargeted to the matching integer kernels, avg attaching a scale
+// bind datum). Authenticate by reproducing the binder's work instead: re-bind the system
+// catalog's own entry over the same argument type and require the query's bound function --
+// callbacks, signature, flags, and bind data -- to match the reproduction exactly.
+// sum_no_overflow (the optimizer's stats rewrite of sum) is compared against its catalog member
+// directly because its bind callback is intentionally uncallable.
+static std::optional<sirius::aggregate_id> exact_builtin_value_aggregate_id(
+  duckdb::ClientContext& context, const duckdb::BoundAggregateExpression& aggr)
+{
+  auto const aggregate_id = sirius::from_duckdb_aggregate_name(aggr.function.name);
+  if (!aggregate_id) { return std::nullopt; }
+  switch (*aggregate_id) {
+    case sirius::aggregate_id::sum:
+    case sirius::aggregate_id::sum_no_overflow:
+    case sirius::aggregate_id::min:
+    case sirius::aggregate_id::max:
+    case sirius::aggregate_id::avg: break;
+    default: return std::nullopt;
+  }
+  auto const canonical_name = sirius::to_duckdb_aggregate_name(*aggregate_id);
+  auto const& function      = aggr.function;
+  if (function.name != canonical_name || aggr.children.size() != 1 ||
+      function.arguments.size() != 1 || function.HasVarArgs()) {
+    return std::nullopt;
+  }
+  auto const& argument_type = aggr.children[0]->return_type;
+  if (function.arguments[0] != argument_type) { return std::nullopt; }
+  // The expression-level result must be the function's declared result, modulo the plan-level
+  // HUGEINT -> BIGINT downcast that runs before detection.
+  if (aggr.return_type != function.GetReturnType() &&
+      !(function.GetReturnType() == duckdb::LogicalType::HUGEINT &&
+        aggr.return_type == duckdb::LogicalType::BIGINT)) {
+    return std::nullopt;
+  }
+  if ((!function.catalog_name.empty() && function.catalog_name != SYSTEM_CATALOG) ||
+      (!function.schema_name.empty() && function.schema_name != DEFAULT_SCHEMA)) {
+    return std::nullopt;
+  }
+
+  try {
+    auto& entry =
+      duckdb::Catalog::GetSystemCatalog(context).GetEntry<duckdb::AggregateFunctionCatalogEntry>(
+        context, DEFAULT_SCHEMA, std::string(canonical_name));
+    duckdb::FunctionBinder binder(context);
+    duckdb::vector<duckdb::LogicalType> argument_types{argument_type};
+    duckdb::ErrorData error;
+    auto const best = binder.BindFunction(entry.name, entry.functions, argument_types, error);
+    if (!best.IsValid()) { return std::nullopt; }
+    auto canonical = entry.functions.GetFunctionByOffset(best.GetIndex());
+    duckdb::unique_ptr<duckdb::FunctionData> canonical_bind_info;
+    if (*aggregate_id != sirius::aggregate_id::sum_no_overflow && canonical.HasBindCallback()) {
+      duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> synthetic_children;
+      synthetic_children.push_back(
+        duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(argument_type)));
+      canonical_bind_info = canonical.GetBindCallback()(context, canonical, synthetic_children);
+    }
+    if (function != canonical || canonical.name != canonical_name ||
+        canonical.arguments.size() != 1 || canonical.arguments[0] != argument_type ||
+        canonical.HasVarArgs() || canonical.GetReturnType() != function.GetReturnType() ||
+        canonical.GetNullHandling() != function.GetNullHandling() ||
+        canonical.GetOrderDependent() != function.GetOrderDependent()) {
+      return std::nullopt;
+    }
+    if ((aggr.bind_info == nullptr) != (canonical_bind_info == nullptr)) { return std::nullopt; }
+    if (aggr.bind_info != nullptr && !aggr.bind_info->Equals(*canonical_bind_info)) {
+      return std::nullopt;
+    }
+  } catch (...) {
+    // A missing catalog entry or a throwing bind is a fallback signal, never a planner error.
+    return std::nullopt;
+  }
+  return aggregate_id;
+}
+
+// Rung P1 screens roughly thirty properties and a miss is silent by design (every generic
+// grouped aggregate takes this path); the reason is recorded at DEBUG so a query that
+// unexpectedly fails to fuse can be diagnosed from its log.
+static std::nullopt_t inner_rung_miss(std::string_view reason)
+{
+  SIRIUS_LOG_DEBUG("[sirius_plan_aggregate] GROUP_JOIN rung P1 miss: {}", reason);
+  return std::nullopt;
+}
+
+// Ladder rung P1: a single value or count aggregate grouped by the preserved-side key of an INNER
+// equi-join (the q17 correlated-AVG shape). Emits an INNER value spec; every check is fail-closed.
+struct inner_value_detection {
+  std::size_t preserved_child   = 0;
+  std::size_t preserved_key_idx = 0;
+  std::size_t counted_key_idx   = 0;
+  std::optional<std::size_t> counted_value_idx;
+  sirius::op::groupjoin::agg_op slot_op = sirius::op::groupjoin::agg_op::COUNT_STAR;
+  bool preserved_is_delim               = false;
+};
+
+static std::optional<inner_value_detection> detect_inner_value_group_join(
+  duckdb::ClientContext& context, const duckdb::LogicalAggregate& op)
+{
+  // The group/aggregate shape screens mirror rung P0 -- one BOUND_REF group and one bound
+  // aggregate without DISTINCT/FILTER/ORDER BY -- with one widening: subquery flattening builds
+  // the delim aggregate by appending the correlation group to an originally ungrouped aggregate,
+  // which leaves `grouping_sets` empty; empty-with-one-group is plain GROUP BY semantics.
+  bool const plain_single_grouping_set =
+    op.grouping_sets.empty() || (op.grouping_sets.size() == 1 && op.grouping_sets[0].size() == 1 &&
+                                 op.grouping_sets[0].count(0) == 1);
+  if (op.groups.size() != 1 || !plain_single_grouping_set || !op.grouping_functions.empty() ||
+      op.expressions.size() != 1) {
+    return inner_rung_miss(
+      "group/aggregate shape (one BOUND_REF group, one aggregate, plain grouping set)");
+  }
+  if (op.groups[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+    return inner_rung_miss("group is not a bound reference");
+  }
+  if (op.expressions[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) {
+    return inner_rung_miss("aggregate expression is not a bound aggregate");
+  }
+  auto const& aggr = op.expressions[0]->Cast<duckdb::BoundAggregateExpression>();
+  if (aggr.IsDistinct() || aggr.filter || aggr.order_bys) {
+    return inner_rung_miss("aggregate has DISTINCT, FILTER, or ORDER BY");
+  }
+
+  auto const name_id = sirius::from_duckdb_aggregate_name(aggr.function.name);
+  if (!name_id) { return inner_rung_miss("aggregate name is not a recognized builtin"); }
+  inner_value_detection det;
+  bool is_count_op = false;
+  switch (*name_id) {
+    case sirius::aggregate_id::count_star:
+      det.slot_op = sirius::op::groupjoin::agg_op::COUNT_STAR;
+      is_count_op = true;
+      break;
+    case sirius::aggregate_id::count:
+      det.slot_op = sirius::op::groupjoin::agg_op::COUNT_VALID;
+      is_count_op = true;
+      break;
+    case sirius::aggregate_id::sum:
+    case sirius::aggregate_id::sum_no_overflow:
+      det.slot_op = sirius::op::groupjoin::agg_op::SUM;
+      break;
+    case sirius::aggregate_id::min: det.slot_op = sirius::op::groupjoin::agg_op::MIN; break;
+    case sirius::aggregate_id::max: det.slot_op = sirius::op::groupjoin::agg_op::MAX; break;
+    case sirius::aggregate_id::avg: det.slot_op = sirius::op::groupjoin::agg_op::AVG; break;
+    default: return inner_rung_miss("aggregate id outside the supported set");
+  }
+  bool const needs_argument = det.slot_op != sirius::op::groupjoin::agg_op::COUNT_STAR;
+  if (needs_argument && (aggr.children.size() != 1 || aggr.children[0]->GetExpressionClass() !=
+                                                        duckdb::ExpressionClass::BOUND_REF)) {
+    return inner_rung_miss("aggregate argument is not a single bound reference");
+  }
+  if (!needs_argument && !aggr.children.empty()) {
+    return inner_rung_miss("COUNT(*) carries arguments");
+  }
+
+  // The child must be an INNER equi-join with exactly one plain-equality condition, no residual
+  // predicate, and validated projection maps -- the same join screens as rung P0 apart from the
+  // join type. RemoveUnusedColumns may leave bare column-selection projections between the
+  // aggregate and the join (it does for q17 at larger scales); compose them into a remap so the
+  // group and argument references resolve through to the join output, and refuse any projection
+  // that computes.
+  if (op.children.size() != 1) { return inner_rung_miss("child is not a comparison join"); }
+  const duckdb::LogicalOperator* join_node = op.children[0].get();
+  std::optional<std::vector<std::size_t>> projection_remap;
+  while (join_node->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+    if (join_node->children.size() != 1) {
+      return inner_rung_miss("intervening projection is not unary");
+    }
+    auto const& child_types = join_node->children[0]->types;
+    std::vector<std::size_t> layer;
+    layer.reserve(join_node->expressions.size());
+    for (std::size_t expr_idx = 0; expr_idx < join_node->expressions.size(); ++expr_idx) {
+      auto const& expr = join_node->expressions[expr_idx];
+      if (expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+        return inner_rung_miss("intervening projection computes expressions");
+      }
+      auto const& ref = expr->Cast<duckdb::BoundReferenceExpression>();
+      if (ref.index >= child_types.size() || ref.return_type != child_types[ref.index] ||
+          expr_idx >= join_node->types.size() || join_node->types[expr_idx] != ref.return_type) {
+        return inner_rung_miss("intervening projection reference is invalid");
+      }
+      layer.push_back(ref.index);
+    }
+    if (projection_remap) {
+      for (auto& mapped : *projection_remap) {
+        if (mapped >= layer.size()) {
+          return inner_rung_miss("intervening projection reference is invalid");
+        }
+        mapped = layer[mapped];
+      }
+    } else {
+      projection_remap = std::move(layer);
+    }
+    join_node = join_node->children[0].get();
+  }
+  if (join_node->type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+    return inner_rung_miss("child is not a comparison join");
+  }
+  auto const& join = join_node->Cast<duckdb::LogicalComparisonJoin>();
+  if (join.join_type != duckdb::JoinType::INNER) {
+    return inner_rung_miss("join type is not INNER");
+  }
+  if (join.children.size() != 2 || join.conditions.size() != 1 || join.predicate) {
+    return inner_rung_miss("join arity, condition count, or residual predicate");
+  }
+  auto const layout = validate_join_projection_layout(join);
+  if (!layout) { return inner_rung_miss("join projection maps are invalid"); }
+  if (layout->left_output_count >
+      std::numeric_limits<std::size_t>::max() - layout->right_output_count) {
+    return inner_rung_miss("join output width overflows");
+  }
+  const auto join_output_width = layout->left_output_count + layout->right_output_count;
+  if (join.types.size() != join_output_width) {
+    return inner_rung_miss("join output width does not match the projection maps");
+  }
+  for (std::size_t output_idx = 0; output_idx < layout->left_output_count; ++output_idx) {
+    auto const child_idx =
+      join.left_projection_map.empty() ? output_idx : join.left_projection_map[output_idx];
+    if (join.types[output_idx] != join.children[0]->types[child_idx]) {
+      return inner_rung_miss("left projection output type mismatch");
+    }
+  }
+  for (std::size_t right_idx = 0; right_idx < layout->right_output_count; ++right_idx) {
+    auto const child_idx =
+      join.right_projection_map.empty() ? right_idx : join.right_projection_map[right_idx];
+    auto const output_idx = layout->left_output_count + right_idx;
+    if (join.types[output_idx] != join.children[1]->types[child_idx]) {
+      return inner_rung_miss("right projection output type mismatch");
+    }
+  }
+
+  auto const& cond = join.conditions[0];
+  if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL ||
+      cond.left->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
+      cond.right->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+    return inner_rung_miss("condition is not a plain equality of bound references");
+  }
+  auto const& left_ref  = cond.left->Cast<duckdb::BoundReferenceExpression>();
+  auto const& right_ref = cond.right->Cast<duckdb::BoundReferenceExpression>();
+  if (left_ref.index >= join.children[0]->types.size() ||
+      right_ref.index >= join.children[1]->types.size() ||
+      left_ref.return_type != join.children[0]->types[left_ref.index] ||
+      right_ref.return_type != join.children[1]->types[right_ref.index]) {
+    return inner_rung_miss("condition reference indices or types are invalid");
+  }
+  const auto key_type_id = cond.left->return_type.id();
+  if (key_type_id != cond.right->return_type.id() ||
+      (key_type_id != duckdb::LogicalTypeId::INTEGER &&
+       key_type_id != duckdb::LogicalTypeId::BIGINT)) {
+    return inner_rung_miss("join keys are not both INT32 or both INT64");
+  }
+
+  // Resolve an aggregate-input reference through the intervening projections to its join output
+  // ordinal; the hop types were validated when the remap was composed.
+  auto const resolve_to_join_output = [&](std::size_t index) -> std::optional<std::size_t> {
+    if (projection_remap) {
+      if (index >= projection_remap->size()) { return std::nullopt; }
+      index = (*projection_remap)[index];
+    }
+    if (index >= join_output_width) { return std::nullopt; }
+    return index;
+  };
+
+  // The group must resolve to one side's join key.
+  auto const& group_ref  = op.groups[0]->Cast<duckdb::BoundReferenceExpression>();
+  auto const group_index = resolve_to_join_output(group_ref.index);
+  if (!group_index || group_ref.return_type != join.types[*group_index]) {
+    return inner_rung_miss("group reference index or type is invalid");
+  }
+  const auto group_target = resolve_join_output_column(join, *layout, *group_index);
+  if (!group_target) { return inner_rung_miss("group does not resolve to a join output column"); }
+  auto const key_idx_of = [&](std::size_t side) {
+    return (side == 0 ? cond.left : cond.right)->Cast<duckdb::BoundReferenceExpression>().index;
+  };
+  if (group_target->second != key_idx_of(group_target->first)) {
+    return inner_rung_miss("group is not its side's join key");
+  }
+
+  // Pick the preserved side: a childless DELIM_GET (delim provenance, the primary q17 target) or
+  // a linear scan chain whose key is proven unique -- the sigma-asymmetry evidence behind this
+  // form's relaxed runtime gate table, not a correctness requirement. The group's own side is
+  // preferred, but a plain INNER equality makes the two key columns pairwise equal on every
+  // emitted row, so the optimizer is free to bind the group to either side (and does); when the
+  // group's side lacks preserved provenance the group is re-homed onto the other side's key,
+  // which emits identical group values.
+  auto const side_qualifies = [&](std::size_t side, bool& is_delim) {
+    auto& node = *join.children[side];
+    if (node.type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET && node.children.empty()) {
+      is_delim = true;
+      return true;
+    }
+    is_delim = false;
+    if (!is_linear_scan_chain(node)) { return false; }
+    auto const unique_columns = prove_unique_columns(node);
+    return unique_columns.size() == 1 &&
+           *unique_columns.begin() == static_cast<duckdb::idx_t>(key_idx_of(side));
+  };
+  if (side_qualifies(group_target->first, det.preserved_is_delim)) {
+    det.preserved_child = group_target->first;
+  } else if (side_qualifies(1 - group_target->first, det.preserved_is_delim)) {
+    det.preserved_child = 1 - group_target->first;
+  } else {
+    return inner_rung_miss(
+      "neither join side is a childless DELIM_GET or a unique-keyed linear scan chain");
+  }
+  const std::size_t counted_child = 1 - det.preserved_child;
+  det.preserved_key_idx           = key_idx_of(det.preserved_child);
+  det.counted_key_idx             = key_idx_of(counted_child);
+
+  if (!is_linear_scan_chain(*join.children[counted_child])) {
+    return inner_rung_miss("counted side is not a linear scan chain");
+  }
+
+  // The aggregate argument must come from the counted side, with a v1-supported carrier
+  // (INT32/INT64, or DECIMAL stored as one of those).
+  if (needs_argument) {
+    auto const& arg_ref  = aggr.children[0]->Cast<duckdb::BoundReferenceExpression>();
+    auto const arg_index = resolve_to_join_output(arg_ref.index);
+    if (!arg_index || arg_ref.return_type != join.types[*arg_index]) {
+      return inner_rung_miss("argument reference index or type is invalid");
+    }
+    const auto arg_target = resolve_join_output_column(join, *layout, *arg_index);
+    if (!arg_target || arg_target->first != counted_child) {
+      return inner_rung_miss("argument does not resolve to the counted side");
+    }
+    if (arg_target->second >= join.children[counted_child]->types.size()) {
+      return inner_rung_miss("argument column index is out of range");
+    }
+    det.counted_value_idx = arg_target->second;
+    switch (arg_ref.return_type.id()) {
+      case duckdb::LogicalTypeId::INTEGER:
+      case duckdb::LogicalTypeId::BIGINT: break;
+      case duckdb::LogicalTypeId::DECIMAL:
+        if (arg_ref.return_type.InternalType() != duckdb::PhysicalType::INT32 &&
+            arg_ref.return_type.InternalType() != duckdb::PhysicalType::INT64) {
+          return inner_rung_miss("DECIMAL argument is not stored as INT32/INT64");
+        }
+        break;
+      default: return inner_rung_miss("argument type outside INT32/INT64/DECIMAL32/DECIMAL64");
+    }
+  }
+
+  // The declared output must be one the fused operator can emit (mirrors the operator's spec
+  // validation, which throws -- and throwing here would fall the whole query back to CPU).
+  auto const output_id = aggr.return_type.id();
+  bool output_type_ok  = false;
+  switch (det.slot_op) {
+    case sirius::op::groupjoin::agg_op::COUNT_STAR:
+    case sirius::op::groupjoin::agg_op::COUNT_VALID:
+      output_type_ok = output_id == duckdb::LogicalTypeId::BIGINT;
+      break;
+    case sirius::op::groupjoin::agg_op::SUM:
+      output_type_ok =
+        output_id == duckdb::LogicalTypeId::BIGINT || output_id == duckdb::LogicalTypeId::DECIMAL;
+      break;
+    case sirius::op::groupjoin::agg_op::MIN:
+    case sirius::op::groupjoin::agg_op::MAX:
+      output_type_ok = output_id == duckdb::LogicalTypeId::INTEGER ||
+                       output_id == duckdb::LogicalTypeId::BIGINT ||
+                       output_id == duckdb::LogicalTypeId::DECIMAL;
+      break;
+    case sirius::op::groupjoin::agg_op::AVG:
+      output_type_ok =
+        output_id == duckdb::LogicalTypeId::DOUBLE || output_id == duckdb::LogicalTypeId::DECIMAL;
+      break;
+  }
+  if (!output_type_ok) {
+    return inner_rung_miss("declared output type unsupported for this aggregate");
+  }
+
+  // Catalog identity last: it is the only check that does catalog work.
+  if (is_count_op) {
+    if (!exact_builtin_count_id(context, aggr)) {
+      return inner_rung_miss("COUNT catalog identity check failed");
+    }
+  } else {
+    auto const identity = exact_builtin_value_aggregate_id(context, aggr);
+    if (!identity || *identity != *name_id) {
+      return inner_rung_miss("value-aggregate catalog identity check failed");
+    }
+  }
+  return det;
+}
+
+// Display name for the P1 fusion log line.
+static std::string_view aggregate_op_display_name(sirius::op::groupjoin::agg_op op)
+{
+  switch (op) {
+    case sirius::op::groupjoin::agg_op::COUNT_STAR: return "COUNT(*)";
+    case sirius::op::groupjoin::agg_op::COUNT_VALID: return "COUNT";
+    case sirius::op::groupjoin::agg_op::SUM: return "SUM";
+    case sirius::op::groupjoin::agg_op::MIN: return "MIN";
+    case sirius::op::groupjoin::agg_op::MAX: return "MAX";
+    case sirius::op::groupjoin::agg_op::AVG: return "AVG";
+  }
+  return "UNKNOWN";
+}
+
+// Byte estimate for one row of @p types: fixed-width columns use their physical size and
+// variable-width columns the configured average, mirroring the GPU-admission estimator's
+// convention.
+static std::size_t estimated_row_bytes(duckdb::vector<duckdb::LogicalType> const& types,
+                                       std::size_t avg_variable_column_bytes)
+{
+  std::size_t total = 0;
+  for (auto const& type : types) {
+    auto const physical = type.InternalType();
+    std::size_t width   = 0;
+    switch (physical) {
+      case duckdb::PhysicalType::VARCHAR:
+      case duckdb::PhysicalType::LIST:
+      case duckdb::PhysicalType::STRUCT:
+      case duckdb::PhysicalType::ARRAY: width = avg_variable_column_bytes; break;
+      default: width = duckdb::GetTypeIdSize(physical); break;
+    }
+    total = sirius::memory::saturating_add(total, width);
+  }
+  return total;
+}
+
 }  // namespace
 
-// The GROUPJOIN detection ladder: rungs are evaluated cheapest-first, each behind its config
-// gate, and any miss falls through to generic join+aggregate planning. The only rung today is
-// P0, the COUNT pathway.
+// The GROUPJOIN detection ladder: rungs are evaluated cheapest-first, each behind its own config
+// gate, and any miss falls through to the next rung and finally to generic join+aggregate
+// planning. Rung P0 is the COUNT-over-outer-join pathway and stays first and verbatim; rung P1 is
+// the INNER value pathway.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::try_plan_group_join(duckdb::LogicalAggregate& op)
 {
@@ -378,18 +810,139 @@ sirius_physical_plan_generator::try_plan_group_join(duckdb::LogicalAggregate& op
                       : nullptr;
   if (!sirius_ctx) { return nullptr; }
   const auto& op_params = sirius_ctx->get_config().get_operator_params();
-  if (!op_params.enable_dense_count_join) { return nullptr; }
 
-  auto detection = detect_count_group_join(context, op);
+  // Rung P0. The config bool gates only this rung; later rungs are gated independently.
+  if (op_params.enable_dense_count_join) {
+    auto detection = detect_count_group_join(context, op);
+    if (detection) {
+      auto& join                      = op.children[0]->Cast<duckdb::LogicalComparisonJoin>();
+      const std::size_t counted_child = 1 - detection->preserved_child;
+
+      // Mirror plan_comparison_join: capture cardinalities before create_plan drains the nodes.
+      const std::size_t preserved_cardinality =
+        join.children[detection->preserved_child]->EstimateCardinality(context);
+      const std::size_t counted_cardinality =
+        join.children[counted_child]->EstimateCardinality(context);
+
+      auto preserved                   = create_plan(*join.children[detection->preserved_child]);
+      auto counted                     = create_plan(*join.children[counted_child]);
+      preserved->estimated_cardinality = preserved_cardinality;
+      counted->estimated_cardinality   = counted_cardinality;
+      if (preserved->children.size() > 1 || counted->children.size() > 1) {
+        throw sirius::internal_exception(
+          "group_join: eligible logical child produced a non-unary physical root");
+      }
+
+      SIRIUS_LOG_INFO(
+        "[sirius_plan_aggregate] Fusing COUNT-join into GROUP_JOIN: {} join, preserved child "
+        "{} (key col {}, est {} rows), counted child {} (key col {}, {}, est {} rows)",
+        join.join_type == duckdb::JoinType::LEFT ? "LEFT" : "RIGHT",
+        detection->preserved_child,
+        detection->preserved_key_idx,
+        preserved_cardinality,
+        counted_child,
+        detection->counted_key_idx,
+        detection->counted_value_idx
+          ? "COUNT(col " + std::to_string(*detection->counted_value_idx) + ")"
+          : std::string("COUNT(*)"),
+        counted_cardinality);
+
+      auto types = sirius::from_duckdb_vec(op.types);
+      sirius::op::groupjoin::group_join_spec spec;
+      spec.form              = sirius::op::groupjoin::join_form::OUTER_PRESERVING;
+      spec.preserved_key_idx = detection->preserved_key_idx;
+      spec.counted_key_idx   = detection->counted_key_idx;
+      spec.slots.push_back(sirius::op::groupjoin::slot_spec{
+        detection->counted_value_idx ? sirius::op::groupjoin::agg_op::COUNT_VALID
+                                     : sirius::op::groupjoin::agg_op::COUNT_STAR,
+        detection->counted_value_idx,
+        types[1]});
+      spec.max_state_bytes = op_params.dense_count_join_max_bytes;
+
+      auto fused = duckdb::make_uniq<sirius::op::sirius_physical_group_join>(
+        std::move(types), op.estimated_cardinality, std::move(spec));
+      fused->children.push_back(std::move(preserved));
+      fused->children.push_back(std::move(counted));
+      return fused;
+    }
+  }
+
+  // Rung P1.
+  if (op_params.enable_group_join) {
+    if (auto fused = try_plan_inner_group_join(op)) { return fused; }
+  }
+
+  return nullptr;
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::try_plan_inner_group_join(duckdb::LogicalAggregate& op)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  if (!sirius_ctx) { return nullptr; }
+  const auto& op_params = sirius_ctx->get_config().get_operator_params();
+
+  auto detection = detect_inner_value_group_join(context, op);
   if (!detection) { return nullptr; }
-  auto& join                      = op.children[0]->Cast<duckdb::LogicalComparisonJoin>();
+  // Detection validated the child chain: the join sits behind zero or more bare
+  // column-selection projections, which the fusion replaces along with the aggregate.
+  duckdb::LogicalOperator* join_node = op.children[0].get();
+  while (join_node->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+    join_node = join_node->children[0].get();
+  }
+  auto& join                      = join_node->Cast<duckdb::LogicalComparisonJoin>();
   const std::size_t counted_child = 1 - detection->preserved_child;
+
+  // Counted-side plan-time byte gate: the fused one-shot schedule colocates the whole counted
+  // side in one task reservation charged at a large multiple of its bytes, so an estimate above
+  // the device-derived gate could never be scheduled -- decline to generic planning instead.
+  const std::size_t counted_cardinality =
+    join.children[counted_child]->EstimateCardinality(context);
+  auto const counted_bytes = sirius::memory::saturating_mul(
+    counted_cardinality,
+    estimated_row_bytes(join.children[counted_child]->types, op_params.avg_variable_column_bytes));
+  if (counted_bytes > op_params.group_join_counted_bytes_gate) {
+    SIRIUS_LOG_INFO(
+      "[sirius_plan_aggregate] GROUP_JOIN INNER fusion declined: counted child estimate {} bytes "
+      "({} rows) exceeds the counted-side byte gate {}",
+      counted_bytes,
+      counted_cardinality,
+      op_params.group_join_counted_bytes_gate);
+    return nullptr;
+  }
+
+  // Dynamic-filter parity. The hash join this fusion replaces publishes membership filters from
+  // its build side (children[1]) when that side carries filter or opaque-build evidence. When the
+  // preserved side is children[1], the fused operator installs the equivalent preserved-key
+  // publication below; when it is children[0], the replaced join's filters would flow from the
+  // counted side, which the fused operator cannot reproduce -- fail closed rather than plan a
+  // filter downgrade.
+  bool const dynamic_filter_enabled = op_params.enable_dynamic_filter;
+  bool const build_filtered =
+    dynamic_filter_enabled && build_subtree_is_filtering(*join.children[1]);
+  bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*join.children[1]);
+  bool const build_evidence = build_filtered || build_opaque;
+  if (build_evidence && detection->preserved_child != 1) {
+    SIRIUS_LOG_INFO(
+      "[sirius_plan_aggregate] GROUP_JOIN INNER fusion declined: the replaced hash join would "
+      "publish counted-side dynamic filters (evidence={}) that the fused operator cannot",
+      build_filtered ? (build_opaque ? "filtered+opaque" : "filtered") : "opaque");
+    return nullptr;
+  }
+
+  // Capture publication evidence before create_plan drains the logical children.
+  auto condition_domains =
+    build_evidence ? build_key_domain_cardinalities(join, duckdb_base_table_cardinality{context})
+                   : std::vector<std::size_t>{};
+  auto condition_shapes = classify_join_key_shapes(join.conditions);
+  auto build_side_unique_cols =
+    build_evidence ? prove_unique_columns(*join.children[1]) : std::unordered_set<duckdb::idx_t>{};
 
   // Mirror plan_comparison_join: capture cardinalities before create_plan drains the nodes.
   const std::size_t preserved_cardinality =
     join.children[detection->preserved_child]->EstimateCardinality(context);
-  const std::size_t counted_cardinality =
-    join.children[counted_child]->EstimateCardinality(context);
 
   auto preserved                   = create_plan(*join.children[detection->preserved_child]);
   auto counted                     = create_plan(*join.children[counted_child]);
@@ -400,34 +953,60 @@ sirius_physical_plan_generator::try_plan_group_join(duckdb::LogicalAggregate& op
       "group_join: eligible logical child produced a non-unary physical root");
   }
 
+  // Preserved-key membership publication (the P1 prerequisite): install the plan the replaced
+  // hash join would have installed, targeting the counted subtree. Identical admission and
+  // discovery inputs make an empty plan here parity with the replaced join, not a downgrade.
+  sirius::op::dynamic_filter_publish_plan filter_plan;
+  if (build_evidence) {
+    auto const& cond = join.conditions[0];
+    membership_publication_request request;
+    request.join_type                    = join.join_type;
+    request.condition.comparison         = sirius::comparison_type::equal;
+    request.condition.left               = sirius::ast::from_duckdb(*cond.left);
+    request.condition.right              = sirius::ast::from_duckdb(*cond.right);
+    request.shape                        = condition_shapes[0];
+    request.build_key_domain_cardinality = condition_domains.empty() ? 0 : condition_domains[0];
+    request.build_side_unique_column =
+      build_side_unique_cols.size() == 1
+        ? std::optional<std::size_t>{static_cast<std::size_t>(*build_side_unique_cols.begin())}
+        : std::nullopt;
+    request.build_estimated_rows = preserved_cardinality;
+    if (request.condition.left != nullptr && request.condition.right != nullptr) {
+      filter_plan = plan_single_key_membership_publication(
+        *sirius_ctx, op_params, std::move(request), counted, "sirius_plan_aggregate");
+    }
+  }
+
   SIRIUS_LOG_INFO(
-    "[sirius_plan_aggregate] Fusing COUNT-join into GROUP_JOIN: {} join, preserved child "
-    "{} (key col {}, est {} rows), counted child {} (key col {}, {}, est {} rows)",
-    join.join_type == duckdb::JoinType::LEFT ? "LEFT" : "RIGHT",
+    "[sirius_plan_aggregate] Fusing INNER {} into GROUP_JOIN: preserved child {} ({}, key col {}, "
+    "est {} rows), counted child {} (key col {}{}, est {} rows), membership publication {}",
+    aggregate_op_display_name(detection->slot_op),
     detection->preserved_child,
+    detection->preserved_is_delim ? "DELIM_GET" : "unique scan chain",
     detection->preserved_key_idx,
     preserved_cardinality,
     counted_child,
     detection->counted_key_idx,
-    detection->counted_value_idx
-      ? "COUNT(col " + std::to_string(*detection->counted_value_idx) + ")"
-      : std::string("COUNT(*)"),
-    counted_cardinality);
+    detection->counted_value_idx ? ", arg col " + std::to_string(*detection->counted_value_idx)
+                                 : std::string(""),
+    counted_cardinality,
+    filter_plan.enabled() ? "installed" : "not wired");
 
   auto types = sirius::from_duckdb_vec(op.types);
   sirius::op::groupjoin::group_join_spec spec;
-  spec.form              = sirius::op::groupjoin::join_form::OUTER_PRESERVING;
+  spec.form              = sirius::op::groupjoin::join_form::INNER;
   spec.preserved_key_idx = detection->preserved_key_idx;
   spec.counted_key_idx   = detection->counted_key_idx;
-  spec.slots.push_back(sirius::op::groupjoin::slot_spec{
-    detection->counted_value_idx ? sirius::op::groupjoin::agg_op::COUNT_VALID
-                                 : sirius::op::groupjoin::agg_op::COUNT_STAR,
-    detection->counted_value_idx,
-    types[1]});
-  spec.max_state_bytes = op_params.dense_count_join_max_bytes;
+  spec.slots.push_back(
+    sirius::op::groupjoin::slot_spec{detection->slot_op, detection->counted_value_idx, types[1]});
+  spec.max_state_bytes = op_params.group_join_max_state_bytes;
 
   auto fused = duckdb::make_uniq<sirius::op::sirius_physical_group_join>(
-    std::move(types), op.estimated_cardinality, std::move(spec));
+    std::move(types),
+    op.estimated_cardinality,
+    std::move(spec),
+    std::move(filter_plan),
+    &sirius_ctx->get_dynamic_filter_stats());
   fused->children.push_back(std::move(preserved));
   fused->children.push_back(std::move(counted));
   return fused;

@@ -21,6 +21,8 @@
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/aggregate/group_join_impl.hpp"
+#include "op/dynamic_filter/dynamic_filter_publisher.hpp"
+#include "op/sirius_physical_delim_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
@@ -40,7 +42,10 @@
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/aligned.hpp>
+#include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
+#include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
@@ -654,12 +659,17 @@ group_join_input::group_join_input(tagged_batches input)
   }
 }
 
-sirius_physical_group_join::sirius_physical_group_join(duckdb::vector<sirius::logical_type> types,
-                                                       std::size_t estimated_cardinality,
-                                                       groupjoin::group_join_spec spec)
+sirius_physical_group_join::sirius_physical_group_join(
+  duckdb::vector<sirius::logical_type> types,
+  std::size_t estimated_cardinality,
+  groupjoin::group_join_spec spec,
+  dynamic_filter_publish_plan dynamic_filter_plan,
+  dynamic_filter_stats* dynamic_filter_stats_sink)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GROUP_JOIN, std::move(types), estimated_cardinality),
-    _spec(std::move(spec))
+    _spec(std::move(spec)),
+    _dynamic_filter_plan(std::move(dynamic_filter_plan)),
+    _dynamic_filter_stats(dynamic_filter_stats_sink)
 {
   validate_group_join_spec(_spec, this->types);
 }
@@ -692,6 +702,15 @@ std::string_view sirius_physical_group_join::input_port_for(
   }
   if (children[0].get() == &producer) { return PRESERVED_PORT; }
   if (children[1].get() == &producer) { return COUNTED_PORT; }
+  // A routing-only DELIM_SCAN preserved child produces no data of its own: the preserved batches
+  // arrive from the owning delim join's distinct-chain root, which the converter retargets to
+  // this operator (mirroring the hash join's non-child CONCAT producer mapping). Accept exactly
+  // that producer; every other non-child producer stays an error.
+  if (auto* owning_delim = producer.owning_delim_join()) {
+    for (auto const& delim_scan : owning_delim->delim_scans) {
+      if (&delim_scan.get() == children[0].get()) { return PRESERVED_PORT; }
+    }
+  }
   throw sirius::internal_exception("GROUP_JOIN repository wiring source is not a direct child");
 }
 
@@ -712,6 +731,15 @@ void sirius_physical_group_join::build_pipelines(pipeline::sirius_pipeline& curr
   auto& host_current = *sink_meta.get_base_pipeline();
 
   auto build_child_side = [&](sirius_physical_operator& child) {
+    // Wiring by provenance: a routing-only DELIM_SCAN child appends no operator and produces no
+    // data -- its build_pipelines registers the mandatory scheduling dependency on the owning
+    // delim join's distinct chain. Invoke it in place against this operator's sink pipeline;
+    // wrapping it as the sink of a fresh producer pipeline would skip that protocol and leave a
+    // sourceless dead pipeline.
+    if (child.type == SiriusPhysicalOperatorType::DELIM_SCAN) {
+      child.build_pipelines(host_current, sink_meta);
+      return;
+    }
     auto& child_meta = sink_meta.create_child_meta_pipeline(host_current, child);
     if (child.children.empty()) { return; }
     if (child.children.size() != 1) {
@@ -725,6 +753,10 @@ void sirius_physical_group_join::build_pipelines(pipeline::sirius_pipeline& curr
 
 std::optional<task_creation_hint> sirius_physical_group_join::get_next_task_hint()
 {
+  // The first poll after the preserved producer finishes is the publication trigger; the call is
+  // a cheap no-op for operators without a publication plan.
+  maybe_publish_preserved_membership();
+
   if (ports.empty()) { return std::nullopt; }
 
   // Either input may be empty, but both producers must finish before the task runs.
@@ -756,6 +788,184 @@ std::unique_ptr<operator_data> sirius_physical_group_join::get_next_task_input_d
   if (preserved_batches.empty() && counted_batches.empty()) { return nullptr; }
   return std::make_unique<group_join_input>(std::move(preserved_batches),
                                             std::move(counted_batches));
+}
+
+void sirius_physical_group_join::maybe_publish_preserved_membership()
+{
+  if (!_dynamic_filter_plan.enabled()) { return; }
+  if (_dynamic_filter_publication_state.load(std::memory_order_acquire) !=
+      dynamic_filter_publication_state::OPEN) {
+    return;
+  }
+  auto const port_it = ports.find(std::string(PRESERVED_PORT));
+  if (port_it == ports.end()) { return; }
+  auto* preserved_port = port_it->second;
+  if (preserved_port->repo == nullptr || preserved_port->src_pipeline == nullptr ||
+      !preserved_port->src_pipeline->is_pipeline_finished()) {
+    return;
+  }
+
+  // Publish only from the complete preserved side; a partial filter could drop valid join rows.
+  // The CAS makes the attempt one-shot under concurrent hint polls.
+  auto expected = dynamic_filter_publication_state::OPEN;
+  if (!_dynamic_filter_publication_state.compare_exchange_strong(
+        expected,
+        dynamic_filter_publication_state::PUBLISHING,
+        std::memory_order_acq_rel,
+        std::memory_order_acquire)) {
+    return;
+  }
+  if (_dynamic_filter_stats != nullptr) {
+    _dynamic_filter_stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  // Publication is optional: any failure below downgrades to "no filters" rather than failing the
+  // query, because this runs on the task-creation path where an escaped exception would not be
+  // attributed to the query.
+  try {
+    auto const batch_ids = preserved_port->repo->get_batch_ids(0);
+    std::shared_ptr<::cucascade::data_batch> preserved_batch;
+    if (batch_ids.size() == 1 && preserved_port->repo->total_size() == 1) {
+      preserved_batch = preserved_port->repo->get_data_batch_by_id(batch_ids[0], 0);
+    }
+    if (preserved_batch == nullptr) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_physical_group_join] dynamic-filter publication (id={}) skipped: the preserved "
+        "side finished as {} batch(es), not one whole delivery.",
+        get_operator_id(),
+        preserved_port->repo->total_size());
+      if (_dynamic_filter_stats != nullptr) {
+        _dynamic_filter_stats->publications_skipped_build_not_whole.fetch_add(
+          1, std::memory_order_relaxed);
+      }
+      _dynamic_filter_publication_state.store(dynamic_filter_publication_state::CLOSED,
+                                              std::memory_order_release);
+      return;
+    }
+
+    auto preserved_ro = preserved_batch->to_read_only();
+    auto* ms          = preserved_ro.get_data() ? preserved_ro.get_memory_space() : nullptr;
+    bool const gpu_resident =
+      ms != nullptr && preserved_ro.get_current_tier() == ::cucascade::memory::Tier::GPU;
+    bool const source_usable =
+      gpu_resident && _dynamic_filter_plan.has_replica_on_device(ms->get_device_id());
+    if (!source_usable) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_physical_group_join] dynamic-filter publication (id={}) skipped: the preserved "
+        "batch is {}.",
+        get_operator_id(),
+        gpu_resident ? "resident on a GPU this plan holds no replica space for"
+                     : "not GPU-resident");
+      if (_dynamic_filter_stats != nullptr) {
+        _dynamic_filter_stats->publications_skipped_source_not_resident.fetch_add(
+          1, std::memory_order_relaxed);
+      }
+      _dynamic_filter_publication_state.store(dynamic_filter_publication_state::CLOSED,
+                                              std::memory_order_release);
+      return;
+    }
+
+    nvtx3::scoped_range nvtx_range{"group_join::dynfilter_publish"};
+    // Wait for the preserved writer before reading on the publication stream.
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{ms->get_device_id()}};
+    auto publish_stream = ms->acquire_stream();
+    if (auto const writer_event = preserved_ro.get_writer_event(); writer_event != nullptr) {
+      auto const status = cudaStreamWaitEvent(publish_stream.value(), writer_event, 0);
+      if (status != cudaSuccess) {
+        throw sirius::internal_exception("group_join: dynamic-filter writer-event wait failed: {}",
+                                         cudaGetErrorString(status));
+      }
+    } else {
+      auto const status = cudaDeviceSynchronize();
+      if (status != cudaSuccess) {
+        throw sirius::internal_exception(
+          "group_join: dynamic-filter source synchronization failed: {}",
+          cudaGetErrorString(status));
+      }
+    }
+    publish_preserved_membership(sirius::get_cudf_table_view(preserved_ro), publish_stream);
+  } catch (std::exception const& error) {
+    auto claimed = dynamic_filter_publication_state::PUBLISHING;
+    if (_dynamic_filter_publication_state.compare_exchange_strong(
+          claimed,
+          dynamic_filter_publication_state::FAILED,
+          std::memory_order_acq_rel,
+          std::memory_order_acquire) &&
+        _dynamic_filter_stats != nullptr) {
+      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
+    }
+    SIRIUS_LOG_WARN(
+      "[sirius_physical_group_join] dynamic-filter publication (id={}) failed; continuing "
+      "without filters: {}",
+      get_operator_id(),
+      error.what());
+  }
+}
+
+void sirius_physical_group_join::publish_preserved_membership(
+  cudf::table_view const& preserved_view, rmm::cuda_stream_view stream)
+{
+  // The trigger owns the PUBLISHING claim until this function sets a terminal state.
+  D_ASSERT(_dynamic_filter_publication_state.load(std::memory_order_acquire) ==
+           dynamic_filter_publication_state::PUBLISHING);
+
+  try {
+    auto const outcome =
+      sirius::op::publish_dynamic_filters(_dynamic_filter_plan, preserved_view, stream);
+    SIRIUS_LOG_DEBUG(
+      "[sirius_physical_group_join] dynamic-filter publication: {} key(s) considered, {} skipped "
+      "(domain gate), {} skipped (type mismatch), {} membership + {} zone-map built, {} filter(s) "
+      "pushed across {} active target(s).",
+      outcome.keys_considered,
+      outcome.keys_skipped_domain_gate,
+      outcome.keys_skipped_type_mismatch,
+      outcome.membership_filters_built,
+      outcome.zone_map_filters_built,
+      outcome.filters_pushed,
+      outcome.active_targets);
+    if (_dynamic_filter_stats != nullptr) {
+      auto& stats        = *_dynamic_filter_stats;
+      auto const relaxed = std::memory_order_relaxed;
+      stats.keys_considered.fetch_add(outcome.keys_considered, relaxed);
+      stats.keys_with_known_domain.fetch_add(outcome.keys_with_known_domain, relaxed);
+      stats.keys_skipped_domain_gate.fetch_add(outcome.keys_skipped_domain_gate, relaxed);
+      stats.keys_skipped_type_mismatch.fetch_add(outcome.keys_skipped_type_mismatch, relaxed);
+      stats.keys_build_exceeded_domain.fetch_add(outcome.keys_build_exceeded_domain, relaxed);
+      stats.membership_filters_built.fetch_add(outcome.membership_filters_built, relaxed);
+      stats.zone_map_filters_built.fetch_add(outcome.zone_map_filters_built, relaxed);
+      stats.publications_skipped_targets_drained.fetch_add(outcome.skipped_targets_drained,
+                                                           relaxed);
+      stats.filters_pushed.fetch_add(outcome.filters_pushed, relaxed);
+    }
+    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FINISHED,
+                                            std::memory_order_release);
+    if (_dynamic_filter_stats != nullptr) {
+      _dynamic_filter_stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
+    }
+  } catch (rmm::out_of_memory const& oom) {
+    // Dynamic filters are optional; device OOM fails publication without failing the query.
+    _dynamic_filter_publication_state.store(dynamic_filter_publication_state::FAILED,
+                                            std::memory_order_release);
+    if (_dynamic_filter_stats != nullptr) {
+      _dynamic_filter_stats->publications_failed.fetch_add(1, std::memory_order_relaxed);
+    }
+    SIRIUS_LOG_WARN(
+      "[sirius_physical_group_join] dynamic-filter publication (id={}) hit device memory "
+      "exhaustion; continuing without filters: {}",
+      get_operator_id(),
+      oom.what());
+  }
+}
+
+void sirius_physical_group_join::on_finalize_operator()
+{
+  // Finalization closes only an unclaimed publication window.
+  auto expected = dynamic_filter_publication_state::OPEN;
+  _dynamic_filter_publication_state.compare_exchange_strong(
+    expected,
+    dynamic_filter_publication_state::CLOSED,
+    std::memory_order_acq_rel,
+    std::memory_order_acquire);
 }
 
 std::size_t sirius_physical_group_join::no_history_peak_memory_estimate(

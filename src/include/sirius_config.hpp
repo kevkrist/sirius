@@ -100,12 +100,21 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
+constexpr bool DEFAULT_ENABLE_GROUP_JOIN = true;
+
 constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
 /// Default GROUP_JOIN value-form state budget: min(16 GiB, smallest device memory / 16).
 /// Device-fraction-capped so small-HBM devices decline dense state they could not reserve; falls
 /// back to the 2 GiB count-form budget when no device is visible.
 uint64_t derived_group_join_max_state_bytes();
+
+/// Default GROUP_JOIN counted-side plan-time byte gate: smallest device memory / 24. The fused
+/// operator colocates the whole counted side in one task reservation charged at up to ~17x the
+/// input bytes plus the materialized bytes, so admitting more than this fraction could never be
+/// scheduled; the planner declines fusion instead. Returns 0 (decline everything) when no device
+/// is visible.
+uint64_t derived_group_join_counted_bytes_gate();
 
 }  // namespace config
 
@@ -190,6 +199,10 @@ struct operator_params {
   /// Enable GROUP_JOIN planning of the fused COUNT pathway for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
+  /// Enable GROUP_JOIN planning of the value pathways (the INNER groupjoin rung); the COUNT
+  /// pathway is gated by enable_dense_count_join independently.
+  bool enable_group_join = config::DEFAULT_ENABLE_GROUP_JOIN;
+
   /// Engine-owned GROUP_JOIN count-state budget; declined ranges use exact sparse aggregation.
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
 
@@ -197,6 +210,12 @@ struct operator_params {
   /// rungs that emit those forms; declined ranges use exact sparse aggregation. See
   /// derived_group_join_max_state_bytes.
   uint64_t group_join_max_state_bytes = config::derived_group_join_max_state_bytes();
+
+  /// Engine-owned GROUP_JOIN counted-side plan-time byte gate: fusion is declined when the
+  /// counted child's estimated bytes exceed this, because the fused one-shot schedule must
+  /// colocate the whole counted side in one reservation. See
+  /// derived_group_join_counted_bytes_gate.
+  uint64_t group_join_counted_bytes_gate = config::derived_group_join_counted_bytes_gate();
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's

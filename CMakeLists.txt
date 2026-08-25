@@ -379,6 +379,7 @@ set(EXTENSION_SOURCES
     src/planner/dynamic_filter/build_filter_evidence.cpp
     src/planner/dynamic_filter/build_key_domain.cpp
     src/planner/dynamic_filter/dynamic_filter_key_admission.cpp
+    src/planner/dynamic_filter/dynamic_filter_publication_planning.cpp
     src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp
     src/planner/gpu_admission.cpp
     src/planner/query.cpp

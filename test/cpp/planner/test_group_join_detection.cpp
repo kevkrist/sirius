@@ -16,6 +16,7 @@
 
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_group_join.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -230,6 +231,30 @@ std::vector<sirius::op::sirius_physical_operator*> collect(
   for (auto& child : root->children) {
     auto sub = collect(child.get(), type);
     out.insert(out.end(), sub.begin(), sub.end());
+  }
+  return out;
+}
+
+// Like collect, but also descends into a delim join's owned subtrees (`join`, `distinct_root`),
+// which live outside `children` -- required to find operators fused under a delim join's branch.
+std::vector<sirius::op::sirius_physical_operator*> collect_deep(
+  sirius::op::sirius_physical_operator* root, sirius::op::SiriusPhysicalOperatorType type)
+{
+  std::vector<sirius::op::sirius_physical_operator*> out;
+  if (!root) { return out; }
+  if (root->type == type) { out.push_back(root); }
+  auto absorb = [&](sirius::op::sirius_physical_operator* node) {
+    auto sub = collect_deep(node, type);
+    out.insert(out.end(), sub.begin(), sub.end());
+  };
+  for (auto& child : root->children) {
+    absorb(child.get());
+  }
+  using T = sirius::op::SiriusPhysicalOperatorType;
+  if (root->type == T::LEFT_DELIM_JOIN || root->type == T::RIGHT_DELIM_JOIN) {
+    auto& delim = static_cast<sirius::op::sirius_physical_delim_join&>(*root);
+    absorb(delim.join.get());
+    absorb(delim.distinct_root.get());
   }
   return out;
 }
@@ -539,6 +564,268 @@ TEST_CASE_METHOD(group_join_fixture,
     has_group_join("SELECT c_id, count(o.o_id) FROM cust LEFT JOIN ("
                    "  SELECT o1.o_id, o1.o_cust FROM ord o1 JOIN ord o2 ON o1.o_id = o2.o_id"
                    ") o ON c_id = o.o_cust GROUP BY c_id"));
+}
+
+namespace {
+
+// Rung P1 fixture: enables the value rungs and adds an INNER-join corpus -- a PRIMARY KEY dim
+// (provable unique preserved side), a plain dim (unprovable), a large PK dim (publication-parity
+// shapes), and a fact table with every v1 argument carrier.
+struct inner_group_join_fixture : group_join_fixture {
+  inner_group_join_fixture()
+  {
+    auto enabled = con->Query("SET enable_group_join = true");
+    REQUIRE(enabled != nullptr);
+    REQUIRE_FALSE(enabled->HasError());
+
+    con->Query("CREATE TABLE dim (d_id INTEGER PRIMARY KEY, d_pad INTEGER, d_txt VARCHAR)");
+    con->Query("INSERT INTO dim SELECT range, range % 5, concat('t', range % 9) FROM range(40)");
+    con->Query("CREATE TABLE dim_plain (dp_id INTEGER, dp_pad INTEGER)");
+    con->Query("INSERT INTO dim_plain SELECT range % 30, range % 5 FROM range(40)");
+    con->Query("CREATE TABLE dim_big (b_id INTEGER PRIMARY KEY)");
+    con->Query("INSERT INTO dim_big SELECT range FROM range(2000)");
+    con->Query(
+      "CREATE TABLE fact (f_d INTEGER, f_v INTEGER, f_dec DECIMAL(15,2), f_big BIGINT, "
+      "f_txt VARCHAR)");
+    con->Query(
+      "INSERT INTO fact SELECT range % 50, range % 7, (range % 90) / 4.0, range, "
+      "concat('t', range % 9) FROM range(200)");
+  }
+
+  // Finds the fused INNER-form operator anywhere in the plan (including under delim joins) and
+  // returns it, or nullptr when the plan did not fuse.
+  sirius::op::sirius_physical_group_join* find_inner_group_join(
+    sirius::op::sirius_physical_operator* root)
+  {
+    auto const fused = collect_deep(root, sirius::op::SiriusPhysicalOperatorType::GROUP_JOIN);
+    if (fused.empty()) { return nullptr; }
+    REQUIRE(fused.size() == 1);
+    auto& op = fused[0]->Cast<sirius::op::sirius_physical_group_join>();
+    REQUIRE(op.spec().form == sirius::op::groupjoin::join_form::INNER);
+    REQUIRE(op.children.size() == 2);
+    return &op;
+  }
+
+  bool has_inner_group_join(const std::string& query)
+  {
+    auto plan = generate_sirius_plan(*con, query);
+    REQUIRE(plan);
+    return find_inner_group_join(plan.get()) != nullptr;
+  }
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P1 fuses delim-preserved value aggregates",
+                 "[group_join][plan]")
+{
+  // The q17 shape: a correlated aggregate whose group key is the DELIM_GET's correlation key.
+  // The outer correlated table must carry a filter -- an unfiltered one lets DuckDB's deliminator
+  // rewrite the delim join away entirely (aggregate directly over the fact side).
+  auto const correlated = [](std::string_view aggregate) {
+    return "SELECT sum(f.f_v) FROM fact f, dim_plain p WHERE p.dp_id = f.f_d AND p.dp_pad = 2 "
+           "AND f.f_v < (SELECT " +
+           std::string(aggregate) + " FROM fact f2 WHERE f2.f_d = p.dp_id)";
+  };
+  REQUIRE(has_inner_group_join(correlated("avg(f2.f_v)")));
+  REQUIRE(has_inner_group_join(correlated("avg(f2.f_dec)")));
+  REQUIRE(has_inner_group_join(correlated("sum(f2.f_v)")));
+  REQUIRE(has_inner_group_join(correlated("min(f2.f_v)")));
+  REQUIRE(has_inner_group_join(correlated("max(f2.f_dec)")));
+
+  // The DELIM_GET preserved side is opaque-build evidence, so the fused operator must carry the
+  // membership publication plan the replaced hash join would have used.
+  auto plan   = generate_sirius_plan(*con, correlated("avg(f2.f_dec)"));
+  auto* fused = find_inner_group_join(plan.get());
+  REQUIRE(fused != nullptr);
+  CHECK(fused->children[0]->type == sirius::op::SiriusPhysicalOperatorType::DELIM_SCAN);
+  CHECK(fused->dynamic_filter_plan().enabled());
+  REQUIRE(fused->dynamic_filter_plan().admitted_keys().size() == 1);
+  CHECK(fused->dynamic_filter_plan().admitted_keys()[0].build_key_ordinal ==
+        static_cast<cudf::size_type>(fused->preserved_key_idx()));
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P1 fuses unique-scan-preserved value aggregates",
+                 "[group_join][plan]")
+{
+  REQUIRE(
+    has_inner_group_join("SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
+  REQUIRE(
+    has_inner_group_join("SELECT d_id, avg(f_dec) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
+  REQUIRE(
+    has_inner_group_join("SELECT d_id, min(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
+  REQUIRE(
+    has_inner_group_join("SELECT d_id, count(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
+  REQUIRE(
+    has_inner_group_join("SELECT d_id, count(*) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P1 is gated by enable_group_join",
+                 "[group_join][plan]")
+{
+  auto const query = "SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id";
+  REQUIRE(has_inner_group_join(query));
+
+  auto off = con->Query("SET enable_group_join = false");
+  REQUIRE_FALSE(off->HasError());
+  CHECK_FALSE(has_inner_group_join(query));
+  auto on = con->Query("SET enable_group_join = true");
+  REQUIRE_FALSE(on->HasError());
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P1 declines off-shape aggregates and joins",
+                 "[group_join][plan]")
+{
+  // Preserved side neither DELIM_GET nor provably unique.
+  CHECK_FALSE(has_inner_group_join(
+    "SELECT dp_id, sum(f_v) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY dp_id"));
+  // Group key on the counted side: the optimizer canonicalizes an INNER-equality group ref onto
+  // either side, so the shape that stays declined is the one where the group side is neither a
+  // DELIM_GET nor provably unique on either binding.
+  CHECK_FALSE(has_inner_group_join(
+    "SELECT f_d, sum(f_v) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY f_d"));
+  // Expression key: the INTEGER = BIGINT comparison inserts a cast.
+  CHECK_FALSE(
+    has_inner_group_join("SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_big GROUP BY d_id"));
+  // Multi-condition join.
+  CHECK_FALSE(has_inner_group_join(
+    "SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_d AND d_pad = f_v GROUP BY d_id"));
+  // Null-safe key.
+  CHECK_FALSE(has_inner_group_join(
+    "SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id IS NOT DISTINCT FROM f_d GROUP BY d_id"));
+  // Non-integer keys.
+  CHECK_FALSE(has_inner_group_join(
+    "SELECT d_txt, min(f_v) FROM dim JOIN fact ON d_txt = f_txt GROUP BY d_txt"));
+  // DISTINCT and FILTER modifiers.
+  CHECK_FALSE(has_inner_group_join(
+    "SELECT d_id, sum(DISTINCT f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
+  CHECK_FALSE(has_inner_group_join(
+    "SELECT d_id, sum(f_v) FILTER (WHERE f_v > 2) FROM dim JOIN fact ON d_id = f_d GROUP BY "
+    "d_id"));
+  // Multiple groups and multiple aggregates.
+  CHECK_FALSE(has_inner_group_join(
+    "SELECT d_id, d_pad, sum(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id, d_pad"));
+  CHECK_FALSE(has_inner_group_join(
+    "SELECT d_id, sum(f_v), min(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id"));
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P1 declines when the counted-side byte gate trips",
+                 "[group_join][plan]")
+{
+  auto const query = "SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id";
+  REQUIRE(has_inner_group_join(query));
+
+  auto tiny = con->Query("SET group_join_counted_bytes_gate = 1");
+  REQUIRE_FALSE(tiny->HasError());
+  CHECK_FALSE(has_inner_group_join(query));
+  auto reset = con->Query("RESET group_join_counted_bytes_gate");
+  REQUIRE_FALSE(reset->HasError());
+  CHECK(has_inner_group_join(query));
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P1 declines a dynamic-filter downgrade and fuses when filters "
+                 "are off",
+                 "[group_join][plan]")
+{
+  // The filtered fact is the smaller relation, so it becomes the replaced hash join's build side
+  // (children[1]) and carries filter evidence, while the preserved (group-key) side is
+  // children[0]: the replaced join would publish fact-key filters onto the dim_big scan, which
+  // the fused operator cannot reproduce -- fusion must decline.
+  auto const query =
+    "SELECT b_id, sum(f.f_v) FROM dim_big JOIN (SELECT * FROM fact WHERE f_v > 3) f "
+    "ON b_id = f.f_d GROUP BY b_id";
+  CHECK_FALSE(has_inner_group_join(query));
+
+  // With dynamic filters disabled there is nothing to drop, so the same shape fuses.
+  auto off = con->Query("SET enable_dynamic_filter = false");
+  REQUIRE_FALSE(off->HasError());
+  CHECK(has_inner_group_join(query));
+  auto reset = con->Query("RESET enable_dynamic_filter");
+  REQUIRE_FALSE(reset->HasError());
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P1 conversion wires the fused-under-delim shape",
+                 "[group_join][pipeline]")
+{
+  auto const query =
+    "SELECT sum(f.f_v) FROM fact f, dim_plain p WHERE p.dp_id = f.f_d AND p.dp_pad = 2 "
+    "AND f.f_v < (SELECT avg(f2.f_v) FROM fact f2 WHERE f2.f_d = p.dp_id)";
+  REQUIRE(has_inner_group_join(query));
+
+  sirius::test::with_conversion_result(
+    *con, query, [](sirius::pipeline::pipeline_conversion_result& result) {
+      using sirius::op::MemoryBarrierType;
+      using sirius::op::SiriusPhysicalOperatorType;
+      using sirius::op::sirius_physical_group_join;
+      using sirius::pipeline::repository_wiring;
+      using sirius::pipeline::sirius_pipeline;
+
+      // The fused operator forms its own source+sink pipeline, and the routing-only DELIM_SCAN
+      // never lands in any pipeline (no sourceless dead pipeline exists).
+      sirius_pipeline* fused_pipeline   = nullptr;
+      sirius_physical_group_join* fused = nullptr;
+      for (auto const& pipeline : result.scheduled_pipelines) {
+        REQUIRE(pipeline->get_source() != nullptr);
+        for (auto const& op_ref : pipeline->get_operators()) {
+          REQUIRE(op_ref.get().type != SiriusPhysicalOperatorType::DELIM_SCAN);
+          if (op_ref.get().type != SiriusPhysicalOperatorType::GROUP_JOIN) { continue; }
+          REQUIRE(fused_pipeline == nullptr);
+          fused_pipeline = pipeline.get();
+          fused          = &op_ref.get().Cast<sirius_physical_group_join>();
+        }
+      }
+      REQUIRE(fused_pipeline != nullptr);
+      REQUIRE(fused != nullptr);
+      REQUIRE(fused->children.size() == 2);
+      REQUIRE(fused->children[0]->type == SiriusPhysicalOperatorType::DELIM_SCAN);
+
+      // Exactly two FULL input wirings: the counted child pipeline onto "counted", and the
+      // distinct-chain root (a non-child producer owned by the delim join) onto "preserved".
+      repository_wiring const* preserved = nullptr;
+      repository_wiring const* counted   = nullptr;
+      for (auto const& wiring : result.repository_wirings) {
+        if (wiring.dest_pipeline.get() != fused_pipeline) { continue; }
+        if (wiring.port_id == sirius_physical_group_join::PRESERVED_PORT) {
+          REQUIRE(preserved == nullptr);
+          preserved = &wiring;
+        } else if (wiring.port_id == sirius_physical_group_join::COUNTED_PORT) {
+          REQUIRE(counted == nullptr);
+          counted = &wiring;
+        } else {
+          FAIL("unexpected input wiring port: " << wiring.port_id);
+        }
+      }
+      REQUIRE(preserved != nullptr);
+      REQUIRE(counted != nullptr);
+      CHECK(preserved->barrier_type == MemoryBarrierType::FULL);
+      CHECK(counted->barrier_type == MemoryBarrierType::FULL);
+      CHECK(counted->source_op == fused->children[1].get());
+
+      // The preserved producer is the delim distinct chain's root, not the DELIM_SCAN child.
+      REQUIRE(preserved->source_op != nullptr);
+      CHECK(preserved->source_op->owning_delim_join() != nullptr);
+      REQUIRE(preserved->source_pipeline);
+      CHECK(preserved->source_pipeline->get_sink().get() == preserved->source_op);
+
+      // The DELIM_SCAN dependency registration and both input wirings land in the fused
+      // pipeline's dependency set, so its single task fires only after both producers finish.
+      auto const& dependencies = fused_pipeline->dependencies;
+      auto depends_on          = [&](sirius_pipeline const* producer) {
+        for (auto const& dependency : dependencies) {
+          if (dependency.get() == producer) { return true; }
+        }
+        return false;
+      };
+      CHECK(depends_on(preserved->source_pipeline.get()));
+      CHECK(depends_on(counted->source_pipeline.get()));
+    });
 }
 
 TEST_CASE("group_join recognizes host COUNT callbacks through a dynamically loaded extension",

@@ -2338,6 +2338,29 @@ static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Va
                    params->dense_count_join_max_bytes);
 }
 
+static void SetEnableGroupJoin(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                 = lock_operator_params_slot(context);
+  params->enable_group_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_GROUP_JOIN to {}", params->enable_group_join);
+}
+
+static void SetGroupJoinCountedBytesGate(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) {
+    throw InvalidInputException("group_join_counted_bytes_gate must be greater than zero");
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                             = lock_operator_params_slot(context);
+  params->group_join_counted_bytes_gate = bytes;
+  SIRIUS_LOG_DEBUG("Updated config GROUP_JOIN_COUNTED_BYTES_GATE to {}",
+                   params->group_join_counted_bytes_gate);
+}
+
 static void SetGroupJoinMaxStateBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
@@ -2631,11 +2654,25 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     SetDenseCountJoinMaxBytes);
   add_sirius_option(config,
                     option_visibility::internal,
+                    "enable_group_join",
+                    "runtime override for the fused GROUP_JOIN value pathways",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_group_join),
+                    SetEnableGroupJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "group_join_max_state_bytes",
                     "internal test hook for the GROUP_JOIN value-form state budget",
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.group_join_max_state_bytes),
                     SetGroupJoinMaxStateBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "group_join_counted_bytes_gate",
+                    "internal test hook for the GROUP_JOIN counted-side byte gate",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.group_join_counted_bytes_gate),
+                    SetGroupJoinCountedBytesGate);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",

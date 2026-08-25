@@ -401,10 +401,18 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
         break;
       }
 
-      // Keys require native values; COUNT(col) uses only its validity mask. Output is native
-      // [key, BIGINT] with no physical sidecar.
+      // Keys require native values, as do SUM/MIN/MAX/AVG arguments (the fused accumulation is
+      // value-sensitive); a COUNT argument uses only its validity mask and may stay narrow.
+      // Output is native [key, aggregate] with no physical sidecar.
+      auto const slot_op             = join.spec().slots[0].op;
+      bool const value_sensitive_arg = slot_op != sirius::op::groupjoin::agg_op::COUNT_STAR &&
+                                       slot_op != sirius::op::groupjoin::agg_op::COUNT_VALID;
+      std::unordered_set<std::size_t> counted_native{counted_key_idx};
+      if (value_sensitive_arg && join.counted_value_idx()) {
+        counted_native.insert(*join.counted_value_idx());
+      }
       restore_native_columns(slot->children[0], {preserved_key_idx});
-      restore_native_columns(slot->children[1], {counted_key_idx});
+      restore_native_columns(slot->children[1], counted_native);
       slot->set_physical_types({});
       return;
     }

@@ -230,7 +230,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
+    REQUIRE(setting_count(con, "enable_group_join") == 0);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
+    REQUIRE(setting_count(con, "group_join_counted_bytes_gate") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -256,7 +258,13 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET enable_dense_count_join = false");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
+    result = con.Query("SET enable_group_join = true");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
     result = con.Query("SET dense_count_join_max_bytes = 1024");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET group_join_counted_bytes_gate = 1024");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");
@@ -276,7 +284,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
+    REQUIRE(setting_count(con, "enable_group_join") == 0);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
+    REQUIRE(setting_count(con, "group_join_counted_bytes_gate") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
   }
 
@@ -292,7 +302,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 1);
+    REQUIRE(setting_count(con, "enable_group_join") == 1);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
+    REQUIRE(setting_count(con, "group_join_counted_bytes_gate") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -337,6 +349,22 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET enable_dense_count_join");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_group_join = true");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_group_join");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET group_join_counted_bytes_gate = 1024");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET group_join_counted_bytes_gate = 0");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(), Catch::Contains("must be greater than zero"));
+    result = con.Query("RESET group_join_counted_bytes_gate");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET dense_count_join_max_bytes = 1024");
@@ -1841,5 +1869,28 @@ TEST_CASE("Sirius configuration enables dense count join by default and accepts 
   REQUIRE_THROWS_WITH(
     invalid_budget.load_from_file(data_dir / "invalid_dense_count_join_engine_policy.yaml"),
     Catch::Contains("sirius.operator_params.dense_count_join_max_bytes") &&
+      Catch::Contains("internal engine policy") && Catch::Contains("remove this key"));
+}
+
+TEST_CASE("Sirius configuration gates the GROUP_JOIN value rungs behind enable_group_join",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config defaults;
+  REQUIRE(defaults.get_operator_params().enable_group_join ==
+          sirius::config::DEFAULT_ENABLE_GROUP_JOIN);
+
+  sirius::sirius_config enabled;
+  REQUIRE_NOTHROW(enabled.load_from_file(data_dir / "valid_group_join_enable.yaml"));
+  REQUIRE(enabled.get_operator_params().enable_group_join);
+  REQUIRE(enabled.get_operator_params().group_join_counted_bytes_gate ==
+          sirius::config::derived_group_join_counted_bytes_gate());
+
+  sirius::sirius_config invalid_gate;
+  REQUIRE_THROWS_WITH(
+    invalid_gate.load_from_file(data_dir / "invalid_group_join_gate_engine_policy.yaml"),
+    Catch::Contains("sirius.operator_params.group_join_counted_bytes_gate") &&
       Catch::Contains("internal engine policy") && Catch::Contains("remove this key"));
 }

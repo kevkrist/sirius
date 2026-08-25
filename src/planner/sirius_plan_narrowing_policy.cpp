@@ -446,13 +446,20 @@ carried_columns analyze_subtree(sirius::op::sirius_physical_operator& op, policy
         break;
       }
 
-      // Keys require native values; COUNT(col) uses only its validity mask. Output is native
-      // [key, BIGINT] with no forwarded carrier.
-      auto mark_key = [&state](carried_columns const& side, std::size_t key_idx) {
-        if (side[key_idx]) { state.candidates[*side[key_idx]].boundary_restore = true; }
+      // Keys require native values, as do SUM/MIN/MAX/AVG arguments (the fused accumulation is
+      // value-sensitive); a COUNT argument uses only its validity mask and may stay narrow.
+      // Output is native [key, aggregate] with no forwarded carrier.
+      auto mark_native = [&state](carried_columns const& side, std::size_t column_idx) {
+        if (side[column_idx]) { state.candidates[*side[column_idx]].boundary_restore = true; }
       };
-      mark_key(child_maps[0], preserved_key_idx);
-      mark_key(child_maps[1], counted_key_idx);
+      mark_native(child_maps[0], preserved_key_idx);
+      mark_native(child_maps[1], counted_key_idx);
+      auto const slot_op             = join.spec().slots[0].op;
+      bool const value_sensitive_arg = slot_op != sirius::op::groupjoin::agg_op::COUNT_STAR &&
+                                       slot_op != sirius::op::groupjoin::agg_op::COUNT_VALID;
+      if (value_sensitive_arg && join.counted_value_idx()) {
+        mark_native(child_maps[1], *join.counted_value_idx());
+      }
       return carried_columns(op.types.size());
     }
 
