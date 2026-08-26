@@ -354,6 +354,11 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
       "'sirius.operator_params.group_join_counted_bytes_gate': GROUP_JOIN counted-side "
       "admission is an internal engine policy; remove this key");
   }
+  if (r.has("group_join_stream_forms")) {
+    throw std::runtime_error(
+      "'sirius.operator_params.group_join_stream_forms': GROUP_JOIN streamed-schedule form "
+      "admission is an internal engine policy; remove this key");
+  }
   // 0 is meaningful here: it turns the estimate off and leaves sizing to gpus_per_query.
   r.optional("admission_bytes_per_gpu", yaml::bytes(opt.admission_bytes_per_gpu));
   r.optional("avg_variable_column_bytes", yaml::bytes(opt.avg_variable_column_bytes));

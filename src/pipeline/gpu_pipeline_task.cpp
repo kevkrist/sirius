@@ -721,7 +721,17 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   info.retry_reservation_floor    = ls.get_retry_reservation_floor();
   info.had_history                = peak_opt.has_value();
 
-  if (peak_opt.has_value()) {
+  // An operator-authoritative per-task charge takes precedence over the history/no-history
+  // ladder: pipelines whose tasks have wildly different peak/input ratios (e.g. GROUP_JOIN's
+  // streamed build/accumulate/emit roles) would otherwise fold one role's ratio into every other
+  // role's history-based estimate. bytes_to_materialize and the retry floor compose below
+  // exactly as for estimated peaks.
+  auto const peak_override =
+    ls._input_data ? ls._input_data->peak_memory_estimate_override() : std::nullopt;
+  if (peak_override.has_value()) {
+    info.had_history          = false;
+    info.peak_memory_estimate = *peak_override;
+  } else if (peak_opt.has_value()) {
     info.peak_memory_estimate = *peak_opt;
     // pipeline_memory_history may estimate below the current fresh batch's known decode working
     // set.

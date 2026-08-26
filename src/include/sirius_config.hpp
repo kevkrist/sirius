@@ -211,11 +211,20 @@ struct operator_params {
   /// derived_group_join_max_state_bytes.
   uint64_t group_join_max_state_bytes = config::derived_group_join_max_state_bytes();
 
-  /// Engine-owned GROUP_JOIN counted-side plan-time byte gate: fusion is declined when the
-  /// counted child's estimated bytes exceed this, because the fused one-shot schedule must
-  /// colocate the whole counted side in one reservation. See
+  /// Engine-owned GROUP_JOIN counted-side plan-time byte gate. The fused one-shot schedule must
+  /// colocate the whole counted side in one reservation, so this gate acts as the schedule
+  /// selector: at-or-under-gate shapes plan the one-shot schedule verbatim; over-gate shapes plan
+  /// the streamed (BUILD_STREAM) schedule when their form is admitted (group_join_stream_*) and
+  /// the streamed plan-time proofs pass, and are declined to generic planning otherwise. See
   /// derived_group_join_counted_bytes_gate.
   uint64_t group_join_counted_bytes_gate = config::derived_group_join_counted_bytes_gate();
+
+  /// Engine-owned per-form streamed-schedule admission set (the `group_join_stream_forms`
+  /// internal test hook): a form outside the set makes the counted-byte gate decline fusion for
+  /// over-gate shapes exactly as it did before the streamed schedule existed. The honest-failure
+  /// mechanism: a form is removed when its streamed measurement gate fails.
+  bool group_join_stream_inner  = true;
+  bool group_join_stream_direct = true;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's

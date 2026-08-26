@@ -276,16 +276,95 @@ TEST_CASE_METHOD(GroupJoinInnerFixture,
 }
 
 TEST_CASE_METHOD(GroupJoinInnerFixture,
-                 "gpu_execution group join P1: counted-side byte gate declines to the generic "
-                 "plan",
+                 "gpu_execution group join P1: over-gate shapes stream; the form knob restores "
+                 "the decline",
                  "[integration][gpu_execution][group_join]")
 {
   sirius::test::scoped_sirius_setting tiny_gate{
     *con, "group_join_counted_bytes_gate", std::uint64_t{1}};
-  sirius::test::scoped_recording_log_sink log{"info"};
-  compare_gpu_vs_cpu(q17_shape("0.2 * avg(l2.l_qty) + 1.03"));
-  REQUIRE(log_contains(log.sink(), "GROUP_JOIN INNER fusion declined: counted child estimate"));
-  CHECK_FALSE(log_contains(log.sink(), "Fusing INNER AVG into GROUP_JOIN"));
+
+  // Over the gate the q17 shape fuses with the streamed schedule (native-table statistics prove
+  // the argument NOT NULL and bound the accumulation), builds on preserved completion, and emits
+  // after the counted producer finishes -- results identical to the CPU oracle.
+  {
+    sirius::test::scoped_recording_log_sink log{"info"};
+    compare_gpu_vs_cpu(q17_shape("0.2 * avg(l2.l_qty) + 1.03"));
+    CHECK(log_contains(log.sink(), "Fusing INNER AVG into GROUP_JOIN (STREAM schedule)"));
+    CHECK(log_contains(log.sink(), "STREAM build: INNER AVG committed"));
+    REQUIRE(log_contains(log.sink(), "STREAM emit:"));
+  }
+
+  // The honest-failure knob: with INNER outside group_join_stream_forms the byte gate declines
+  // fusion exactly as it did before the streamed schedule existed.
+  {
+    sirius::test::scoped_sirius_setting no_stream_forms{
+      *con, "group_join_stream_forms", std::string{""}};
+    sirius::test::scoped_recording_log_sink log{"info"};
+    compare_gpu_vs_cpu(q17_shape("0.2 * avg(l2.l_qty) + 1.03"));
+    REQUIRE(log_contains(log.sink(), "GROUP_JOIN INNER fusion declined: counted child estimate"));
+    CHECK_FALSE(log_contains(log.sink(), "Fusing INNER AVG into GROUP_JOIN"));
+  }
+}
+
+TEST_CASE_METHOD(GroupJoinInnerFixture,
+                 "gpu_execution group join P1: streamed dense and sparse matrix with publication "
+                 "parity",
+                 "[integration][gpu_execution][group_join]")
+{
+  sirius::test::scoped_sirius_setting tiny_gate{
+    *con, "group_join_counted_bytes_gate", std::uint64_t{1}};
+
+  // Dense commit: the dense-forcing MIN/MAX shapes stream with the state built from the
+  // preserved extrema.
+  {
+    sirius::test::scoped_recording_log_sink log{"info"};
+    compare_gpu_vs_cpu(
+      "SELECT d, min(fv) AS m FROM dim_dense JOIN fact_dense ON d = fd GROUP BY d");
+    CHECK(log_contains(log.sink(), "Fusing INNER MIN into GROUP_JOIN (STREAM schedule)"));
+    REQUIRE(log_contains(log.sink(), "STREAM build: INNER MIN committed dense"));
+    compare_gpu_vs_cpu(
+      "SELECT d, max(fv) AS m FROM dim_dense JOIN fact_dense ON d = fd GROUP BY d");
+    REQUIRE(log_contains(log.sink(), "STREAM build: INNER MAX committed dense"));
+    compare_gpu_vs_cpu(
+      "SELECT d, sum(fv) AS s FROM dim_dense JOIN fact_dense ON d = fd GROUP BY d");
+    REQUIRE(log_contains(log.sink(), "STREAM build: INNER SUM committed dense"));
+    compare_gpu_vs_cpu(
+      "SELECT d, count(*) AS c FROM dim_dense JOIN fact_dense ON d = fd GROUP BY d");
+    compare_gpu_vs_cpu(
+      "SELECT d, avg(fv) AS a FROM dim_dense JOIN fact_dense ON d = fd GROUP BY d");
+    REQUIRE(log_contains(log.sink(), "STREAM build: INNER AVG committed dense"));
+  }
+
+  // Streamed publication parity: the q17 shape's preserved keys still publish membership filters
+  // from the same preserved-completion trigger.
+  {
+    auto const before = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+    compare_gpu_vs_cpu(q17_shape("0.2 * avg(l2.l_qty) + 1.03"));
+    auto const after = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+    REQUIRE(after.publication_attempts > before.publication_attempts);
+    REQUIRE(after.publications_finished > before.publications_finished);
+    REQUIRE(after.filters_pushed > before.filters_pushed);
+    REQUIRE(after.publications_failed == before.publications_failed);
+  }
+
+  // Proof-inconclusive shapes (nullable argument) do not stream as INNER; the ladder hands them
+  // to the streamed DIRECT form, which is sparse and mask-exact.
+  {
+    sirius::test::scoped_recording_log_sink log{"info"};
+    compare_gpu_vs_cpu("SELECT dn, sum(nv) AS s FROM dim_n JOIN fact_n ON dn = fn GROUP BY dn");
+    CHECK_FALSE(log_contains(log.sink(), "Fusing INNER SUM into GROUP_JOIN (STREAM schedule)"));
+    CHECK(log_contains(log.sink(), "Fusing DIRECT SUM into GROUP_JOIN (STREAM schedule)"));
+    REQUIRE(log_contains(log.sink(), "STREAM build: DIRECT SUM committed sparse"));
+  }
+
+  // Runtime-empty sides under the streamed schedule: an empty preserved side discards the
+  // counted stream, and an empty counted stream emits the empty result.
+  compare_gpu_vs_cpu(
+    "SELECT d, count(fv) AS c FROM (SELECT * FROM dim_dense WHERE d > 1000000) dd(d) "
+    "JOIN fact_dense ON d = fd GROUP BY d");
+  compare_gpu_vs_cpu(
+    "SELECT d, sum(f.fv) AS s FROM dim_dense "
+    "JOIN (SELECT * FROM fact_dense WHERE fv > 1000000) f ON d = f.fd GROUP BY d");
 }
 
 TEST_CASE_METHOD(GroupJoinInnerFixture,
@@ -458,7 +537,8 @@ TEST_CASE_METHOD(GroupJoinDirectFixture,
 }
 
 TEST_CASE_METHOD(GroupJoinDirectFixture,
-                 "gpu_execution group join P2: runtime-empty child and byte-gate decline",
+                 "gpu_execution group join P2: runtime-empty child, streamed schedule, and the "
+                 "form-knob decline",
                  "[integration][gpu_execution][group_join]")
 {
   // Keep scans nonempty at plan time so the filter produces an empty child at runtime: the fused
@@ -467,11 +547,32 @@ TEST_CASE_METHOD(GroupJoinDirectFixture,
     "SELECT g, min(v) AS m FROM dk_t JOIN (SELECT * FROM dj_t WHERE v > 1000000) d "
     "ON k = d.j GROUP BY g");
 
-  // A forced tiny child byte gate declines fusion to the generic plan.
   sirius::test::scoped_sirius_setting tiny_gate{
     *con, "group_join_counted_bytes_gate", std::uint64_t{1}};
-  sirius::test::scoped_recording_log_sink log{"info"};
-  compare_gpu_vs_cpu("SELECT g, min(v) AS m FROM dk_t JOIN dj_t ON k = j GROUP BY g");
-  REQUIRE(log_contains(log.sink(), "GROUP_JOIN DIRECT fusion declined: child estimate"));
-  CHECK_FALSE(log_contains(log.sink(), "Fusing DIRECT MIN into GROUP_JOIN"));
+
+  // Over the gate a DIRECT shape streams the sparse merge ladder (committed at plan time, no
+  // admission proofs) -- including the q2 regime and outer-join padding NULLs.
+  {
+    sirius::test::scoped_recording_log_sink log{"info"};
+    compare_gpu_vs_cpu("SELECT g, min(v) AS m FROM dk_t JOIN dj_t ON k = j GROUP BY g");
+    CHECK(log_contains(log.sink(), "Fusing DIRECT MIN into GROUP_JOIN (STREAM schedule)"));
+    REQUIRE(log_contains(log.sink(), "STREAM build: DIRECT MIN committed sparse"));
+    REQUIRE(log_contains(log.sink(), "STREAM emit:"));
+    compare_gpu_vs_cpu(
+      "SELECT ps_p, min(ps_cost) AS m FROM sup_t JOIN ps_t ON s_id = ps_s GROUP BY ps_p");
+    compare_gpu_vs_cpu("SELECT c, sum(amt) AS s FROM cust_t LEFT JOIN ord_t ON c = oc GROUP BY c");
+    compare_gpu_vs_cpu("SELECT g, count(*) AS c FROM dk_t JOIN dj_t ON k = j GROUP BY g");
+    compare_gpu_vs_cpu("SELECT g, avg(v) AS a FROM dk_t JOIN dj_t ON k = j GROUP BY g");
+  }
+
+  // The honest-failure knob: with DIRECT outside group_join_stream_forms the byte gate declines
+  // fusion to the generic plan exactly as it did before the streamed schedule existed.
+  {
+    sirius::test::scoped_sirius_setting no_direct{
+      *con, "group_join_stream_forms", std::string{"INNER"}};
+    sirius::test::scoped_recording_log_sink log{"info"};
+    compare_gpu_vs_cpu("SELECT g, min(v) AS m FROM dk_t JOIN dj_t ON k = j GROUP BY g");
+    REQUIRE(log_contains(log.sink(), "GROUP_JOIN DIRECT fusion declined: child estimate"));
+    CHECK_FALSE(log_contains(log.sink(), "Fusing DIRECT MIN into GROUP_JOIN"));
+  }
 }

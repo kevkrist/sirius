@@ -44,6 +44,7 @@
 #include "planner/dynamic_filter/build_key_domain.hpp"
 #include "planner/dynamic_filter/dynamic_filter_key_admission.hpp"
 #include "planner/dynamic_filter/dynamic_filter_publication_planning.hpp"
+#include "planner/group_join_stream_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "planner/sirius_plan_unique_columns.hpp"
@@ -1018,22 +1019,42 @@ sirius_physical_plan_generator::try_plan_inner_group_join(duckdb::LogicalAggrega
   auto& join                      = join_node->Cast<duckdb::LogicalComparisonJoin>();
   const std::size_t counted_child = 1 - detection->preserved_child;
 
-  // Counted-side plan-time byte gate: the fused one-shot schedule colocates the whole counted
-  // side in one task reservation charged at a large multiple of its bytes, so an estimate above
-  // the device-derived gate could never be scheduled -- decline to generic planning instead.
+  // Counted-side plan-time byte gate, acting as the schedule selector. At or under the gate the
+  // fused one-shot schedule colocates the whole counted side in one task reservation (today's
+  // admission, wiring, and estimate verbatim). Over the gate that reservation could never be
+  // scheduled, so the shape plans the streamed schedule instead -- when the INNER form is
+  // stream-admitted and the plan-time proofs pass -- and declines to generic planning otherwise.
+  // Estimate error is harmless in both directions here: it selects a schedule, not a reservation.
   const std::size_t counted_cardinality =
     join.children[counted_child]->EstimateCardinality(context);
   auto const counted_bytes = sirius::memory::saturating_mul(
     counted_cardinality,
     estimated_row_bytes(join.children[counted_child]->types, op_params.avg_variable_column_bytes));
+  auto schedule                     = sirius::op::groupjoin::schedule_kind::ONE_SHOT;
+  uint64_t stream_counted_row_bound = 0;
   if (counted_bytes > op_params.group_join_counted_bytes_gate) {
-    SIRIUS_LOG_INFO(
-      "[sirius_plan_aggregate] GROUP_JOIN INNER fusion declined: counted child estimate {} bytes "
-      "({} rows) exceeds the counted-side byte gate {}",
-      counted_bytes,
-      counted_cardinality,
-      op_params.group_join_counted_bytes_gate);
-    return nullptr;
+    auto const declined = [&](std::string_view reason) {
+      SIRIUS_LOG_INFO(
+        "[sirius_plan_aggregate] GROUP_JOIN INNER fusion declined: counted child estimate {} "
+        "bytes ({} rows) exceeds the counted-side byte gate {} and the streamed schedule is "
+        "inadmissible ({})",
+        counted_bytes,
+        counted_cardinality,
+        op_params.group_join_counted_bytes_gate,
+        reason);
+      return nullptr;
+    };
+    if (!op_params.group_join_stream_inner) {
+      return declined("INNER is outside group_join_stream_forms");
+    }
+    auto const admission = admit_group_join_inner_stream(context,
+                                                         &sirius_ctx->get_scan_manager(),
+                                                         *join.children[counted_child],
+                                                         detection->counted_value_idx,
+                                                         detection->slot_op);
+    if (!admission.admitted) { return declined(admission.reason); }
+    schedule                 = sirius::op::groupjoin::schedule_kind::STREAM;
+    stream_counted_row_bound = admission.counted_row_bound;
   }
 
   // Dynamic-filter parity. The hash join this fusion replaces publishes membership filters from
@@ -1101,9 +1122,11 @@ sirius_physical_plan_generator::try_plan_inner_group_join(duckdb::LogicalAggrega
   }
 
   SIRIUS_LOG_INFO(
-    "[sirius_plan_aggregate] Fusing INNER {} into GROUP_JOIN: preserved child {} ({}, key col {}, "
-    "est {} rows), counted child {} (key col {}{}, est {} rows), membership publication {}",
+    "[sirius_plan_aggregate] Fusing INNER {} into GROUP_JOIN ({} schedule): preserved child {} "
+    "({}, key col {}, est {} rows), counted child {} (key col {}{}, est {} rows), membership "
+    "publication {}",
     aggregate_op_display_name(detection->slot_op),
+    schedule == sirius::op::groupjoin::schedule_kind::STREAM ? "STREAM" : "one-shot",
     detection->preserved_child,
     detection->preserved_is_delim ? "DELIM_GET" : "unique scan chain",
     detection->preserved_key_idx,
@@ -1122,7 +1145,9 @@ sirius_physical_plan_generator::try_plan_inner_group_join(duckdb::LogicalAggrega
   spec.counted_key_idx   = detection->counted_key_idx;
   spec.slots.push_back(
     sirius::op::groupjoin::slot_spec{detection->slot_op, detection->counted_value_idx, types[1]});
-  spec.max_state_bytes = op_params.group_join_max_state_bytes;
+  spec.max_state_bytes          = op_params.group_join_max_state_bytes;
+  spec.schedule                 = schedule;
+  spec.stream_counted_row_bound = stream_counted_row_bound;
 
   auto fused = duckdb::make_uniq<sirius::op::sirius_physical_group_join>(
     std::move(types),
@@ -1148,20 +1173,26 @@ sirius_physical_plan_generator::try_plan_direct_group_join(duckdb::LogicalAggreg
   if (!detection) { return nullptr; }
   auto& child = *op.children[0];
 
-  // Child plan-time byte gate: the fused one-shot schedule colocates the whole child output in
-  // one task reservation charged at a large multiple of its bytes, so an estimate above the
-  // device-derived gate could never be scheduled -- decline to generic planning instead.
+  // Child plan-time byte gate, acting as the schedule selector (as in rung P1). An over-gate
+  // DIRECT shape streams the sparse merge ladder -- committed at plan time, because a dense
+  // DIRECT domain cannot be known before the stream ends -- and needs no admission proofs (the
+  // sparse path is mask-exact with generic-parity int64 accumulation).
   const std::size_t child_cardinality = child.EstimateCardinality(context);
   auto const child_bytes              = sirius::memory::saturating_mul(
     child_cardinality, estimated_row_bytes(child.types, op_params.avg_variable_column_bytes));
+  auto schedule = sirius::op::groupjoin::schedule_kind::ONE_SHOT;
   if (child_bytes > op_params.group_join_counted_bytes_gate) {
-    SIRIUS_LOG_INFO(
-      "[sirius_plan_aggregate] GROUP_JOIN DIRECT fusion declined: child estimate {} bytes "
-      "({} rows) exceeds the counted-side byte gate {}",
-      child_bytes,
-      child_cardinality,
-      op_params.group_join_counted_bytes_gate);
-    return nullptr;
+    if (!op_params.group_join_stream_direct) {
+      SIRIUS_LOG_INFO(
+        "[sirius_plan_aggregate] GROUP_JOIN DIRECT fusion declined: child estimate {} bytes "
+        "({} rows) exceeds the counted-side byte gate {} and the streamed schedule is "
+        "inadmissible (DIRECT is outside group_join_stream_forms)",
+        child_bytes,
+        child_cardinality,
+        op_params.group_join_counted_bytes_gate);
+      return nullptr;
+    }
+    schedule = sirius::op::groupjoin::schedule_kind::STREAM;
   }
 
   // Unlike rung P1, no dynamic-filter publication is installed: DIRECT replaces only the
@@ -1172,9 +1203,10 @@ sirius_physical_plan_generator::try_plan_direct_group_join(duckdb::LogicalAggreg
   counted->estimated_cardinality = child_cardinality;
 
   SIRIUS_LOG_INFO(
-    "[sirius_plan_aggregate] Fusing DIRECT {} into GROUP_JOIN: group key col {}{}, opaque "
-    "comparison-join child (est {} rows)",
+    "[sirius_plan_aggregate] Fusing DIRECT {} into GROUP_JOIN ({} schedule): group key col {}{}, "
+    "opaque comparison-join child (est {} rows)",
     aggregate_op_display_name(detection->slot_op),
+    schedule == sirius::op::groupjoin::schedule_kind::STREAM ? "STREAM" : "one-shot",
     detection->group_key_idx,
     detection->arg_idx ? ", arg col " + std::to_string(*detection->arg_idx) : std::string(""),
     child_cardinality);
@@ -1188,6 +1220,7 @@ sirius_physical_plan_generator::try_plan_direct_group_join(duckdb::LogicalAggreg
   spec.slots.push_back(
     sirius::op::groupjoin::slot_spec{detection->slot_op, detection->arg_idx, types[1]});
   spec.max_state_bytes = op_params.group_join_max_state_bytes;
+  spec.schedule        = schedule;
 
   auto fused = duckdb::make_uniq<sirius::op::sirius_physical_group_join>(
     std::move(types), op.estimated_cardinality, std::move(spec));

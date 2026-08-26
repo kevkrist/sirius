@@ -51,8 +51,10 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -61,6 +63,8 @@
 namespace sirius::op {
 
 namespace {
+
+constexpr std::size_t k_allocation_floor = 1024 * 1024;
 [[nodiscard]] cudf::size_type checked_cudf_size(std::size_t value, std::string_view what)
 {
   auto const max = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
@@ -442,6 +446,41 @@ void push_merge_aggregation(std::vector<cudf::groupby::aggregation_request>& req
   }
 }
 
+/// Concatenate two `[key, partials...]` views and groupby-merge them losslessly. The inputs stay
+/// alive across the merge, which is what lets the streamed ladder fold stay consistent under an
+/// OOM retry; the consuming wrapper below frees them eagerly for the one-shot merge tree.
+std::unique_ptr<cudf::table> sparse_merge_value_views(cudf::table_view const& lhs,
+                                                      cudf::table_view const& rhs,
+                                                      groupjoin::agg_op op,
+                                                      cudf::null_policy key_policy,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr)
+{
+  std::vector<cudf::table_view> views{lhs, rhs};
+  auto combined = cudf::concatenate(views, stream, mr);
+
+  auto const num_value_cols = combined->num_columns() - 1;
+  cudf::groupby::groupby gb(
+    cudf::table_view({combined->view().column(0)}), key_policy, cudf::sorted::NO);
+  std::vector<cudf::groupby::aggregation_request> requests;
+  requests.reserve(static_cast<std::size_t>(num_value_cols));
+  for (cudf::size_type i = 0; i < num_value_cols; ++i) {
+    requests.emplace_back();
+    requests.back().values = combined->view().column(i + 1);
+    // The first value column carries the op's partial; AVG's second column is a count.
+    push_merge_aggregation(requests, i == 0 ? op : groupjoin::agg_op::COUNT_VALID);
+  }
+  auto [group_keys, results] = gb.aggregate(requests, stream, mr);
+  combined.reset();
+  auto key_cols = group_keys->release();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(key_cols[0]));
+  for (auto& result : results) {
+    columns.push_back(std::move(result.results[0]));
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 std::unique_ptr<cudf::table> sparse_merge_value_pair(std::unique_ptr<cudf::table> lhs,
                                                      std::unique_ptr<cudf::table> rhs,
                                                      groupjoin::agg_op op,
@@ -476,6 +515,25 @@ std::unique_ptr<cudf::table> sparse_merge_value_pair(std::unique_ptr<cudf::table
   return std::make_unique<cudf::table>(std::move(columns));
 }
 
+/// Zero-group `[key, partial(s)]` shell of the sparse value pathway's partial schema (AVG carries
+/// a second count partial).
+std::unique_ptr<cudf::table> empty_sparse_value_partial(cudf::data_type key_type,
+                                                        groupjoin::agg_op op,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(
+    cudf::make_fixed_width_column(key_type, 0, cudf::mask_state::UNALLOCATED, stream, mr));
+  columns.push_back(cudf::make_fixed_width_column(
+    cudf::data_type{cudf::type_id::INT64}, 0, cudf::mask_state::UNALLOCATED, stream, mr));
+  if (op == groupjoin::agg_op::AVG) {
+    columns.push_back(cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT64}, 0, cudf::mask_state::UNALLOCATED, stream, mr));
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 // Merge in balanced pairs to avoid one all-partials concatenation (the count path's discipline).
 std::unique_ptr<cudf::table> sparse_merge_value_partials(
   std::vector<std::unique_ptr<cudf::table>> partials,
@@ -485,18 +543,7 @@ std::unique_ptr<cudf::table> sparse_merge_value_partials(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
-  if (partials.empty()) {
-    std::vector<std::unique_ptr<cudf::column>> columns;
-    columns.push_back(
-      cudf::make_fixed_width_column(key_type, 0, cudf::mask_state::UNALLOCATED, stream, mr));
-    columns.push_back(cudf::make_fixed_width_column(
-      cudf::data_type{cudf::type_id::INT64}, 0, cudf::mask_state::UNALLOCATED, stream, mr));
-    if (op == groupjoin::agg_op::AVG) {
-      columns.push_back(cudf::make_fixed_width_column(
-        cudf::data_type{cudf::type_id::INT64}, 0, cudf::mask_state::UNALLOCATED, stream, mr));
-    }
-    return std::make_unique<cudf::table>(std::move(columns));
-  }
+  if (partials.empty()) { return empty_sparse_value_partial(key_type, op, stream, mr); }
   while (partials.size() > 1) {
     std::vector<std::unique_ptr<cudf::table>> next;
     next.reserve(partials.size() / 2 + partials.size() % 2);
@@ -511,6 +558,216 @@ std::unique_ptr<cudf::table> sparse_merge_value_partials(
     partials = std::move(next);
   }
   return std::move(partials.front());
+}
+
+/// INNER-form sparse combine: the distinct-key inner join of the preserved multiplicity partial
+/// with the counted aggregate partial realizes the matched > 0 emit filter structurally (a
+/// counted-partial key exists iff at least one key-match row does), then the Yan-Larson scaling
+/// applies per op. @p preserved_agg is read by view and must stay alive across the call: the
+/// streamed emit combines directly from unreleased stream state, so an OOM retry of the emit task
+/// replays against the same consistent partial. @p counted_rows drives COUNT's exact product
+/// validation and is the accumulated stream total under the streamed schedule.
+std::unique_ptr<cudf::table> sparse_inner_combine(cudf::table_view const& preserved_agg,
+                                                  std::unique_ptr<cudf::table> counted_agg,
+                                                  groupjoin::agg_op op,
+                                                  int64_t preserved_rows,
+                                                  int64_t counted_rows,
+                                                  rmm::cuda_stream_view stream,
+                                                  rmm::device_async_resource_ref mr)
+{
+  using groupjoin::agg_op;
+  auto const preserved_key_view      = cudf::table_view({preserved_agg.column(0)});
+  auto const counted_key_view        = cudf::table_view({counted_agg->view().column(0)});
+  auto [left_indices, right_indices] = cudf::inner_join(
+    preserved_key_view, counted_key_view, cudf::null_equality::UNEQUAL, stream, mr);
+
+  auto keys_out = cudf::gather(preserved_key_view,
+                               gather_map_view(*left_indices),
+                               cudf::out_of_bounds_policy::DONT_CHECK,
+                               stream,
+                               mr);
+  auto presence = cudf::gather(cudf::table_view({preserved_agg.column(1)}),
+                               gather_map_view(*left_indices),
+                               cudf::out_of_bounds_policy::DONT_CHECK,
+                               stream,
+                               mr);
+  std::vector<cudf::column_view> counted_value_views;
+  for (cudf::size_type c = 1; c < counted_agg->view().num_columns(); ++c) {
+    counted_value_views.push_back(counted_agg->view().column(c));
+  }
+  auto matched = cudf::gather(cudf::table_view(counted_value_views),
+                              gather_map_view(*right_indices),
+                              cudf::out_of_bounds_policy::DONT_CHECK,
+                              stream,
+                              mr);
+  left_indices.reset();
+  right_indices.reset();
+  counted_agg.reset();
+
+  auto matched_cols = matched->release();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(keys_out->release()[0]));
+  switch (op) {
+    case agg_op::COUNT_STAR:
+    case agg_op::COUNT_VALID: {
+      if (count_product_needs_validation(preserved_rows, counted_rows, false)) {
+        throw_if_count_product_overflows(
+          presence->view().column(0), matched_cols[0]->view(), stream, mr);
+      }
+      columns.push_back(cudf::binary_operation(presence->view().column(0),
+                                               matched_cols[0]->view(),
+                                               cudf::binary_operator::MUL,
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               stream,
+                                               mr));
+      break;
+    }
+    case agg_op::SUM:
+      // Yan-Larson scaling; a NULL sum (all-NULL-argument group) stays NULL through the
+      // multiply.
+      columns.push_back(cudf::binary_operation(presence->view().column(0),
+                                               matched_cols[0]->view(),
+                                               cudf::binary_operator::MUL,
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               stream,
+                                               mr));
+      break;
+    case agg_op::MIN:
+    case agg_op::MAX:
+      // Duplicate-agnostic: no scaling.
+      columns.push_back(std::move(matched_cols[0]));
+      break;
+    case agg_op::AVG:
+      // Presence cancels in numerator and divisor.
+      columns.push_back(std::move(matched_cols[0]));
+      columns.push_back(std::move(matched_cols[1]));
+      break;
+  }
+  presence.reset();
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+/// Shared INNER/DIRECT output finalize: cast the raw INT64 aggregate (and divide for AVG) into
+/// the declared output type.
+std::unique_ptr<cudf::table> finalize_inner_direct_output(std::unique_ptr<cudf::table> raw,
+                                                          groupjoin::agg_op op,
+                                                          cudf::data_type out_type,
+                                                          cudf::data_type arg_type,
+                                                          rmm::cuda_stream_view stream,
+                                                          rmm::device_async_resource_ref mr)
+{
+  auto raw_cols = raw->release();
+  std::unique_ptr<cudf::column> divisor;
+  if (op == groupjoin::agg_op::AVG) { divisor = std::move(raw_cols[2]); }
+  auto final_value = finalize_value_column(
+    std::move(raw_cols[1]), std::move(divisor), op, out_type, arg_type, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> output_columns;
+  output_columns.push_back(std::move(raw_cols[0]));
+  output_columns.push_back(std::move(final_value));
+  return std::make_unique<cudf::table>(std::move(output_columns));
+}
+
+/// Device bytes of a materialized fixed-width table (data plus validity masks); the streamed
+/// schedule sizes its sparse accumulate/emit reservations from per-slot measurements of this.
+[[nodiscard]] std::size_t device_table_bytes(cudf::table_view const& view)
+{
+  std::size_t total = 0;
+  for (auto const& col : view) {
+    total = sirius::memory::saturating_add(
+      total,
+      sirius::memory::saturating_mul(static_cast<std::size_t>(col.size()),
+                                     static_cast<std::size_t>(cudf::size_of(col.type()))));
+    if (col.nullable()) {
+      total = sirius::memory::saturating_add(
+        total, static_cast<std::size_t>(cudf::bitmask_allocation_size_bytes(col.size())));
+    }
+  }
+  return total;
+}
+
+/// Per-input-row allocation model of one hash-groupby partial construction over @p value_columns
+/// value columns: the cuco hash set (2x capacity over 8-byte slots), per-input-row sparse
+/// aggregation results, the populated-key index vector, and the gathered-plus-widened output
+/// bounded by the input rows.
+[[nodiscard]] constexpr std::size_t groupby_partial_bytes_per_row(std::size_t key_width,
+                                                                  std::size_t value_columns)
+{
+  return key_width + 16 + 24 * value_columns + 4;
+}
+
+/// Merge-step allocation bound over @p input_bytes of concatenated `[key, int64 partials]` input:
+/// the concatenation itself, the merged output (never wider than its input), and hash-groupby
+/// scratch bounded by twice the input.
+[[nodiscard]] std::size_t groupby_merge_step_bytes(std::size_t input_bytes)
+{
+  return sirius::memory::saturating_mul(4, input_bytes);
+}
+
+/// Row bound of a counted batch of @p batch_bytes: every batch carries at least the key column
+/// (plus an argument column for every op but COUNT_STAR, whose narrowest carrier is 4 bytes).
+[[nodiscard]] std::size_t counted_batch_row_bound(std::size_t batch_bytes,
+                                                  std::size_t key_width,
+                                                  groupjoin::agg_op op)
+{
+  auto const divisor = key_width + (op == groupjoin::agg_op::COUNT_STAR ? 0 : sizeof(int32_t));
+  return batch_bytes / divisor + 1;
+}
+
+/// Task-lifetime allocation peak of folding one counted batch of @p batch_bytes into the sparse
+/// merge ladder. The fold's carry chain is deterministic at input-pop time (sparse accumulates
+/// serialize, so the ladder cannot change between the pop and the fold): the batch partial merges
+/// through exactly the contiguous resident-slot prefix, each step holding the running merge, the
+/// two-input concatenation, the merged output, and the hash-groupby scratch, while the resident
+/// slots themselves stay charged to the reservations that built them.
+[[nodiscard]] std::size_t sparse_fold_peak_bytes(
+  std::vector<std::unique_ptr<cudf::table>> const& ladder,
+  std::size_t batch_bytes,
+  std::size_t key_width,
+  groupjoin::agg_op op)
+{
+  using sirius::memory::saturating_add;
+  using sirius::memory::saturating_mul;
+  auto const value_columns = op == groupjoin::agg_op::AVG ? std::size_t{2} : std::size_t{1};
+  auto const row_bound     = counted_batch_row_bound(batch_bytes, key_width, op);
+  auto const partial_phase =
+    saturating_mul(row_bound, groupby_partial_bytes_per_row(key_width, value_columns));
+  // The retained batch partial: key plus int64 partial(s) plus validity-mask slack.
+  auto const partial_bound =
+    saturating_mul(row_bound, saturating_add(key_width, 9 * value_columns));
+
+  std::size_t peak   = partial_phase;
+  std::size_t merged = partial_bound;
+  for (auto const& slot : ladder) {
+    if (slot == nullptr) { break; }  // The carry chain stops at the first empty slot.
+    auto const pair = saturating_add(device_table_bytes(slot->view()), merged);
+    peak            = std::max(peak, saturating_add(merged, groupby_merge_step_bytes(pair)));
+    merged          = pair;
+  }
+  return peak;
+}
+
+/// Task-lifetime allocation peak of the emit's non-destructive ladder collapse: resident slots
+/// merge sequentially by view into a task-local running table, so each step holds the running
+/// merge plus one merge step's allocations; a single-resident ladder deep-copies its slot.
+[[nodiscard]] std::size_t sparse_collapse_peak_bytes(
+  std::vector<std::unique_ptr<cudf::table>> const& ladder)
+{
+  using sirius::memory::saturating_add;
+  std::size_t peak   = 0;
+  std::size_t merged = 0;
+  for (auto const& slot : ladder) {
+    if (slot == nullptr) { continue; }
+    auto const slot_bytes = device_table_bytes(slot->view());
+    if (merged == 0) {
+      merged = slot_bytes;
+      peak   = std::max(peak, slot_bytes);
+      continue;
+    }
+    auto const pair = saturating_add(slot_bytes, merged);
+    peak            = std::max(peak, saturating_add(merged, groupby_merge_step_bytes(pair)));
+    merged          = pair;
+  }
+  return peak;
 }
 
 [[nodiscard]] std::string_view form_name(groupjoin::join_form form)
@@ -646,18 +903,81 @@ group_join_input::tagged_batches group_join_input::tag_batches(
 
 group_join_input::group_join_input(
   std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
-  std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches)
-  : group_join_input(tag_batches(std::move(preserved_batches), std::move(counted_batches)))
+  std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches,
+  task_role role)
+  : group_join_input(
+      tagged_ctor{}, tag_batches(std::move(preserved_batches), std::move(counted_batches)), role)
 {
 }
 
-group_join_input::group_join_input(tagged_batches input)
-  : pipelineable_operator_data(std::move(input.batches)), _input_sides(std::move(input.sides))
+group_join_input::group_join_input(tagged_ctor, tagged_batches input, task_role role)
+  : pipelineable_operator_data(std::move(input.batches)),
+    _input_sides(std::move(input.sides)),
+    _role(role)
 {
   if (_input_sides.size() != get_data_batches().size()) {
     throw sirius::internal_exception("group_join: input side metadata is not batch-aligned");
   }
 }
+
+/**
+ * @brief Single-slot state machine of the streamed (BUILD_STREAM) schedule.
+ *
+ * The hash-join `per_partition_build_state` analogue: `stage` runs NOT_BUILT -> SCHEDULING (the
+ * hint-side compare-exchange claiming the build) -> SCHEDULED (input popped) -> BUILT
+ * (release-stored at the end of the build's execute, after a stream sync makes the state visible
+ * to accumulate tasks on other streams). Fields below `stage` that are not atomics are written by
+ * the build task before the BUILT release-store and only read afterwards. Hint/pop transitions
+ * beyond the stage CAS are serialized by the owning pipeline's task-creation lock.
+ */
+struct sirius_physical_group_join::stream_state {
+  enum class build_stage : uint8_t { NOT_BUILT, SCHEDULING, SCHEDULED, BUILT };
+
+  std::atomic<build_stage> stage{build_stage::NOT_BUILT};
+  /// INNER whose preserved side finished empty: counted batches are drained and dropped, no task
+  /// is ever created, and no emit is pending (the one-shot no-task degenerate).
+  std::atomic<bool> discard_mode{false};
+  std::atomic<bool> emit_claimed{false};
+  /// Accumulate tasks currently popped but not yet completed. Dense tasks run concurrently;
+  /// sparse tasks serialize (the ladder is not concurrency-safe), enforced at pop time.
+  std::atomic<int64_t> in_flight{0};
+  /// Total counted rows accumulated; feeds emit-time COUNT product validation and the streamed
+  /// SUM/AVG row-bound belt-check.
+  std::atomic<int64_t> counted_rows_total{0};
+
+  // Committed once by the build task (pre-BUILT).
+  strategy committed                       = strategy::NOT_RUN;
+  int device_id                            = -1;
+  ::cucascade::memory::memory_space* space = nullptr;
+  int64_t preserved_rows                   = 0;
+  int64_t preserved_null_keys              = 0;
+
+  /// Dense commit (INNER only): operator-owned direct-address arrays, resident from build to
+  /// emit. Unspillable by design (the hash-join cuco-table class), bounded by the budget gate.
+  std::unique_ptr<group_join_stream_dense_state> dense;
+
+  // Sparse commit: the preserved distinct+multiplicity partial (INNER) and the binary merge
+  // ladder -- slot i holds a partial of ~2^i batches; a carry collision merges pairwise.
+  std::unique_ptr<cudf::table> preserved_partial;
+  std::size_t preserved_partial_bytes = 0;
+  std::vector<std::unique_ptr<cudf::table>> ladder;
+  int64_t ladder_rows = 0;
+
+  /// Aggregate argument type as first seen on a counted batch (drives the emit finalize);
+  /// guarded by arg_type_mutex because dense accumulate tasks run concurrently.
+  std::mutex arg_type_mutex;
+  cudf::data_type arg_type{cudf::type_id::EMPTY};
+
+  /// Test-only override of the memory resource the streamed roles allocate through; the unit
+  /// tests inject failure and statistics adaptors to exercise OOM-retry and the per-role
+  /// reservation property. See set_stream_memory_resource_for_testing.
+  std::optional<rmm::device_async_resource_ref> test_allocator;
+
+  [[nodiscard]] rmm::device_async_resource_ref allocator() const
+  {
+    return test_allocator ? *test_allocator : space->get_default_allocator();
+  }
+};
 
 sirius_physical_group_join::sirius_physical_group_join(
   duckdb::vector<sirius::logical_type> types,
@@ -676,7 +996,17 @@ sirius_physical_group_join::sirius_physical_group_join(
     throw sirius::internal_exception(
       "group_join: the DIRECT form has no preserved side to publish dynamic filters from");
   }
+  if (_spec.schedule == groupjoin::schedule_kind::STREAM) {
+    if (_spec.form == groupjoin::join_form::OUTER_PRESERVING) {
+      throw sirius::internal_exception(
+        "group_join: the COUNT pathway keeps the one-shot schedule; STREAM is invalid on "
+        "OUTER_PRESERVING");
+    }
+    _stream = std::make_unique<stream_state>();
+  }
 }
+
+sirius_physical_group_join::~sirius_physical_group_join() { release_stream_state(); }
 
 std::string sirius_physical_group_join::params_to_string() const
 {
@@ -689,12 +1019,17 @@ std::string sirius_physical_group_join::params_to_string() const
                                 : std::string(", count_star")) +
            ", max_state_bytes=" + std::to_string(_spec.max_state_bytes) + ")";
   }
+  // The schedule marker is appended only for STREAM so one-shot plan renders stay byte-identical
+  // to prior releases.
+  auto const schedule_suffix = _spec.schedule == groupjoin::schedule_kind::STREAM
+                                 ? std::string(", schedule=STREAM")
+                                 : std::string();
   if (_spec.form == groupjoin::join_form::DIRECT) {
     return " (form=DIRECT, op=" + std::string(agg_op_name(_spec.slots[0].op)) +
            ", group_key=" + std::to_string(_spec.counted_key_idx) +
            (counted_value_idx() ? ", arg_col=" + std::to_string(*counted_value_idx())
                                 : std::string(", count_star")) +
-           ", max_state_bytes=" + std::to_string(_spec.max_state_bytes) + ")";
+           ", max_state_bytes=" + std::to_string(_spec.max_state_bytes) + schedule_suffix + ")";
   }
   return " (form=" + std::string(form_name(_spec.form)) +
          ", op=" + std::string(agg_op_name(_spec.slots[0].op)) +
@@ -702,7 +1037,7 @@ std::string sirius_physical_group_join::params_to_string() const
          ", counted_key=" + std::to_string(_spec.counted_key_idx) +
          (counted_value_idx() ? ", arg_col=" + std::to_string(*counted_value_idx())
                               : std::string(", count_star")) +
-         ", max_state_bytes=" + std::to_string(_spec.max_state_bytes) + ")";
+         ", max_state_bytes=" + std::to_string(_spec.max_state_bytes) + schedule_suffix + ")";
 }
 
 std::string_view sirius_physical_group_join::input_port_for(
@@ -734,8 +1069,15 @@ std::string_view sirius_physical_group_join::input_port_for(
 }
 
 MemoryBarrierType sirius_physical_group_join::input_barrier_for(
-  sirius_physical_operator const& /*producer*/) const
+  sirius_physical_operator const& producer) const
 {
+  // The streamed schedule's whole wiring delta: the counted producer delivers per batch
+  // (PIPELINE) while the preserved side stays FULL -- both provenance classes included, since
+  // input_port_for maps the distinct-chain-root producer onto the preserved port.
+  if (_spec.schedule == groupjoin::schedule_kind::STREAM &&
+      input_port_for(producer) == COUNTED_PORT) {
+    return MemoryBarrierType::PIPELINE;
+  }
   return MemoryBarrierType::FULL;
 }
 
@@ -794,6 +1136,8 @@ std::optional<task_creation_hint> sirius_physical_group_join::get_next_task_hint
 
   if (ports.empty()) { return std::nullopt; }
 
+  if (_spec.schedule == groupjoin::schedule_kind::STREAM) { return stream_task_hint(); }
+
   // Either input may be empty, but both producers must finish before the task runs.
   for (auto const& p : _ports_list) {
     if (p->src_pipeline && !p->src_pipeline->is_pipeline_finished()) {
@@ -805,8 +1149,86 @@ std::optional<task_creation_hint> sirius_physical_group_join::get_next_task_hint
   return std::nullopt;
 }
 
+std::optional<task_creation_hint> sirius_physical_group_join::stream_task_hint()
+{
+  using build_stage = stream_state::build_stage;
+  auto& st          = *_stream;
+
+  auto const ready      = task_creation_hint{TaskCreationHint::READY, this};
+  auto const waiting_on = [](port* p) -> std::optional<task_creation_hint> {
+    if (p->src_pipeline == nullptr) { return std::nullopt; }
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA,
+                              &(p->src_pipeline->get_operators()[0].get())};
+  };
+  auto* counted_port = get_port(COUNTED_PORT);
+  bool const counted_nonempty =
+    counted_port->repo != nullptr && counted_port->repo->total_size() > 0;
+  bool const counted_finished =
+    counted_port->src_pipeline != nullptr && counted_port->src_pipeline->is_pipeline_finished();
+
+  if (st.discard_mode.load(std::memory_order_acquire)) {
+    // Drained-and-dropped through get_next_task_input_data; no tasks, no emit.
+    if (counted_nonempty) { return ready; }
+    return counted_finished ? std::nullopt : waiting_on(counted_port);
+  }
+
+  switch (st.stage.load(std::memory_order_acquire)) {
+    case build_stage::NOT_BUILT: {
+      if (_spec.form == groupjoin::join_form::INNER) {
+        auto* preserved_port = get_port(PRESERVED_PORT);
+        if (preserved_port->src_pipeline == nullptr ||
+            !preserved_port->src_pipeline->is_pipeline_finished()) {
+          return waiting_on(preserved_port);
+        }
+        bool const preserved_nonempty =
+          preserved_port->repo != nullptr && preserved_port->repo->total_size() > 0;
+        if (!preserved_nonempty) {
+          // INNER over an empty preserved side is empty: enter discard mode.
+          st.discard_mode.store(true, std::memory_order_release);
+          if (counted_nonempty) { return ready; }
+          return counted_finished ? std::nullopt : waiting_on(counted_port);
+        }
+        auto expected = build_stage::NOT_BUILT;
+        if (st.stage.compare_exchange_strong(
+              expected, build_stage::SCHEDULING, std::memory_order_acq_rel)) {
+          return ready;
+        }
+        // A concurrent hint won the claim; the build is in flight.
+        return counted_finished ? std::nullopt : waiting_on(counted_port);
+      }
+      // DIRECT: the first accumulate doubles as the build.
+      if (counted_nonempty) {
+        auto expected = build_stage::NOT_BUILT;
+        if (st.stage.compare_exchange_strong(
+              expected, build_stage::SCHEDULING, std::memory_order_acq_rel)) {
+          return ready;
+        }
+      }
+      return counted_finished ? std::nullopt : waiting_on(counted_port);
+    }
+    case build_stage::SCHEDULING:
+    case build_stage::SCHEDULED:
+      // Build in flight; accumulates wait for the BUILT release-store.
+      return counted_finished ? std::nullopt : waiting_on(counted_port);
+    case build_stage::BUILT: {
+      bool const sparse_busy =
+        st.committed == strategy::SPARSE && st.in_flight.load(std::memory_order_acquire) > 0;
+      if (counted_nonempty && !sparse_busy) { return ready; }
+      if (!counted_finished || counted_nonempty) { return waiting_on(counted_port); }
+      if (st.in_flight.load(std::memory_order_acquire) == 0 &&
+          !st.emit_claimed.load(std::memory_order_acquire)) {
+        return ready;  // emit
+      }
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
 std::unique_ptr<operator_data> sirius_physical_group_join::get_next_task_input_data()
 {
+  if (_spec.schedule == groupjoin::schedule_kind::STREAM) { return stream_task_input_data(); }
+
   std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches;
   std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches;
 
@@ -826,6 +1248,184 @@ std::unique_ptr<operator_data> sirius_physical_group_join::get_next_task_input_d
   if (preserved_batches.empty() && counted_batches.empty()) { return nullptr; }
   return std::make_unique<group_join_input>(std::move(preserved_batches),
                                             std::move(counted_batches));
+}
+
+std::unique_ptr<operator_data> sirius_physical_group_join::stream_task_input_data()
+{
+  using groupjoin::schedule_kind;
+  using sirius::memory::saturating_add;
+  using sirius::memory::saturating_mul;
+  using build_stage  = stream_state::build_stage;
+  auto& st           = *_stream;
+  auto* counted_port = get_port(COUNTED_PORT);
+
+  auto const batch_bytes = [](std::shared_ptr<::cucascade::data_batch> const& batch) {
+    if (!batch) { return std::size_t{0}; }
+    auto const ro    = batch->to_read_only();
+    auto const* data = ro.get_data();
+    return data ? data->get_uncompressed_data_size_in_bytes() : std::size_t{0};
+  };
+  // Sparse accumulate charge: the exact carry chain this batch will fold through, simulated over
+  // the tracked resident-slot sizes (sparse accumulates serialize -- the in-flight == 0 gate at
+  // the pop below -- so the ladder read here is the ladder the fold observes).
+  auto const key_width = static_cast<std::size_t>(cudf::size_of(sirius::get_cudf_type(types[0])));
+  auto const sparse_accumulate_charge = [&](std::size_t bytes) {
+    return saturating_add(sparse_fold_peak_bytes(st.ladder, bytes, key_width, _spec.slots[0].op),
+                          k_allocation_floor);
+  };
+
+  if (st.discard_mode.load(std::memory_order_acquire)) {
+    if (counted_port->repo != nullptr) {
+      while (auto batch = counted_port->repo->pop_next_data_batch()) {
+        batch.reset();
+      }
+    }
+    return nullptr;
+  }
+
+  auto const stage = st.stage.load(std::memory_order_acquire);
+  if (stage == build_stage::SCHEDULING) {
+    if (_spec.form == groupjoin::join_form::INNER) {
+      std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches;
+      auto* preserved_port = get_port(PRESERVED_PORT);
+      if (preserved_port->repo != nullptr) {
+        while (auto batch = preserved_port->repo->pop_next_data_batch()) {
+          preserved_batches.push_back(std::move(batch));
+        }
+      }
+      if (preserved_batches.empty()) {
+        // Unreachable through the hint (the claim requires a non-empty repo); fail open to a
+        // later re-claim rather than build from nothing.
+        st.stage.store(build_stage::NOT_BUILT, std::memory_order_release);
+        return nullptr;
+      }
+      std::size_t preserved_bytes = 0;
+      for (auto const& batch : preserved_batches) {
+        preserved_bytes = saturating_add(preserved_bytes, batch_bytes(batch));
+      }
+      auto input =
+        std::make_unique<group_join_input>(std::move(preserved_batches),
+                                           std::vector<std::shared_ptr<::cucascade::data_batch>>{},
+                                           group_join_input::task_role::STREAM_BUILD);
+      // The budget is the only sound pre-extrema bound on a dense commit's state; a sparse
+      // commit's preserved-partial groupby (per-row modeled over key-only batches) and its
+      // pairwise merge tree ride on top, with the extrema scalars under the floor.
+      auto const preserved_row_bound = preserved_bytes / key_width + 1;
+      auto const partial_sum_bound =
+        saturating_mul(preserved_row_bound, saturating_add(key_width, std::size_t{9}));
+      auto sparse_build_bound =
+        saturating_mul(preserved_row_bound, groupby_partial_bytes_per_row(key_width, 1));
+      sparse_build_bound =
+        std::max(sparse_build_bound,
+                 saturating_add(partial_sum_bound, groupby_merge_step_bytes(partial_sum_bound)));
+      auto charge =
+        saturating_add(static_cast<std::size_t>(_spec.max_state_bytes), sparse_build_bound);
+      charge = saturating_add(charge, k_allocation_floor);
+      input->set_peak_memory_estimate(charge);
+      st.stage.store(build_stage::SCHEDULED, std::memory_order_release);
+      return input;
+    }
+    // DIRECT: pop the stream's first counted batch; its build task initializes the ladder and
+    // folds this batch's partial.
+    auto batch =
+      counted_port->repo != nullptr ? counted_port->repo->pop_next_data_batch() : nullptr;
+    if (!batch) {
+      st.stage.store(build_stage::NOT_BUILT, std::memory_order_release);
+      return nullptr;
+    }
+    auto const bytes = batch_bytes(batch);
+    std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches;
+    counted_batches.push_back(std::move(batch));
+    auto input =
+      std::make_unique<group_join_input>(std::vector<std::shared_ptr<::cucascade::data_batch>>{},
+                                         std::move(counted_batches),
+                                         group_join_input::task_role::STREAM_BUILD);
+    input->set_peak_memory_estimate(sparse_accumulate_charge(bytes));
+    st.stage.store(build_stage::SCHEDULED, std::memory_order_release);
+    return input;
+  }
+  if (stage != build_stage::BUILT) { return nullptr; }
+
+  bool const sparse = st.committed == strategy::SPARSE;
+  if (counted_port->repo != nullptr && counted_port->repo->total_size() > 0 &&
+      (!sparse || st.in_flight.load(std::memory_order_acquire) == 0)) {
+    if (auto batch = counted_port->repo->pop_next_data_batch()) {
+      auto const bytes = batch_bytes(batch);
+      std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches;
+      counted_batches.push_back(std::move(batch));
+      auto input =
+        std::make_unique<group_join_input>(std::vector<std::shared_ptr<::cucascade::data_batch>>{},
+                                           std::move(counted_batches),
+                                           group_join_input::task_role::STREAM_ACCUMULATE);
+      // Accumulates run where the state lives; the scheduler treats the preference as binding.
+      input->set_preferred_device_id(st.device_id);
+      // A dense accumulate is one kernel pass into pre-allocated arrays: it allocates nothing,
+      // which is the schedule's point -- per-batch tasks are small.
+      input->set_peak_memory_estimate(sparse ? sparse_accumulate_charge(bytes)
+                                             : k_allocation_floor);
+      st.in_flight.fetch_add(1, std::memory_order_acq_rel);
+      return input;
+    }
+  }
+
+  bool const counted_finished =
+    counted_port->src_pipeline != nullptr && counted_port->src_pipeline->is_pipeline_finished();
+  bool const counted_empty = counted_port->repo == nullptr || counted_port->repo->total_size() == 0;
+  if (counted_finished && counted_empty && st.in_flight.load(std::memory_order_acquire) == 0 &&
+      !st.emit_claimed.exchange(true, std::memory_order_acq_rel)) {
+    auto const out_width = static_cast<std::size_t>(cudf::size_of(sirius::get_cudf_type(types[1])));
+    bool const is_avg    = _spec.slots[0].op == groupjoin::agg_op::AVG;
+    auto const output_charge = [&](std::size_t rows) {
+      rows = std::min(rows, static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max()));
+      auto per_row = saturating_add(key_width, std::size_t{sizeof(int64_t)});
+      per_row      = saturating_add(per_row, out_width);
+      if (is_avg) { per_row = saturating_add(per_row, 3 * sizeof(int64_t)); }
+      auto charge = saturating_mul(per_row, rows);
+      // The selection index vector plus key and aggregate validity masks.
+      charge = saturating_add(charge, saturating_mul(sizeof(int64_t), rows));
+      charge =
+        saturating_add(charge,
+                       saturating_mul(2,
+                                      static_cast<std::size_t>(cudf::bitmask_allocation_size_bytes(
+                                        checked_cudf_size(rows, "emit charge row bound")))));
+      return charge;
+    };
+    // Emit outputs are bounded by the non-null preserved rows (INNER: presence > 0 requires a
+    // preserved row) or the ladder rows (DIRECT).
+    auto const non_null_preserved =
+      static_cast<std::size_t>(std::max<int64_t>(st.preserved_rows - st.preserved_null_keys, 0));
+    std::size_t charge = k_allocation_floor;
+    if (sparse) {
+      charge = saturating_add(charge, sparse_collapse_peak_bytes(st.ladder));
+      charge = saturating_add(charge, saturating_mul(4, st.preserved_partial_bytes));
+      auto const row_bound =
+        _spec.form == groupjoin::join_form::INNER
+          ? std::min<std::size_t>(non_null_preserved, static_cast<std::size_t>(st.ladder_rows))
+          : static_cast<std::size_t>(st.ladder_rows);
+      charge = saturating_add(charge, output_charge(row_bound));
+    } else {
+      // The state-bytes-again CUB selection-workspace proxy, today's discipline.
+      charge = saturating_add(charge, st.dense != nullptr ? st.dense->state_bytes() : 0);
+      charge = saturating_add(charge, output_charge(non_null_preserved));
+    }
+    return std::make_unique<group_join_emit_input>(charge, st.device_id);
+  }
+  return nullptr;
+}
+
+bool sirius_physical_group_join::all_ports_empty()
+{
+  // Hold the pipeline open (and keep the task-creator loop entering) while a built stream state
+  // has an unclaimed emit pending: without this, update_pipeline_status's finish condition could
+  // retire the pipeline in the window after the last accumulate completes and before the emit
+  // task exists, and the creator loop would never enter for the port-less emit input.
+  if (_stream != nullptr &&
+      _stream->stage.load(std::memory_order_acquire) == stream_state::build_stage::BUILT &&
+      !_stream->discard_mode.load(std::memory_order_acquire) &&
+      !_stream->emit_claimed.load(std::memory_order_acquire)) {
+    return false;
+  }
+  return sirius_physical_operator::all_ports_empty();
 }
 
 void sirius_physical_group_join::maybe_publish_preserved_membership()
@@ -1004,6 +1604,9 @@ void sirius_physical_group_join::on_finalize_operator()
     dynamic_filter_publication_state::CLOSED,
     std::memory_order_acq_rel,
     std::memory_order_acquire);
+  // Device-guarded backstop for abandoned streamed queries; the emit task already released the
+  // state on the normal path (the hash-join teardown discipline).
+  release_stream_state();
 }
 
 std::size_t sirius_physical_group_join::no_history_peak_memory_estimate(
@@ -1012,7 +1615,7 @@ std::size_t sirius_physical_group_join::no_history_peak_memory_estimate(
   using sirius::memory::saturating_add;
   using sirius::memory::saturating_mul;
 
-  constexpr std::size_t allocation_floor = 1024 * 1024;
+  constexpr std::size_t allocation_floor = k_allocation_floor;
   constexpr auto allocation_alignment    = rmm::CUDA_ALLOCATION_ALIGNMENT;
   auto const aligned_charge              = [](std::size_t bytes) {
     if (bytes == 0) { return std::size_t{0}; }
@@ -1083,9 +1686,21 @@ std::unique_ptr<operator_data> sirius_physical_group_join::execute(const operato
                                                                    rmm::cuda_stream_view stream)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_group_join::execute"};
+  if (dynamic_cast<const group_join_emit_input*>(&input_data) != nullptr) {
+    return execute_stream_emit(stream);
+  }
   auto const* input = dynamic_cast<const group_join_input*>(&input_data);
   if (input == nullptr) {
     throw sirius::internal_exception("group_join: unexpected input data type");
+  }
+  switch (input->role()) {
+    case group_join_input::task_role::ONE_SHOT: break;
+    case group_join_input::task_role::STREAM_BUILD: return execute_stream_build(*input, stream);
+    case group_join_input::task_role::STREAM_ACCUMULATE:
+      return execute_stream_accumulate(*input, stream);
+  }
+  if (_spec.schedule != groupjoin::schedule_kind::ONE_SHOT) {
+    throw sirius::internal_exception("group_join: one-shot input reached a streamed schedule");
   }
   auto const ro_batches   = input->get_read_only_batches();
   auto const& input_sides = input->input_sides();
@@ -1661,89 +2276,463 @@ std::unique_ptr<cudf::table> sirius_physical_group_join::execute_inner_direct(
 
       // INNER form: a key joins iff it appears on both sides, which realizes the matched > 0
       // emit filter structurally (every counted-partial key has at least one row).
-      auto const preserved_key_view      = cudf::table_view({preserved_agg->view().column(0)});
-      auto const counted_key_view        = cudf::table_view({counted_agg->view().column(0)});
-      auto [left_indices, right_indices] = cudf::inner_join(
-        preserved_key_view, counted_key_view, cudf::null_equality::UNEQUAL, stream, mr);
-
-      auto keys_out = cudf::gather(preserved_key_view,
-                                   gather_map_view(*left_indices),
-                                   cudf::out_of_bounds_policy::DONT_CHECK,
-                                   stream,
-                                   mr);
-      auto presence = cudf::gather(cudf::table_view({preserved_agg->view().column(1)}),
-                                   gather_map_view(*left_indices),
-                                   cudf::out_of_bounds_policy::DONT_CHECK,
-                                   stream,
-                                   mr);
-      std::vector<cudf::column_view> counted_value_views;
-      for (cudf::size_type c = 1; c < counted_agg->view().num_columns(); ++c) {
-        counted_value_views.push_back(counted_agg->view().column(c));
-      }
-      auto matched = cudf::gather(cudf::table_view(counted_value_views),
-                                  gather_map_view(*right_indices),
-                                  cudf::out_of_bounds_policy::DONT_CHECK,
-                                  stream,
-                                  mr);
-      left_indices.reset();
-      right_indices.reset();
-      preserved_agg.reset();
-      counted_agg.reset();
-
-      auto matched_cols = matched->release();
-      std::vector<std::unique_ptr<cudf::column>> columns;
-      columns.push_back(std::move(keys_out->release()[0]));
-      switch (slot.op) {
-        case agg_op::COUNT_STAR:
-        case agg_op::COUNT_VALID: {
-          if (count_product_needs_validation(preserved_rows, counted_rows, false)) {
-            throw_if_count_product_overflows(
-              presence->view().column(0), matched_cols[0]->view(), stream, mr);
-          }
-          columns.push_back(cudf::binary_operation(presence->view().column(0),
-                                                   matched_cols[0]->view(),
-                                                   cudf::binary_operator::MUL,
-                                                   cudf::data_type{cudf::type_id::INT64},
-                                                   stream,
-                                                   mr));
-          break;
-        }
-        case agg_op::SUM:
-          // Yan-Larson scaling; a NULL sum (all-NULL-argument group) stays NULL through the
-          // multiply.
-          columns.push_back(cudf::binary_operation(presence->view().column(0),
-                                                   matched_cols[0]->view(),
-                                                   cudf::binary_operator::MUL,
-                                                   cudf::data_type{cudf::type_id::INT64},
-                                                   stream,
-                                                   mr));
-          break;
-        case agg_op::MIN:
-        case agg_op::MAX:
-          // Duplicate-agnostic: no scaling.
-          columns.push_back(std::move(matched_cols[0]));
-          break;
-        case agg_op::AVG:
-          // Presence cancels in numerator and divisor.
-          columns.push_back(std::move(matched_cols[0]));
-          columns.push_back(std::move(matched_cols[1]));
-          break;
-      }
-      presence.reset();
-      raw = std::make_unique<cudf::table>(std::move(columns));
+      raw = sparse_inner_combine(preserved_agg->view(),
+                                 std::move(counted_agg),
+                                 slot.op,
+                                 preserved_rows,
+                                 counted_rows,
+                                 stream,
+                                 mr);
     }
   }
 
-  // Shared finalize: cast the raw INT64 aggregate (and divide for AVG) into the declared type.
-  auto raw_cols = raw->release();
-  std::unique_ptr<cudf::column> divisor;
-  if (slot.op == agg_op::AVG) { divisor = std::move(raw_cols[2]); }
-  auto final_value = finalize_value_column(
-    std::move(raw_cols[1]), std::move(divisor), slot.op, out_type, arg_type, stream, mr);
-  std::vector<std::unique_ptr<cudf::column>> output_columns;
-  output_columns.push_back(std::move(raw_cols[0]));
-  output_columns.push_back(std::move(final_value));
-  return std::make_unique<cudf::table>(std::move(output_columns));
+  return finalize_inner_direct_output(std::move(raw), slot.op, out_type, arg_type, stream, mr);
+}
+
+std::unique_ptr<operator_data> sirius_physical_group_join::execute_stream_build(
+  group_join_input const& input, rmm::cuda_stream_view stream)
+{
+  auto& st              = *_stream;
+  auto const& slot      = _spec.slots[0];
+  auto const key_type   = sirius::get_cudf_type(types[0]);
+  auto const ro_batches = input.get_read_only_batches();
+  auto empty_result     = [] {
+    return std::make_unique<pipelineable_operator_data>(
+      std::vector<std::shared_ptr<::cucascade::data_batch>>{});
+  };
+
+  // An OOM-rescheduled build reconstructs from scratch; drop any partial state first.
+  {
+    std::optional<rmm::cuda_set_device_raii> device_guard;
+    if (st.device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{st.device_id}); }
+    st.dense.reset();
+    st.preserved_partial.reset();
+    st.preserved_partial_bytes = 0;
+    st.ladder.clear();
+    st.ladder_rows = 0;
+  }
+
+  cucascade::memory::memory_space* space = nullptr;
+  for (auto const& batch : ro_batches) {
+    if (batch.get_memory_space() != nullptr) {
+      space = batch.get_memory_space();
+      break;
+    }
+  }
+  if (space == nullptr) {
+    throw sirius::internal_exception("group_join: no memory space on stream build batches");
+  }
+  st.space     = space;
+  st.device_id = space->get_device_id();
+
+  if (_spec.form == groupjoin::join_form::DIRECT) {
+    // The first counted batch doubles as the build: DIRECT streams sparse-only (the group domain
+    // -- and the NULL-group slot -- cannot be known before the stream ends, so a dense DIRECT
+    // state would have to discard later out-of-range keys, which are real groups).
+    st.committed   = strategy::SPARSE;
+    _last_strategy = strategy::SPARSE;
+    SIRIUS_LOG_INFO(
+      "[group_join] STREAM build: DIRECT {} committed sparse (merge ladder) on device {}",
+      agg_op_name(slot.op),
+      st.device_id);
+    auto accumulate_result = execute_stream_accumulate(input, stream);
+    stream.synchronize();
+    st.stage.store(stream_state::build_stage::BUILT, std::memory_order_release);
+    return accumulate_result;
+  }
+
+  // INNER: harvest the preserved key columns with checked accounting, then commit the strategy
+  // once from the preserved extrema (the whole group domain).
+  auto mr               = st.allocator();
+  auto require_key_type = [&](cudf::column_view const& col) {
+    if (col.type().id() != key_type.id()) {
+      throw sirius::internal_exception(
+        "group_join: preserved key column carrier {} does not match declared key type {}",
+        static_cast<int32_t>(col.type().id()),
+        static_cast<int32_t>(key_type.id()));
+    }
+  };
+  auto const& input_sides = input.input_sides();
+  std::vector<cudf::column_view> preserved_keys;
+  int64_t preserved_rows      = 0;
+  int64_t preserved_null_keys = 0;
+  for (std::size_t i = 0; i < ro_batches.size(); ++i) {
+    if (input_sides.size() <= i || input_sides[i] != group_join_input::input_side::PRESERVED) {
+      throw sirius::internal_exception("group_join: stream build received a counted batch");
+    }
+    auto const batch_view = sirius::get_cudf_table_view(ro_batches[i]);
+    auto const col        = checked_column(batch_view, _spec.preserved_key_idx, i, "preserved key");
+    require_key_type(col);
+    preserved_rows =
+      checked_add_rows(preserved_rows, static_cast<int64_t>(col.size()), "preserved");
+    preserved_null_keys =
+      checked_add_rows(preserved_null_keys, checked_null_count(col, i), "preserved NULL-key");
+    preserved_keys.push_back(col);
+  }
+  st.preserved_rows      = preserved_rows;
+  st.preserved_null_keys = preserved_null_keys;
+
+  if (preserved_rows - preserved_null_keys == 0) {
+    // INNER over a preserved side with no non-NULL key is empty; discard the counted stream.
+    SIRIUS_LOG_INFO(
+      "[group_join] STREAM build: INNER {} preserved side has no non-NULL keys; discarding the "
+      "counted stream",
+      agg_op_name(slot.op));
+    st.discard_mode.store(true, std::memory_order_release);
+    stream.synchronize();
+    st.stage.store(stream_state::build_stage::BUILT, std::memory_order_release);
+    return empty_result();
+  }
+
+  // Preserved-key extrema: the 2-slot device array and its single sync. SUM/AVG safety was proven
+  // at plan time, so no value-extrema variant runs under STREAM.
+  auto const min_max = group_join_global_minmax(preserved_keys, stream, mr);
+  if (!min_max) {
+    throw sirius::internal_exception(
+      "group_join: minmax reported no valid keys but null accounting found {}",
+      preserved_rows - preserved_null_keys);
+  }
+
+  // Build-time-computable gate subset: (a) layout-valid range from the preserved extrema and (b)
+  // state within budget under the streamed widths -- presence sized from the (known) preserved
+  // rows, matched u64 forced, payloads i64. Gates (d)/(e) compare against whole-input quantities
+  // a stream cannot know; their regret is bounded by (b) itself.
+  uint64_t const range_u =
+    static_cast<uint64_t>(min_max->second) - static_cast<uint64_t>(min_max->first) + 1;
+  bool const presence_wide =
+    preserved_rows >= static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+  uint64_t const combined_slot_bytes = (presence_wide ? sizeof(uint64_t) : sizeof(uint32_t)) +
+                                       sizeof(uint64_t) +
+                                       (is_count_op(slot.op) ? 0 : sizeof(int64_t));
+  auto const size_max     = std::numeric_limits<std::size_t>::max();
+  bool const layout_valid = range_u != 0 && range_u <= size_max / combined_slot_bytes &&
+                            range_u <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  bool const dense_ok = layout_valid && range_u <= _spec.max_state_bytes / combined_slot_bytes;
+
+  if (dense_ok) {
+    st.committed     = strategy::DENSE;
+    _last_strategy   = strategy::DENSE;
+    auto const range = static_cast<int64_t>(range_u);
+    SIRIUS_LOG_INFO(
+      "[group_join] STREAM build: INNER {} committed dense on device {}: keys in [{}, {}] "
+      "(range {}, presence {}-bit, matched 64-bit), preserved rows {} (null keys {})",
+      agg_op_name(slot.op),
+      st.device_id,
+      min_max->first,
+      min_max->second,
+      range,
+      presence_wide ? 64 : 32,
+      preserved_rows,
+      preserved_null_keys);
+    st.dense = make_group_join_stream_dense_state(
+      dense_op_for(slot.op), key_type, presence_wide, min_max->first, range, stream, mr);
+    for (auto const& col : preserved_keys) {
+      st.dense->accumulate_preserved(col, stream);
+    }
+  } else {
+    st.committed   = strategy::SPARSE;
+    _last_strategy = strategy::SPARSE;
+    SIRIUS_LOG_INFO(
+      "[group_join] STREAM build: INNER {} committed sparse on device {}: keys in [{}, {}], "
+      "range {}, budget {}",
+      agg_op_name(slot.op),
+      st.device_id,
+      min_max->first,
+      min_max->second,
+      range_u,
+      _spec.max_state_bytes);
+    std::vector<std::unique_ptr<cudf::table>> preserved_partials;
+    for (auto const& col : preserved_keys) {
+      if (col.size() == 0) { continue; }
+      preserved_partials.push_back(
+        sparse_partial_count(col, col, cudf::null_policy::INCLUDE, stream, mr));
+    }
+    st.preserved_partial =
+      sparse_merge_partials(std::move(preserved_partials), key_type, stream, mr);
+    st.preserved_partial_bytes = device_table_bytes(st.preserved_partial->view());
+  }
+
+  // State initialization must be device-visible to accumulate tasks running on other streams.
+  stream.synchronize();
+  st.stage.store(stream_state::build_stage::BUILT, std::memory_order_release);
+  return empty_result();
+}
+
+std::unique_ptr<operator_data> sirius_physical_group_join::execute_stream_accumulate(
+  group_join_input const& input, rmm::cuda_stream_view stream)
+{
+  using groupjoin::agg_op;
+  auto& st                      = *_stream;
+  auto const& slot              = _spec.slots[0];
+  auto const key_type           = sirius::get_cudf_type(types[0]);
+  bool const needs_argument     = slot.op != agg_op::COUNT_STAR;
+  bool const dense              = st.committed == strategy::DENSE;
+  bool const is_accumulate_task = input.role() == group_join_input::task_role::STREAM_ACCUMULATE;
+
+  // The claim latch detects an OOM-rescheduled replay: sparse replays are safe (the ladder
+  // mutates only after a fold fully succeeds), but a dense replay could double-apply a batch
+  // whose kernels partially ran -- throwing is the exact bail.
+  bool const first_application = input.claim_stream_application();
+  if (dense && !first_application) {
+    throw sirius::internal_exception(
+      "group_join: cannot replay a streamed dense accumulate whose state mutation may have "
+      "started");
+  }
+
+  auto const ro_batches   = input.get_read_only_batches();
+  auto const& input_sides = input.input_sides();
+
+  // Validation pass: harvest and type-check every column and count the rows before any state
+  // mutation or device allocation, so the row accounting below can precede the (allocating,
+  // OOM-retryable) fold.
+  struct batch_columns {
+    cudf::column_view key;
+    cudf::column_view rep;
+  };
+  std::vector<batch_columns> columns;
+  columns.reserve(ro_batches.size());
+  int64_t batch_rows = 0;
+  for (std::size_t i = 0; i < ro_batches.size(); ++i) {
+    if (input_sides.size() <= i || input_sides[i] != group_join_input::input_side::COUNTED) {
+      throw sirius::internal_exception("group_join: stream accumulate received a preserved batch");
+    }
+    auto const batch_view = sirius::get_cudf_table_view(ro_batches[i]);
+    auto const key_col    = checked_column(batch_view, _spec.counted_key_idx, i, "counted key");
+    if (key_col.type().id() != key_type.id()) {
+      throw sirius::internal_exception(
+        "group_join: counted key column carrier {} does not match declared key type {}",
+        static_cast<int32_t>(key_col.type().id()),
+        static_cast<int32_t>(key_type.id()));
+    }
+    batch_rows = checked_add_rows(batch_rows, static_cast<int64_t>(key_col.size()), "counted");
+
+    cudf::column_view rep{};
+    if (needs_argument) {
+      auto const arg = checked_column(batch_view, *slot.arg_idx, i, "aggregate argument");
+      // Record (and cross-check) the argument type; the emit-time finalize needs it and no
+      // batches exist by then.
+      {
+        std::lock_guard<std::mutex> guard(st.arg_type_mutex);
+        if (st.arg_type.id() == cudf::type_id::EMPTY) {
+          st.arg_type = arg.type();
+        } else if (arg.type() != st.arg_type) {
+          throw sirius::internal_exception(
+            "group_join: aggregate argument carrier changed across streamed batches ({} "
+            "versus {})",
+            static_cast<int32_t>(arg.type().id()),
+            static_cast<int32_t>(st.arg_type.id()));
+        }
+      }
+      // Belt-check of the plan-time NOT-NULL proof: the proof makes this unreachable, so a
+      // violation (lying source metadata) throws rather than corrupt the matched counts.
+      if (dense && arg.null_count() != 0) {
+        throw sirius::internal_exception(
+          "group_join: streamed NOT-NULL proof violated -- argument column carries {} NULLs",
+          arg.null_count());
+      }
+      rep = is_count_op(slot.op) ? arg : arg_rep_view(arg);
+    }
+    columns.push_back({key_col, rep});
+  }
+
+  // Record the row accounting exactly once, before the fold: a fold interrupted by a retryable
+  // OOM replays over an already-claimed input (first_application false) and must find its rows
+  // already counted, because the emit-time COUNT product validation consumes this total.
+  if (first_application) {
+    auto const total =
+      st.counted_rows_total.fetch_add(batch_rows, std::memory_order_acq_rel) + batch_rows;
+    // Belt-check of the plan-time SUM/AVG row bound: the accumulated stream must stay within the
+    // row count the overflow proof consumed.
+    if (dense && _spec.stream_counted_row_bound > 0 &&
+        static_cast<uint64_t>(total) > _spec.stream_counted_row_bound) {
+      throw sirius::internal_exception(
+        "group_join: streamed row-bound proof violated -- accumulated {} counted rows against a "
+        "plan-proven bound of {}",
+        total,
+        _spec.stream_counted_row_bound);
+    }
+  }
+
+  for (auto const& batch : columns) {
+    if (dense) {
+      st.dense->accumulate_counted(batch.key, is_count_op(slot.op) ? nullptr : &batch.rep, stream);
+    } else {
+      stream_sparse_fold(batch.key, needs_argument ? &batch.rep : nullptr, stream, st.allocator());
+    }
+  }
+
+  // A task observed complete must have device-visible effects: emit and other accumulates run on
+  // different streams.
+  stream.synchronize();
+  if (is_accumulate_task) { st.in_flight.fetch_sub(1, std::memory_order_acq_rel); }
+  return std::make_unique<pipelineable_operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{});
+}
+
+void sirius_physical_group_join::stream_sparse_fold(cudf::column_view const& keys,
+                                                    cudf::column_view const* rep_args,
+                                                    rmm::cuda_stream_view stream,
+                                                    rmm::device_async_resource_ref mr)
+{
+  auto& st              = *_stream;
+  auto const& slot      = _spec.slots[0];
+  auto const key_policy = _spec.form == groupjoin::join_form::DIRECT ? cudf::null_policy::INCLUDE
+                                                                     : cudf::null_policy::EXCLUDE;
+
+  if (keys.size() == 0) { return; }
+  auto merged = sparse_partial_value(keys, rep_args, slot.op, key_policy, stream, mr);
+
+  // Binary-counter carry: slot i holds a partial of ~2^i batches. Merges read the resident slots
+  // by view and the ladder mutates only after the whole chain succeeded, so an OOM retry always
+  // observes a consistent ladder.
+  std::size_t carry = 0;
+  while (carry < st.ladder.size() && st.ladder[carry] != nullptr) {
+    auto next = sparse_merge_value_views(
+      st.ladder[carry]->view(), merged->view(), slot.op, key_policy, stream, mr);
+    merged = std::move(next);
+    ++carry;
+  }
+  for (std::size_t i = 0; i < carry; ++i) {
+    st.ladder[i].reset();
+  }
+  if (carry >= st.ladder.size()) { st.ladder.resize(carry + 1); }
+  st.ladder[carry] = std::move(merged);
+
+  st.ladder_rows = 0;
+  for (auto const& partial : st.ladder) {
+    if (partial == nullptr) { continue; }
+    st.ladder_rows += static_cast<int64_t>(partial->num_rows());
+  }
+}
+
+std::unique_ptr<operator_data> sirius_physical_group_join::execute_stream_emit(
+  rmm::cuda_stream_view stream)
+{
+  using groupjoin::agg_op;
+  auto& st            = *_stream;
+  auto const& slot    = _spec.slots[0];
+  auto const key_type = sirius::get_cudf_type(types[0]);
+  auto const out_type = sirius::get_cudf_type(types[1]);
+  if (st.space == nullptr) {
+    throw sirius::internal_exception("group_join: stream emit without a built state");
+  }
+  auto* space = st.space;
+  auto mr     = st.allocator();
+
+  // OOM inside this task reschedules it and re-runs this function against the same stream state,
+  // so nothing here may mutate that state before the output batch is fully constructed: the
+  // sparse collapse below reads the ladder by view, the INNER combine takes the preserved partial
+  // by view, and release_stream_state at the end is the emit's only state mutation.
+  std::unique_ptr<cudf::table> output;
+  auto const counted_rows = st.counted_rows_total.load(std::memory_order_acquire);
+  if (st.committed == strategy::DENSE) {
+    bool const check_count_overflow =
+      is_count_op(slot.op) &&
+      count_product_needs_validation(st.preserved_rows, counted_rows, /*count_star=*/false);
+    auto raw = st.dense->emit(check_count_overflow, stream, mr);
+    // A stream that saw no counted batches has no recorded argument type; the zero-group output
+    // needs only the declared column shells.
+    if (raw->num_rows() == 0) {
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      columns.push_back(
+        cudf::make_fixed_width_column(key_type, 0, cudf::mask_state::UNALLOCATED, stream, mr));
+      columns.push_back(
+        cudf::make_fixed_width_column(out_type, 0, cudf::mask_state::UNALLOCATED, stream, mr));
+      output = std::make_unique<cudf::table>(std::move(columns));
+    } else {
+      output =
+        finalize_inner_direct_output(std::move(raw), slot.op, out_type, st.arg_type, stream, mr);
+    }
+  } else {
+    // Final ladder collapse (sequential merges of the resident slots, by view), then (for INNER)
+    // the distinct-key inner join + Yan-Larson combine of the one-shot sparse path.
+    auto const key_policy = _spec.form == groupjoin::join_form::DIRECT ? cudf::null_policy::INCLUDE
+                                                                       : cudf::null_policy::EXCLUDE;
+    std::unique_ptr<cudf::table> counted_agg;
+    cudf::table_view first_resident{};
+    bool have_first = false;
+    for (auto const& partial : st.ladder) {
+      if (partial == nullptr) { continue; }
+      if (!have_first) {
+        first_resident = partial->view();
+        have_first     = true;
+        continue;
+      }
+      auto const merged = counted_agg != nullptr ? counted_agg->view() : first_resident;
+      counted_agg =
+        sparse_merge_value_views(merged, partial->view(), slot.op, key_policy, stream, mr);
+    }
+    if (counted_agg == nullptr) {
+      counted_agg = have_first ? std::make_unique<cudf::table>(first_resident, stream, mr)
+                               : empty_sparse_value_partial(key_type, slot.op, stream, mr);
+    }
+    std::unique_ptr<cudf::table> raw;
+    if (_spec.form == groupjoin::join_form::DIRECT) {
+      raw = std::move(counted_agg);
+    } else {
+      raw = sparse_inner_combine(st.preserved_partial->view(),
+                                 std::move(counted_agg),
+                                 slot.op,
+                                 st.preserved_rows,
+                                 counted_rows,
+                                 stream,
+                                 mr);
+    }
+    if (raw->num_rows() == 0) {
+      std::vector<std::unique_ptr<cudf::column>> columns;
+      columns.push_back(
+        cudf::make_fixed_width_column(key_type, 0, cudf::mask_state::UNALLOCATED, stream, mr));
+      columns.push_back(
+        cudf::make_fixed_width_column(out_type, 0, cudf::mask_state::UNALLOCATED, stream, mr));
+      output = std::make_unique<cudf::table>(std::move(columns));
+    } else {
+      output =
+        finalize_inner_direct_output(std::move(raw), slot.op, out_type, st.arg_type, stream, mr);
+    }
+  }
+
+  SIRIUS_LOG_INFO("[group_join] STREAM emit: {} group rows ({} strategy, {} counted rows)",
+                  output->num_rows(),
+                  st.committed == strategy::DENSE ? "dense" : "sparse",
+                  counted_rows);
+
+  std::vector<std::shared_ptr<::cucascade::data_batch>> results;
+  results.push_back(sirius::make_data_batch(std::move(output), *space, stream, batch_telemetry()));
+  // Return the state's device residents before downstream work begins; synchronize first so no
+  // in-flight kernel still reads them.
+  stream.synchronize();
+  release_stream_state();
+  return std::make_unique<pipelineable_operator_data>(std::move(results));
+}
+
+void sirius_physical_group_join::set_stream_memory_resource_for_testing(
+  std::optional<rmm::device_async_resource_ref> mr)
+{
+  if (_stream == nullptr) {
+    throw sirius::internal_exception(
+      "group_join: stream memory-resource override on a non-STREAM spec");
+  }
+  _stream->test_allocator = mr;
+}
+
+int64_t sirius_physical_group_join::stream_counted_rows_for_testing() const
+{
+  if (_stream == nullptr) {
+    throw sirius::internal_exception("group_join: stream counted rows on a non-STREAM spec");
+  }
+  return _stream->counted_rows_total.load(std::memory_order_acquire);
+}
+
+void sirius_physical_group_join::release_stream_state()
+{
+  if (_stream == nullptr) { return; }
+  std::optional<rmm::cuda_set_device_raii> device_guard;
+  if (_stream->device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{_stream->device_id}); }
+  _stream->dense.reset();
+  _stream->preserved_partial.reset();
+  _stream->preserved_partial_bytes = 0;
+  _stream->ladder.clear();
+  _stream->ladder_rows = 0;
 }
 
 }  // namespace sirius::op

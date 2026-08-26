@@ -199,6 +199,22 @@ class operator_data {
   }
 
   /**
+   * @brief Operator-authoritative peak-memory estimate for the task fed by this data, or
+   *        std::nullopt (the default) to use the normal history/no-history estimation ladder.
+   *
+   * gpu_pipeline_task::get_estimated_reservation_size_info consults this before
+   * pipeline_memory_history. Producers whose tasks have wildly different peak/input ratios within
+   * one pipeline (e.g. sirius_physical_group_join's streamed build/accumulate/emit roles) stamp
+   * the exact per-task charge here, because the flat per-pipeline history ring would fold one
+   * role's ratio into every other role's estimate. bytes_to_materialize and the OOM
+   * retry-reservation floor compose on top of the returned value exactly as for estimated peaks.
+   */
+  [[nodiscard]] virtual std::optional<std::size_t> peak_memory_estimate_override() const noexcept
+  {
+    return std::nullopt;
+  }
+
+  /**
    * @brief Record the GPU this data should be processed on.
    *
    * Set upstream of task creation when the producer of this data has already
@@ -560,10 +576,14 @@ class sirius_physical_operator {
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
   //! An operator is a pipeline sink iff its tree parent is a PARTITION, RIGHT_DELIM_JOIN, or
-  //! GROUP_JOIN — parents that consume their input across one-shot FULL-barrier ports rather
-  //! than in-pipeline streaming — computed from `_parent_op` so it always reflects the final
-  //! tree. Unconditional sinks (HGB, ORDER_BY, MERGE ops, scans) override to `true`; the
-  //! `delim.join` of a RIGHT_DELIM_JOIN overrides to `false`.
+  //! GROUP_JOIN — parents that consume their input across repository ports (FULL and PIPELINE
+  //! barriers alike: a PIPELINE-ported child still terminates its own pipeline and pushes into
+  //! the port repository, so this test keys on the parent type, never on the barrier) — computed
+  //! from `_parent_op` so it always reflects the final tree. Unconditional sinks (HGB, ORDER_BY,
+  //! MERGE ops, scans) override to `true`; the `delim.join` of a RIGHT_DELIM_JOIN overrides to
+  //! `false`. For GROUP_JOIN parents this also means the merge-fusion dead-end walk
+  //! (`merge_downstream_is_streaming_dead_end`) terminates at the fused operator's child, which
+  //! is a sink here rather than a streaming pass-through.
   virtual bool is_sink() const
   {
     return _parent_op != nullptr &&

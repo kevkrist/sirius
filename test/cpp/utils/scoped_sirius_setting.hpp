@@ -29,13 +29,24 @@ namespace sirius::test {
 class scoped_sirius_setting final {
  public:
   scoped_sirius_setting(duckdb::Connection& connection, std::string name, bool value)
-    : scoped_sirius_setting(
-        connection, std::move(name), value ? std::string{"true"} : std::string{"false"})
+    : scoped_sirius_setting(literal_tag{},
+                            connection,
+                            std::move(name),
+                            value ? std::string{"true"} : std::string{"false"},
+                            /*quote_restore=*/false)
   {
   }
 
   scoped_sirius_setting(duckdb::Connection& connection, std::string name, std::uint64_t value)
-    : scoped_sirius_setting(connection, std::move(name), std::to_string(value))
+    : scoped_sirius_setting(
+        literal_tag{}, connection, std::move(name), std::to_string(value), /*quote_restore=*/false)
+  {
+  }
+
+  /// VARCHAR settings: the value and the captured original are both single-quoted.
+  scoped_sirius_setting(duckdb::Connection& connection, std::string name, std::string value)
+    : scoped_sirius_setting(
+        literal_tag{}, connection, std::move(name), "'" + value + "'", /*quote_restore=*/true)
   {
   }
 
@@ -54,13 +65,21 @@ class scoped_sirius_setting final {
   scoped_sirius_setting& operator=(scoped_sirius_setting&&)      = delete;
 
  private:
-  scoped_sirius_setting(duckdb::Connection& connection, std::string name, std::string value_literal)
+  /// Keeps the literal-taking core out of overload resolution against the public constructors.
+  struct literal_tag {};
+
+  scoped_sirius_setting(literal_tag,
+                        duckdb::Connection& connection,
+                        std::string name,
+                        std::string value_literal,
+                        bool quote_restore)
     : con_(connection), name_(std::move(name))
   {
     auto current = con_.Query("SELECT current_setting('" + name_ + "');");
     REQUIRE(current);
     REQUIRE_FALSE(current->HasError());
     original_ = current->GetValue(0, 0).ToString();
+    if (quote_restore) { original_ = "'" + original_ + "'"; }
 
     auto applied = con_.Query("SET " + name_ + " = " + value_literal + ";");
     REQUIRE(applied);

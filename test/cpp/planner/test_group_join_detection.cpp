@@ -791,18 +791,130 @@ TEST_CASE_METHOD(inner_group_join_fixture,
 }
 
 TEST_CASE_METHOD(inner_group_join_fixture,
-                 "group_join rung P1 declines when the counted-side byte gate trips",
+                 "group_join rung P1 counted-byte gate selects the schedule",
                  "[group_join][plan]")
 {
+  using sirius::op::groupjoin::join_form;
+  using sirius::op::groupjoin::schedule_kind;
   auto const query = "SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id";
-  REQUIRE(has_inner_group_join(query));
 
-  auto tiny = con->Query("SET group_join_counted_bytes_gate = 1");
-  REQUIRE_FALSE(tiny->HasError());
-  CHECK_FALSE(has_inner_group_join(query));
-  auto reset = con->Query("RESET group_join_counted_bytes_gate");
-  REQUIRE_FALSE(reset->HasError());
+  // At or under the gate: today's one-shot admission verbatim.
+  {
+    auto plan   = generate_sirius_plan(*con, query);
+    auto* fused = find_inner_group_join(plan.get());
+    REQUIRE(fused != nullptr);
+    CHECK(fused->spec().schedule == schedule_kind::ONE_SHOT);
+    CHECK(fused->spec().stream_counted_row_bound == 0);
+  }
+
+  // Over the gate the same shape streams: native-table statistics prove the argument NOT NULL and
+  // the exact seq_scan row count (fact has 200 rows) bounds the SUM accumulation.
+  REQUIRE_FALSE(con->Query("SET group_join_counted_bytes_gate = 1")->HasError());
+  {
+    auto plan   = generate_sirius_plan(*con, query);
+    auto* fused = find_inner_group_join(plan.get());
+    REQUIRE(fused != nullptr);
+    CHECK(fused->spec().schedule == schedule_kind::STREAM);
+    CHECK(fused->spec().stream_counted_row_bound == 200);
+  }
+
+  // The honest-failure knob: with INNER outside group_join_stream_forms the gate declines rung P1
+  // exactly as before the streamed schedule existed; rung P2 then picks the shape up as a
+  // streamed DIRECT (ladder-ordering evidence of the P1 decline), and with both forms removed the
+  // over-gate shape falls all the way to generic planning.
+  REQUIRE_FALSE(con->Query("SET group_join_stream_forms = 'DIRECT'")->HasError());
+  CHECK(fused_form(query) == join_form::DIRECT);
+  REQUIRE_FALSE(con->Query("SET group_join_stream_forms = ''")->HasError());
+  CHECK_FALSE(fused_form(query).has_value());
+  REQUIRE_FALSE(con->Query("RESET group_join_stream_forms")->HasError());
+  REQUIRE_FALSE(con->Query("RESET group_join_counted_bytes_gate")->HasError());
   CHECK(has_inner_group_join(query));
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join streamed admission proofs fail closed per op",
+                 "[group_join][plan]")
+{
+  using sirius::op::groupjoin::join_form;
+  using sirius::op::groupjoin::schedule_kind;
+
+  // A nullable argument, and a magnitude that breaks rows x max(|value|) <= INT64_MAX.
+  con->Query("CREATE TABLE fact_p (p_d INTEGER, p_null INTEGER, p_huge BIGINT)");
+  con->Query(
+    "INSERT INTO fact_p SELECT range % 40, CASE WHEN range % 7 = 0 THEN NULL ELSE range END, "
+    "4000000000000000000 + range FROM range(120)");
+  REQUIRE_FALSE(con->Query("SET group_join_counted_bytes_gate = 1")->HasError());
+
+  auto stream_schedule_of = [&](std::string const& query) -> std::optional<schedule_kind> {
+    auto plan = generate_sirius_plan(*con, query);
+    REQUIRE(plan);
+    auto* fused = find_group_join(plan.get());
+    if (fused == nullptr) { return std::nullopt; }
+    return fused->spec().schedule;
+  };
+
+  // NOT-NULL inconclusive: rung P1 declines the stream; rung P2's DIRECT (sparse, proof-free)
+  // legitimately takes the shape.
+  CHECK(fused_form("SELECT d_id, sum(p_null) FROM dim JOIN fact_p ON d_id = p_d GROUP BY d_id") ==
+        join_form::DIRECT);
+  // Magnitude bound fails for SUM/AVG on the huge column...
+  CHECK(fused_form("SELECT d_id, sum(p_huge) FROM dim JOIN fact_p ON d_id = p_d GROUP BY d_id") ==
+        join_form::DIRECT);
+  // ... while MIN over the same column needs only NOT-NULL and streams as INNER.
+  {
+    auto plan   = generate_sirius_plan(*con,
+                                     "SELECT d_id, min(p_huge) FROM dim JOIN fact_p ON d_id = p_d "
+                                       "GROUP BY d_id");
+    auto* fused = find_inner_group_join(plan.get());
+    REQUIRE(fused != nullptr);
+    CHECK(fused->spec().schedule == schedule_kind::STREAM);
+    CHECK(fused->spec().stream_counted_row_bound == 0);
+  }
+  // A computed argument resolves to no base scan column: inconclusive, DIRECT takes it.
+  CHECK(fused_form("SELECT d_id, sum(fv2) FROM dim JOIN (SELECT f_d, f_v * 2 AS fv2 FROM fact) f "
+                   "ON d_id = f.f_d GROUP BY d_id") == join_form::DIRECT);
+  // COUNT(*) needs no proofs (its BIGINT product is validated at emit from runtime totals).
+  CHECK(stream_schedule_of("SELECT d_id, count(*) FROM dim JOIN fact_p ON d_id = p_d GROUP BY "
+                           "d_id") == schedule_kind::STREAM);
+
+  // With both forms removed, every declined shape falls to generic planning.
+  REQUIRE_FALSE(con->Query("SET group_join_stream_forms = ''")->HasError());
+  CHECK_FALSE(
+    fused_form("SELECT d_id, sum(p_null) FROM dim JOIN fact_p ON d_id = p_d GROUP BY d_id")
+      .has_value());
+  REQUIRE_FALSE(con->Query("RESET group_join_stream_forms")->HasError());
+  REQUIRE_FALSE(con->Query("RESET group_join_counted_bytes_gate")->HasError());
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join rung P2 byte gate selects the streamed sparse schedule",
+                 "[group_join][plan]")
+{
+  using sirius::op::groupjoin::join_form;
+  using sirius::op::groupjoin::schedule_kind;
+  // A P2-only shape (the preserved side is neither DELIM_GET nor provably unique).
+  auto const query =
+    "SELECT dp_id, sum(f_v) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY "
+    "dp_id";
+
+  auto direct_schedule_of = [&](std::string const& q) -> std::optional<schedule_kind> {
+    auto plan = generate_sirius_plan(*con, q);
+    REQUIRE(plan);
+    auto* fused = find_group_join(plan.get());
+    if (fused == nullptr) { return std::nullopt; }
+    REQUIRE(fused->spec().form == join_form::DIRECT);
+    return fused->spec().schedule;
+  };
+
+  CHECK(direct_schedule_of(query) == schedule_kind::ONE_SHOT);
+  // DIRECT streams sparse-only and needs no admission proofs.
+  REQUIRE_FALSE(con->Query("SET group_join_counted_bytes_gate = 1")->HasError());
+  CHECK(direct_schedule_of(query) == schedule_kind::STREAM);
+  // The honest-failure knob declines DIRECT streams to generic planning.
+  REQUIRE_FALSE(con->Query("SET group_join_stream_forms = 'INNER'")->HasError());
+  CHECK_FALSE(direct_schedule_of(query).has_value());
+  REQUIRE_FALSE(con->Query("RESET group_join_stream_forms")->HasError());
+  REQUIRE_FALSE(con->Query("RESET group_join_counted_bytes_gate")->HasError());
 }
 
 TEST_CASE_METHOD(inner_group_join_fixture,
@@ -917,6 +1029,82 @@ TEST_CASE_METHOD(inner_group_join_fixture,
       CHECK(depends_on(preserved->source_pipeline.get()));
       CHECK(depends_on(counted->source_pipeline.get()));
     });
+}
+
+TEST_CASE_METHOD(inner_group_join_fixture,
+                 "group_join STREAM conversion wires a PIPELINE counted barrier",
+                 "[group_join][pipeline]")
+{
+  using sirius::op::MemoryBarrierType;
+  using sirius::op::sirius_physical_group_join;
+  using sirius::op::groupjoin::schedule_kind;
+
+  REQUIRE_FALSE(con->Query("SET group_join_counted_bytes_gate = 1")->HasError());
+
+  // Collects the fused pipeline's input wirings keyed by port.
+  auto require_stream_barriers = [&](std::string const& query, bool delim_fed, bool direct) {
+    sirius::test::with_conversion_result(
+      *con, query, [&](sirius::pipeline::pipeline_conversion_result& result) {
+        using sirius::pipeline::repository_wiring;
+        using sirius::pipeline::sirius_pipeline;
+        sirius_pipeline* fused_pipeline   = nullptr;
+        sirius_physical_group_join* fused = nullptr;
+        for (auto const& pipeline : result.scheduled_pipelines) {
+          for (auto const& op_ref : pipeline->get_operators()) {
+            if (op_ref.get().type != sirius::op::SiriusPhysicalOperatorType::GROUP_JOIN) {
+              continue;
+            }
+            REQUIRE(fused_pipeline == nullptr);
+            fused_pipeline = pipeline.get();
+            fused          = &op_ref.get().Cast<sirius_physical_group_join>();
+          }
+        }
+        REQUIRE(fused_pipeline != nullptr);
+        REQUIRE(fused != nullptr);
+        REQUIRE(fused->spec().schedule == schedule_kind::STREAM);
+
+        repository_wiring const* preserved = nullptr;
+        repository_wiring const* counted   = nullptr;
+        for (auto const& wiring : result.repository_wirings) {
+          if (wiring.dest_pipeline.get() != fused_pipeline) { continue; }
+          if (wiring.port_id == sirius_physical_group_join::PRESERVED_PORT) {
+            REQUIRE(preserved == nullptr);
+            preserved = &wiring;
+          } else if (wiring.port_id == sirius_physical_group_join::COUNTED_PORT) {
+            REQUIRE(counted == nullptr);
+            counted = &wiring;
+          }
+        }
+        REQUIRE(counted != nullptr);
+        CHECK(counted->barrier_type == MemoryBarrierType::PIPELINE);
+        if (direct) {
+          CHECK(preserved == nullptr);
+        } else {
+          REQUIRE(preserved != nullptr);
+          CHECK(preserved->barrier_type == MemoryBarrierType::FULL);
+          if (delim_fed) {
+            REQUIRE(preserved->source_op != nullptr);
+            CHECK(preserved->source_op->owning_delim_join() != nullptr);
+          }
+        }
+      });
+  };
+
+  // Plain INNER, the delim-fed INNER shape, and the single-child DIRECT shape.
+  require_stream_barriers("SELECT d_id, sum(f_v) FROM dim JOIN fact ON d_id = f_d GROUP BY d_id",
+                          /*delim_fed=*/false,
+                          /*direct=*/false);
+  require_stream_barriers(
+    "SELECT sum(f.f_v) FROM fact f, dim_plain p WHERE p.dp_id = f.f_d AND p.dp_pad = 2 "
+    "AND f.f_v < (SELECT avg(f2.f_v) FROM fact f2 WHERE f2.f_d = p.dp_id)",
+    /*delim_fed=*/true,
+    /*direct=*/false);
+  require_stream_barriers(
+    "SELECT dp_id, sum(f_v) FROM dim_plain JOIN fact ON dp_id = f_d GROUP BY dp_id",
+    /*delim_fed=*/false,
+    /*direct=*/true);
+
+  REQUIRE_FALSE(con->Query("RESET group_join_counted_bytes_gate")->HasError());
 }
 
 TEST_CASE_METHOD(inner_group_join_fixture,
@@ -1058,9 +1246,16 @@ TEST_CASE_METHOD(inner_group_join_fixture,
   auto on = con->Query("SET enable_group_join = true");
   REQUIRE_FALSE(on->HasError());
 
+  // Over the byte gate the shape streams (the DIRECT selector); the decline survives only when
+  // DIRECT is outside group_join_stream_forms.
   auto tiny = con->Query("SET group_join_counted_bytes_gate = 1");
   REQUIRE_FALSE(tiny->HasError());
+  CHECK(fused_form(query) == join_form::DIRECT);
+  auto no_forms = con->Query("SET group_join_stream_forms = ''");
+  REQUIRE_FALSE(no_forms->HasError());
   CHECK_FALSE(fused_form(query));
+  auto restore_forms = con->Query("RESET group_join_stream_forms");
+  REQUIRE_FALSE(restore_forms->HasError());
   auto reset = con->Query("RESET group_join_counted_bytes_gate");
   REQUIRE_FALSE(reset->HasError());
   CHECK(fused_form(query) == join_form::DIRECT);

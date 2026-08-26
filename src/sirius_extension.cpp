@@ -2361,6 +2361,39 @@ static void SetGroupJoinCountedBytesGate(ClientContext& context, SetScope scope,
                    params->group_join_counted_bytes_gate);
 }
 
+static void SetGroupJoinStreamForms(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const value = StringValue::Get(parameter);
+  bool inner       = false;
+  bool direct      = false;
+  std::size_t pos  = 0;
+  while (pos <= value.size()) {
+    auto next  = value.find(',', pos);
+    auto token = value.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+    // Trim surrounding spaces.
+    auto const first = token.find_first_not_of(' ');
+    auto const last  = token.find_last_not_of(' ');
+    token = first == std::string::npos ? std::string() : token.substr(first, last - first + 1);
+    if (token == "INNER") {
+      inner = true;
+    } else if (token == "DIRECT") {
+      direct = true;
+    } else if (!token.empty()) {
+      throw InvalidInputException(
+        "group_join_stream_forms accepts a comma-separated subset of {INNER, DIRECT}; got '%s'",
+        token);
+    }
+    if (next == std::string::npos) { break; }
+    pos = next + 1;
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                        = lock_operator_params_slot(context);
+  params->group_join_stream_inner  = inner;
+  params->group_join_stream_direct = direct;
+  SIRIUS_LOG_DEBUG("Updated config GROUP_JOIN_STREAM_FORMS to inner={} direct={}", inner, direct);
+}
+
 static void SetGroupJoinMaxStateBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto const bytes = UBigIntValue::Get(parameter);
@@ -2673,6 +2706,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.group_join_counted_bytes_gate),
                     SetGroupJoinCountedBytesGate);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "group_join_stream_forms",
+                    "internal test hook for the GROUP_JOIN streamed-schedule form set",
+                    LogicalType::VARCHAR,
+                    Value("INNER,DIRECT"),
+                    SetGroupJoinStreamForms);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",

@@ -134,6 +134,54 @@ std::unique_ptr<cudf::table> group_join_dense_direct(groupjoin::dense_value_op o
                                                      rmm::cuda_stream_view stream,
                                                      rmm::device_async_resource_ref mr);
 
+/**
+ * @brief Persistent dense state of a streamed INNER groupjoin (the BUILD_STREAM schedule).
+ *
+ * The one-task dense drivers above run allocate -> accumulate -> emit inside one call; a STREAM
+ * spec instead builds this state once (on the build task, from the completed preserved side),
+ * accumulates counted batches into it from many later tasks, and emits once at the end. The
+ * arrays live on the device the build task ran on and are owned by the operator between tasks;
+ * accumulation into them uses the same commutative atomics as the one-shot drivers, so concurrent
+ * accumulate tasks need no merge logic. The matched array is always uint64 (the counted row count
+ * is unknown at allocation time, so the safe width is forced). Argument batches are dispatched on
+ * their INT32/INT64 representation per call; they must be NULL-free (the streamed plan-time
+ * NOT-NULL proof, belt-checked by the caller).
+ */
+class group_join_stream_dense_state {
+ public:
+  virtual ~group_join_stream_dense_state() = default;
+
+  virtual void accumulate_preserved(cudf::column_view const& keys,
+                                    rmm::cuda_stream_view stream) = 0;
+
+  /// @p rep_args is the argument column viewed as its integer representation; nullptr for COUNT.
+  virtual void accumulate_counted(cudf::column_view const& keys,
+                                  cudf::column_view const* rep_args,
+                                  rmm::cuda_stream_view stream) = 0;
+
+  /// Emits the raw group table (layout as `group_join_dense_inner`); COUNT products are
+  /// overflow-validated on-device when @p check_count_product_overflow is set.
+  virtual std::unique_ptr<cudf::table> emit(bool check_count_product_overflow,
+                                            rmm::cuda_stream_view stream,
+                                            rmm::device_async_resource_ref mr) const = 0;
+
+  [[nodiscard]] virtual std::size_t state_bytes() const noexcept = 0;
+};
+
+/** @brief Allocate and zero/sentinel-initialize a streamed dense INNER state.
+ *
+ * @p presence_wide selects the presence width from the preserved row count; matched is always
+ * uint64. The caller must synchronize @p stream before other streams accumulate into the state.
+ */
+std::unique_ptr<group_join_stream_dense_state> make_group_join_stream_dense_state(
+  groupjoin::dense_value_op op,
+  cudf::data_type key_type,
+  bool presence_wide,
+  int64_t min_key,
+  int64_t range,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
 /** @brief Accumulate preserved-key multiplicities and per-key bundle slots in direct-address
  * arrays.
  *

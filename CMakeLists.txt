@@ -382,6 +382,7 @@ set(EXTENSION_SOURCES
     src/planner/dynamic_filter/dynamic_filter_publication_planning.cpp
     src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp
     src/planner/gpu_admission.cpp
+    src/planner/group_join_stream_admission.cpp
     src/planner/query.cpp
     src/planner/query_index.cpp
     src/planner/sirius_physical_plan_generator.cpp
@@ -764,6 +765,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
     test/cpp/operator/test_physical_group_join.cpp
+    test/cpp/operator/test_physical_group_join_stream.cpp
     test/cpp/operator/test_physical_group_join_value.cpp
     test/cpp/operator/test_physical_sort_sample.cpp
     test/cpp/operator/test_physical_filter.cpp

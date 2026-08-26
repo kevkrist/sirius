@@ -37,6 +37,10 @@ namespace sirius::op {
 class sirius_dynamic_filter_set;  // membership pushdown channel (op/sirius_dynamic_filter.hpp)
 }
 
+namespace cudf::io::parquet {
+struct FileMetaData;  // parsed parquet footer (cudf/io/parquet_schema.hpp)
+}
+
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
@@ -605,6 +609,14 @@ class sirius_scan_manager {
     std::span<std::string const> resolved_file_paths) const;
 
   parquet_bind_result describe_parquet(std::string const& uri);
+
+  /// The parsed parquet footer of @p uri: served from the ioctx metadata store when a prior bind
+  /// or scan of the same file parked it, otherwise fetched, Thrift-parsed, and parked (footer-only
+  /// IO; exactly once per file per process). This is the fact source of the GROUP_JOIN streamed
+  /// plan-time proofs -- exact per-file row counts, schema-level REQUIRED repetition, and
+  /// column-chunk statistics -- for scans whose multi-file DuckDB binding surfaces no statistics.
+  [[nodiscard]] std::shared_ptr<cudf::io::parquet::FileMetaData const> describe_parquet_metadata(
+    std::string const& uri);
 
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
   ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager

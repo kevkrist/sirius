@@ -30,7 +30,8 @@ and result consumption — such that:
    **q18** (SUM per orderkey with functionally-determined carried columns), is fully specified
    but scheduled behind the explicitly-designed sparse/remap seam (§5.4).
 3. Everything else — DISTINCT aggregates, composite keys, arbitrary sparse domains, semi/anti
-   membership, streamed accumulation, multi-GPU — is a named seam or a named non-goal (§8).
+   membership, multi-GPU — is a named seam or a named non-goal (§8). Streamed accumulation,
+   originally a named seam, is specified as the `BUILD_STREAM` schedule (§4.8.1, PR-5).
 
 The theoretical foundation is deliberately **not** the papers' groupjoin operator itself but
 their both-sides eager-aggregation identity (M11 Eq 13/18 with the Yan–Larson ⊗ correction):
@@ -104,7 +105,8 @@ policy is designed around this asymmetry.
 
 - F21's three parallel strategies target CPU cache-contention; GPU hardware atomics on dense
   arrays already give contention-free accumulation, and the dense histogram supports concurrent
-  accumulation from many tasks with zero merge logic (relevant to the streaming seam, §4.8).
+  accumulation from many tasks with zero merge logic (load-bearing for the streamed schedule,
+  §4.8.1).
 - F21 §4's skew-normal aggregate estimates require a stats subsystem Sirius does not have;
   DuckDB's `estimated_cardinality` plus stats-free runtime gating (today's approach) suffices
   for our gate ladder.
@@ -304,7 +306,10 @@ provably equal:
 **Argument-validity gate (dense precondition, value bundles and COUNT(col) on INNER/DIRECT):**
 the dense strategy is selected only if the argument column reports `null_count() == 0` across
 every harvested counted batch — known before state allocation in the one-shot schedule
-(`execute` harvests all batch views first, .cpp:460-488) at metadata cost. Under the gate,
+(`execute_inner_direct` harvests all batch views first,
+`sirius_physical_group_join.cpp:1408-1454`, null accounting :1445-1447) at metadata cost. The
+streamed schedule cannot inspect batches it has not seen before allocating; it replaces this
+runtime gate with a plan-time NOT-NULL proof plus a per-batch belt-check (§4.8.1). Under the gate,
 per-key valid-arg count ≡ key-match count ≡ `c2`, so one `matched` array is simultaneously the
 INNER emit filter, the ⊗ input, COUNT(col)'s value, and AVG's divisor — and AVG needs no
 separate `valid_cnt` array at all. Any NULL argument (organic, or padding from an outer join
@@ -319,7 +324,7 @@ ps_supplycost) are NOT NULL, so the gate never fires on them.
 |---|---|---|---|---|
 | COUNT(col) | memset 0 | `presence × matched` (valid ≡ matched under the argument-validity gate) | 0 | today's: host coarse bound (.cpp:107-116) → device flag (impl.cu:182-186) |
 | COUNT(*) | memset 0 | `presence × max(matched,1)` | presence (≥1) | same |
-| SUM | memset 0 | `presence × sum`, cast to declared type (DECIMAL64→128 as `gpu_aggregate_impl.cpp:420-435` does) | NULL (v1: form excluded, §4.5) | host bound `counted_rows × max(|vmin|,|vmax|)` from value extrema folded into the single sync; inconclusive ⇒ decline dense → sparse (parity with generic GPU int64 accumulation) |
+| SUM | memset 0 | `presence × sum`, cast to declared type (DECIMAL64→128 as `gpu_aggregate_impl.cpp:420-435` does) | NULL (v1: form excluded, §4.5) | host bound `counted_rows × max(abs(vmin), abs(vmax))` from value extrema folded into the single sync; inconclusive ⇒ decline dense → sparse (parity with generic GPU int64 accumulation). One-shot schedule only — streamed specs prove the bound at plan time instead (§4.8.1) |
 | MIN/MAX | fill sentinel | raw slot; validity = `matched>0` | NULL (v1: excluded) | none needed |
 | AVG | memset 0 | `DIV(sum, matched)` (divisor ≡ valid count under the gate) — reuse the finalize construction of `sirius_physical_grouped_aggregate_merge.cpp:259-284` (DECIMAL fixed-point vs FLOAT64) | NULL (v1: excluded) | as SUM |
 
@@ -385,7 +390,9 @@ arrays, `min + slot` key reconstruction at emit (no gather). Generalizations:
   side below 2^32 rows, the runtime derivation yields 16 B/slot automatically.
 - Value extrema (needed by SUM/AVG overflow bounds) merge into the same device extrema array
   (2 slots → 2 + 2·num_sum_slots) and are read back **in the same single memcpy/sync**
-  (impl.cu:436-441). The count bundle keeps a 2-slot array and identical kernels.
+  (impl.cu:436-441). The count bundle keeps a 2-slot array and identical kernels. One-shot only:
+  a streamed build sees no counted batches, so STREAM keeps the 2-slot key-extrema pass and moves
+  the SUM/AVG bound to a plan-time proof (§4.8.1).
 
 **Gate policy is per-form** (the load-bearing policy/mechanism split):
 
@@ -560,7 +567,8 @@ Every pathway emits a `group_join_spec` (§4.2); construction mirrors today's
 | `operator_params.enable_dense_count_join` | YAML bool (existing, `sirius_config.cpp:298`) | true | P0 count pathway — semantics unchanged |
 | `operator_params.enable_group_join` | YAML bool (new) | **false** until Phase-3 measurement gate, then true (flipped in PR-3 after its §9 gates passed) | P1 + P2 value pathways |
 | `group_join_max_state_bytes` | engine-owned, internal test hook only (pattern: `sirius_config.cpp:299-303` + `SIRIUS_ENABLE_TEST_OPTIONS` SQL setting) | `min(16 GiB, smallest visible device's memory / 16)`, falling back to the 2 GiB count-form budget when no device is visible — device-fraction-capped so small-HBM devices decline dense instead of planning unreservable state; derived from the corrected per-array widths (§4.4): q17-class 200 M-slot AVG state = 3.2–4.0 GB (SF1000), 6.4–8.0 GB (SF2000), 9.6–12 GB (SF3000), all ≤ 16 GiB on GB300-class devices | value-form gate (b) |
-| `group_join_counted_bytes_gate` | engine-owned, internal test hook only (same pattern) | smallest visible device's memory / 24; 0 (decline everything) when no device is visible | value-form plan-time counted-side gate (§4.8) |
+| `group_join_counted_bytes_gate` | engine-owned, internal test hook only (same pattern; `sirius_config.hpp:218`, derivation `sirius_config.cpp:65-83`) | smallest visible device's memory / 24; 0 when no device is visible | value-form plan-time counted-side gate. From PR-5 it is the **schedule selector** (§4.8.1): estimate ≤ gate ⇒ one-shot exactly as today; estimate > gate ⇒ STREAM. It reverts to a plan-time decline only where STREAM is inadmissible (proofs inconclusive, or the form is outside `group_join_stream_forms`) |
+| `group_join_stream_forms` | engine-owned, internal test hook only (new in PR-5; same pattern) | `{INNER, DIRECT}` once §9's PR-5 gates pass; a form is removed on a gate failure | the honest-failure clause (§9): a form outside the set makes the byte gate decline fusion for over-gate shapes exactly as PR-3/PR-4 did, with the streamed code still merged |
 | `dense_count_join_max_bytes` | engine-owned (existing) | 2 GiB | count-form gate (b), untouched |
 
 One new public knob total; no per-pathway knob sprawl. With `enable_group_join = false` the
@@ -570,7 +578,8 @@ planner's decisions are bit-identical to today (P1/P2 ladder rungs are behind th
 
 **Operator.** `sirius_physical_group_join` (enum `GROUP_JOIN`, replacing `DENSE_COUNT_JOIN` in
 `src/include/op/sirius_physical_operator_type.hpp` and all integration arms in the same PR).
-Source+sink; ports "preserved"/"counted" (DIRECT registers only "counted"); FULL barriers. The
+Source+sink; ports "preserved"/"counted" (DIRECT registers only "counted"); FULL barriers under
+the one-shot schedule (a STREAM spec's counted port is PIPELINE, §4.8.1). The
 `dense_count_join_input` side-tagging generalizes trivially (DIRECT has one side). Pipeline
 construction and port wiring are **per-provenance, not "identical to today"** — today's bodies
 survive only for provenance class (i):
@@ -657,7 +666,9 @@ sparse remains reachable (small-counted and nullable-argument regimes, §4.4) an
 must cover whichever strategy runs. Same saturating arithmetic
 (`src/include/memory/size_arithmetic.hpp`), same OOM retry floor
 (`gpu_pipeline_task.hpp:93-130`), same allocator discipline (`rmm::exec_policy(stream, mr)`,
-space taken from colocated input batches, .cpp:429-440).
+space taken from colocated input batches, .cpp:429-440). This formula is the **one-shot
+schedule's**; STREAM specs replace it wholesale with the per-role task charges of §4.8.1,
+keeping only the saturating arithmetic and the retry floor.
 
 **Downgrade/spill story (explicit, per R5):** unchanged from today, and justified: the operator
 has **no CPU implementation** and is not downgrade-eligible; its FULL-barrier port repositories
@@ -667,7 +678,9 @@ contract). Bail-to-generic exists **only at plan time** (any ladder rung fails �
 join+aggregate); post-plan the only runtime bail is dense→sparse, which is exact. The one new
 memory risk — INNER forms colocating a huge counted side in one reservation (q17: ~96 GB at
 SF1000) — is handled by a **plan-time byte gate** on the counted child's
-`estimated_cardinality × row width`, failing closed to generic until the streaming seam lands.
+`estimated_cardinality × row width`, failing closed to generic until PR-5; §4.8.1 then
+repurposes the same gate as the schedule selector, so over-gate shapes stream instead of
+declining.
 The fraction is derived, not hand-waved: the reservation is
 `max(dense, sparse, minmax) + bytes_to_materialize` with `sparse = 16 × bytes`, i.e. ~17× the
 input must fit in usable device memory, so the gate is **counted-child estimated bytes ≤
@@ -678,19 +691,297 @@ PR-5** — plan-time refusal is the honest answer, stated as such in §5.1's mea
 grossly exceed the estimate remains the same exposure class as today's operator (which also
 charges 16× on actuals) and is caught by the reservation math, not by a hang.
 
-**Named seam: streamed accumulation (`BUILD_STREAM`).** The one-shot both-FULL schedule is a
-policy choice, not a mechanism constraint: dense-array atomics make concurrent accumulation from
-many tasks correct with zero merge logic. The seam: preserved port FULL → build state (extrema +
-allocation) once; counted port PIPELINE → per-batch accumulate tasks pinned to the state's
-device; emit when the counted producer finishes. Template: the hash join's
-`per_partition_build_state` machine (`src/include/op/sirius_physical_hash_join.hpp:418-434` —
-atomic build-state, device-pinned slots). This removes the counted-side colocation gate (and
-with it the reason P1 cannot fuse at SF1000) and is scheduled as its own phase (§9, PR-5); the
-count pathway never switches (R1). Two commitments the seam must honor, resolved now: streamed
-specs fix `matched` at **u64** (counted row count is unknown at allocation time; +4 B/slot buys
-the safe bound); and PR-5 must restate the memory estimate for streamed specs — the strategy
-commits at build time, sparse partials are already per-batch (they stream structurally), so the
-16×-all-input term is replaced by per-task charges plus the final merge/emit charge.
+**Streamed accumulation (`BUILD_STREAM`) — specified in §4.8.1.** The one-shot both-FULL
+schedule is a policy choice, not a mechanism constraint: dense-array atomics make concurrent
+accumulation from many tasks correct with zero merge logic. PR-5 makes the schedule a spec field
+and specifies the streamed alternative below; the count pathway **never switches schedule (R1)**,
+and streamed specs fix `matched` at **u64** (counted row count is unknown at allocation time;
++4 B/slot buys the safe bound) — the two commitments recorded when this was a seam, honored in
+full below.
+
+#### 4.8.1 `BUILD_STREAM` — the streamed schedule (PR-5 specification)
+
+**Schedule is planner policy.** `group_join_spec` gains `schedule ∈ {ONE_SHOT, STREAM}`,
+decided at plan time (the port barrier is fixed at conversion; there is no runtime schedule
+switch). The selector is the existing counted-byte gate, repurposed: for rungs P1/P2, counted
+estimate ≤ `group_join_counted_bytes_gate` ⇒ `ONE_SHOT` — today's admission, wiring, estimate,
+and execution **verbatim**, so everything that fused in PR-3/PR-4 (all SF100 shapes, the
+dense-forcing reachability shapes) keeps byte-identical behavior; estimate > gate ⇒ `STREAM`,
+subject to the streamed-admission proofs below (gate sites:
+`sirius_plan_aggregate.cpp:1021-1036` INNER, `:1151-1165` DIRECT). Estimate error is now
+harmless in both directions: an overestimate (q2's 1000×, the PR-4 lesson) selects a schedule
+rather than sizing a reservation, and an underestimate keeps the one-shot exposure class the
+operator already has. Rung P0 constructs `ONE_SHOT` unconditionally, consults no gate, and the
+operator ctor rejects `STREAM` on `OUTER_PRESERVING` fail-closed (R1). Per-form streamed
+admission is the engine-owned `group_join_stream_forms` set (§4.7) — the §9 honest-failure
+mechanism.
+
+**Wiring delta: the barrier, nothing else.** `input_barrier_for` (today unconditionally FULL,
+`sirius_physical_group_join.cpp:736-740`) becomes per-producer: preserved FULL (both provenance
+classes, the distinct-chain-root arm included), counted PIPELINE for STREAM specs. The converter
+already consumes the per-producer virtual (`sirius_pipeline_converter.cpp:215-217`); ports,
+pipeline construction, the three provenance classes, and every `input_port_for` arm are
+untouched. The **PR-4 `is_sink()` commitment is discharged by restating the invariant, not by
+conditioning the predicate**: the base rule (`sirius_physical_operator.hpp:562-573`) keys on
+parent type because those parents consume across *repository ports* — true of FULL and PIPELINE
+ports alike — and a PIPELINE-ported counted child must still terminate its pipeline and push
+into the port repository, so a barrier-conditional test would be wrong. PR-5 corrects the
+comment's "one-shot FULL-barrier ports" rationale to "repository ports" at that site and adds
+the carried merge-fusion breadcrumb (§9 PR-4 carry (iii)). `terminal_sink_supports_fusion`
+(`sirius_physical_plan_generator.cpp:850-866`) needs no change: folding an upstream merge into
+the counted child's pipeline moves a task boundary upstream of the port and is
+barrier-indifferent.
+
+**Schedule state machine — the hash-join build-state pattern, single slot.** The operator owns
+one `stream_state`, the single-slot analogue of `per_partition_build_state`
+(`sirius_physical_hash_join.hpp:418-434`; stage enum and scheduling shape per
+`BUILD_HASH_TABLE_STATE` / `select_build_probe_action`, hpp:64, :70-99): an atomic stage
+`NOT_BUILT → SCHEDULING → SCHEDULED → BUILT`, `device_id`, the committed strategy, the dense
+driver state *or* the sparse merge ladder, an atomic in-flight accumulate count, an atomic
+accumulated counted-row total (feeds emit-time COUNT product validation), and one-shot
+emit/discard claim flags. Transitions mirror the hash join: hint-side CAS `NOT_BUILT →
+SCHEDULING` claims the build, `SCHEDULED` at input-pop, release-store `BUILT` at the end of the
+build execute. The STREAM hint table (replaces the wait-both-FULL body, cpp:789-806;
+`maybe_publish_preserved_membership` stays the first statement — same hook):
+
+| stage | condition | hint |
+|---|---|---|
+| NOT_BUILT (INNER) | preserved pipeline unfinished | WAITING(preserved producer) |
+| NOT_BUILT (INNER) | preserved finished, preserved repo non-empty | CAS→SCHEDULING; READY — build |
+| NOT_BUILT (INNER) | preserved finished, preserved repo empty | claim discard mode; thereafter READY whenever the counted repo is non-empty, and `get_next_task_input_data` drains and drops the batches and returns null — no tasks, no emit-pending flag (INNER over an empty preserved side is empty; matches the one-shot no-task/no-output degenerate) |
+| NOT_BUILT (DIRECT) | counted repo non-empty | CAS→SCHEDULING; READY — the first accumulate doubles as the build (claims the device, initializes the ladder, folds its own partial) |
+| SCHEDULING / SCHEDULED | build in flight | WAITING(counted producer) — the hash join's SCHEDULING rule |
+| BUILT | counted repo non-empty (sparse: and in-flight == 0) | READY — accumulate |
+| BUILT | counted producer unfinished, repo empty | WAITING(counted producer) |
+| BUILT | counted finished ∧ repo empty ∧ in-flight == 0 ∧ emit unclaimed | READY — emit |
+| emit claimed / discarded out | — | nullopt |
+
+Completion safety: `all_ports_empty()` is overridden to report non-empty while a built state's
+emit is pending-unclaimed. That override is load-bearing twice: the task-creator loop
+(`task_creator.cpp:403`) would otherwise never enter for the port-less emit, and
+`update_pipeline_status`'s finish condition (`sirius_pipeline.cpp:414-426`: source pipelines
+finished ∧ ports empty ∧ tasks created == completed) would otherwise finish the operator's
+pipeline in the window after the last accumulate completes and before the emit task exists.
+Once the emit is claimed, the created/completed imbalance holds the pipeline open; when it
+completes, the pipeline finishes and the FULL-ported consumer unblocks exactly as today.
+**Pops** are serialized by the pipeline's task-creation lock (`task_creator.cpp:404-405`);
+**hints are lock-free** (`task_creator.cpp:264`, `:335` poll under unrelated locks), so every
+hint-side transition must be — and is — a single atomic operation: the stage CAS and the
+idempotent discard-mode store. That is the same division the hash-join machine relies on
+(lock-free `select_build_probe_action` over atomics; pops under the lock). The emit-trigger
+chain needs no new scheduling edge — the last accumulate's completion schedules the downstream
+consumer, whose WAITING hint recurses back into this operator (`get_operator_for_next_task`).
+
+**Build task (INNER): strategy commits here, once.** Input = every preserved batch (the FULL
+drain, today's pop). Work: preserved-key extrema — `group_join_global_minmax`
+(`group_join_impl.hpp:66-69`), the 2-slot device array and its single sync; the value-extrema
+variant (:87-91) is *not used* under STREAM, since SUM/AVG safety is proven at plan time (below)
+— then strategy commit, state construction on the task's reservation device, `device_id`
+recorded, one further sync (state init must be visible to accumulate tasks on other streams),
+release-store `BUILT`. The commit gate is the **build-time-computable subset** of §4.4's table:
+(a) layout-valid range from the *preserved* extrema; (b) state ≤ budget under the streamed
+widths — presence sized from preserved rows (known), **matched u64 forced**, payloads i64.
+Gates (d)/(e) are one-shot-only by construction: they compare against whole-input quantities a
+stream cannot know, and their pessimization-avoidance role is bounded under STREAM by (b)
+itself — the worst case they prevented (state far larger than the live data) now costs at most
+one budget-bounded fill + emit scan (~2× state bytes of linear traffic, single-digit ms/GB),
+the same bounded trade §4.4 accepted when it dropped (c), while the opposite error (sparse on
+an unfiltered multi-billion-row counted side) remains the F21 10× hazard. Commit **dense** iff
+(a) ∧ (b) — the plan-time value proofs are a STREAM admission precondition, so they already
+held — else commit **sparse**, for which the build materializes the preserved
+distinct+multiplicity partial (`sparse_partial_count` over the preserved batches, exactly the
+one-shot sparse's preserved side, cpp:1651-1660) and the counted side streams through the
+ladder. A build-task OOM releases any partially constructed state before rethrowing the
+reschedule (RAII in the driver) and retries under the standard floor. The PR-2 drivers'
+internal allocate → accumulate-per-batch → emit phasing makes this split a mechanical refactor
+of `group_join_dense_inner`/`group_join_dense_direct` (`group_join_impl.hpp:104-135`) into a
+persistent state object, as recorded at PR-2 time.
+
+**Dense-domain extrema under streaming — the correctness core.** For INNER the group key *is*
+the preserved join key, so the domain `[min, max]` taken from the completed preserved side is
+the whole group domain: a counted key outside it cannot equal any preserved key, and the
+accumulate kernel's existing counted-side bounds check (the checked-counted asymmetry, §3)
+discards exactly the provably-non-matching rows — correct, not lossy. Counted rows that
+accumulate *before* the membership filter lands (or with no filter at all) are
+correctness-neutral for the INNER emit: every in-range key has a physically allocated slot (the
+state allocates the full range, so no out-of-range write exists to begin with), and emit's
+`presence > 0 ∧ matched > 0` predicate drops every key with no preserved row, discarding the
+spurious accumulation wholesale. Order is immaterial: presence is complete at `BUILT`, before
+any counted accumulation — the one-shot pass order — and dense accumulation is commutative
+atomics.
+
+**Accumulate tasks.** One counted batch per task — the recorded per-batch commitment
+(multi-batch coalescing is a named seam, not built). The input (a counted-only
+`group_join_input` tagged with its task role) is stamped with
+`set_preferred_device_id(state.device_id)` — the producer-preference channel the task creator
+honors first and the scheduler treats as binding (`task_creator.cpp:429-431`,
+`sirius_physical_operator.hpp:201-217`) — and `prepare_for_processing` colocates the batch onto
+that device (host upgrades and cross-GPU clones charged as `bytes_to_materialize`; the pin is
+reapplied on OOM reschedule). Dense: one kernel pass into the pre-allocated arrays — zero
+allocations — plus a per-batch metadata belt-check that the argument column carries no NULLs
+(the plan-time proof makes this unreachable; a violation throws rather than corrupt `matched`),
+and a final stream sync so a task observed complete has device-visible effects (emit and other
+accumulate tasks run on different streams; µs-class per task against ms-class task work — the
+single-sync invariant is a P0 per-task property, §7.3, and is not claimed for STREAM). Sparse:
+compute the batch partial (`sparse_partial_value`, cpp:374-422) and fold it into the
+operator-owned **binary merge ladder** — slot *i* holds a partial of ~2^i batches; a carry
+collision merges pairwise (`sparse_merge_value_pair`, cpp:445-477) and propagates — preserving
+today's balanced-merge discipline (cpp:479-514) in streaming form with ≤ ⌈log2 N⌉ + 1 resident
+partials. The ladder is not concurrency-safe, so sparse accumulate tasks serialize through the
+state machine (in-flight ≤ 1; the PIPELINE repo buffers, and spills, meanwhile); dense tasks
+run fully concurrent (contention-free hardware atomics, §2.5). Ladder folds build the merged
+table before swapping it in, so an OOM retry always observes a consistent ladder; the counted-row
+accounting records once per input (the one-shot claim latch), *before* the fold, so a replayed
+fold pairs with already-recorded rows and the emit-time COUNT product validation never consumes
+an undercount.
+
+**Emit task.** Trigger per the hint table. Its input is a synthetic, non-pipelineable
+`group_join_emit_input : operator_data` — estimated size 0, base no-op `prepare_for_processing`
+(`sirius_physical_operator.hpp:167`, :179; precedent: `scan_operator_input` is likewise
+non-pipelineable) — because the creator loop drops an *empty pipelineable* input without
+creating a task (`task_creator.cpp:408-412`); it is stamped with the state's device. Work:
+dense — selection/⊗/finalize exactly as the one-shot emit, with COUNT's product validation
+driven by the runtime accumulated counted-row total; sparse — final ladder collapse, then (for
+INNER) the distinct-key inner join + ⊗ + finalize of the one-shot sparse path. The collapse
+reads the ladder by view and the combine takes the preserved partial by view: stream state stays
+untouched until the output batch is fully constructed, so an OOM-rescheduled emit replays
+against the same consistent state (the end-of-emit release is the emit's only state mutation).
+The output batch
+is built on the state's memory space (recorded at build; the emit input carries no batches to
+alias) and pushed through the normal sink path. The state is released at the end of emit
+(returning the 3.2–4 GB early), with `on_finalize_operator` as the device-guarded backstop for
+abandoned queries — the hash-join teardown discipline (`device_id` guards frees).
+
+**DIRECT under STREAM: sparse only, by soundness.** Dense DIRECT cannot stream: the group
+domain is the counted key domain itself, unknowable until the stream ends — a
+first-batch-extrema state would have to bounds-*discard* later out-of-range keys, which for
+DIRECT are real groups (wrong results), and §4.5's NULL-group slot needs the domain too. A
+STREAM DIRECT spec therefore commits **sparse at plan time** (the ladder, NULL-inclusive keys
+preserving the NULL group), which is exactly what q2 needs and is never a pathology for DIRECT:
+per-batch partial + ladder merge is the same work as the generic HASH_GROUP_BY → PARTITION →
+MERGE fragment it replaces, minus the repository round-trips. Dense DIRECT — the sentinel init,
+`atomicMin/Max`, and the NULL-group slot — remains reachable through the one-shot schedule,
+which every at-or-under-gate shape keeps, so §10's dense-forcing reachability tests are
+unaffected. The state machine degenerates as tabled above: no preserved port, first accumulate
+doubles as build.
+
+**Streamed value admission — plan-time proofs, fail-closed.** Two facts the one-shot schedule
+reads off harvested batches are unknowable at streamed build time. Both move to plan time, and
+both consume **sound bounds only — never cardinality estimates**:
+
+- *NOT-NULL argument (every argument-taking op: COUNT(col), SUM, MIN, MAX, AVG).* The one-shot
+  argument-validity gate (§4.2) inspects every batch before allocation; a stream can meet its
+  first NULL argument after dense accumulation began, and the dense state cannot absorb it
+  (`matched` would count valid-argument rows, not key matches — breaking the INNER emit filter
+  and §4.5's all-NULL-argument row; the dense emit has no output mask). STREAM therefore admits
+  an argument-taking spec only with plan-time NOT-NULL evidence for the argument column,
+  resolved through the rung's composed projection remap to the counted GET column: a catalog
+  NOT NULL constraint, or column statistics excluding NULLs. Absent or inconclusive ⇒ no STREAM
+  spec. The per-batch belt-check above keeps wrong results impossible even against lying
+  metadata — it throws (the last-resort semantics) on a path the proof makes unreachable.
+- *SUM/AVG int64 accumulation bound.* The one-shot host bound is `counted_rows × max(|v|)` from
+  runtime extrema (cpp:269-280, applied :1535-1538). The streamed replacement is static:
+  `base_table_rows(counted GET) × max(|stat_min|, |stat_max|)` on the argument's **unscaled**
+  representation, ≤ INT64_MAX ⇒ admitted. Soundness: rung P1's counted side is a linear
+  GET/FILTER/PROJECTION chain, which is row-non-increasing, so actual counted rows ≤ the gets
+  exact row count (catalog / parquet metadata — a fact, not an estimate); statistics min/max are
+  conservative bounds; the product of two hard bounds is a hard bound. q17 passes by five
+  orders of magnitude: 6.0e9 lineitem rows × 5000 (unscaled |50.00| at DECIMAL(15,2)) = 3.0e13
+  ≪ 2^63−1 ≈ 9.2e18. No stats, an unbounded column, or a non-exact row source ⇒ inconclusive ⇒
+  no STREAM spec.
+
+A failed proof falls back to **one-shot admission**, whose byte gate then declines the very
+shapes that needed streaming — the PR-3/PR-4 honest-refusal class — chosen over both
+alternatives: *streamed-sparse-always* would eager-aggregate precisely the huge counted sides
+STREAM exists for (the §2.4 hazard, worse than the unfused baseline), and the *running
+per-batch bound with mid-stream dense→sparse conversion* is buildable — the dense state is an
+exact, self-contained partial: presence and matched/sum extract to the two sparse-side tables
+by an emit-shaped scan, no retained batches needed, and the state is exact up to any batch not
+yet accumulated — but it adds a second strategy-transition path, a conversion kernel set, and a
+mid-stream failure surface for a case no named pathway reaches (every pathway column has
+catalog stats and passes trivially). Fail-closed is the tiebreaker; the conversion is recorded
+as the escalation seam if a real inconclusive-stats pathway ever appears. This is the one
+deliberate nuance to the stats-free-gates principle (§2.5): that principle bans *estimates* in
+gating because they are unreliable; these proofs consume only hard bounds and fail closed when
+bounds are absent. P0 remains statistics-free on every path. COUNT(*) needs neither proof (no
+argument; the COUNT product is validated at emit from runtime totals); MIN/MAX need only
+NOT-NULL; sparse commits (DIRECT, or an INNER build whose extrema fail (a)/(b)) need no proofs —
+the sparse path is mask-exact with generic-parity int64 accumulation, unchanged.
+
+**Memory estimate and admission — per-role charges replace 16×-all-input.** A STREAM spec never
+colocates the counted side and never charges 16× of anything; each task role charges what it
+uses, and the reservation estimate is **operator-authoritative**: every streamed task input
+carries a per-role peak estimate consumed through a new
+`operator_data::peak_memory_estimate_override()` (default `nullopt`), which
+`get_estimated_reservation_size_info` (`gpu_pipeline_task.cpp:679-754`) consults ahead of the
+history/no-history ladder; `bytes_to_materialize` and the OOM retry floor compose exactly as
+today (:750-752, `gpu_pipeline_task.hpp:99-108`). Bypassing `pipeline_memory_history` for these
+tasks is load-bearing, not cosmetic: the flat per-pipeline ring
+(`pipeline_memory_history.hpp:118-155`) would fold the build's peak/input ratio (a budget-scale
+charge against ~13 MB of
+preserved input, ~10^3×) into the first accumulate estimates (basis ~1–2 GB ⇒ device-scale
+requests), which the manager-loop clamp turns into serialized full-device reservations for the
+first several batches — a reservation-profile regression the operator can simply not have,
+because every role's peak is computable exactly at input-pop time. Charges:
+
+| role | reservation charge |
+|---|---|
+| build, dense commit (INNER) | `max_state_bytes` — the budget is the only sound pre-extrema bound on the state, transient for one task and self-scaling because it is device-fraction-capped (§4.7) — + preserved `bytes_to_materialize` + the 2-slot extrema array + per-batch extrema scalars + floor |
+| build, sparse commit (INNER) | the preserved-partial groupby modeled per input row (hash set + per-row sparse results + populated keys + gathered output, sound down to key-only batches) and one pairwise merge-tree step over the partial-sum bound — charged on top of the budget row, because the commit is unknown at input-pop time — + preserved `bytes_to_materialize` + extrema terms + floor |
+| accumulate, dense | floor + the batch's `bytes_to_materialize` — the kernel pass allocates nothing; **per-batch tasks are small, which is the point** |
+| accumulate, sparse | the exact carry chain this batch will fold through, simulated at input-pop time over the measured resident-slot sizes (sparse accumulates serialize, so the ladder cannot change between pop and fold): the batch-partial groupby phase, then per merge step the running merge + the two-input concatenation + the merged output + 2× hash-groupby scratch, while the resident slots stay charged to the reservations that built them — + `bytes_to_materialize` + floor |
+| emit, dense | state-bytes-again (the CUB selection-workspace proxy, today's discipline) + outputs/selected/finalize temporaries bounded by **non-null preserved rows** (known exactly at emit; `presence > 0` requires a preserved row) + masks + floor |
+| emit, sparse | the non-destructive sequential collapse simulated over the measured resident-slot sizes (each step holds the running merge plus one merge step's concatenation/output/scratch; a single-resident ladder deep-copies its slot) + (INNER) the distinct-key join and ⊗ terms on group-sized tables (≈ 4× the preserved partial) + outputs + masks + floor |
+
+A DIRECT stream's build *is* its first sparse accumulate and is charged as one (the carry-chain
+simulation over an empty ladder); there is no separate DIRECT build row.
+
+Downgrade/spill, explicit per R5: counted batches waiting in the PIPELINE port are idle
+repository batches — first-class downgrade candidates (the provider walk,
+`docs/super-sirius/memory-management.md`) — so a scan running ahead of the accumulate
+backpressures into HOST/DISK and re-materializes per task through `bytes_to_materialize`;
+this is the story the one-shot schedule structurally could not have. The dense state itself is
+an operator-owned device allocation (the hash-join cuco-table class): invisible to the
+downgrade executor, unspillable by design, bounded by gate (b), resident from build to emit —
+the schedule's one fixed device-residency cost, stated as such. Publication keeps its existing
+non-task allocation behavior (§4.9). Per-task OOM retry is otherwise unchanged.
+
+**Re-derived pathways at SF1000 (what §9's PR-5 gates measure).**
+
+- *q17 — INNER AVG, STREAM, dense commit.* Plan: 72 GB counted estimate > 11.17 GB gate ⇒
+  STREAM; NOT-NULL and magnitude proofs pass on l_quantity. Build: 4.0 GB state — presence u32
+  (540 K preserved) + matched u64 (forced) + sum i64 = 20 B × 200 M slots; the u64 commitment
+  costs +0.8 GB over the one-shot filtered layout — inside a transient budget-bounded
+  reservation. Accumulate: filtered regime ~16 M rows ⇒ ~1.5 ms of atomics total; unfiltered
+  fallback ⇒ ~565 ms total (archived GB300 microbenchmark, 21.2 G atomics/s). Emit: ~4 GB
+  transient (CUB proxy) + ~30 MB of 540 K-group outputs. Peak resident across the stream: the
+  state plus one in-flight batch (plus a spillable repo backlog) — versus the one-shot's
+  unschedulable ~17 × 96 GB. *Measured (PR-5 kit, SF1000):* the ~540 K preserved projection was
+  stale — 200,585 delim keys (200 M × 1/25 brand × 1/40 container), range 199,996,990; state
+  math unchanged at 4.0 GB (presence 32-bit, matched 64-bit); 6.0 M counted rows accumulated of
+  the 6.0 B-row scan — the filtered regime, so the membership filter landed ahead of the
+  accumulates as the publication-timing paragraph predicts.
+- *q2 — DIRECT MIN, STREAM, sparse.* Plan: 19.2 GB estimate > gate ⇒ STREAM — the PR-4 decline
+  dissolves, and the estimate's ~1000× error over the ~640 K actual rows is harmless (it
+  selected a schedule, not a reservation). Actual: a few ~MB batches ⇒ a handful of serialized
+  partial tasks + one emit; per-task reservations in the tens of MB.
+
+**Publication timing under STREAM.** Publication still triggers on preserved-producer
+completion from the first hint poll — same hook, same one-shot CAS, same
+whole-single-GPU-resident-delivery rule (cpp:789-806, :831-941) — which under STREAM is
+structurally *before* the build task drains the preserved repo (the hint publishes before
+returning READY) and structurally early in the query: q17's preserved distinct chain reduces
+the part side to ~540 K keys while the counted side is a 6 B-row scan. Expected SF1000 regime:
+the membership filter lands before most counted batches decode, the scan delivers ~16 M
+filtered rows, and the entire accumulate phase is ~1.5 ms. Filter parity is
+**identical-by-construction** to the baseline's — same evidence, same trigger point (the
+preserved/build side completing), same best-effort semantics — so parity is structural, not
+aspirational. Fallback regime: scan-ahead batches that decode before the filter lands
+accumulate unfiltered and harmlessly (the correctness-core paragraph) at 21.2 G atomics/s —
+~5 ms per 100 M-row batch, ~565 ms if no filter ever lands, which against a 272 ms whole-query
+baseline is exactly the regression the §9 honest-failure clause exists for. PIPELINE scheduling
+additionally overlaps accumulation with the scan, deleting the one-shot's scan-then-fuse
+serialization — the same phase-serialization class the q9/q21 profiles identified.
 
 ### 4.9 Integration inventory
 
@@ -798,10 +1089,39 @@ which fusion correctly declines; the **−10…25% q17 wall-time estimate belong
 scattered-atomic microbenchmark (§4.4) confirming the accumulate pass is not the new critical
 path. Realistic floor in every regime: neutral-if-scan-bound. All in the PR #1371 kit regime.
 
+*PR-5 (streamed) regime:* at SF1000 the spec plans as STREAM (§4.8.1: 72 GB estimate over the
+gate; the NOT-NULL and magnitude proofs pass on l_quantity — 6.0e9 rows × 5000 unscaled =
+3.0e13 ≪ 2^63). The build commits **dense in both filter regimes** (gates (d)/(e) are
+one-shot-only), so the one-shot regime table above is SF100/one-shot-specific: streamed state is
+4.0 GB (matched u64), accumulate ~1.5 ms filtered / ~565 ms never-filtered — the archived GB300
+microbenchmark (21.2 G atomics/s) resolves condition (b): the filtered accumulate is nowhere
+near the critical path, and the never-filtered worst case against a 272 ms whole-query baseline
+is precisely the regression the §9 honest-failure clause covers. Filter parity is structural
+(§4.8.1 publication timing), and PIPELINE scheduling overlaps accumulation with the scan
+instead of serializing behind it — that overlap plus the deleted fragment is where the −10…25%
+must come from.
+
+*Measured (PR-5 gate, SF1000):* **the −10…25% did not materialize; the floor
+(neutral-if-scan-bound) is what was measured.** q17 fuses streamed-dense as designed (STREAM
+plan line, dense commit line, membership publication installed) and runs the filtered regime —
+6.0 M of 6.0 B rows accumulate, 200,585 groups emit — so q17 stays scan/decode/delim-bound, the
+deleted fragment is small, and the streamed state's fixed costs (the 4.0 GB memset plus the
+state-sized emit selection scan — exactly the bounded regret §4.8.1 accepted when it made gates
+(d)/(e) one-shot-only) are the visible residue: suite best-of-3 A 0.2705 s / B 0.2641 s
+(−2.4%, the gate's own instrument, neutral), isolated x9 pooled warm means A 0.2685 / B 0.2766
+(+3.0%, ~8 ms, consistent sign, overlapping distributions). The two channels disagree in sign,
+so "regresses beyond noise" is not established, the honest-failure clause was not invoked, and
+INNER stays in `group_join_stream_forms` — under the named post-merge re-measure trigger
+recorded in §9's delivery status. Results are byte-identical to knob-off. Where STREAM's
+headroom actually lives is the shapes the filtered regime does not rescue — the unfiltered
+fallback and the q18-class P3 pathway — not filtered q17.
+
 **Gating (fail-closed):** `enable_group_join`; every detection miss → generic; counted-byte
-plan gate → generic (this is what declines SF1000 pre-PR-5); runtime dense decline →
-sparse-exact (correct; benign in the filtered regime; slow only for adversarial
-extrema — p_partkey cannot exceed [1, 200 M·SF/1000]).
+plan gate → generic pre-PR-5, schedule selector from PR-5 (§4.8.1 — over-gate shapes stream;
+declines remain only where STREAM is inadmissible: proofs inconclusive or the form outside
+`group_join_stream_forms`); runtime dense decline → sparse-exact (correct; benign in the
+filtered regime; slow only for adversarial extrema — p_partkey cannot exceed
+[1, 200 M·SF/1000]).
 
 **Risks:** (1) one-shot colocation of the counted side — refused at plan time by the byte gate,
 removed by PR-5 streaming; (2) dynamic-filter parity — the baseline's delim-side hash join is
@@ -871,6 +1191,22 @@ MERGE fragment (3 pipelines, 2 barriers) with one sink task — an overhead/late
 is (a) breadth proof for the MIN bundle (sparse) and the DIRECT form at near-zero risk, (b) the
 DIRECT machinery itself, which any future dense-grouped-aggregate work reuses. Accept "neutral,
 no regressions" as its gate.
+
+*PR-5:* at SF1000 the spec plans as STREAM (§4.8.1: 19.2 GB child estimate over the gate — the
+PR-4 decline dissolves; the estimate's ~1000× error over the ~640 K actual rows is harmless
+because it now selects a schedule rather than sizing a reservation) and runs the sparse merge
+ladder: a few serialized per-batch partial tasks plus one emit, the same work as the replaced
+fragment minus its repository round-trips. Gate stays neutral-or-better (§9).
+
+*Measured (PR-5 gate, SF1000):* fuses streamed-sparse as designed — 471,301 groups from 638,799
+counted rows, results md5-identical to knob-off. Timing is **neutral within q2's documented
+13–28% swing class but with an unresolved sign**: suite best-of-3 +8.6% B-slower, first x9 pair
+best −1.6% / median +3.3%; the post-review-fix re-measure (two independent x9 pairs) shows both
+warm medians B-slower (+7.9%, +5.7%; pooled warm means +5.0%) while B holds the single fastest
+iteration of all four runs. "Regresses beyond noise" is not established against the swing class,
+so DIRECT stays in `group_join_stream_forms` — under the same named post-merge re-measure
+trigger as q17 (§9 delivery status). The pathway's value was always the machinery, not q2's
+wall time (§5.2's own "accept neutral" framing).
 
 **Gating/risks:** `enable_group_join`; byte gate on the child estimate; runtime dense/sparse as
 usual. Risk: DIRECT territory overlap with future perfect-hash aggregate work — bounded by the
@@ -942,6 +1278,10 @@ graph LR
   `DELIM_SCAN` child; distinct-chain-root producer → "preserved" port; single-child sink build).
 - The DIRECT form registers a single port; hint logic degenerates to "counted producer
   finished".
+- Under a STREAM spec (§4.8.1) the counted edge's barrier in the diagram is PIPELINE rather
+  than FULL and "one task" becomes build → per-batch accumulate → emit; every interface named
+  above keeps its signature, with `input_barrier_for` per-producer and `all_ports_empty`
+  overridden while an emit is pending.
 
 ---
 
@@ -1007,7 +1347,7 @@ reach the instantiated count kernels.
 | composite keys (q20) | dense composite domains don't exist; needs `preserved_remap`; single pathway, low urgency |
 | arbitrary sparse/hash domains | `preserved_remap` is a designed seam (§4.4), built only when P3's decision gate passes |
 | SEMI/ANTI dense membership (q4/q22) | different operator family (bitmap at the delim join); shares only the domain machinery |
-| streamed / multi-GPU accumulation | `BUILD_STREAM` seam (§4.8), PR-5; multi-GPU stays single-device like every single-task op |
+| multi-GPU accumulation | streamed accumulation is specified and lands in PR-5 (§4.8.1); the state stays single-device with accumulate tasks pinned to it — multi-GPU state replication/merge has no pathway |
 | CPU downgrade of the operator | plan-time bail + data-tier spill covers it (§4.8); a CPU groupjoin duplicates DuckDB |
 | groupjoin-aware join ordering | M11's Q9 caveat accepted; we pattern-match optimized plans, fail closed, and measure |
 | aggregate cardinality estimates (F21 §4) | needs a stats subsystem; our gates are stats-free by design |
@@ -1026,26 +1366,40 @@ measurement-regimes protocol), and fail-closed by default.
 | **PR-2** | Value slot policies (SUM/MIN/MAX/AVG), INNER + DIRECT forms, value-extrema fold-in, sparse-value fallback, overflow policies, NULL-group slot; **no planner rung enabled** — Catch2 drives the executor directly | Catch2 kernel/operator suites incl. oracle comparisons; kit neutral by construction (plan parity asserted) |
 | **PR-3** | P1 (q17) detection rung behind `enable_group_join` (default off); counted-byte plan gate (device-mem/24, §4.8); **preserved-port membership publication** (§4.9 prerequisite); delim-fed wiring arms + fused-under-delim conversion test (§4.8); the two-child value-sensitive narrowing/compressed-schema arms (§4.9 — pulled forward from PR-4 as a correctness prerequisite for value fusion); SQLLogic + oracle tests | scattered-atomic microbenchmark (§4.4) run and archived; **SF100** kit A/B with the knob on: q17 fuses (verified in the log) and improves or is neutral; **SF1000**: fusion declines by design (byte gate) — assert plan parity and no regression on the 22-query suite (leave-one-out discipline); then flip default on. The SF1000 q17 win is *not* claimable here |
 | **PR-4** | P2 (q2) DIRECT rung; single-child sink build path + the single-child narrowing/compressed-schema arms (§4.8/§4.9; the two-child value arms landed in PR-3); dense-forcing DIRECT reachability test (§10) | same protocol; accept neutral for q2 given no suite regressions |
-| **PR-5** | `BUILD_STREAM` schedule for INNER/DIRECT (hash-join build-state pattern; streamed `matched` fixed at u64, §4.8); remove the counted-byte gate and restate the memory estimate for streaming-capable specs; count pathway untouched | **SF1000** kit A/B: q17 fuses and shows the §5.1 estimate (−10…25%, floor neutral-if-scan-bound) conditional on filter parity + the microbenchmark; memory profile (reservation sizes, downgrade counts) improves; wall time ≥ PR-3 result |
+| **PR-5** | `BUILD_STREAM` schedule per §4.8.1: spec `schedule` field with the counted-byte gate as schedule selector (not removed — its decline role is retired for stream-admissible shapes); per-producer barriers (counted PIPELINE); single-slot hash-join-pattern stream state machine (build / per-batch accumulate / emit tasks; streamed `matched` u64); plan-time NOT-NULL + SUM/AVG-bound admission proofs; per-role reservation charges via `operator_data::peak_memory_estimate_override`; sparse binary merge ladder; `all_ports_empty` emit-pending override; `is_sink` rationale fix + carried merge-fusion breadcrumb (PR-4 carry (iii)); `operators.md` rung-P2/streamed update (PR-4 carry (i)); count pathway untouched (R1) | **SF1000** kit A/B: q17 fuses streamed-dense (verified in the log: STREAM plan line + dense commit line) and shows the §5.1 estimate — the **−10…25% claim is tested here**, floor neutral-if-scan-bound, filter parity structural per §4.8.1; q2 fuses streamed-sparse, neutral-or-better; **SF100 not worse than PR-4** (every shape stays one-shot by the selector — plan parity vs PR-4 asserted); 22/22 result parity at both SFs; count-kernel SASS parity; memory-profile evidence improves (reservation logs: no ~17×-input charges; budget-bounded build + batch-sized accumulate + state-sized emit reservations). **Honest-failure clause:** if q17 fuses streamed and regresses beyond noise, the streamed path stays merged but INNER is removed from `group_join_stream_forms` (§4.7) — the byte gate then declines over-gate INNER shapes exactly as PR-3/PR-4 — and the numbers are reported as-is; same per-form mechanism for a q2 regression |
 | **PR-6** (decision-gated) | `preserved_remap` + carried determined columns → P3 (q18), possibly q20 | go/no-go on PR-5 profiling evidence (§5.4); then the standard protocol |
 
 Rollback story at every stage: one config bool (`enable_group_join`) returns planning to
 bit-identical-to-today behavior; PR-1's refactor itself is guarded by its parity gates.
 
-**Delivery status (2026-08-25, PR-4 audit):** PR-1 through PR-4 are delivered and their merge
-gates passed; all three v1 pathways are live — P0 (q13 COUNT, R1 baseline preserved: SASS 24/24
-identical, plan/result parity), P1 (q17 INNER AVG: fuses at SF100 with publication, declines at
-SF1000 by the byte gate as designed), P2 (q2 DIRECT MIN: fuses at SF100 on the sparse strategy
-exactly per §5.2, accepted neutral). The genericity claim is proven at v1 scope: PR-4 added a
-whole join form through the form-indexed seams alone (detection rung, one wiring arm, per-form
-narrowing/compressed-schema arms, spec validation) with **zero device-code changes** — the
-bundle, emit, strategy, and memory-estimate axes were untouched. PR-5 (`BUILD_STREAM`) and
-PR-6 (decision-gated `preserved_remap`) remain. Carried to PR-5, non-blocking:
-(i) `docs/super-sirius/operators.md` still describes two wired pathways — extend with rung P2;
-(ii) archive the knob-off-vs-HEAD plan-parity artifact in the PR-4 evidence set (the property
-itself was independently verified in review: 22/22 plans, results md5-equal vs PR-3-A);
-(iii) a breadcrumb comment at the base `is_sink()` GROUP_JOIN clause noting the merge-fusion
-dead-end walk now terminates at the fused op's child.
+**Delivery status (2026-08-26, PR-5 audit):** PR-1 through PR-5 are delivered. PR-5's gate
+disposition, item by item: q17 fuses streamed-dense at SF1000 (STREAM plan line + dense commit
+line verified) — the **−10…25% claim was NOT met; the neutral-if-scan-bound floor was**
+(suite −2.4% / isolated x9 +3.0%, sign conflict; measured detail in §5.1) — and the
+honest-failure clause was **correctly not invoked** ("regresses beyond noise" not established);
+q2 fuses streamed-sparse, neutral within its swing class but with both post-fix x9 medians
+B-slower (§5.2); SF100 not worse than PR-4 with every shape one-shot by the selector (plan
+parity vs PR-4 asserted); 22/22 result parity at both SFs; count-kernel SASS parity 24/24
+(byte-identical again after the review-fix relink); knob-off planning structurally identical to
+PR-4-B with md5-equal results; memory-profile evidence decisive — one budget-bounded transient
+build reservation (16.77 GB), sixteen accumulates at the 1 MiB floor, one 4.0 GB emit, and no
+~17×-input charge anywhere. PR-4 carries (i)–(iii) discharged (`operators.md` streamed/rung-P2
+update; knob-off parity artifact `pr5/sf1000-plan-parity.md` §2; `is_sink` breadcrumb).
+**Named post-merge re-measure trigger (both streamed pathways):** after merge, take two further
+independent SF1000 x9 pairs per query in the PR #1371 kit regime; if the suite A/B and the
+pooled x9 warm medians *agree* on ≥3% B-slower for a query, remove that query's form from
+`group_join_stream_forms` per this section's honest-failure mechanism and report the numbers
+as-is. Carried to post-merge, non-blocking: (i) narrow the dense-accumulate claim window —
+consume the replay-claim latch after the validation pass so a retryable OOM there stays
+retryable (the current fail-closed refusal is tested and never wrong, §4.8.1 resolution);
+(ii) correct the in-code `stream_state` comment to the pops-locked / hints-single-atomic
+discipline (the discard store is hint-side and lock-free); (iii) widen the per-role reservation
+property test's instrument to observe cudf-internal scratch (swap the current device resource
+within the task scope) so the charge model becomes falsifiable by test, not only by audit.
+PR-6 (decision-gated `preserved_remap`) remains, and nothing in PR-5 narrows its seam: the
+stream build's strategy commit is the single site a `preserved_remap` commit would join, the
+emit task is where carried-column gathers ride, and the per-role charge table extends per
+strategy.
 
 ---
 
@@ -1103,6 +1457,20 @@ pattern), covering:
   registers its distinct-chain dependency, no sourceless pipeline exists, the distinct-root
   producer resolves to the "preserved" port, and the task fires after both producers (§4.8
   provenance class 2); the DIRECT shape converts via the single-child sink path (class 3);
+- streamed-schedule tests (PR-5 gates, §4.8.1): conversion — a STREAM spec wires counted
+  PIPELINE / preserved FULL, including the delim-fed streamed shape; state-machine units —
+  build-claim CAS one-shot under concurrent hints, sparse in-flight ≤ 1 serialization, emit
+  trigger exactly once, empty-preserved discard drains the counted repo with no tasks, and the
+  emit-pending `all_ports_empty` override holds the pipeline open across the
+  last-accumulate-completes window (the `update_pipeline_status` race); one-shot vs streamed
+  result-parity oracles across this section's whole matrix (forced via the byte-gate test hook);
+  the per-batch NULL-argument belt-check throws on a violation; plan-proof negatives — nullable
+  argument, missing stats, magnitude-bound failure each yield one-shot admission and the
+  asserted byte-gate decline; mid-stream spill — counted batches forced to HOST between arrival
+  and accumulate re-materialize per task; OOM-retry of build (partial-state rollback),
+  accumulate (pin carried), and emit; per-role reservation property test — the
+  `peak_memory_estimate_override` of every role ≥ its observed allocation, and no streamed task
+  reserves more than budget + inputs;
 - PR-1 parity harness: count-bundle kernel outputs bit-compared against recorded pre-refactor
   outputs across the dense/sparse/NULL/overflow matrix.
 
@@ -1110,7 +1478,9 @@ pattern), covering:
 scattered-atomic microbenchmark (6 B random atomicAdds over a 3.2–4 GB device array, §4.4)
 archived before PR-3 merges; per-query nsys spot checks that the fused task shows the expected
 pass structure (one accumulate launch per batch per side, one count_if/copy_if pair, one emit)
-and exactly one sync on the new pathways.
+and exactly one sync on the new one-shot pathways; for STREAM (PR-5), the expected shape is one
+build task (two syncs: extrema readback + pre-BUILT visibility), one kernel launch + one sync
+per accumulate task, one emit task, and reservation logs matching the §4.8.1 per-role charges.
 
 ---
 
@@ -1121,16 +1491,21 @@ and exactly one sync on the new pathways.
    way, mirroring `sirius_physical_grouped_aggregate_merge.cpp:268-284`).
 2. **Plan-parity tooling** — is there an existing EXPLAIN-hash harness for the 22-query
    plan-parity gate, or does PR-1 add a small one?
-3. **Dynamic-filter effectiveness on q17** (§4.9): eligibility is settled — the delim-side
-   build qualifies today (`build_relation_is_opaque`), so preserved-port publication is a P1
-   prerequisite, not an open design choice. What PR-3's kit run must still quantify is
-   *effectiveness*: how often the filter lands before the counted scan finishes (publication
-   timing), and the measured row cut, to validate §5.1's filtered-regime assumptions.
+3. **Dynamic-filter effectiveness on q17** (§4.9) — narrowed twice. Eligibility settled
+   (PR-3: the delim-side build qualifies; publication is a P1 prerequisite). SF100
+   effectiveness settled by the PR-3/PR-4 kit logs: fused q17 runs the filtered regime
+   (`INNER AVG sparse path` — post-filter, byte-shaped input), i.e. publication landed ahead of
+   the counted scan. Remaining: **SF1000 streamed timing only**, now with quantified bounds
+   (§4.8.1: ~1.5 ms filtered accumulate, ~5 ms per 100 M-row scan-ahead batch, ~565 ms if no
+   filter ever lands); PR-5's kit run reports the landed-before-decode fraction and the row
+   cut, and the honest-failure clause covers the never-lands tail.
 4. **SF-scaling cliff of the relaxed budget:** with the per-array widths (§4.4) and the
    `min(16 GiB, device/16)` budget, q17-class state fits through SF3000 (~12 GB unfiltered) on
    GB300-class HBM; beyond that, or on smaller devices, dense declines ⇒ sparse ⇒ eager hazard
-   in the unfiltered regime (the filtered regime is benign, §5.1). Option when it bites: pull
-   `preserved_remap` forward. Decide on evidence, not now.
+   in the unfiltered regime (the filtered regime is benign, §5.1). Streamed specs always sit at
+   the top of those state ranges (matched u64, §4.8.1: 4.0/8.0/12.0 GB at SF1000/2000/3000), and
+   a streamed build whose extrema fail gate (b) commits streamed-sparse — the same hazard class.
+   Option when it bites: pull `preserved_remap` forward. Decide on evidence, not now.
 5. **DIRECT-form breadth:** should PR-4's rung later accept non-join children (pure dense
    group-by, q15-adjacent)? Deliberately out of scope until the perfect-hash aggregate
    direction is settled; revisit with the aggregation owners.
@@ -1159,6 +1534,11 @@ and exactly one sync on the new pathways.
 - [scope/minor, PR-3 audit] §9 assigned all per-form narrowing/compressed-schema arms to PR-4, but the two-child value-sensitive arms (SUM/MIN/MAX/AVG args restore native, §4.9) are a correctness prerequisite for PR-3's value fusion -> amended: re-sliced — two-child value arms in PR-3, single-child DIRECT arms stay in PR-4, §9.
 - [config/minor, PR-3 audit] §4.8's counted-byte gate had no knob row and §10's byte-gate negatives need a test hook -> amended: engine-owned `group_join_counted_bytes_gate` added to §4.7's table (smallest visible device's memory / 24; 0 = decline everything when no device is visible; YAML key rejected, internal SET hook rejecting 0 — the `group_join_max_state_bytes` pattern); the one-new-public-knob claim is unchanged, §4.7.
 - [mechanism/minor, PR-3 audit] §4.9's publication row specified the runtime hook reuse but left the planning side unnamed -> amended: planning extracted as the shared `plan_single_key_membership_publication` helper reusing the hash join's evidence/admission/discovery/placement mechanisms with probe=counted/build=preserved orientation; counted-side build evidence declines fusion (no-downgrade rule); runtime realized as the hash join's one-shot CAS machine triggered from the first hint poll after the preserved producer finishes, whole-single-batch GPU-resident deliveries only (a FULL one-shot port has no later delivery, so a non-resident or multi-batch preserved side closes the window permanently); named follow-up: re-home `plan_comparison_join`'s inline discovery loop onto the helper, §4.9. All other PR-3 deviations from this doc: none found (P0 verbatim under the ladder inversion; wiring class 2, byte-gate derivation, publication-downgrade decline, and the default flip realized as written; the −10…25% q17 claim correctly not made — PR-3's evidence shows SF100 fuse-neutral, SF1000 decline-by-design, microbenchmark archived with its PR-5 implication stated).
-- [estimate/minor, PR-4 audit] §5.2 expected q2's fused sparse task at every SF; delivered: q2 fuses (and runs sparse, as specified) at SF100 but **does not fuse at SF1000** — the plan-time byte gate declines because DuckDB's `EstimateCardinality` for the aggregate's child join reports the full ~800 M-row partsupp cardinality (19.2 GB > device/24 = 11.17 GB) without crediting the delim semi-filter that cuts the true input to ~640 K rows -> accepted as the design's own honest-refusal class (§4.8: "plan-time estimates do not see dynamic filters", stated for q17; the same fact governs q2's child estimate); §9's "accept neutral" gate met via SF1000 22/22 plan/result parity; PR-5's `BUILD_STREAM` removes the gate and with it this decline, §5.2/§4.8/§9.
+- [estimate/minor, PR-4 audit] §5.2 expected q2's fused sparse task at every SF; delivered: q2 fuses (and runs sparse, as specified) at SF100 but **does not fuse at SF1000** — the plan-time byte gate declines because DuckDB's `EstimateCardinality` for the aggregate's child join reports the full ~800 M-row partsupp cardinality (19.2 GB > device/24 = 11.17 GB) without crediting the delim semi-filter that cuts the true input to ~640 K rows -> accepted as the design's own honest-refusal class (§4.8: "plan-time estimates do not see dynamic filters", stated for q17; the same fact governs q2's child estimate); §9's "accept neutral" gate met via SF1000 22/22 plan/result parity; PR-5's `BUILD_STREAM` dissolves this decline (the gate survives as the schedule selector, §4.8.1), §5.2/§4.8/§9.
 - [mechanism/minor, PR-4 audit] §4.8's wiring class 3 named the "standard single-child sink pattern (base-class shape)" without stating how the child reaches it -> amended: reached by adding `GROUP_JOIN` to the base `is_sink()` parent list (alongside PARTITION / RIGHT_DELIM_JOIN — parents consuming across one-shot FULL ports); the change is knob-independent and was verified benign across every consumer (DELIM_SCAN early-returns before its `is_sink()` check, so class-2 wiring is unaffected; knob-off plans and results bit-identical vs PR-3). PR-5 commitment recorded: when the streamed counted port goes PIPELINE, this parent-type test must become barrier-aware at the same site, §4.8.
 - [test/minor, PR-4 audit] §10's dense-forcing reachability bullet asserted `last_strategy() == DENSE`; the integration realization asserts the operator's strategy log line ("DIRECT MIN dense path", with the sparse line asserted absent) since the operator instance is not reachable through a connection -> accepted: the proof obligation — full planner, rung P2, dense strategy selected, NULL-group slot exercised, CPU-oracle-identical results — is discharged; `last_strategy()` remains the assertion channel in the operator-level Catch2 suites, §10. All other PR-4 deviations from this doc: none found (P0 rung verbatim; P1 body untouched with its screens extracted into the shared value-rung helpers §4.7 prescribed; DIRECT anti-overlap join-root guard, opaque-child planning, argument-validity-gate soundness for padding NULLs, per-form single-child narrowing/compressed-schema arms, fail-closed wiring in both arity directions, ctor rejection of DIRECT publication, and the PR-3 named follow-up (shared `discover_membership_publication_targets`) all realized as written).
+- [design/PR-5 addendum] §4.8's `BUILD_STREAM` seam specified into §4.8.1 (design only, pre-implementation) -> the counted-byte gate is retained as the **schedule selector** rather than removed as the seam text sketched (at-or-under-gate shapes keep the one-shot verbatim, preserving PR-3/PR-4 behavior; over-gate shapes stream); INNER streams with the strategy committed once at build from **preserved** extrema under gates (a)/(b) with matched u64 forced — gates (d)/(e) are one-shot-only, their regret bounded by (b) — and out-of-range/pre-filter counted rows shown correctness-neutral for the INNER emit; DIRECT streams **sparse-only** (dense DIRECT is unsound to stream: the domain and the NULL group need the whole input) with dense DIRECT reachability preserved one-shot; SUM/AVG overflow and the argument-validity gate move to **plan-time proofs from hard bounds** (counted GET row count × unscaled stat extrema; catalog/stat NOT-NULL — bounds, never estimates; q17 passes at 3.0e13 ≪ 2^63), inconclusive ⇒ one-shot admission (= the byte-gate decline), with running-bound + mid-stream dense→sparse conversion recorded as the escalation seam (the dense state is an exact self-contained partial, so the conversion is buildable when a pathway demands it); the 16×-input estimate is replaced by per-role task charges delivered through a new `operator_data::peak_memory_estimate_override` that bypasses `pipeline_memory_history` (the flat ring would fold the build's ~10^3× peak/input ratio into device-scale accumulate reservations); the emit is a synthetic non-pipelineable-input task held schedulable by an `all_ports_empty` emit-pending override (the creator loop and `update_pipeline_status` both key on it); sparse streaming uses a binary merge ladder with in-flight ≤ 1; the PR-4 `is_sink` commitment is discharged by restating the rationale (repository ports — FULL and PIPELINE alike), a barrier-conditional predicate being wrong; honest-failure clause mechanized as the engine-owned per-form `group_join_stream_forms` admission set. §4.2/§4.4/§4.7/§4.8/§5.1/§5.2/§6/§8/§9/§10/§11 updated accordingly.
+- [mechanism/minor, PR-5 audit] §4.8.1's plan-time proofs named catalog NOT-NULL constraints and column statistics as the fact sources; realized: DuckDB's multi-file parquet binding surfaces neither column statistics nor an exactness-flagged cardinality (`MultiFileScanStats` returns nullptr; cardinality is estimate-only), so the kit's `read_parquet` shapes would have failed the proofs closed for want of plumbing, not facts -> the proofs read the parquet footers themselves through a new `sirius_scan_manager::describe_parquet_metadata` (footer fetched/Thrift-parsed once per file per process, served from the ioctx metadata store the pin phase already populates — zero extra IO in the kit); NOT-NULL evidence is schema-level REQUIRED repetition **or** zero `null_count` on every column chunk (the null-count channel is what fires — cudf's parse reports these files' repetition as non-REQUIRED), the row bound is the exact summed `num_rows`, value bounds decode INT32/INT64 chunk statistics, and native tables use `statistics_extended` plus the `has_max_cardinality`-flagged exact count. Still hard bounds only; every missing or ambiguous piece is inconclusive ⇒ one-shot admission — the specified fail-closed direction, wider fact plumbing (`src/planner/group_join_stream_admission.cpp`), §4.8.1.
+- [concurrency/minor, PR-5 audit] §4.8.1 claimed "all hint/pop transitions are serialized by the pipeline's task-creation lock" — false as written: only pops hold that lock (`task_creator.cpp:404-405`); hints poll lock-free (`:264`, `:335`) -> corrected to the true invariant the implementation (and the hash-join precedent) actually relies on: pops lock-serialized, every hint-side transition a single atomic (the stage CAS; the idempotent discard store), §4.8.1. Residual named in §9's delivery status: the in-code `stream_state` comment still overstates lock coverage for the discard store — comment-only, the machinery is sound.
+- [robustness/minor, PR-5 audit] the streamed dense accumulate consumes its replay-claim latch at task entry, before the validation pass, so a retryable OOM inside that window (e.g. an uncached `null_count` mask reduction) converts into the "cannot replay" query failure although no atomic was applied -> accepted for merge as fail-closed-never-wrong (the refusal is intentional, tested, and the window performs no reservation-scale allocation under the 1 MiB-floor charge); the minimal tightening — consume the claim immediately after the validation pass, leaving the F3 row-accounting order untouched — is a named post-merge item, §9 delivery status.
+- [measurement, PR-5 audit] §5.1's −10…25% q17 estimate did not materialize and §4.8.1's q17 cardinality projections were stale -> reconciled with the measured SF1000 numbers: 200,585 preserved delim keys (not ~540 K; 200 M × 1/25 × 1/40), 6.0 M filtered counted rows, 4.0 GB dense state exactly as derived, suite −2.4% vs isolated x9 +3.0% (sign conflict ⇒ floor met, honest-failure correctly not invoked, both forms retained); q2 streamed-sparse neutral within its 13–28% swing with an unresolved B-slower median sign -> both pathways placed under a named post-merge re-measure trigger with a mechanized removal criterion (§9 delivery status), §4.8.1/§5.1/§5.2/§9. All other PR-5 deviations from this doc: none found (schedule selector, per-producer barriers, state machine, build-time commit under gates (a)/(b) with matched u64, plan-time proofs with runtime belt-checks, per-role charges through `peak_memory_estimate_override` bypassing the history ring, sparse binary ladder with in-flight ≤ 1 and view-based non-destructive emit, `all_ports_empty` emit-pending override, DIRECT sparse-only streaming with its build charged as the first accumulate, publication from the first hint poll, `is_sink` restated not conditioned, `group_join_stream_forms` as an engine-owned SET hook with the YAML key rejected — all realized as specified).

@@ -355,10 +355,9 @@ slots. Three pathways are wired today: rung P0 fuses eligible `COUNT(col | *) GR
 a preserved-side outer equi-join (gated by `enable_dense_count_join`); rung P1 fuses a single
 `COUNT/SUM/MIN/MAX/AVG` grouped by the preserved-side key of an INNER equi-join whose preserved
 side is a `DELIM_GET` or a proven-unique scan chain -- the TPC-H q17 correlated-AVG shape (gated
-by `enable_group_join`, plus a plan-time counted-side byte gate because the single fused task
-colocates the whole counted side); and rung P2 fuses a single supported aggregate grouped over
+by `enable_group_join`); and rung P2 fuses a single supported aggregate grouped over
 an opaque join-rooted child as the single-input DIRECT form -- the TPC-H q2 correlated-MIN shape
-(same knob and byte gate; no publication, since no join is replaced). Children are normalized as
+(same knob; no publication, since no join is replaced). Children are normalized as
 [preserved, counted] (DIRECT registers only [counted]); a
 `DELIM_SCAN` preserved child is routing-only, with the preserved data arriving from the owning
 delim join's distinct chain. When rung P1 replaces a hash join that would have published
@@ -366,8 +365,23 @@ membership dynamic filters, the fused operator carries the equivalent publicatio
 publishes the preserved keys on preserved-producer completion (see
 [Dynamic Filters](dynamic-filters.md)); a fusion that would drop such a filter is declined.
 
-Both inputs are FULL barriers. Execution uses direct-address histograms or exact sparse aggregation;
-ineligible and disabled plans retain the standard path. See [Configuration](configuration.md).
+Rungs P1 and P2 pick the operator's schedule with an engine-owned counted-side byte gate. At or
+under the gate the spec plans `ONE_SHOT`: both inputs are FULL barriers and one task drains them.
+Over the gate -- where colocating the whole counted side in one reservation could never be
+scheduled -- the spec plans `STREAM` when the form is in the engine-owned `group_join_stream_forms`
+set and, for argument-taking INNER ops, the plan-time proofs pass (a NOT-NULL argument, plus a
+`base rows x max |value|` int64 bound for SUM/AVG, resolved from catalog statistics or parquet
+footer metadata -- hard bounds, never estimates); otherwise fusion is declined to generic
+planning. A STREAM spec keeps the preserved port FULL but takes a PIPELINE barrier on the counted
+port and splits execution into a build task (preserved extrema, one-time dense/sparse strategy
+commit; a DIRECT stream always commits the sparse merge ladder), one accumulate task per counted
+batch pinned to the build's device, and one emit task once the counted producer finishes; the
+operator holds its pipeline open through an `all_ports_empty` override while the emit is pending,
+and streamed tasks carry operator-authoritative per-role reservation charges through
+`operator_data::peak_memory_estimate_override`. Rung P0 always plans `ONE_SHOT`.
+
+Execution uses direct-address histograms or exact sparse aggregation; ineligible and disabled
+plans retain the standard path. See [Configuration](configuration.md).
 
 ## Pipeline Breakers (Sirius-Specific)
 

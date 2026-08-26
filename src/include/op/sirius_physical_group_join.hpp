@@ -59,6 +59,13 @@ enum class join_form : uint8_t {
 /// Aggregate operation computed by one slot of the fused state.
 enum class agg_op : uint8_t { COUNT_STAR, COUNT_VALID, SUM, MIN, MAX, AVG };
 
+/// Accumulation schedule of the fused operator, decided at plan time (the counted port's barrier
+/// is fixed at pipeline conversion, so there is no runtime schedule switch). ONE_SHOT drains both
+/// FULL-barrier ports into a single task; STREAM builds state from the completed preserved side,
+/// accumulates the counted side one PIPELINE-delivered batch per task, and emits once the counted
+/// producer finishes. The COUNT pathway (rung P0) is always ONE_SHOT.
+enum class schedule_kind : uint8_t { ONE_SHOT, STREAM };
+
 /// One aggregate output of the fusion.
 struct slot_spec {
   agg_op op;                           ///< Aggregate operation.
@@ -73,6 +80,14 @@ struct group_join_spec {
   std::size_t counted_key_idx;      ///< Join key column on the counted child; DIRECT's group key.
   duckdb::vector<slot_spec> slots;  ///< Detection emits exactly one; the mechanism takes N.
   uint64_t max_state_bytes;         ///< Engine-owned dense-state budget for this form.
+  /// Accumulation schedule; the counted-byte plan gate selects STREAM for over-gate shapes whose
+  /// streamed-admission proofs pass. STREAM is invalid on OUTER_PRESERVING (the ctor throws).
+  schedule_kind schedule = schedule_kind::ONE_SHOT;
+  /// Plan-proven upper bound on the counted-side row count backing a streamed SUM/AVG int64
+  /// accumulation proof; 0 when no such proof applies. A streamed dense accumulate belt-checks
+  /// its running row total against this bound and throws on a violation, so lying source
+  /// metadata can fail the query but never corrupt the accumulation.
+  uint64_t stream_counted_row_bound = 0;
 };
 
 }  // namespace groupjoin
@@ -81,23 +96,76 @@ class group_join_input : public pipelineable_operator_data {
  public:
   enum class input_side : uint8_t { PRESERVED, COUNTED };
 
+  /// Which task of the operator's schedule this input feeds. ONE_SHOT is the both-sides single
+  /// task; STREAM_BUILD carries the whole preserved side (INNER) or the stream's first counted
+  /// batch (DIRECT); STREAM_ACCUMULATE carries exactly one counted batch.
+  enum class task_role : uint8_t { ONE_SHOT, STREAM_BUILD, STREAM_ACCUMULATE };
+
   group_join_input(std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
-                   std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches);
+                   std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches,
+                   task_role role = task_role::ONE_SHOT);
 
   [[nodiscard]] std::vector<input_side> const& input_sides() const noexcept { return _input_sides; }
+  [[nodiscard]] task_role role() const noexcept { return _role; }
+
+  /// Operator-authoritative reservation charge for streamed tasks; unset for ONE_SHOT inputs.
+  void set_peak_memory_estimate(std::size_t bytes) noexcept { _peak_memory_estimate = bytes; }
+  [[nodiscard]] std::optional<std::size_t> peak_memory_estimate_override() const noexcept override
+  {
+    return _peak_memory_estimate;
+  }
+
+  /// One-shot latch over this input's streamed side effects (row accounting; a dense
+  /// accumulate's state mutation). Returns true exactly once, so an OOM-rescheduled task
+  /// re-running over the same input can detect the replay instead of double-applying.
+  [[nodiscard]] bool claim_stream_application() const noexcept
+  {
+    return !_stream_application_claimed.exchange(true, std::memory_order_acq_rel);
+  }
 
  private:
   struct tagged_batches {
     std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
     std::vector<input_side> sides;
   };
+  /// Keeps the delegating constructor out of overload resolution against the public one.
+  struct tagged_ctor {};
 
-  explicit group_join_input(tagged_batches input);
+  group_join_input(tagged_ctor, tagged_batches input, task_role role);
   [[nodiscard]] static tagged_batches tag_batches(
     std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
     std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches);
 
   std::vector<input_side> _input_sides;
+  task_role _role = task_role::ONE_SHOT;
+  std::optional<std::size_t> _peak_memory_estimate;
+  mutable std::atomic<bool> _stream_application_claimed{false};
+};
+
+/**
+ * @brief Synthetic input of a STREAM schedule's emit task.
+ *
+ * The emit consumes only the operator-owned stream state, so this input carries no batches. It is
+ * deliberately NOT a pipelineable_operator_data: the task-creator loop drops an empty
+ * pipelineable input without creating a task, while a non-pipelineable input passes through (the
+ * scan_operator_input precedent). The base no-op prepare_for_processing applies; the output batch
+ * is built on the memory space the stream state recorded at build time.
+ */
+class group_join_emit_input : public operator_data {
+ public:
+  group_join_emit_input(std::size_t peak_memory_estimate, int device_id)
+    : _peak_memory_estimate(peak_memory_estimate)
+  {
+    set_preferred_device_id(device_id);
+  }
+
+  [[nodiscard]] std::optional<std::size_t> peak_memory_estimate_override() const noexcept override
+  {
+    return _peak_memory_estimate;
+  }
+
+ private:
+  std::size_t _peak_memory_estimate;
 };
 
 /**
@@ -130,6 +198,23 @@ class group_join_input : public pipelineable_operator_data {
  * The DIRECT form carries exactly one child and never a publication plan (there is no preserved
  * side); `build_pipelines` and `input_port_for` fail closed on any child count that does not
  * match the spec's form.
+ *
+ * A spec with `schedule == STREAM` (never emitted for the COUNT pathway) keeps the same ports and
+ * pipeline construction but takes a PIPELINE barrier on the counted port and splits the single
+ * task into a schedule driven by a single-slot build-state machine (the
+ * `per_partition_build_state` pattern of `sirius_physical_hash_join`): one build task claimed by
+ * a hint-side compare-exchange once the preserved producer finishes (INNER; a DIRECT stream's
+ * first counted batch doubles as its build), then one accumulate task per counted batch pinned to
+ * the build's device, then one emit task whose synthetic `group_join_emit_input` fires after the
+ * counted producer finishes and every accumulate completed. `all_ports_empty` reports non-empty
+ * while a built state's emit is pending so neither the task-creator loop nor
+ * `update_pipeline_status` can retire the pipeline in the window between the last accumulate and
+ * the emit. INNER commits its strategy once at build time from the preserved-key extrema (the
+ * preserved domain is the whole group domain, so out-of-range counted keys are bounds-checked
+ * away and pre-filter rows are discarded by the emit predicate); a DIRECT stream always runs the
+ * sparse merge ladder, because a dense DIRECT domain cannot be known before the stream ends.
+ * Streamed reservation sizing is per role through `peak_memory_estimate_override` on the task
+ * inputs rather than the pipeline memory history.
  */
 class sirius_physical_group_join : public sirius_physical_operator {
  public:
@@ -138,13 +223,15 @@ class sirius_physical_group_join : public sirius_physical_operator {
   static constexpr std::string_view PRESERVED_PORT = "preserved";
   static constexpr std::string_view COUNTED_PORT   = "counted";
 
-  /// Throws on any @p spec outside the whitelisted (form, bundle) combinations, and on a DIRECT
-  /// spec carrying a publication plan.
+  /// Throws on any @p spec outside the whitelisted (form, bundle) combinations, on a DIRECT spec
+  /// carrying a publication plan, and on a STREAM schedule over OUTER_PRESERVING (the COUNT
+  /// pathway never streams).
   sirius_physical_group_join(duckdb::vector<sirius::logical_type> types,
                              std::size_t estimated_cardinality,
                              groupjoin::group_join_spec spec,
                              dynamic_filter_publish_plan dynamic_filter_plan = {},
                              dynamic_filter_stats* dynamic_filter_stats_sink = nullptr);
+  ~sirius_physical_group_join() override;
 
   std::string params_to_string() const override;
   [[nodiscard]] std::string_view input_port_for(
@@ -175,6 +262,11 @@ class sirius_physical_group_join : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
+  /// Reports non-empty while a streamed schedule's built state has an unclaimed emit pending, so
+  /// the pipeline cannot finish (and the task-creator loop still enters) in the window between
+  /// the last accumulate's completion and the emit task's creation.
+  [[nodiscard]] bool all_ports_empty() override;
+
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
@@ -191,10 +283,47 @@ class sirius_physical_group_join : public sirius_physical_operator {
   enum class strategy : uint8_t { NOT_RUN, DENSE, SPARSE };
   [[nodiscard]] strategy last_strategy() const noexcept { return _last_strategy; }
 
+  /// Test seam: overrides the memory resource the streamed build/accumulate/emit roles allocate
+  /// through (default: the stream state's memory-space allocator), so unit tests can inject
+  /// failure and statistics adaptors to exercise OOM-retry and the per-role reservation
+  /// property. Throws on a non-STREAM spec.
+  void set_stream_memory_resource_for_testing(std::optional<rmm::device_async_resource_ref> mr);
+
+  /// Accumulated streamed counted-row total (test observability for the OOM-retry row
+  /// accounting that drives emit-time COUNT product validation). Throws on a non-STREAM spec.
+  [[nodiscard]] int64_t stream_counted_rows_for_testing() const;
+
  protected:
   void on_finalize_operator() override;
 
  private:
+  /// Single-slot streamed-schedule state; allocated in the ctor for STREAM specs only. Defined in
+  /// the source file.
+  struct stream_state;
+
+  /// STREAM analogues of the base hint/input methods, driven by the stream_state stage machine.
+  [[nodiscard]] std::optional<task_creation_hint> stream_task_hint();
+  [[nodiscard]] std::unique_ptr<operator_data> stream_task_input_data();
+
+  /// Build task: preserved-key extrema, one-time strategy commit, and state construction (INNER);
+  /// ladder initialization folding the first counted batch (DIRECT).
+  std::unique_ptr<operator_data> execute_stream_build(group_join_input const& input,
+                                                      rmm::cuda_stream_view stream);
+  /// Accumulate task: fold exactly one counted batch into the built state.
+  std::unique_ptr<operator_data> execute_stream_accumulate(group_join_input const& input,
+                                                           rmm::cuda_stream_view stream);
+  /// Emit task: selection/finalize over the built state, then state release.
+  std::unique_ptr<operator_data> execute_stream_emit(rmm::cuda_stream_view stream);
+
+  /// Folds one counted batch into the sparse merge ladder (callers serialize; in-flight <= 1).
+  void stream_sparse_fold(cudf::column_view const& keys,
+                          cudf::column_view const* rep_args,
+                          rmm::cuda_stream_view stream,
+                          rmm::device_async_resource_ref mr);
+
+  /// Releases the stream state's device residents under a device guard; idempotent.
+  void release_stream_state();
+
   /// COUNT-over-outer-join execution (the OUTER_PRESERVING form).
   std::unique_ptr<cudf::table> execute_count_outer(
     std::vector<::cucascade::read_only_data_batch> const& ro_batches,
@@ -228,6 +357,8 @@ class sirius_physical_group_join : public sirius_physical_operator {
 
   groupjoin::group_join_spec _spec;
   strategy _last_strategy = strategy::NOT_RUN;
+  /// Non-null exactly for STREAM specs.
+  std::unique_ptr<stream_state> _stream;
 
   // Narrowed before execution; immutable during execution.
   dynamic_filter_publish_plan _dynamic_filter_plan;

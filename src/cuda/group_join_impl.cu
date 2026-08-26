@@ -715,7 +715,226 @@ void accumulate_counted_form(groupjoin::dense_value_op op,
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
+/// Selection + emit tail shared by the one-task INNER driver and the streamed dense state: count
+/// and gather the surviving slots, then write `[key, value:int64]` (plus AVG's divisor) with the
+/// op's emit kernel.
+template <typename KeyT, typename PresenceT, typename MatchedT>
+std::unique_ptr<cudf::table> emit_inner_dense_groups(groupjoin::dense_value_op op,
+                                                     cudf::data_type key_type,
+                                                     int64_t min_key,
+                                                     int64_t range,
+                                                     PresenceT const* presence,
+                                                     MatchedT const* matched,
+                                                     int64_t const* payload,
+                                                     bool check_count_product_overflow,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr)
+{
+  using groupjoin::dense_value_op;
+  auto const policy = rmm::exec_policy(stream, mr);
+  auto const begin  = thrust::make_counting_iterator<int64_t>(0);
+  auto const end    = thrust::make_counting_iterator<int64_t>(range);
+  inner_positive<PresenceT, MatchedT> const selector{presence, matched};
+  int64_t const num_groups = thrust::count_if(policy, begin, end, selector);
+  auto const group_rows    = checked_output_rows(num_groups, false);
+
+  auto key_col =
+    cudf::make_fixed_width_column(key_type, group_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto value_col = cudf::make_fixed_width_column(
+    cudf::data_type{cudf::type_id::INT64}, group_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+  std::unique_ptr<cudf::column> divisor_col;
+  if (op == dense_value_op::AVG) {
+    divisor_col = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT64}, group_rows, cudf::mask_state::UNALLOCATED, stream, mr);
+  }
+  std::optional<cudf::numeric_scalar<int32_t>> overflow_flag;
+  if (op == dense_value_op::COUNT && check_count_product_overflow && num_groups > 0) {
+    overflow_flag.emplace(0, true, stream, mr);
+  }
+
+  if (num_groups > 0) {
+    rmm::device_uvector<int64_t> selected(static_cast<std::size_t>(group_rows), stream, mr);
+    thrust::copy_if(policy, begin, end, selected.begin(), selector);
+
+    auto const grid = grid_size_for(num_groups);
+    auto key_out    = key_col->mutable_view().template data<KeyT>();
+    auto value_out  = value_col->mutable_view().template data<int64_t>();
+    switch (op) {
+      case dense_value_op::COUNT:
+        inner_count_emit_kernel<KeyT, PresenceT, MatchedT>
+          <<<grid, k_block_size, 0, stream.value()>>>(
+            selected.data(),
+            num_groups,
+            presence,
+            matched,
+            min_key,
+            key_out,
+            value_out,
+            overflow_flag ? overflow_flag->data() : nullptr);
+        break;
+      case dense_value_op::SUM:
+        inner_sum_emit_kernel<KeyT, PresenceT><<<grid, k_block_size, 0, stream.value()>>>(
+          selected.data(), num_groups, presence, payload, min_key, key_out, value_out);
+        break;
+      case dense_value_op::MIN:
+      case dense_value_op::MAX:
+        emit_raw_slot_kernel<KeyT, int64_t><<<grid, k_block_size, 0, stream.value()>>>(
+          selected.data(), num_groups, payload, min_key, key_out, value_out);
+        break;
+      case dense_value_op::AVG:
+        emit_raw_slot_kernel<KeyT, int64_t><<<grid, k_block_size, 0, stream.value()>>>(
+          selected.data(), num_groups, payload, min_key, key_out, value_out);
+        emit_raw_slot_kernel<KeyT, MatchedT><<<grid, k_block_size, 0, stream.value()>>>(
+          selected.data(),
+          num_groups,
+          matched,
+          min_key,
+          static_cast<KeyT*>(nullptr),
+          divisor_col->mutable_view().template data<int64_t>());
+        break;
+    }
+    CUDF_CUDA_TRY(cudaGetLastError());
+    // The scalar read synchronizes only on the rare path whose coarse host bound was inconclusive.
+    if (overflow_flag && overflow_flag->value(stream) != 0) {
+      throw sirius::invalid_input_exception("group_join: COUNT result exceeds BIGINT max {}",
+                                            k_bigint_max);
+    }
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(key_col));
+  columns.push_back(std::move(value_col));
+  if (divisor_col) { columns.push_back(std::move(divisor_col)); }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+/// Streamed dense INNER state (see the interface documentation): PresenceT is chosen from the
+/// preserved row count; matched is always uint64; the aggregate argument's representation is
+/// dispatched per accumulate call.
+template <typename KeyT, typename PresenceT>
+class stream_dense_inner_impl final : public group_join_stream_dense_state {
+ public:
+  stream_dense_inner_impl(groupjoin::dense_value_op op,
+                          cudf::data_type key_type,
+                          int64_t min_key,
+                          int64_t range,
+                          rmm::cuda_stream_view stream,
+                          rmm::device_async_resource_ref mr)
+    : _op(op),
+      _key_type(key_type),
+      _min_key(min_key),
+      _range(range),
+      _slots(checked_value_slots(range, slot_width(op), /*with_null_slot=*/false)),
+      _presence(_slots, stream, mr),
+      _matched(_slots, stream, mr),
+      _payload(make_payload_array(op, _slots, stream, mr))
+  {
+    if (key_type.id() != key_type_id_for<KeyT>()) {
+      throw sirius::internal_exception("group_join: stream state key type mismatch");
+    }
+    CUDF_CUDA_TRY(cudaMemsetAsync(_presence.data(), 0, _slots * sizeof(PresenceT), stream.value()));
+    CUDF_CUDA_TRY(cudaMemsetAsync(_matched.data(), 0, _slots * sizeof(uint64_t), stream.value()));
+  }
+
+  void accumulate_preserved(cudf::column_view const& keys, rmm::cuda_stream_view stream) override
+  {
+    // The count bundle's kernel verbatim: no bounds check, the state is sized from the preserved
+    // extrema.
+    accumulate_impl<KeyT, groupjoin::count_bundle<PresenceT>>(
+      keys, nullptr, _min_key, _range, /*bounds_check=*/false, _presence.data(), stream);
+  }
+
+  void accumulate_counted(cudf::column_view const& keys,
+                          cudf::column_view const* rep_args,
+                          rmm::cuda_stream_view stream) override
+  {
+    auto launch = [&](auto arg_tag) {
+      using ArgT = decltype(arg_tag);
+      accumulate_counted_form<KeyT, uint64_t, ArgT>(_op,
+                                                    keys,
+                                                    rep_args,
+                                                    _min_key,
+                                                    _range,
+                                                    /*bounds_check=*/true,
+                                                    /*null_slot=*/-1,
+                                                    _matched.data(),
+                                                    _payload ? _payload->data() : nullptr,
+                                                    stream);
+    };
+    if (rep_args != nullptr && rep_args->type().id() == cudf::type_id::INT32) {
+      launch(int32_t{});
+    } else {
+      launch(int64_t{});
+    }
+  }
+
+  std::unique_ptr<cudf::table> emit(bool check_count_product_overflow,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr) const override
+  {
+    return emit_inner_dense_groups<KeyT, PresenceT, uint64_t>(_op,
+                                                              _key_type,
+                                                              _min_key,
+                                                              _range,
+                                                              _presence.data(),
+                                                              _matched.data(),
+                                                              _payload ? _payload->data() : nullptr,
+                                                              check_count_product_overflow,
+                                                              stream,
+                                                              mr);
+  }
+
+  [[nodiscard]] std::size_t state_bytes() const noexcept override
+  {
+    return _slots * slot_width(_op);
+  }
+
+ private:
+  [[nodiscard]] static std::size_t slot_width(groupjoin::dense_value_op op) noexcept
+  {
+    return sizeof(PresenceT) + sizeof(uint64_t) +
+           (op == groupjoin::dense_value_op::COUNT ? 0 : sizeof(int64_t));
+  }
+
+  groupjoin::dense_value_op _op;
+  cudf::data_type _key_type;
+  int64_t _min_key;
+  int64_t _range;
+  std::size_t _slots;
+  rmm::device_uvector<PresenceT> _presence;
+  rmm::device_uvector<uint64_t> _matched;
+  std::optional<rmm::device_uvector<int64_t>> _payload;
+};
+
 }  // namespace
+
+std::unique_ptr<group_join_stream_dense_state> make_group_join_stream_dense_state(
+  groupjoin::dense_value_op op,
+  cudf::data_type key_type,
+  bool presence_wide,
+  int64_t min_key,
+  int64_t range,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const make = [&](auto key_tag,
+                        auto presence_tag) -> std::unique_ptr<group_join_stream_dense_state> {
+    using KeyT      = decltype(key_tag);
+    using PresenceT = decltype(presence_tag);
+    return std::make_unique<stream_dense_inner_impl<KeyT, PresenceT>>(
+      op, key_type, min_key, range, stream, mr);
+  };
+  switch (key_type.id()) {
+    case cudf::type_id::INT32:
+      return presence_wide ? make(int32_t{}, uint64_t{}) : make(int32_t{}, uint32_t{});
+    case cudf::type_id::INT64:
+      return presence_wide ? make(int64_t{}, uint64_t{}) : make(int64_t{}, uint32_t{});
+    default:
+      throw sirius::internal_exception(
+        "group_join: unsupported stream state key type {} (expected INT32/INT64)",
+        static_cast<int32_t>(key_type.id()));
+  }
+}
 
 std::optional<std::pair<int64_t, int64_t>> group_join_global_minmax(
   std::vector<cudf::column_view> const& keys,
@@ -1002,87 +1221,16 @@ std::unique_ptr<cudf::table> group_join_dense_inner(
                                                   stream);
   }
 
-  auto const policy = rmm::exec_policy(stream, mr);
-  auto const begin  = thrust::make_counting_iterator<int64_t>(0);
-  auto const end    = thrust::make_counting_iterator<int64_t>(range);
-  inner_positive<PresenceT, MatchedT> const selector{presence.data(), matched.data()};
-  int64_t const num_groups = thrust::count_if(policy, begin, end, selector);
-  auto const group_rows    = checked_output_rows(num_groups, false);
-
-  auto key_col =
-    cudf::make_fixed_width_column(key_type, group_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  auto value_col = cudf::make_fixed_width_column(
-    cudf::data_type{cudf::type_id::INT64}, group_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  std::unique_ptr<cudf::column> divisor_col;
-  if (op == dense_value_op::AVG) {
-    divisor_col = cudf::make_fixed_width_column(
-      cudf::data_type{cudf::type_id::INT64}, group_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  }
-  std::optional<cudf::numeric_scalar<int32_t>> overflow_flag;
-  if (op == dense_value_op::COUNT && check_count_product_overflow && num_groups > 0) {
-    overflow_flag.emplace(0, true, stream, mr);
-  }
-
-  if (num_groups > 0) {
-    rmm::device_uvector<int64_t> selected(static_cast<std::size_t>(group_rows), stream, mr);
-    thrust::copy_if(policy, begin, end, selected.begin(), selector);
-
-    auto const grid = grid_size_for(num_groups);
-    auto key_out    = key_col->mutable_view().template data<KeyT>();
-    auto value_out  = value_col->mutable_view().template data<int64_t>();
-    switch (op) {
-      case dense_value_op::COUNT:
-        inner_count_emit_kernel<KeyT, PresenceT, MatchedT>
-          <<<grid, k_block_size, 0, stream.value()>>>(
-            selected.data(),
-            num_groups,
-            presence.data(),
-            matched.data(),
-            min_key,
-            key_out,
-            value_out,
-            overflow_flag ? overflow_flag->data() : nullptr);
-        break;
-      case dense_value_op::SUM:
-        inner_sum_emit_kernel<KeyT, PresenceT>
-          <<<grid, k_block_size, 0, stream.value()>>>(selected.data(),
-                                                      num_groups,
-                                                      presence.data(),
-                                                      payload->data(),
-                                                      min_key,
-                                                      key_out,
-                                                      value_out);
-        break;
-      case dense_value_op::MIN:
-      case dense_value_op::MAX:
-        emit_raw_slot_kernel<KeyT, int64_t><<<grid, k_block_size, 0, stream.value()>>>(
-          selected.data(), num_groups, payload->data(), min_key, key_out, value_out);
-        break;
-      case dense_value_op::AVG:
-        emit_raw_slot_kernel<KeyT, int64_t><<<grid, k_block_size, 0, stream.value()>>>(
-          selected.data(), num_groups, payload->data(), min_key, key_out, value_out);
-        emit_raw_slot_kernel<KeyT, MatchedT><<<grid, k_block_size, 0, stream.value()>>>(
-          selected.data(),
-          num_groups,
-          matched.data(),
-          min_key,
-          static_cast<KeyT*>(nullptr),
-          divisor_col->mutable_view().template data<int64_t>());
-        break;
-    }
-    CUDF_CUDA_TRY(cudaGetLastError());
-    // The scalar read synchronizes only on the rare path whose coarse host bound was inconclusive.
-    if (overflow_flag && overflow_flag->value(stream) != 0) {
-      throw sirius::invalid_input_exception("group_join: COUNT result exceeds BIGINT max {}",
-                                            k_bigint_max);
-    }
-  }
-
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.push_back(std::move(key_col));
-  columns.push_back(std::move(value_col));
-  if (divisor_col) { columns.push_back(std::move(divisor_col)); }
-  return std::make_unique<cudf::table>(std::move(columns));
+  return emit_inner_dense_groups<KeyT, PresenceT, MatchedT>(op,
+                                                            key_type,
+                                                            min_key,
+                                                            range,
+                                                            presence.data(),
+                                                            matched.data(),
+                                                            payload ? payload->data() : nullptr,
+                                                            check_count_product_overflow,
+                                                            stream,
+                                                            mr);
 }
 
 template <typename KeyT, typename MatchedT, typename ArgT>

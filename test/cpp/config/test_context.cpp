@@ -1895,4 +1895,15 @@ TEST_CASE("Sirius configuration gates the GROUP_JOIN value rungs behind enable_g
     invalid_gate.load_from_file(data_dir / "invalid_group_join_gate_engine_policy.yaml"),
     Catch::Contains("sirius.operator_params.group_join_counted_bytes_gate") &&
       Catch::Contains("internal engine policy") && Catch::Contains("remove this key"));
+
+  // The streamed-schedule form set is engine-owned too (the honest-failure mechanism); its
+  // defaults admit both streaming forms.
+  REQUIRE(defaults.get_operator_params().group_join_stream_inner);
+  REQUIRE(defaults.get_operator_params().group_join_stream_direct);
+  sirius::sirius_config invalid_stream_forms;
+  REQUIRE_THROWS_WITH(invalid_stream_forms.load_from_file(
+                        data_dir / "invalid_group_join_stream_forms_engine_policy.yaml"),
+                      Catch::Contains("sirius.operator_params.group_join_stream_forms") &&
+                        Catch::Contains("internal engine policy") &&
+                        Catch::Contains("remove this key"));
 }

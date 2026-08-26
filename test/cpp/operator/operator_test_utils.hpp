@@ -76,11 +76,22 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
   return manager;
 }
 
-inline cucascade::memory::memory_space* get_default_gpu_space()
+inline sirius::memory::sirius_memory_reservation_manager& get_default_memory_manager()
 {
   static auto manager = initialize_memory_manager();
+  return *manager;
+}
+
+inline cucascade::memory::memory_space* get_default_gpu_space()
+{
   return const_cast<cucascade::memory::memory_space*>(
-    manager->get_memory_space(cucascade::memory::Tier::GPU, 0));
+    get_default_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0));
+}
+
+inline cucascade::memory::memory_space* get_default_host_space()
+{
+  return const_cast<cucascade::memory::memory_space*>(
+    get_default_memory_manager().get_memory_space(cucascade::memory::Tier::HOST, 0));
 }
 inline rmm::device_async_resource_ref get_resource_ref(cucascade::memory::memory_space& space)
 {

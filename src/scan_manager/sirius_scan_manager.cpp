@@ -569,6 +569,36 @@ sirius_scan_manager::~sirius_scan_manager()
   }
 }
 
+namespace {
+
+// Reuse a previously parsed footer when present — a prior bind or scan of the same file parks it
+// in the ioctx metadata store, which lives for the ioctx's lifetime. On a miss, fetch +
+// Thrift-parse the footer once and park it so the subsequent scan reuses it. Mirrors
+// parquet_gpu_ingestible::build_file_scan_info, so the footer is parsed exactly once per file per
+// process.
+std::shared_ptr<cudf::io::parquet::FileMetaData const> parquet_metadata_for(
+  sirius::io::sirius_datasource& datasource)
+{
+  if (auto cached = datasource.metadata()) {
+    if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached))) {
+      return pm->file_metadata();
+    }
+  }
+  auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(datasource);
+  auto const footer_byte_len = footer_buffer->size();
+  auto reader_options        = cudf::io::parquet_reader_options::builder().build();
+  cudf::io::parquet::experimental::hybrid_scan_reader reader{
+    cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
+    reader_options};
+  auto file_metadata =
+    std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
+  [[maybe_unused]] auto const stored = datasource.store_metadata(
+    std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len));
+  return file_metadata;
+}
+
+}  // namespace
+
 parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri)
 {
   // Footer-probe only when we will actually read + parse the footer.  On a warm
@@ -586,29 +616,7 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
                              uri);
   }
 
-  // Reuse a previously parsed footer when present — a prior bind or scan of the
-  // same file parks it in the ioctx metadata store, which lives for the ioctx's
-  // lifetime. On a miss, fetch + Thrift-parse the footer once and park it so the
-  // subsequent scan reuses it. Mirrors parquet_gpu_ingestible::build_file_scan_info,
-  // so the footer is parsed exactly once per file per process.
-  std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
-  if (auto cached = datasource->metadata()) {
-    if (auto pm = std::dynamic_pointer_cast<op::scan::parquet_metadata>(std::move(cached))) {
-      file_metadata = pm->file_metadata();
-    }
-  }
-  if (!file_metadata) {
-    auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
-    auto const footer_byte_len = footer_buffer->size();
-    auto reader_options        = cudf::io::parquet_reader_options::builder().build();
-    cudf::io::parquet::experimental::hybrid_scan_reader reader{
-      cudf::host_span<std::uint8_t const>(footer_buffer->data(), footer_buffer->size()),
-      reader_options};
-    file_metadata =
-      std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
-    [[maybe_unused]] auto const stored = datasource->store_metadata(
-      std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len));
-  }
+  auto const file_metadata = parquet_metadata_for(*datasource);
 
   auto schema = sirius::io::parquet_helpers::extract_schema(*file_metadata);
 
@@ -618,6 +626,23 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   result.object_size    = datasource->size();
   result.total_num_rows = static_cast<std::size_t>(file_metadata->num_rows);
   return result;
+}
+
+std::shared_ptr<cudf::io::parquet::FileMetaData const>
+sirius_scan_manager::describe_parquet_metadata(std::string const& uri)
+{
+  auto const cache_key     = normalize_path(uri);
+  auto const io_ctx        = ioctx_for_path(uri);
+  bool const footer_cached = io_ctx && io_ctx->metadata_store().get_metadata(cache_key) != nullptr;
+  auto const hint =
+    footer_cached ? sirius::io::open_hint::generic : sirius::io::open_hint::parquet_footer_probe;
+
+  auto datasource = create_datasource(uri, hint);
+  if (!datasource) {
+    throw std::runtime_error(
+      "[sirius_scan_manager::describe_parquet_metadata] no backend supports URI: " + uri);
+  }
+  return parquet_metadata_for(*datasource);
 }
 
 void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
