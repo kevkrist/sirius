@@ -21,8 +21,12 @@
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/order/gpu_order_impl.hpp"
 #include "scan/test_utils.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/utilities/bit.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
@@ -680,7 +684,244 @@ void validate_grouped_aggregate(const std::vector<std::shared_ptr<data_batch>>& 
   }
 }
 
+std::unique_ptr<cudf::column> make_dedup_test_column(std::vector<int32_t> const& values,
+                                                     std::vector<bool> const& valids,
+                                                     memory_space& mem_space)
+{
+  auto const stream = cudf::get_default_stream();
+  auto mr           = mem_space.get_default_allocator();
+  auto const size   = static_cast<cudf::size_type>(values.size());
+
+  std::unique_ptr<cudf::column> column;
+  if (valids.empty()) {
+    column = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32}, size, cudf::mask_state::UNALLOCATED, stream, mr);
+  } else {
+    REQUIRE(valids.size() == values.size());
+    auto mask      = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
+    auto* mask_ptr = static_cast<cudf::bitmask_type*>(mask.data());
+    cudf::size_type null_count = 0;
+    for (cudf::size_type row = 0; row < size; ++row) {
+      if (!valids[row]) {
+        cudf::set_null_mask(mask_ptr, row, row + 1, false, stream);
+        ++null_count;
+      }
+    }
+    column = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32}, size, std::move(mask), null_count, stream, mr);
+  }
+  cudaMemcpy(column->mutable_view().data<int32_t>(),
+             values.data(),
+             values.size() * sizeof(int32_t),
+             cudaMemcpyHostToDevice);
+  return column;
+}
+
+std::shared_ptr<data_batch> make_dedup_test_batch(memory_space& mem_space)
+{
+  std::vector<int32_t> const keys{9, 0, 0, 1, 1, 9};
+  std::vector<int32_t> const values{99, 10, 20, 30, 40, 99};
+  std::vector<bool> const valids{true, true, false, true, false, true};
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(make_dedup_test_column(keys, {}, mem_space));
+  columns.push_back(make_dedup_test_column(values, valids, mem_space));
+  columns.push_back(make_dedup_test_column(values, valids, mem_space));
+  auto owner = std::make_shared<cudf::table>(std::move(columns));
+
+  // Exercise non-zero offsets. Columns 1-4 are aliases of one nullable slice; column 5 has
+  // equal values and validity but owns distinct data and mask allocations. Column 6 shares the
+  // allocation with a different offset, and column 7 shares data but uses a distinct null mask.
+  auto const slices              = cudf::slice(owner->view(), {1, 5});
+  auto const sliced              = slices.front();
+  auto const different_offset    = cudf::slice(owner->view(), {2, 6}).front().column(1);
+  auto const alias_values        = sliced.column(1);
+  auto const alternate_mask      = sliced.column(2);
+  auto const different_null_mask = cudf::column_view{alias_values.type(),
+                                                     alias_values.size(),
+                                                     alias_values.head<void>(),
+                                                     alternate_mask.null_mask(),
+                                                     alternate_mask.null_count(),
+                                                     alias_values.offset()};
+  auto const decimal_scale_2     = cudf::column_view{cudf::data_type{cudf::type_id::DECIMAL32, -2},
+                                                 alias_values.size(),
+                                                 alias_values.head<void>(),
+                                                 alias_values.null_mask(),
+                                                 alias_values.null_count(),
+                                                 alias_values.offset()};
+  auto const decimal_scale_3     = cudf::column_view{cudf::data_type{cudf::type_id::DECIMAL32, -3},
+                                                 alias_values.size(),
+                                                 alias_values.head<void>(),
+                                                 alias_values.null_mask(),
+                                                 alias_values.null_count(),
+                                                 alias_values.offset()};
+  std::vector<cudf::column_view> views{sliced.column(0),
+                                       sliced.column(1),
+                                       sliced.column(1),
+                                       sliced.column(1),
+                                       sliced.column(1),
+                                       sliced.column(2),
+                                       different_offset,
+                                       different_null_mask,
+                                       decimal_scale_2,
+                                       decimal_scale_3};
+  return sirius::make_data_batch_from_view(
+    cudf::table_view(views), owner, owner->alloc_size(), mem_space, cudf::get_default_stream(), {});
+}
+
+std::map<int64_t, std::vector<int64_t>> copy_grouped_rows(cudf::table_view output)
+{
+  std::vector<std::vector<int64_t>> columns(output.num_columns());
+  copy_data_to_host(output, columns);
+  std::map<int64_t, std::vector<int64_t>> rows;
+  for (cudf::size_type row = 0; row < output.num_rows(); ++row) {
+    auto& values = rows[columns[0][row]];
+    for (cudf::size_type column = 1; column < output.num_columns(); ++column) {
+      values.push_back(columns[column][row]);
+    }
+  }
+  return rows;
+}
+
+bool has_dedup_log(sirius::test::scoped_recording_log_sink const& logs, size_t count)
+{
+  auto const needle =
+    "deduplicated " + std::to_string(count) + " alias-equivalent aggregate state(s)";
+  auto const records = logs.records();
+  return std::any_of(records.begin(), records.end(), [&](auto const& record) {
+    return record.message.find(needle) != std::string::npos;
+  });
+}
+bool has_any_dedup_log(sirius::test::scoped_recording_log_sink const& logs)
+{
+  auto const records = logs.records();
+  return std::any_of(records.begin(), records.end(), [](auto const& record) {
+    return record.message.find("alias-equivalent aggregate state(s)") != std::string::npos;
+  });
+}
+
 }  // namespace
+
+TEST_CASE("Local grouped aggregate deduplicates only alias-equivalent SUM states",
+          "[operator][local_grouped_agg][dedup]")
+{
+  auto* mem_space = get_shared_mem_space();
+  REQUIRE(mem_space);
+  auto input = make_dedup_test_batch(*mem_space);
+  sirius::test::scoped_recording_log_sink logs{"debug"};
+
+  auto input_ro = input->to_read_only();
+  auto output   = gpu_aggregate_impl::local_grouped_aggregate(input_ro,
+                                                              {0},
+                                                              {cudf::aggregation::Kind::SUM,
+                                                               cudf::aggregation::Kind::SUM,
+                                                               cudf::aggregation::Kind::SUM,
+                                                               cudf::aggregation::Kind::SUM,
+                                                               cudf::aggregation::Kind::SUM},
+                                                              {1, 2, 5, 6, 7},
+                                                              {},
+                                                            cudf::get_default_stream(),
+                                                            *mem_space);
+  REQUIRE(has_dedup_log(logs, 1));
+
+  auto output_ro   = output->to_read_only();
+  auto output_view = sirius::get_cudf_table_view(output_ro);
+  REQUIRE(output_view.num_columns() == 6);
+  REQUIRE(output_view.column(0).type().id() == cudf::type_id::INT32);
+  for (cudf::size_type column = 1; column < output_view.num_columns(); ++column) {
+    REQUIRE(output_view.column(column).type().id() == cudf::type_id::INT64);
+  }
+  REQUIRE(output_view.column(1).head<void>() != output_view.column(2).head<void>());
+  auto const rows = copy_grouped_rows(output_view);
+  REQUIRE(rows.at(0) == std::vector<int64_t>{10, 10, 10, 30, 10});
+  REQUIRE(rows.at(1) == std::vector<int64_t>{30, 30, 30, 99, 30});
+}
+
+TEST_CASE("Local grouped aggregate preserves original nullable count widths and output order",
+          "[operator][local_grouped_agg][dedup]")
+{
+  auto* mem_space = get_shared_mem_space();
+  REQUIRE(mem_space);
+  auto input = make_dedup_test_batch(*mem_space);
+  sirius::test::scoped_recording_log_sink logs{"debug"};
+
+  auto input_ro = input->to_read_only();
+  auto output   = gpu_aggregate_impl::local_grouped_aggregate(input_ro,
+                                                              {0},
+                                                              {cudf::aggregation::Kind::COUNT_VALID,
+                                                               cudf::aggregation::Kind::SUM,
+                                                               cudf::aggregation::Kind::COUNT_VALID,
+                                                               cudf::aggregation::Kind::COUNT_ALL,
+                                                               cudf::aggregation::Kind::COUNT_ALL},
+                                                              {1, 1, 2, 3, 4},
+                                                              {},
+                                                            cudf::get_default_stream(),
+                                                            *mem_space);
+  REQUIRE(has_dedup_log(logs, 2));
+
+  auto output_ro   = output->to_read_only();
+  auto output_view = sirius::get_cudf_table_view(output_ro);
+  REQUIRE(output_view.num_columns() == 6);
+  REQUIRE(output_view.column(0).type().id() == cudf::type_id::INT32);
+  REQUIRE(output_view.column(1).type().id() == cudf::type_id::INT32);
+  REQUIRE(output_view.column(2).type().id() == cudf::type_id::INT64);
+  REQUIRE(output_view.column(3).type().id() == cudf::type_id::INT64);
+  REQUIRE(output_view.column(4).type().id() == cudf::type_id::INT64);
+  REQUIRE(output_view.column(5).type().id() == cudf::type_id::INT64);
+  auto const rows = copy_grouped_rows(output_view);
+  REQUIRE(rows.at(0) == std::vector<int64_t>{1, 10, 1, 2, 2});
+  REQUIRE(rows.at(1) == std::vector<int64_t>{1, 30, 1, 2, 2});
+}
+TEST_CASE("Local grouped aggregate identity includes decimal scale",
+          "[operator][local_grouped_agg][dedup]")
+{
+  auto* mem_space = get_shared_mem_space();
+  REQUIRE(mem_space);
+  auto input = make_dedup_test_batch(*mem_space);
+  sirius::test::scoped_recording_log_sink logs{"debug"};
+
+  auto output = gpu_aggregate_impl::local_grouped_aggregate(
+    input->to_read_only(),
+    {0},
+    {cudf::aggregation::Kind::SUM, cudf::aggregation::Kind::SUM},
+    {8, 9},
+    {},
+    cudf::get_default_stream(),
+    *mem_space);
+  REQUIRE_FALSE(has_any_dedup_log(logs));
+
+  auto output_view = sirius::get_cudf_table_view(output->to_read_only());
+  REQUIRE(output_view.num_columns() == 3);
+  REQUIRE(output_view.column(1).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(output_view.column(1).type().scale() == -2);
+  REQUIRE(output_view.column(2).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(output_view.column(2).type().scale() == -3);
+}
+
+TEST_CASE("Local grouped aggregate excludes a whole mixed COLLECT_SET request from dedup",
+          "[operator][local_grouped_agg][dedup]")
+{
+  auto* mem_space = get_shared_mem_space();
+  REQUIRE(mem_space);
+  auto input = make_dedup_test_batch(*mem_space);
+  sirius::test::scoped_recording_log_sink logs{"debug"};
+
+  auto output = gpu_aggregate_impl::local_grouped_aggregate(input->to_read_only(),
+                                                            {0},
+                                                            {cudf::aggregation::Kind::SUM,
+                                                             cudf::aggregation::Kind::COLLECT_SET,
+                                                             cudf::aggregation::Kind::SUM,
+                                                             cudf::aggregation::Kind::SUM},
+                                                            {1, 1, 1, 2},
+                                                            {},
+                                                            cudf::get_default_stream(),
+                                                            *mem_space);
+  REQUIRE_FALSE(has_any_dedup_log(logs));
+
+  auto output_view = sirius::get_cudf_table_view(output->to_read_only());
+  REQUIRE(output_view.num_columns() == 5);
+  REQUIRE(output_view.column(1).head<void>() != output_view.column(3).head<void>());
+}
 
 TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grouped_agg]")
 {

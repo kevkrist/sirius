@@ -284,17 +284,75 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   // For multi-column COLLECT_SET, a synthetic negative key -(i+1) is used so that each such
   // aggregate gets its own request with a freshly synthesized struct column.
   std::unordered_map<int, std::vector<std::unique_ptr<cudf::groupby_aggregation>>> input_col_to_agg;
-  std::unordered_map<int, std::vector<size_t>> input_col_to_output_idx;
+  std::unordered_map<int, std::vector<std::vector<size_t>>> input_col_to_output_idx;
+  std::vector<int> original_aggregate_col_ids(aggregates.size());
+  std::unordered_map<int, size_t> original_request_multiplicity;
+  std::unordered_map<int, bool> original_request_is_dedup_eligible;
+
+  auto const is_dedup_eligible_kind = [](cudf::aggregation::Kind kind) {
+    switch (kind) {
+      case cudf::aggregation::Kind::MIN:
+      case cudf::aggregation::Kind::MAX:
+      case cudf::aggregation::Kind::COUNT_ALL:
+      case cudf::aggregation::Kind::COUNT_VALID:
+      case cudf::aggregation::Kind::SUM: return true;
+      default: return false;
+    }
+  };
+
+  for (size_t i = 0; i < aggregates.size(); ++i) {
+    int const aggregate_col_id = has_struct_col_indices && !aggregate_struct_col_indices[i].empty()
+                                   ? -(static_cast<int>(i) + 1)
+                                   : aggregate_idx[i];
+    original_aggregate_col_ids[i] = aggregate_col_id;
+    ++original_request_multiplicity[aggregate_col_id];
+
+    auto eligibility = original_request_is_dedup_eligible.try_emplace(aggregate_col_id, true).first;
+    if (aggregate_col_id < 0) {
+      eligibility->second = false;
+      continue;
+    }
+    auto const values = input_table.column(aggregate_col_id);
+    eligibility->second &= is_dedup_eligible_kind(aggregates[i]) && values.size() > 0 &&
+                           cudf::is_fixed_width(values.type()) && !cudf::is_nested(values.type());
+  }
+
+  struct canonical_aggregation {
+    cudf::column_view values;
+    cudf::aggregation::Kind kind;
+    int aggregate_col_id;
+    size_t result_idx;
+  };
+  std::vector<canonical_aggregation> canonical_aggregations;
+  size_t deduplicated_states = 0;
+
+  auto const is_alias_equivalent = [](cudf::column_view const& lhs, cudf::column_view const& rhs) {
+    return lhs.type().id() == rhs.type().id() && lhs.type().scale() == rhs.type().scale() &&
+           lhs.size() == rhs.size() && lhs.offset() == rhs.offset() &&
+           lhs.head<void>() == rhs.head<void>() && lhs.null_mask() == rhs.null_mask();
+  };
+
   std::vector<int> input_col_order;
   for (size_t i = 0; i < aggregates.size(); ++i) {
     const auto& aggregate_kind = aggregates[i];
-    int aggregate_col_id;
-    if (has_struct_col_indices && !aggregate_struct_col_indices[i].empty()) {
-      // Multi-column COLLECT_SET: use a unique synthetic negative key for this slot.
-      aggregate_col_id = -(static_cast<int>(i) + 1);
-    } else {
-      aggregate_col_id = aggregate_idx[i];
+    int const aggregate_col_id = original_aggregate_col_ids[i];
+
+    bool const request_is_dedup_eligible = original_request_is_dedup_eligible.at(aggregate_col_id);
+    if (request_is_dedup_eligible) {
+      auto const values = input_table.column(aggregate_col_id);
+      auto const match  = std::find_if(canonical_aggregations.begin(),
+                                      canonical_aggregations.end(),
+                                      [&](canonical_aggregation const& candidate) {
+                                        return candidate.kind == aggregate_kind &&
+                                               is_alias_equivalent(candidate.values, values);
+                                      });
+      if (match != canonical_aggregations.end()) {
+        input_col_to_output_idx[match->aggregate_col_id][match->result_idx].push_back(i);
+        ++deduplicated_states;
+        continue;
+      }
     }
+
     if (!input_col_to_agg.contains(aggregate_col_id)) {
       input_col_order.push_back(aggregate_col_id);
     }
@@ -306,7 +364,18 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       groupby_aggregation = get_local_aggregation<cudf::groupby_aggregation>(aggregate_kind);
     }
     input_col_to_agg[aggregate_col_id].push_back(std::move(groupby_aggregation));
-    input_col_to_output_idx[aggregate_col_id].push_back(i);
+    auto& output_indices = input_col_to_output_idx[aggregate_col_id];
+    output_indices.push_back({i});
+    if (request_is_dedup_eligible) {
+      canonical_aggregations.push_back({input_table.column(aggregate_col_id),
+                                        aggregate_kind,
+                                        aggregate_col_id,
+                                        output_indices.size() - 1});
+    }
+  }
+  if (deduplicated_states != 0) {
+    SIRIUS_LOG_DEBUG("local_grouped_agg: deduplicated {} alias-equivalent aggregate state(s)",
+                     deduplicated_states);
   }
 
   // Temp struct columns for multi-col COLLECT_SET; must outlive the groupby call.
@@ -368,24 +437,6 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     int aggregate_col_id     = input_col_order[i];
     auto& aggregation_result = groupby_result.second[i];
 
-    // need to cast count aggregation result to int64 (not applicable for COLLECT_SET)
-    if (requests[i].aggregations.size() == 1 &&
-        requests[i].aggregations[0]->kind != cudf::aggregation::Kind::COLLECT_SET &&
-        (requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_VALID ||
-         requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_ALL)) {
-      if (aggregation_result.results.size() != 1) {
-        throw std::runtime_error("Expected 1 result for count aggregation, got " +
-                                 std::to_string(aggregation_result.results.size()));
-      }
-      auto result_view = aggregation_result.results[0]->view();
-      if (result_view.type().id() != cudf::type_id::INT64) {
-        aggregation_result.results[0] = cudf::cast(result_view,
-                                                   cudf::data_type(cudf::type_id::INT64),
-                                                   stream,
-                                                   memory_space.get_default_allocator());
-      }
-    }
-
     const auto& output_idx = input_col_to_output_idx[aggregate_col_id];
     for (size_t j = 0; j < output_idx.size(); ++j) {
       auto result_view = aggregation_result.results[j]->view();
@@ -405,8 +456,52 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
                        memory_space.get_default_allocator());
         }
       }
-      size_t output_col_id       = group_idx.size() + output_idx[j];
-      output_cols[output_col_id] = std::move(aggregation_result.results[j]);
+
+      auto result     = std::move(aggregation_result.results[j]);
+      auto const kind = requests[i].aggregations[j]->kind;
+      bool const is_count =
+        kind == cudf::aggregation::Kind::COUNT_VALID || kind == cudf::aggregation::Kind::COUNT_ALL;
+      std::vector<size_t> native_output_idx;
+      std::vector<size_t> int64_output_idx;
+      for (auto const output : output_idx[j]) {
+        bool const legacy_int64_count =
+          is_count && original_request_multiplicity[original_aggregate_col_ids[output]] == 1;
+        (legacy_int64_count ? int64_output_idx : native_output_idx).push_back(output);
+      }
+
+      auto emit_outputs = [&](std::unique_ptr<cudf::column> source,
+                              std::vector<size_t> const& destinations) {
+        for (size_t k = 0; k < destinations.size(); ++k) {
+          auto const output_col_id = group_idx.size() + destinations[k];
+          if (k + 1 == destinations.size()) {
+            output_cols[output_col_id] = std::move(source);
+          } else {
+            output_cols[output_col_id] = std::make_unique<cudf::column>(
+              source->view(), stream, memory_space.get_default_allocator());
+          }
+        }
+      };
+
+      if (int64_output_idx.empty()) {
+        emit_outputs(std::move(result), native_output_idx);
+      } else if (native_output_idx.empty()) {
+        if (result->type().id() != cudf::type_id::INT64) {
+          result = cudf::cast(result->view(),
+                              cudf::data_type(cudf::type_id::INT64),
+                              stream,
+                              memory_space.get_default_allocator());
+        }
+        emit_outputs(std::move(result), int64_output_idx);
+      } else {
+        auto int64_result = result->type().id() == cudf::type_id::INT64
+                              ? std::make_unique<cudf::column>(result->view(), stream, mr)
+                              : cudf::cast(result->view(),
+                                           cudf::data_type(cudf::type_id::INT64),
+                                           stream,
+                                           memory_space.get_default_allocator());
+        emit_outputs(std::move(result), native_output_idx);
+        emit_outputs(std::move(int64_result), int64_output_idx);
+      }
     }
   }
 
