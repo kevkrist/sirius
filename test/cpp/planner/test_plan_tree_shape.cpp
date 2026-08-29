@@ -394,6 +394,11 @@ struct plan_tree_shape_fixture {
     con->Query("INSERT INTO small_right VALUES (0, 0), (1, 1)");
     con->Query("CREATE TABLE decimal_values (amount DECIMAL(15,2))");
     con->Query("INSERT INTO decimal_values VALUES (1.00), (2.50), (3.75)");
+    con->Query(
+      "CREATE TABLE q1_values (return_flag VARCHAR, line_status VARCHAR, "
+      "quantity DECIMAL(15,2), extended_price DECIMAL(15,2), discount DECIMAL(15,2), "
+      "tax DECIMAL(15,2))");
+    con->Query("INSERT INTO q1_values VALUES ('A', 'F', 1.00, 2.00, 0.05, 0.02)");
 
     // Complete a left-deep join whose outer probe key comes from the inner build side.
     con->Query("CREATE TABLE small_c (ckey INTEGER, cother INTEGER)");
@@ -1066,6 +1071,59 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     CHECK(local->get_types()[0] == sirius::logical_type::make_decimal(15, 2));
     CHECK(local->get_types()[1].id() == sirius::type_id::BIGINT);
   }
+}
+
+TEST_CASE_METHOD(
+  plan_tree_shape_fixture,
+  "plan tree shape - exact Q1 projection fusion activates and rejects a nearby shape",
+  "[plan_tree_shape][isolated_context][tiny_domain_q1_projection]")
+{
+  tiny_domain_switch_guard tiny_domain_on(*con, /*enabled=*/true);
+  auto compressed_off = con->Query("SET enable_compressed_materialization = false");
+  REQUIRE(compressed_off != nullptr);
+  REQUIRE_FALSE(compressed_off->HasError());
+
+  auto q1_query = [](char tax_operator) {
+    std::ostringstream query;
+    query << "SELECT return_flag, line_status, "
+          << "sum(quantity) AS sum_qty, "
+          << "sum(extended_price) AS sum_base_price, "
+          << "sum(extended_price * (1 - discount)) AS sum_disc_price, "
+          << "sum(extended_price * (1 - discount) * (1 " << tax_operator << " tax)) AS sum_charge, "
+          << "avg(quantity) AS avg_qty, "
+          << "avg(extended_price) AS avg_price, "
+          << "avg(discount) AS avg_disc, "
+          << "count(*) AS count_order "
+          << "FROM q1_values GROUP BY return_flag, line_status";
+    return query.str();
+  };
+
+  auto exact_plan = generate_sirius_plan(*con, q1_query('+'));
+  INFO(tree_to_string(exact_plan.get()));
+  auto exact_locals = collect(exact_plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+  REQUIRE(exact_locals.size() == 1);
+  auto& exact_local = exact_locals.front()->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  REQUIRE(exact_local.tiny_domain_projection_fusion_enabled());
+  CHECK(exact_local.tiny_domain_projection_fallback_stage_count() == 2);
+  REQUIRE(exact_local.children.size() == 1);
+  CHECK(exact_local.children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
+  CHECK(collect(exact_local.children[0].get(), SiriusPhysicalOperatorType::PROJECTION).empty());
+
+  auto nearby_plan = generate_sirius_plan(*con, q1_query('-'));
+  INFO(tree_to_string(nearby_plan.get()));
+  auto nearby_locals = collect(nearby_plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+  REQUIRE(nearby_locals.size() == 1);
+  auto& nearby_local = nearby_locals.front()->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  CHECK_FALSE(nearby_local.tiny_domain_projection_fusion_enabled());
+  CHECK(nearby_local.tiny_domain_projection_fallback_stage_count() == 0);
+  REQUIRE(nearby_local.children.size() == 1);
+  auto* p2 = nearby_local.children[0].get();
+  REQUIRE(p2->type == SiriusPhysicalOperatorType::PROJECTION);
+  REQUIRE(p2->children.size() == 1);
+  auto* p1 = p2->children[0].get();
+  REQUIRE(p1->type == SiriusPhysicalOperatorType::PROJECTION);
+  REQUIRE(p1->children.size() == 1);
+  CHECK(p1->children[0]->type == SiriusPhysicalOperatorType::GPU_SCAN);
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,

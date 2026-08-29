@@ -53,6 +53,7 @@
 namespace {
 
 using sirius::op::try_tiny_domain_grouped_aggregate;
+using sirius::op::try_tiny_domain_q1_projection_aggregate;
 using sirius::test::vector_to_cudf_column;
 using sirius::test::operator_utils::gpu_type_traits;
 using sirius::test::operator_utils::string_tag;
@@ -194,6 +195,104 @@ std::vector<int> q1_aggregate_indices(bool cloned_average_sources = false)
 {
   if (cloned_average_sources) { return {2, 3, 4, 5, 7, 7, 8, 8, 6, 6, 0}; }
   return {2, 3, 4, 5, 2, 2, 3, 3, 6, 6, 0};
+}
+
+std::vector<int> q1_projection_aggregate_indices() { return {2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 0}; }
+
+sirius::op::tiny_domain_q1_projection_plan q1_projection_plan()
+{
+  using sirius::op::tiny_domain_q1_value_source;
+
+  auto const decimal_15_2 = sirius::logical_type::make_decimal(15, 2);
+  return {{0, 1},
+          {2, 3, 4, 5},
+          {decimal_15_2, decimal_15_2, decimal_15_2, decimal_15_2},
+          {decimal_15_2,
+           decimal_15_2,
+           sirius::logical_type::make_decimal(18, 4),
+           sirius::logical_type::make_decimal(18, 6),
+           decimal_15_2},
+          {tiny_domain_q1_value_source::independent_sum,
+           tiny_domain_q1_value_source::price,
+           tiny_domain_q1_value_source::discounted_price,
+           tiny_domain_q1_value_source::charge,
+           tiny_domain_q1_value_source::discount},
+          {0, 1, 2, 3, 0, 5, 1, 5, 4, 5, 5}};
+}
+
+std::unique_ptr<cudf::table> make_q1_raw_input(
+  std::vector<std::string> const& return_flags,
+  std::vector<std::string> const& line_statuses,
+  std::array<std::vector<int64_t>, 4> const& decimal_values,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  int32_t price_scale = -2)
+{
+  REQUIRE(return_flags.size() == line_statuses.size());
+  for (auto const& values : decimal_values) {
+    REQUIRE(values.size() == return_flags.size());
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(6);
+  columns.push_back(make_strings(return_flags, stream, mr));
+  columns.push_back(make_strings(line_statuses, stream, mr));
+  columns.push_back(make_fixed<int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, -2}, decimal_values[0], stream, mr));
+  columns.push_back(make_fixed<int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, price_scale}, decimal_values[1], stream, mr));
+  columns.push_back(make_fixed<int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, -2}, decimal_values[2], stream, mr));
+  columns.push_back(make_fixed<int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, -2}, decimal_values[3], stream, mr));
+  return make_table(std::move(columns));
+}
+
+std::unique_ptr<cudf::table> make_q1_projected_input(
+  std::vector<std::string> const& return_flags,
+  std::vector<std::string> const& line_statuses,
+  std::array<std::vector<int64_t>, 4> const& decimal_values,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  REQUIRE(return_flags.size() == line_statuses.size());
+  for (auto const& values : decimal_values) {
+    REQUIRE(values.size() == return_flags.size());
+  }
+
+  std::vector<int64_t> discounted_price(return_flags.size());
+  std::vector<int64_t> charge(return_flags.size());
+  for (std::size_t row = 0; row < return_flags.size(); ++row) {
+    auto const discounted =
+      static_cast<__int128_t>(decimal_values[1][row]) * (int64_t{100} - decimal_values[2][row]);
+    auto const charged = discounted * (int64_t{100} + decimal_values[3][row]);
+    REQUIRE(discounted >= std::numeric_limits<int64_t>::min());
+    REQUIRE(discounted <= std::numeric_limits<int64_t>::max());
+    REQUIRE(charged >= std::numeric_limits<int64_t>::min());
+    REQUIRE(charged <= std::numeric_limits<int64_t>::max());
+    discounted_price[row] = static_cast<int64_t>(discounted);
+    charge[row]           = static_cast<int64_t>(charged);
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.reserve(9);
+  columns.push_back(make_strings(return_flags, stream, mr));
+  columns.push_back(make_strings(line_statuses, stream, mr));
+  columns.push_back(make_fixed<int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, -2}, decimal_values[0], stream, mr));
+  columns.push_back(make_fixed<int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, -2}, decimal_values[1], stream, mr));
+  columns.push_back(make_fixed<int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, -4}, discounted_price, stream, mr));
+  columns.push_back(
+    make_fixed<int64_t>(cudf::data_type{cudf::type_id::DECIMAL64, -6}, charge, stream, mr));
+  columns.push_back(make_fixed<int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, -2}, decimal_values[0], stream, mr));
+  columns.push_back(make_fixed<int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, -2}, decimal_values[1], stream, mr));
+  columns.push_back(make_fixed<int64_t>(
+    cudf::data_type{cudf::type_id::DECIMAL64, -2}, decimal_values[2], stream, mr));
+  return make_table(std::move(columns));
 }
 
 constexpr std::size_t q1_preflight_sample_rows = 1U << 16;
@@ -842,6 +941,85 @@ TEST_CASE("Q1 register-private negative overflow falls back before exact mixed-s
   }
   REQUIRE(copy_values<int64_t>(view.column(12), stream) ==
           std::vector<int64_t>(4, static_cast<int64_t>(rows / 4)));
+}
+
+TEST_CASE("fused Q1 projection aggregate matches the sequential projected path",
+          "[physical_grouped_aggregate][tiny_domain_q1_projection]")
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = cudf::get_current_device_resource_ref();
+
+  auto require_matches_sequential = [&](cudf::table_view raw, cudf::table_view projected) {
+    auto fused = try_tiny_domain_q1_projection_aggregate(
+      raw, q1_projection_plan(), q1_aggregate_kinds(), stream, mr);
+    auto sequential = try_tiny_domain_grouped_aggregate(
+      projected, {0, 1}, q1_aggregate_kinds(), q1_projection_aggregate_indices(), stream, mr);
+    REQUIRE(fused);
+    REQUIRE(sequential);
+    REQUIRE(fused.register_private_attempted);
+    REQUIRE(fused.used_register_private);
+    REQUIRE(fused.num_groups == sequential.num_groups);
+    require_tables_equal(fused.table->view(), sequential.table->view(), stream, mr);
+  };
+
+  SECTION("whole input")
+  {
+    std::vector<std::string> const return_flags{"N", "A", "N", "A", "A", "N", "A", "N"};
+    std::vector<std::string> const line_statuses{"O", "F", "F", "O", "F", "O", "O", "F"};
+    std::array<std::vector<int64_t>, 4> const values{
+      std::vector<int64_t>{100, 200, 300, 400, 500, 600, 700, 800},
+      std::vector<int64_t>{1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000},
+      std::vector<int64_t>{5, 10, 15, 20, 25, 30, 35, 40},
+      std::vector<int64_t>{2, 4, 6, 8, 10, 12, 14, 16}};
+
+    auto raw       = make_q1_raw_input(return_flags, line_statuses, values, stream, mr);
+    auto projected = make_q1_projected_input(return_flags, line_statuses, values, stream, mr);
+    require_matches_sequential(raw->view(), projected->view());
+  }
+
+  SECTION("non-zero-offset slice")
+  {
+    std::vector<std::string> const return_flags{"Z", "N", "A", "N", "A", "A", "N", "A", "N", "Z"};
+    std::vector<std::string> const line_statuses{"Z", "O", "F", "F", "O", "F", "O", "O", "F", "Z"};
+    std::array<std::vector<int64_t>, 4> const values{
+      std::vector<int64_t>{999, 100, 200, 300, 400, 500, 600, 700, 800, 999},
+      std::vector<int64_t>{999, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 999},
+      std::vector<int64_t>{99, 5, 10, 15, 20, 25, 30, 35, 40, 99},
+      std::vector<int64_t>{99, 2, 4, 6, 8, 10, 12, 14, 16, 99}};
+
+    auto raw       = make_q1_raw_input(return_flags, line_statuses, values, stream, mr);
+    auto projected = make_q1_projected_input(return_flags, line_statuses, values, stream, mr);
+    auto raw_slice = cudf::slice(raw->view(), {1, raw->num_rows() - 1}, stream).front();
+    auto projected_slice =
+      cudf::slice(projected->view(), {1, projected->num_rows() - 1}, stream).front();
+    REQUIRE(raw_slice.column(0).offset() == 1);
+    REQUIRE(raw_slice.column(2).offset() == 1);
+    REQUIRE(projected_slice.column(4).offset() == 1);
+    require_matches_sequential(raw_slice, projected_slice);
+  }
+}
+
+TEST_CASE("fused Q1 projection aggregate rejects a malformed logical-state map",
+          "[physical_grouped_aggregate][tiny_domain_q1_projection]")
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = cudf::get_current_device_resource_ref();
+
+  std::vector<std::string> const return_flags{"A", "A", "N", "N"};
+  std::vector<std::string> const line_statuses{"F", "O", "F", "O"};
+  std::array<std::vector<int64_t>, 4> const values{std::vector<int64_t>(4, 100),
+                                                   std::vector<int64_t>(4, 1000),
+                                                   std::vector<int64_t>(4, 5),
+                                                   std::vector<int64_t>(4, 2)};
+  auto raw                    = make_q1_raw_input(return_flags, line_statuses, values, stream, mr);
+  auto plan                   = q1_projection_plan();
+  plan.logical_to_physical[0] = 5;
+
+  auto attempt =
+    try_tiny_domain_q1_projection_aggregate(raw->view(), plan, q1_aggregate_kinds(), stream, mr);
+  REQUIRE_FALSE(attempt);
+  REQUIRE(attempt.table == nullptr);
+  REQUIRE(attempt.fallback_reason.find("logical states do not match") != std::string::npos);
 }
 
 TEST_CASE("tiny-domain aggregate fails closed for overflow and out-of-domain inputs",

@@ -32,6 +32,10 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "expression/ast/node.hpp"
+#include "expression/function_id.hpp"
+#include "expression/value.hpp"
+#include "late_mat/column_origin.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
@@ -66,8 +70,12 @@
 
 #include <cudf/cudf_utils.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <numeric>
 #include <utility>
+#include <variant>
 
 namespace sirius::planner {
 
@@ -387,6 +395,229 @@ void replace_with_gpu_values(duckdb::unique_ptr<sirius::op::sirius_physical_oper
     default: return;
   }
   slot = std::move(gpu_values);
+}
+[[nodiscard]] bool exact_projection_type(sirius::op::sirius_physical_projection const& projection,
+                                         std::size_t output,
+                                         sirius::logical_type const& expected)
+{
+  return output < projection.types.size() && output < projection.select_list.size() &&
+         projection.types[output] == expected && projection.select_list[output] &&
+         projection.select_list[output]->return_type() == expected;
+}
+
+[[nodiscard]] sirius::ast::reference const* exact_reference(sirius::ast::node const* expression,
+                                                            sirius::logical_type const& expected)
+{
+  if (!expression || !expression->holds<sirius::ast::reference>() ||
+      expression->return_type() != expected) {
+    return nullptr;
+  }
+  return &expression->get<sirius::ast::reference>();
+}
+
+[[nodiscard]] sirius::ast::function_call const* exact_binary_function(
+  sirius::ast::node const* expression,
+  sirius::function_id function,
+  sirius::logical_type const& expected)
+{
+  if (!expression || !expression->holds<sirius::ast::function_call>() ||
+      expression->return_type() != expected) {
+    return nullptr;
+  }
+  auto const& call = expression->get<sirius::ast::function_call>();
+  return call.function() == function && call.arguments().size() == 2 ? &call : nullptr;
+}
+
+[[nodiscard]] bool exact_folded_decimal_one(sirius::ast::node const* expression)
+{
+  auto const one_type = sirius::logical_type::make_decimal(16, 2);
+  if (!expression || !expression->holds<sirius::ast::constant>() ||
+      expression->return_type() != one_type) {
+    return false;
+  }
+  auto const& payload = expression->get<sirius::ast::constant>().payload;
+  auto const* decimal = std::get_if<sirius::decimal64>(&payload);
+  return decimal != nullptr && decimal->value == 100 && decimal->scale == 2;
+}
+
+[[nodiscard]] bool exact_reference_output(sirius::op::sirius_physical_projection const& projection,
+                                          std::size_t output,
+                                          uint32_t input,
+                                          sirius::logical_type const& expected)
+{
+  if (!exact_projection_type(projection, output, expected)) { return false; }
+  auto const* reference = exact_reference(projection.select_list[output].get(), expected);
+  return reference != nullptr && reference->column_index == input;
+}
+
+[[nodiscard]] bool try_install_tiny_domain_q1_projection_fusion(
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot, duckdb::ClientContext& context)
+{
+  using sirius::op::SiriusPhysicalOperatorType;
+  using sirius::op::tiny_domain_q1_projection_plan;
+  using sirius::op::tiny_domain_q1_value_source;
+
+  if (!slot || slot->type != SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+      sirius::late_mat::late_mat_enabled() || duckdb::compressed_materialization_enabled(context)) {
+    return false;
+  }
+
+  auto& aggregate = slot->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+  if (!aggregate.tiny_domain_strategy_enabled() ||
+      aggregate.tiny_domain_projection_fusion_enabled() || aggregate.children.size() != 1 ||
+      aggregate.grouping_sets.size() > 1 || aggregate.has_count_distinct || !aggregate.has_avg ||
+      aggregate.group_idx != std::vector<int>{0, 1}) {
+    return false;
+  }
+
+  std::vector<cudf::aggregation::Kind> const expected_kinds{cudf::aggregation::Kind::SUM,
+                                                            cudf::aggregation::Kind::SUM,
+                                                            cudf::aggregation::Kind::SUM,
+                                                            cudf::aggregation::Kind::SUM,
+                                                            cudf::aggregation::Kind::SUM,
+                                                            cudf::aggregation::Kind::COUNT_VALID,
+                                                            cudf::aggregation::Kind::SUM,
+                                                            cudf::aggregation::Kind::COUNT_VALID,
+                                                            cudf::aggregation::Kind::SUM,
+                                                            cudf::aggregation::Kind::COUNT_VALID,
+                                                            cudf::aggregation::Kind::COUNT_ALL};
+  std::vector<int> const expected_indices{2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 0};
+  if (aggregate.cudf_aggregates != expected_kinds ||
+      aggregate.cudf_aggregate_idx != expected_indices ||
+      aggregate.cudf_aggregate_struct_col_indices.size() != expected_kinds.size() ||
+      std::ranges::any_of(aggregate.cudf_aggregate_struct_col_indices,
+                          [](auto const& indices) { return !indices.empty(); })) {
+    return false;
+  }
+
+  auto* p2_base = aggregate.children[0].get();
+  if (!p2_base || p2_base->type != SiriusPhysicalOperatorType::PROJECTION ||
+      p2_base->children.size() != 1) {
+    return false;
+  }
+  auto& p2      = p2_base->Cast<sirius::op::sirius_physical_projection>();
+  auto* p1_base = p2.children[0].get();
+  if (!p1_base || p1_base->type != SiriusPhysicalOperatorType::PROJECTION ||
+      p1_base->children.size() != 1) {
+    return false;
+  }
+  auto& p1  = p1_base->Cast<sirius::op::sirius_physical_projection>();
+  auto* raw = p1.children[0].get();
+  if (!raw || raw->types.size() != 6 || p1.types.size() != 7 || p1.select_list.size() != 7 ||
+      p2.types.size() != 9 || p2.select_list.size() != 9) {
+    return false;
+  }
+
+  auto const string_type  = sirius::logical_type::make(sirius::type_id::VARCHAR);
+  auto const decimal_15_2 = sirius::logical_type::make_decimal(15, 2);
+  auto const decimal_16_2 = sirius::logical_type::make_decimal(16, 2);
+  auto const decimal_18_4 = sirius::logical_type::make_decimal(18, 4);
+  auto const decimal_18_6 = sirius::logical_type::make_decimal(18, 6);
+
+  if (!exact_projection_type(p1, 0, string_type) || !exact_projection_type(p1, 1, string_type) ||
+      !exact_projection_type(p1, 2, decimal_15_2) || !exact_projection_type(p1, 3, decimal_15_2) ||
+      !exact_projection_type(p1, 4, decimal_18_4) || !exact_projection_type(p1, 5, decimal_15_2) ||
+      !exact_projection_type(p1, 6, decimal_15_2)) {
+    return false;
+  }
+
+  auto const* group0      = exact_reference(p1.select_list[0].get(), string_type);
+  auto const* group1      = exact_reference(p1.select_list[1].get(), string_type);
+  auto const* independent = exact_reference(p1.select_list[2].get(), decimal_15_2);
+  auto const* price       = exact_reference(p1.select_list[3].get(), decimal_15_2);
+  auto const* tax         = exact_reference(p1.select_list[5].get(), decimal_15_2);
+  auto const* discount    = exact_reference(p1.select_list[6].get(), decimal_15_2);
+  if (!group0 || !group1 || !independent || !price || !tax || !discount) { return false; }
+
+  auto const* discounted =
+    exact_binary_function(p1.select_list[4].get(), sirius::function_id::mul, decimal_18_4);
+  if (!discounted) { return false; }
+  auto const* discounted_price = exact_reference(discounted->arguments()[0].get(), decimal_15_2);
+  auto const* discount_factor =
+    exact_binary_function(discounted->arguments()[1].get(), sirius::function_id::sub, decimal_16_2);
+  if (!discounted_price || discounted_price->column_index != price->column_index ||
+      !discount_factor || !exact_folded_decimal_one(discount_factor->arguments()[0].get())) {
+    return false;
+  }
+  auto const* discounted_discount =
+    exact_reference(discount_factor->arguments()[1].get(), decimal_15_2);
+  if (!discounted_discount || discounted_discount->column_index != discount->column_index) {
+    return false;
+  }
+
+  if (!exact_reference_output(p2, 0, 0, string_type) ||
+      !exact_reference_output(p2, 1, 1, string_type) ||
+      !exact_reference_output(p2, 2, 2, decimal_15_2) ||
+      !exact_reference_output(p2, 3, 3, decimal_15_2) ||
+      !exact_reference_output(p2, 4, 4, decimal_18_4) ||
+      !exact_projection_type(p2, 5, decimal_18_6) ||
+      !exact_reference_output(p2, 6, 2, decimal_15_2) ||
+      !exact_reference_output(p2, 7, 3, decimal_15_2) ||
+      !exact_reference_output(p2, 8, 6, decimal_15_2)) {
+    return false;
+  }
+
+  auto const* charge =
+    exact_binary_function(p2.select_list[5].get(), sirius::function_id::mul, decimal_18_6);
+  if (!charge) { return false; }
+  auto const* charge_discounted = exact_reference(charge->arguments()[0].get(), decimal_18_4);
+  auto const* tax_factor =
+    exact_binary_function(charge->arguments()[1].get(), sirius::function_id::add, decimal_16_2);
+  if (!charge_discounted || charge_discounted->column_index != 4 || !tax_factor ||
+      !exact_folded_decimal_one(tax_factor->arguments()[0].get())) {
+    return false;
+  }
+  auto const* charge_tax = exact_reference(tax_factor->arguments()[1].get(), decimal_15_2);
+  if (!charge_tax || charge_tax->column_index != 5) { return false; }
+
+  std::array<uint32_t, 6> raw_indices{group0->column_index,
+                                      group1->column_index,
+                                      independent->column_index,
+                                      price->column_index,
+                                      discount->column_index,
+                                      tax->column_index};
+  auto sorted_raw_indices = raw_indices;
+  std::sort(sorted_raw_indices.begin(), sorted_raw_indices.end());
+  if (sorted_raw_indices != std::array<uint32_t, 6>{0, 1, 2, 3, 4, 5} ||
+      raw->types[group0->column_index] != string_type ||
+      raw->types[group1->column_index] != string_type ||
+      raw->types[independent->column_index] != decimal_15_2 ||
+      raw->types[price->column_index] != decimal_15_2 ||
+      raw->types[discount->column_index] != decimal_15_2 ||
+      raw->types[tax->column_index] != decimal_15_2) {
+    return false;
+  }
+
+  tiny_domain_q1_projection_plan plan{
+    {static_cast<int>(group0->column_index), static_cast<int>(group1->column_index)},
+    {static_cast<int>(independent->column_index),
+     static_cast<int>(price->column_index),
+     static_cast<int>(discount->column_index),
+     static_cast<int>(tax->column_index)},
+    {decimal_15_2, decimal_15_2, decimal_15_2, decimal_15_2},
+    {decimal_15_2, decimal_15_2, decimal_18_4, decimal_18_6, decimal_15_2},
+    {tiny_domain_q1_value_source::independent_sum,
+     tiny_domain_q1_value_source::price,
+     tiny_domain_q1_value_source::discounted_price,
+     tiny_domain_q1_value_source::charge,
+     tiny_domain_q1_value_source::discount},
+    {0, 1, 2, 3, 0, 5, 1, 5, 4, 5, 5}};
+
+  auto p2_owned  = std::move(aggregate.children[0]);
+  auto p1_owned  = std::move(p2_owned->children[0]);
+  auto raw_owned = std::move(p1_owned->children[0]);
+  p1_owned->children.clear();
+  p2_owned->children.clear();
+  aggregate.children[0] = std::move(raw_owned);
+
+  std::vector<duckdb::unique_ptr<sirius::op::sirius_physical_operator>> fallback_stages;
+  fallback_stages.reserve(2);
+  fallback_stages.push_back(std::move(p1_owned));
+  fallback_stages.push_back(std::move(p2_owned));
+  aggregate.install_tiny_domain_projection_fusion(std::move(plan), std::move(fallback_stages));
+  SIRIUS_LOG_INFO(
+    "[sirius_physical_plan_generator] installed exact Q1 projection-to-aggregate fusion");
+  return true;
 }
 
 //! Replace a HASH_GROUP_BY slot with `GROUPED_AGGREGATE_MERGE → PARTITION → HASH_GROUP_BY →
@@ -764,6 +995,7 @@ void insert_gpu_pipeline_operators_recursive(
       break;
     }
     case sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY:
+      (void)try_install_tiny_domain_q1_projection_fusion(slot, context);
       wrap_hash_group_by(slot, op_params, compressed_materialization_observer);
       break;
     case sirius::op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE:
