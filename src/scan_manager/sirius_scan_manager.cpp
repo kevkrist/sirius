@@ -1288,8 +1288,8 @@ sirius_scan_manager::sirius_scan_manager(
     if (!_io_ctx) {
       throw std::runtime_error("[sirius_scan_manager] failed to create uring io_context");
     }
-    SIRIUS_LOG_DEBUG("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
-                     _config.uring_n_reactors);
+    SIRIUS_LOG_INFO("[sirius_scan_manager] sirius_datasource enabled (uring_ioctx n_reactors={})",
+                    _config.uring_n_reactors);
   } else {
     if (_topology_index->gpu_ids().size() > 1) {
       throw std::runtime_error(
