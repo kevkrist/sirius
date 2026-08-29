@@ -25,6 +25,7 @@
 #include "io/types.hpp"
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/duckdb_native_read_overlap.hpp"
 #include "sirius_context.hpp"
 
 #include <cudf/column/column.hpp>
@@ -42,6 +43,7 @@
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -79,12 +81,17 @@ namespace sirius::op::scan {
 
 namespace {
 
+using ::sirius::cuda::scan::decode_descriptor_arena;
 using ::sirius::cuda::scan::gpu_codec_run;
 using ::sirius::cuda::scan::gpu_column_decode_input;
 using ::sirius::cuda::scan::gpu_segment_desc;
 using ::sirius::cuda::scan::gpu_string_codec_run;
 using ::sirius::cuda::scan::gpu_string_column_decode_input;
 using ::sirius::cuda::scan::gpu_string_segment_desc;
+using ::sirius::cuda::scan::prepare_strings_column_decode;
+using ::sirius::cuda::scan::prepare_table_decode;
+using ::sirius::cuda::scan::prepared_strings_column_decode;
+using ::sirius::cuda::scan::prepared_table_decode;
 
 constexpr char const* kTag = "[sirius_gpu_duckdb_native_scan]";
 
@@ -671,20 +678,135 @@ staged_column stage_one_array_column(staging_state& s,
 //===----------------------------------------------------------------------===//
 // Issue staged reads into a pinned host buffer, then copy them to the device.
 //
-// File-near segment reads are coalesced into large sequential reads (bridging the
-// per-block header gaps) and dispatched as one batch via host_read_ranges_async_io,
-// packed into a pinned multiple_blocks_allocation; the 16B device alignment the decode kernels need
-// is imposed by the per-segment H2D scatter instead.
+// File-near segment reads are coalesced into large sequential reads (bridging the per-block
+// header gaps), packed into a pinned multiple_blocks_allocation; the 16B device alignment the
+// decode kernels need is imposed by the per-segment H2D scatter instead. The coalesced pieces
+// partition into sub-batches (op/scan/duckdb_native_read_overlap.hpp): every sub-batch's
+// asynchronous read is issued up front via host_read_ranges_async_io, and as each completes its
+// per-segment H2D copies enqueue -- so the GPU uploads earlier sub-batches while the io service
+// is still reading later ones. The pinned staging blocks are released through a CUDA event
+// recorded behind the split's last H2D (deferred_staging_release) instead of a blanket
+// post-H2D stream synchronize, so the task thread never waits on the copies.
 //===----------------------------------------------------------------------===//
 
 using multiple_blocks_allocation =
   cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
+/// Sub-batch byte target for the read -> H2D overlap. Large enough to amortize the per-sub-batch
+/// H2D submit cost, small enough that the first upload starts well before the whole read
+/// completes (an 8 GB split yields ~4-16 sub-batches at typical on-disk sizes).
+constexpr std::size_t kReadSubBatchTargetBytes = std::size_t{512} << 20;
+
+/// @brief Deferred, event-gated release of a split's pinned read staging.
+///
+/// Removing the post-H2D stream synchronize means `submit_reads_and_stage_h2d` returns while its
+/// host-to-device copies may still be reading the pinned FSMR blocks, so the blocks (and the host
+/// reservation backing them) cannot unwind with the function -- they would return to the shared
+/// host pool and be reused mid-copy. Instead each split hands them here with a CUDA event
+/// recorded behind its last H2D enqueue, and they are released once that event has completed.
+///
+/// One instance per task thread (thread-local). The release points are chosen so no host wait
+/// lands on a split's critical path, and so a thread never blocks inside the host pool's
+/// no-timeout `request_reservation` while it still holds blocks only it could free: `drain()`
+/// runs before each new staging reservation (its wait is against events recorded a whole split
+/// earlier, in practice long since fired), and `reap_completed()` opportunistically frees
+/// finished entries whenever one is added. Residual: an idle thread can hold its last split's
+/// staging until its next split or thread exit; VALIDATION.md carries the budget arithmetic.
+class deferred_staging_release {
+ public:
+  static deferred_staging_release& local()
+  {
+    static thread_local deferred_staging_release registry;
+    return registry;
+  }
+
+  /// Takes ownership of a split's staging blocks + reservation, gated on an event recorded on
+  /// @p stream (which must be ordered after the split's last H2D enqueue).
+  void add(rmm::cuda_stream_view stream,
+           std::unique_ptr<multiple_blocks_allocation> blocks,
+           std::unique_ptr<cucascade::memory::reservation> resv)
+  {
+    cudaEvent_t ev = nullptr;
+    if (!_free_events.empty()) {
+      ev = _free_events.back();
+      _free_events.pop_back();
+    } else {
+      auto const create_status = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+      if (create_status != cudaSuccess) {
+        // Without an event the entry could never be released; fall back to the blanket sync so
+        // the unwind (blocks + resv destruct in the caller) stays safe, then surface the error.
+        cudaStreamSynchronize(stream.value());
+        RMM_CUDA_TRY(create_status);
+      }
+    }
+    auto const record_status = cudaEventRecord(ev, stream.value());
+    if (record_status != cudaSuccess) {
+      // Same fallback as above: unreleasable entries must not be enqueued.
+      _free_events.push_back(ev);
+      cudaStreamSynchronize(stream.value());
+      RMM_CUDA_TRY(record_status);
+    }
+    _entries.push_back(entry{std::move(resv), std::move(blocks), ev});
+    reap_completed();
+  }
+
+  /// Releases every entry whose event has completed (non-blocking).
+  void reap_completed()
+  {
+    std::erase_if(_entries, [this](entry& e) {
+      if (cudaEventQuery(e.event) != cudaSuccess) { return false; }
+      _free_events.push_back(e.event);
+      return true;
+    });
+  }
+
+  /// Waits for every entry's event and releases them all. The events were recorded behind
+  /// already-enqueued copies, so the wait is bounded by GPU progress alone.
+  void drain()
+  {
+    for (auto& e : _entries) {
+      RMM_CUDA_TRY(cudaEventSynchronize(e.event));
+      _free_events.push_back(e.event);
+    }
+    _entries.clear();
+  }
+
+  ~deferred_staging_release()
+  {
+    // Thread teardown: best effort -- the CUDA context may already be gone, and an error here
+    // has no better recovery than proceeding with the release.
+    for (auto& e : _entries) {
+      cudaEventSynchronize(e.event);
+    }
+    _entries.clear();
+    for (auto* ev : _free_events) {
+      cudaEventDestroy(ev);
+    }
+  }
+
+  deferred_staging_release(deferred_staging_release const&)            = delete;
+  deferred_staging_release& operator=(deferred_staging_release const&) = delete;
+
+ private:
+  deferred_staging_release() = default;
+
+  struct entry {
+    // Declaration order is load-bearing: `blocks` returns its chunks against the reservation's
+    // arena on destruction, so it must be destroyed BEFORE `reservation` (members destroy in
+    // reverse declaration order).
+    std::unique_ptr<cucascade::memory::reservation> reservation;
+    std::unique_ptr<multiple_blocks_allocation> blocks;
+    cudaEvent_t event = nullptr;
+  };
+  std::vector<entry> _entries;
+  std::vector<cudaEvent_t> _free_events;
+};
+
 /// @brief Batched pinned->device H2D (one cudaMemcpyBatchAsync launch); per-entry
 /// fallback on toolkits without the batch API.
-void batched_h2d(std::vector<void*> const& dst,
-                 std::vector<void const*> const& src,
-                 std::vector<std::size_t> const& size,
+void batched_h2d(std::span<void* const> dst,
+                 std::span<void const* const> src,
+                 std::span<std::size_t const> size,
                  rmm::cuda_stream_view stream)
 {
   if (dst.empty()) { return; }
@@ -719,13 +841,13 @@ void batched_h2d(std::vector<void*> const& dst,
 #endif
 }
 
-void submit_and_await(rmm::device_buffer& device_buf,
-                      staging_state const& s,
-                      const sirius::io::sirius_datasource& datasource,
-                      cucascade::memory::memory_reservation_manager& host_mem_mgr,
-                      int host_numa_node,
-                      std::size_t coalesce_max_gap,
-                      rmm::cuda_stream_view stream)
+void submit_reads_and_stage_h2d(rmm::device_buffer& device_buf,
+                                staging_state const& s,
+                                const sirius::io::sirius_datasource& datasource,
+                                cucascade::memory::memory_reservation_manager& host_mem_mgr,
+                                int host_numa_node,
+                                std::size_t coalesce_max_gap,
+                                rmm::cuda_stream_view stream)
 {
   namespace ccm = cucascade::memory;
 
@@ -763,8 +885,10 @@ void submit_and_await(rmm::device_buffer& device_buf,
 
   std::vector<piece> pieces;
   std::vector<seg_copy> seg_copies;
+  std::vector<std::size_t> piece_first_seg_copy;  // seg_copies index where each piece starts
   pieces.reserve(reads.size());
   seg_copies.reserve(reads.size());
+  piece_first_seg_copy.reserve(reads.size());
   std::size_t cur_block = 0, cur_off = 0;
   for (auto const& r : reads) {
     if (r.size == 0) { continue; }
@@ -781,6 +905,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
         cur_off = 0;
       }
       pieces.push_back({r.file_offset, r.file_offset + r.size, cur_block, cur_off});
+      piece_first_seg_copy.push_back(seg_copies.size());
     } else {
       pieces.back().file_end = r.file_offset + r.size;
     }
@@ -789,6 +914,11 @@ void submit_and_await(rmm::device_buffer& device_buf,
       {p.host_block, p.host_off + (r.file_offset - p.file_off), r.device_offset, r.size});
     cur_off = p.host_off + (p.file_end - p.file_off);
   }
+
+  // Release any staging this thread deferred for an earlier split BEFORE taking a new
+  // reservation, so the thread never enters the pool's no-timeout wait while holding blocks
+  // only it could free. The events were recorded a whole split ago; in practice this never waits.
+  deferred_staging_release::local().drain();
 
   // Reserve and allocate exactly the host bytes the pieces occupy (cur_block + 1 blocks),
   // not the device-buffer size, preferring the GPU's local NUMA node. The strategy may fall
@@ -813,60 +943,102 @@ void submit_and_await(rmm::device_buffer& device_buf,
 
   // One coalesced range + contiguous dst span per piece.
   std::vector<io::io_object_segment> ranges;
+  std::vector<std::size_t> piece_bytes;
   ranges.reserve(pieces.size());
-  std::size_t total_read = 0;
+  piece_bytes.reserve(pieces.size());
   for (auto const& p : pieces) {
     std::size_t const sz = p.file_end - p.file_off;
     ranges.emplace_back(
       p.file_off,
       sz,
       reinterpret_cast<std::uint8_t*>(host_alloc->at(p.host_block).data()) + p.host_off);
-    total_read += sz;
+    piece_bytes.push_back(sz);
   }
 
-  // Issue the coalesced reads as one batch and await completion.
-  {
-    nvtx3::scoped_range nvtx_reads{"native_reads"};
-    auto io_ctx           = datasource.io_ctx();
-    auto fut              = io_ctx->host_read_ranges_async_io(datasource.io_object(), ranges);
-    std::size_t const got = std::move(fut).get();
-    if (got != total_read) {
-      throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +
-                               std::to_string(got) + " expected " + std::to_string(total_read));
-    }
-  }
-
-  // CPU-produced segments (CONSTANT/ROARING): copy straight to their device slots; no
-  // overwrite hazard since each segment owns a disjoint device range.
+  // CPU-produced segments (CONSTANT/ROARING): copy straight to their device slots; no overwrite
+  // hazard since each segment owns a disjoint device range, and no dependency on the file reads.
+  // The sources are PAGEABLE host memory, so cudaMemcpyAsync stages their bytes before returning
+  // -- their owners (the staging_state local and the enclosing scan_info) only need to outlive
+  // this call, not the copies' completion, which is why the event scheme below need not cover
+  // them.
   for (auto const& h : s.host_copies) {
     RMM_CUDA_TRY(cudaMemcpyAsync(
       device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.value()));
   }
 
-  // Per-segment H2D: host (packed) -> device (16B-aligned), batched. Sync before
-  // host_alloc / reservation drop so the copies finish reading pinned memory first.
-  {
-    nvtx3::scoped_range nvtx_h2d{"native_h2d"};
-    std::vector<void*> h2d_dst;
-    std::vector<void const*> h2d_src;
-    std::vector<std::size_t> h2d_size;
-    h2d_dst.reserve(seg_copies.size());
-    h2d_src.reserve(seg_copies.size());
-    h2d_size.reserve(seg_copies.size());
-    for (auto const& c : seg_copies) {
-      h2d_dst.push_back(device_base + c.device_off);
-      h2d_src.push_back(reinterpret_cast<uint8_t*>(host_alloc->at(c.host_block).data()) +
-                        c.host_off);
-      h2d_size.push_back(c.size);
-    }
-    batched_h2d(h2d_dst, h2d_src, h2d_size, stream);
-    RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  // Per-segment H2D targets: host (packed) -> device (16B-aligned), indexed alongside
+  // seg_copies so each sub-batch's slice is a contiguous span.
+  std::vector<void*> h2d_dst;
+  std::vector<void const*> h2d_src;
+  std::vector<std::size_t> h2d_size;
+  h2d_dst.reserve(seg_copies.size());
+  h2d_src.reserve(seg_copies.size());
+  h2d_size.reserve(seg_copies.size());
+  for (auto const& c : seg_copies) {
+    h2d_dst.push_back(device_base + c.device_off);
+    h2d_src.push_back(reinterpret_cast<uint8_t*>(host_alloc->at(c.host_block).data()) + c.host_off);
+    h2d_size.push_back(c.size);
   }
+
+  // Issue every sub-batch's read now; the io service works requests roughly in submission
+  // order, so awaiting them in order below overlaps later sub-batches' disk reads with earlier
+  // sub-batches' H2D.
+  auto const sub_batches = partition_read_sub_batches(piece_bytes, kReadSubBatchTargetBytes);
+  auto io_ctx            = datasource.io_ctx();
+  std::vector<exec::semi_future<std::size_t>> futures;
+  futures.reserve(sub_batches.size());
+  for (auto const& sb : sub_batches) {
+    futures.push_back(io_ctx->host_read_ranges_async_io(
+      datasource.io_object(),
+      std::span<io::io_object_segment>(ranges.data() + sb.piece_begin,
+                                       sb.piece_end - sb.piece_begin)));
+  }
+
+  {
+    nvtx3::scoped_range nvtx_overlap{"native_reads_h2d_overlap"};
+    await_read_sub_batches(
+      sub_batches.size(),
+      /*wait=*/
+      [&](std::size_t k) {
+        std::size_t const got = std::move(futures[k]).get();
+        if (got != sub_batches[k].bytes) {
+          throw std::runtime_error(
+            std::string(kTag) + " short coalesced host read: got " + std::to_string(got) +
+            " expected " + std::to_string(sub_batches[k].bytes) + " (sub-batch " +
+            std::to_string(k) + " of " + std::to_string(sub_batches.size()) + ")");
+        }
+      },
+      /*on_ready=*/
+      [&](std::size_t k) {
+        auto const& sb              = sub_batches[k];
+        std::size_t const seg_begin = piece_first_seg_copy[sb.piece_begin];
+        std::size_t const seg_end =
+          sb.piece_end < pieces.size() ? piece_first_seg_copy[sb.piece_end] : seg_copies.size();
+        std::size_t const n = seg_end - seg_begin;
+        batched_h2d(std::span<void* const>(h2d_dst.data() + seg_begin, n),
+                    std::span<void const* const>(h2d_src.data() + seg_begin, n),
+                    std::span<std::size_t const>(h2d_size.data() + seg_begin, n),
+                    stream);
+      },
+      /*join_remaining=*/
+      [&](std::size_t j) {
+        if (futures[j].valid()) { (void)std::move(futures[j]).get_try(); }
+      },
+      /*fail_safe=*/
+      [&]() {
+        // Error path: every issued H2D must finish before unwind releases host_alloc /
+        // reservation back to the shared pool. A host wait is acceptable here.
+        cudaStreamSynchronize(stream.value());
+      });
+  }
+
+  // Success: defer the pinned staging release behind the last H2D instead of synchronizing.
+  deferred_staging_release::local().add(stream, std::move(host_alloc), std::move(reservation));
 }
 
 /// H2D for a split with no file reads: no io, no pinned staging blocks, no
 /// SiriusContext. Synchronizes before returning so the caller may drop the
-/// source buffers' owners, same as submit_and_await.
+/// source buffers' owners.
 void submit_host_only_and_await(rmm::device_buffer& device_buf,
                                 staging_state const& s,
                                 rmm::cuda_stream_view stream)
@@ -1087,22 +1259,21 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     // them into one sequential read without pulling the larger unprojected-column waste
     // that sits between row groups.
     std::size_t const coalesce_max_gap = sf_bm->GetBlockHeaderSize();
-    submit_and_await(device_buf,
-                     staging,
-                     *datasource,
-                     sirius_st->get_memory_manager(),
-                     host_numa,
-                     coalesce_max_gap,
-                     stream);
+    submit_reads_and_stage_h2d(device_buf,
+                               staging,
+                               *datasource,
+                               sirius_st->get_memory_manager(),
+                               host_numa,
+                               coalesce_max_gap,
+                               stream);
   } else if (!staging.host_copies.empty()) {
     // All-host split: no file io, no staging blocks, no SiriusContext needed.
     submit_host_only_and_await(device_buf, staging, stream);
   }
 
-  // Group fixed-width columns for a single gpu_decode_table call; varchar
-  // columns each go through gpu_decode_strings_column separately; array
-  // columns decode child data as fixed-width, then wrap into cudf LIST
-  // with offsets child.
+  // Group fixed-width columns for a single prepared table decode; varchar
+  // columns each prepare separately; array columns decode child data as
+  // fixed-width, then wrap into cudf LIST with offsets child.
   std::vector<gpu_column_decode_input> fw_inputs;
   std::vector<std::size_t> fw_to_final_idx;
   std::vector<gpu_string_column_decode_input> vc_inputs;
@@ -1147,28 +1318,68 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     }
   }
 
-  std::vector<std::unique_ptr<cudf::column>> fw_cols;
-  if (!fw_inputs.empty()) {
-    auto fw_table = ::sirius::cuda::scan::gpu_decode_table(fw_inputs, stream, mr_ref);
-    fw_cols       = fw_table->release();
+  // Prepare every column's decode (fixed-width table, varchar columns, array children and
+  // array-level validity) so their kernel descriptors pack into one pinned blob, upload that blob
+  // with a single H2D, then launch all decode kernels. DICT_FSST's prepare keeps its own internal
+  // device round trips (see gpu_decode_strings.cuh). The arena outlives every launch below; its
+  // pinned slab is released through a completion event, never a host wait.
+  decode_descriptor_arena arena;
+
+  std::optional<prepared_table_decode> fw_prep;
+  if (!fw_inputs.empty()) { fw_prep = prepare_table_decode(fw_inputs, arena, stream, mr_ref); }
+
+  std::vector<prepared_strings_column_decode> vc_preps;
+  vc_preps.reserve(vc_inputs.size());
+  for (auto const& vc : vc_inputs) {
+    vc_preps.push_back(prepare_strings_column_decode(vc, arena, stream, mr_ref));
   }
 
+  // Each array child prepares on its own as different columns might have different array sizes
+  // (and therefore different child row counts).
+  std::vector<prepared_table_decode> child_preps;
+  child_preps.reserve(array_child_inputs.size());
+  for (auto const& child_input : array_child_inputs) {
+    child_preps.push_back(prepare_table_decode(
+      std::span<gpu_column_decode_input const>(&child_input, 1), arena, stream, mr_ref));
+  }
+
+  // Array-level validity masks decode as throwaway BOOL8 columns.
+  // TODO: this wastes a throwaway BOOL8 column just to grab the null mask. If
+  // decode_column_validity() were exposed in gpu_native_decode.cuh, we could
+  // decode the array-level mask directly.
+  std::vector<std::optional<prepared_table_decode>> array_validity_preps(array_to_final_idx.size());
+  for (std::size_t ai = 0; ai < array_to_final_idx.size(); ++ai) {
+    auto const& staged = staged_cols[array_to_final_idx[ai]];
+    if (staged.has_nulls && !staged.validity.empty()) {
+      gpu_column_decode_input validity_input;
+      validity_input.out_type   = cudf::data_type{cudf::type_id::BOOL8};  // dummy type
+      validity_input.total_rows = static_cast<uint32_t>(staged.total_rows);
+      validity_input.has_nulls  = true;
+      fill_fixed_width_runs(staged.validity, device_buf, validity_input.validity);
+      array_validity_preps[ai] = prepare_table_decode(
+        std::span<gpu_column_decode_input const>(&validity_input, 1), arena, stream, mr_ref);
+    }
+  }
+
+  arena.flush(stream, mr_ref);
+
+  std::vector<std::unique_ptr<cudf::column>> fw_cols;
+  if (fw_prep) { fw_cols = fw_prep->launch(stream, mr_ref)->release(); }
+
   std::vector<std::unique_ptr<cudf::column>> vc_cols;
-  vc_cols.reserve(vc_inputs.size());
-  for (auto const& vc : vc_inputs) {
-    vc_cols.push_back(::sirius::cuda::scan::gpu_decode_strings_column(vc, stream, mr_ref));
+  vc_cols.reserve(vc_preps.size());
+  for (auto& vc_prep : vc_preps) {
+    vc_cols.push_back(vc_prep.launch(stream, mr_ref));
   }
 
   // Decode ARRAY child data as fixed-width columns, then wrap into LIST with offsets
   std::vector<std::unique_ptr<cudf::column>> array_cols;
   array_cols.reserve(array_child_inputs.size());
   if (!array_child_inputs.empty()) {
-    // Decode each child column on its own as different columns might have different array sizes
     std::vector<std::unique_ptr<cudf::column>> child_cols;
-    child_cols.reserve(array_child_inputs.size());
-    for (auto const& child_input : array_child_inputs) {
-      auto child_table = ::sirius::cuda::scan::gpu_decode_table({child_input}, stream, mr_ref);
-      auto cols        = child_table->release();
+    child_cols.reserve(child_preps.size());
+    for (auto& child_prep : child_preps) {
+      auto cols = child_prep.launch(stream, mr_ref)->release();
       child_cols.push_back(std::move(cols[0]));
     }
 
@@ -1183,23 +1394,11 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
       auto step_scalar = cudf::numeric_scalar<cudf::size_type>(array_size, true, stream, mr_ref);
       auto offsets     = cudf::sequence(total_rows + 1, init_scalar, step_scalar, stream, mr_ref);
 
-      // Decode array-level validity from staged.validity segments
+      // Decode array-level validity from the prepared dummy BOOL8 column.
       rmm::device_buffer parent_null_mask(0, stream, mr_ref);
       cudf::size_type parent_null_count = 0;
-      if (staged.has_nulls && !staged.validity.empty()) {
-        // Temporary decode input for the array validity mask
-        gpu_column_decode_input validity_input;
-        validity_input.out_type   = cudf::data_type{cudf::type_id::BOOL8};  // dummy type
-        validity_input.total_rows = total_rows;
-        validity_input.has_nulls  = true;
-        fill_fixed_width_runs(staged.validity, device_buf, validity_input.validity);
-        // Decode a dummy BOOL8 column to get the null mask
-        // TODO: this wastes a throwaway BOOL8 column just to grab the null mask. If
-        // decode_column_validity() were exposed in gpu_native_decode.cuh, we could
-        // decode the array-level mask directly.
-        auto validity_table =
-          ::sirius::cuda::scan::gpu_decode_table({validity_input}, stream, mr_ref);
-        auto validity_cols = validity_table->release();
+      if (array_validity_preps[ai]) {
+        auto validity_cols = array_validity_preps[ai]->launch(stream, mr_ref)->release();
         parent_null_count  = validity_cols[0]->null_count();
         auto released      = validity_cols[0]->release();
         parent_null_mask   = std::move(*released.null_mask);

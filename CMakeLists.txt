@@ -460,6 +460,7 @@ set(CUDA_SOURCES
     src/cuda/sirius_dynamic_in_list_filter.cu
     src/cuda/sirius_dynamic_small_in_list_filter.cu
     src/cuda/sirius_like_multiliteral.cu
+    src/cuda/scan/decode_descriptor_arena.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
@@ -866,6 +867,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_native_deferred_walk.cpp
     test/cpp/scan/test_duckdb_native_empty_split_decode.cpp
     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
+    test/cpp/scan/test_duckdb_native_read_overlap.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp

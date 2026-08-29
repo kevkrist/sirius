@@ -24,6 +24,7 @@
 #include <cuda/scan/gpu_native_decode.cuh>
 
 #include <cstdint>
+#include <memory>
 
 namespace sirius::cuda::scan {
 
@@ -31,7 +32,19 @@ namespace sirius::cuda::scan {
 /// See `duckdb/src/storage/compression/rle.cpp::RLEConstants::RLE_HEADER_SIZE`.
 static constexpr uint32_t RLE_HEADER_SIZE = sizeof(uint64_t);
 
-//! @brief Decode an RLE codec run into `d_output`.
+//! @brief Prepare an RLE codec run: stage its build and expand descriptors into @p arena and
+//! allocate the prefix-sum working buffers. Returns nullptr when the run has no live segments.
+//! The returned launcher enqueues the two-pass build + expand kernels.
+std::unique_ptr<decode_run_launcher> prepare_rle_data(gpu_codec_run const& run,
+                                                      uint8_t* d_output,
+                                                      cudf::data_type type,
+                                                      uint32_t type_size,
+                                                      decode_descriptor_arena& arena,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr);
+
+//! @brief Decode an RLE codec run into `d_output` in one call (prepare + flush + launch against a
+//! private arena).
 void decode_rle_data(gpu_codec_run const& run,
                      uint8_t* d_output,
                      cudf::data_type type,

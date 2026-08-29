@@ -24,6 +24,8 @@
 //! symbol table, ...) lives inside the segment bytes; per-codec kernels parse
 //! their own headers.
 
+#include "cuda/scan/decode_descriptor_arena.cuh"
+
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
@@ -34,6 +36,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace sirius::cuda::scan {
@@ -72,15 +75,57 @@ struct gpu_column_decode_input {
   bool has_nulls;
 };
 
-/// Decode every column in `cols` into a `cudf::table`. All device work runs
-/// on `stream`; the dispatcher synchronises the stream once before returning,
-/// so columns come back with their `null_count` already populated.
-///
-/// Allocations go through `mr`. Throws `std::runtime_error` if a column
-/// violates a viability invariant (unsupported codec, non-fixed-width type,
-/// malformed validity offset, row count > `cudf::size_type` max). Callers are
-/// expected to pre-filter unsupported columns; these throws are a defensive
-/// backstop, not the primary gate.
+/// Deferred kernel work for one prepared codec run. `prepare_*` functions build and stage a run's
+/// descriptors into a `decode_descriptor_arena` and return one of these; `launch` enqueues the
+/// run's kernels after the arena has been flushed. Concrete launchers own any device working
+/// buffers whose pointers were baked into the staged descriptors.
+class decode_run_launcher {
+ public:
+  virtual ~decode_run_launcher()                                                       = default;
+  virtual void launch(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) = 0;
+};
+
+/// A table decode split into its two phases: `prepare_table_decode` validates the inputs,
+/// allocates the output buffers, builds every codec run's descriptors, and stages them into the
+/// caller's `decode_descriptor_arena`; `launch` then enqueues all decode kernels and assembles the
+/// `cudf::table`. The split exists so `decode_duckdb_native_split` can pack the descriptors of
+/// every column in a scan split (fixed-width, varchar, and array children) into one arena and
+/// upload them with a single host-to-device copy before any kernel runs.
+class prepared_table_decode {
+ public:
+  prepared_table_decode(prepared_table_decode&&) noexcept;
+  prepared_table_decode& operator=(prepared_table_decode&&) noexcept;
+  ~prepared_table_decode();
+
+  /// Enqueues every prepared run's kernels and builds the table. The arena passed to
+  /// `prepare_table_decode` must have been flushed (throws `std::logic_error` otherwise) and must
+  /// outlive the enqueued kernels. Synchronises the stream once for the batched null count, or
+  /// not at all when no column staged validity runs (their null counts are host-known zero).
+  std::unique_ptr<cudf::table> launch(rmm::cuda_stream_view stream,
+                                      rmm::device_async_resource_ref mr);
+
+ private:
+  friend prepared_table_decode prepare_table_decode(std::span<gpu_column_decode_input const> cols,
+                                                    decode_descriptor_arena& arena,
+                                                    rmm::cuda_stream_view stream,
+                                                    rmm::device_async_resource_ref mr);
+  struct impl;
+  explicit prepared_table_decode(std::unique_ptr<impl> state);
+  std::unique_ptr<impl> _impl;
+};
+
+/// Phase one of a table decode (see `prepared_table_decode`). Throws `std::runtime_error` on
+/// viability violations (unsupported codec, non-fixed-width type, malformed validity offset, row
+/// count > `cudf::size_type` max); callers are expected to pre-filter unsupported columns, so
+/// these throws are a defensive backstop, not the primary gate.
+prepared_table_decode prepare_table_decode(std::span<gpu_column_decode_input const> cols,
+                                           decode_descriptor_arena& arena,
+                                           rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr);
+
+/// Decode every column in `cols` into a `cudf::table` in one call: prepares against a private
+/// arena, flushes it, and launches. All device work runs on `stream`; columns come back with
+/// their `null_count` populated. Allocations go through `mr`.
 std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_input> const& cols,
                                               rmm::cuda_stream_view stream,
                                               rmm::device_async_resource_ref mr);

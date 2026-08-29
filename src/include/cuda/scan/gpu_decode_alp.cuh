@@ -31,6 +31,7 @@
 #include <duckdb/storage/compression/alprd/alprd_constants.hpp>
 
 #include <cstdint>
+#include <memory>
 
 namespace sirius::cuda::scan {
 
@@ -47,6 +48,25 @@ inline constexpr uint32_t ALPRD_HEADER_SIZE   = duckdb::AlpRDConstants::HEADER_S
 
 // `type_size` must be 4 (float) or 8 (double); other widths throw.
 // Output is written at `seg.row_offset * type_size` for each segment.
+// The prepare_* variants stage the per-vector descriptors into the caller's arena and return a
+// launcher (nullptr when the run has no live vectors); the decode_* variants prepare + flush +
+// launch in one call against a private arena.
+std::unique_ptr<decode_run_launcher> prepare_alp_data(gpu_codec_run const& run,
+                                                      uint8_t* d_output,
+                                                      cudf::data_type type,
+                                                      uint32_t type_size,
+                                                      decode_descriptor_arena& arena,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr);
+
+std::unique_ptr<decode_run_launcher> prepare_alprd_data(gpu_codec_run const& run,
+                                                        uint8_t* d_output,
+                                                        cudf::data_type type,
+                                                        uint32_t type_size,
+                                                        decode_descriptor_arena& arena,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref mr);
+
 void decode_alp_data(gpu_codec_run const& run,
                      uint8_t* d_output,
                      cudf::data_type type,

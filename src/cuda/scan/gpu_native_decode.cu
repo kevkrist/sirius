@@ -17,13 +17,18 @@
 //===----------------------------------------------------------------------===//
 // GPU decode pipeline — entry point and codec dispatch.
 //
-// gpu_decode_table decodes one row-group slice. For each column it runs the
-// data codec(s) into a values buffer and the validity codec(s) into a null
-// mask, builds a cudf::column, then finishes the table with one batched
-// null-count.
+// A table decode runs in two phases. `prepare_table_decode` validates the
+// inputs, allocates each column's output buffers, builds every codec run's
+// kernel descriptors, and stages them into the caller's
+// `decode_descriptor_arena`; after the caller flushes the arena (one pinned
+// host-to-device copy for every staged descriptor), `prepared_table_decode::
+// launch` enqueues the decode kernels and finishes the table with one batched
+// null-count (skipped entirely when no column staged validity runs).
+// `gpu_decode_table` wraps both phases around a private arena for callers
+// that decode a single table.
 //
 // A column's data is a sequence of runs, each carrying one codec.
-// dispatch_data_run routes a run by codec:
+// prepare_data_run routes a run by codec:
 //
 //   UNCOMPRESSED   device-to-device copy                   (this file)
 //   CONSTANT       broadcast one value to every row        (this file)
@@ -150,13 +155,41 @@ void launch_broadcast_constant(uint8_t* d_dest,
   cudf::type_dispatcher(type, broadcast_dispatch{}, d_dest, d_val_src, row_count, stream);
 }
 
+/// Deferred CONSTANT broadcasts: one kernel per live segment; the constant
+/// values live in the segments' device bytes, so nothing is staged.
 /// @todo [KEVIN]: consider batching to align execution and design here.
-void decode_constant_data(gpu_codec_run const& run,
-                          uint8_t* d_output,
-                          cudf::data_type type,
-                          uint32_t type_size,
-                          rmm::cuda_stream_view stream)
+class constant_run_launcher final : public decode_run_launcher {
+ public:
+  constant_run_launcher(std::vector<gpu_segment_desc> segments,
+                        uint8_t* d_output,
+                        cudf::data_type type,
+                        uint32_t type_size)
+    : _segments(std::move(segments)), _d_output(d_output), _type(type), _type_size(type_size)
+  {
+  }
+
+  void launch(rmm::cuda_stream_view stream, rmm::device_async_resource_ref /*mr*/) override
+  {
+    for (auto const& seg : _segments) {
+      launch_broadcast_constant(
+        _d_output + size_t{seg.row_offset} * _type_size, seg.d_bytes, _type, seg.row_count, stream);
+    }
+  }
+
+ private:
+  std::vector<gpu_segment_desc> _segments;
+  uint8_t* _d_output;
+  cudf::data_type _type;
+  uint32_t _type_size;
+};
+
+std::unique_ptr<decode_run_launcher> prepare_constant_data(gpu_codec_run const& run,
+                                                           uint8_t* d_output,
+                                                           cudf::data_type type,
+                                                           uint32_t type_size)
 {
+  std::vector<gpu_segment_desc> live;
+  live.reserve(run.segments.size());
   for (auto const& seg : run.segments) {
     if (seg.row_count == 0) continue;
     if (seg.bytes_size < type_size) {
@@ -164,9 +197,10 @@ void decode_constant_data(gpu_codec_run const& run,
                                std::to_string(seg.bytes_size) + ") < type_size (" +
                                std::to_string(type_size) + ")");
     }
-    launch_broadcast_constant(
-      d_output + size_t{seg.row_offset} * type_size, seg.d_bytes, type, seg.row_count, stream);
+    live.push_back(seg);
   }
+  if (live.empty()) return nullptr;
+  return std::make_unique<constant_run_launcher>(std::move(live), d_output, type, type_size);
 }
 
 //===----------------------------------------------------------------------===//
@@ -215,14 +249,54 @@ __global__ void kernel_batched_memcpy(copy_chunk_desc const* __restrict__ chunks
     c.dst[i] = c.src[i];
 }
 
+/// Deferred single-copy work shared by the one-live-segment UNCOMPRESSED and
+/// validity paths.
+class single_memcpy_launcher final : public decode_run_launcher {
+ public:
+  single_memcpy_launcher(void* dst, void const* src, size_t bytes)
+    : _dst(dst), _src(src), _bytes(bytes)
+  {
+  }
+
+  void launch(rmm::cuda_stream_view stream, rmm::device_async_resource_ref /*mr*/) override
+  {
+    RMM_CUDA_TRY(cudaMemcpyAsync(_dst, _src, _bytes, cudaMemcpyDeviceToDevice, stream.value()));
+  }
+
+ private:
+  void* _dst;
+  void const* _src;
+  size_t _bytes;
+};
+
+/// Deferred multi-segment UNCOMPRESSED copy over `copy_chunk_desc`s staged in
+/// the arena at prepare time.
+class uncompressed_run_launcher final : public decode_run_launcher {
+ public:
+  uncompressed_run_launcher(decode_descriptor_arena const& arena, arena_slot chunks)
+    : _arena(&arena), _chunks(chunks)
+  {
+  }
+
+  void launch(rmm::cuda_stream_view stream, rmm::device_async_resource_ref /*mr*/) override
+  {
+    auto const* d_chunks = _arena->device_ptr<copy_chunk_desc>(_chunks);
+    auto const n         = static_cast<uint32_t>(_chunks.count);
+    kernel_batched_memcpy<<<n, DECODE_BLOCK_DIM, 0, stream.value()>>>(d_chunks, n);
+  }
+
+ private:
+  decode_descriptor_arena const* _arena;
+  arena_slot _chunks;
+};
+
 /// Copies UNCOMPRESSED segments to the output. A single live segment uses a
 /// direct `cudaMemcpyAsync`; multiple segments are split into `COPY_CHUNK_BYTES`
 /// chunks and copied by one `kernel_batched_memcpy` launch.
-void decode_uncompressed_data(gpu_codec_run const& run,
-                              uint8_t* d_output,
-                              uint32_t type_size,
-                              rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr)
+std::unique_ptr<decode_run_launcher> prepare_uncompressed_data(gpu_codec_run const& run,
+                                                               uint8_t* d_output,
+                                                               uint32_t type_size,
+                                                               decode_descriptor_arena& arena)
 {
   // Each live segment must own at least row_count * type_size bytes — the
   // memcpy below would otherwise read past the end of the source buffer.
@@ -247,15 +321,13 @@ void decode_uncompressed_data(gpu_codec_run const& run,
     ++live_count;
     if (live_count > 1) break;
   }
-  if (live_count == 0) return;
+  if (live_count == 0) return nullptr;
 
   if (live_count == 1) {
-    RMM_CUDA_TRY(cudaMemcpyAsync(d_output + size_t{live_seg->row_offset} * type_size,
-                                 live_seg->d_bytes,
-                                 size_t{live_seg->row_count} * type_size,
-                                 cudaMemcpyDeviceToDevice,
-                                 stream.value()));
-    return;
+    return std::make_unique<single_memcpy_launcher>(
+      d_output + size_t{live_seg->row_offset} * type_size,
+      live_seg->d_bytes,
+      size_t{live_seg->row_count} * type_size);
   }
 
   // Multi-segment path: split each segment into <= COPY_CHUNK_BYTES chunks
@@ -274,111 +346,33 @@ void decode_uncompressed_data(gpu_codec_run const& run,
     }
   }
 
-  size_t n = hchunks.size();
-  rmm::device_uvector<copy_chunk_desc> d_chunks(n, stream, mr);
-  RMM_CUDA_TRY(cudaMemcpyAsync(d_chunks.data(),
-                               hchunks.data(),
-                               n * sizeof(copy_chunk_desc),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
-  kernel_batched_memcpy<<<static_cast<uint32_t>(n), DECODE_BLOCK_DIM, 0, stream.value()>>>(
-    d_chunks.data(), static_cast<uint32_t>(n));
-}
-
-/// `cub::DeviceMemcpy::Batched` alternative to `decode_uncompressed_data`.
-[[maybe_unused]] void decode_uncompressed_data_cub(gpu_codec_run const& run,
-                                                   uint8_t* d_output,
-                                                   uint32_t type_size,
-                                                   rmm::cuda_stream_view stream,
-                                                   rmm::device_async_resource_ref mr)
-{
-  std::vector<void const*> h_src;
-  std::vector<void*> h_dst;
-  std::vector<size_t> h_sizes;
-  h_src.reserve(run.segments.size());
-  h_dst.reserve(run.segments.size());
-  h_sizes.reserve(run.segments.size());
-  for (auto const& seg : run.segments) {
-    if (seg.row_count == 0) continue;
-    auto const bytes = size_t{seg.row_count} * type_size;
-    if (size_t{seg.bytes_size} < bytes) {
-      throw std::runtime_error("gpu_decode_table: UNCOMPRESSED segment bytes_size (" +
-                               std::to_string(seg.bytes_size) + ") < required " +
-                               std::to_string(bytes));
-    }
-    h_src.push_back(static_cast<void const*>(seg.d_bytes));
-    h_dst.push_back(static_cast<void*>(d_output + size_t{seg.row_offset} * type_size));
-    h_sizes.push_back(bytes);
-  }
-
-  auto const n = h_src.size();
-  //===----------0 live segments----------===//
-  if (n == 0) return;
-
-  //===----------1 live segment----------===//
-  if (n == 1) {
-    RMM_CUDA_TRY(
-      cudaMemcpyAsync(h_dst[0], h_src[0], h_sizes[0], cudaMemcpyDeviceToDevice, stream.value()));
-    return;
-  }
-
-  //===---------->1 live segment----------===//
-  rmm::device_uvector<void const*> d_src(n, stream, mr);
-  rmm::device_uvector<void*> d_dst(n, stream, mr);
-  rmm::device_uvector<size_t> d_sizes(n, stream, mr);
-  RMM_CUDA_TRY(cudaMemcpyAsync(
-    d_src.data(), h_src.data(), n * sizeof(void const*), cudaMemcpyHostToDevice, stream.value()));
-  RMM_CUDA_TRY(cudaMemcpyAsync(
-    d_dst.data(), h_dst.data(), n * sizeof(void*), cudaMemcpyHostToDevice, stream.value()));
-  RMM_CUDA_TRY(cudaMemcpyAsync(
-    d_sizes.data(), h_sizes.data(), n * sizeof(size_t), cudaMemcpyHostToDevice, stream.value()));
-
-  size_t tmp_bytes = 0;
-  RMM_CUDA_TRY(cub::DeviceMemcpy::Batched(nullptr,
-                                          tmp_bytes,
-                                          d_src.data(),
-                                          d_dst.data(),
-                                          d_sizes.data(),
-                                          static_cast<int64_t>(n),
-                                          stream.value()));
-  rmm::device_buffer d_tmp(tmp_bytes, stream, mr);
-  RMM_CUDA_TRY(cub::DeviceMemcpy::Batched(d_tmp.data(),
-                                          tmp_bytes,
-                                          d_src.data(),
-                                          d_dst.data(),
-                                          d_sizes.data(),
-                                          static_cast<int64_t>(n),
-                                          stream.value()));
+  auto const slot = arena.stage(hchunks.data(), hchunks.size());
+  return std::make_unique<uncompressed_run_launcher>(arena, slot);
 }
 
 /// Routes a data run to its codec impl. Adding a codec means adding one case
-/// here and a corresponding `decode_<codec>_data` (or batched equivalent).
-void dispatch_data_run(gpu_codec_run const& run,
-                       uint8_t* d_output,
-                       cudf::data_type type,
-                       uint32_t type_size,
-                       rmm::cuda_stream_view stream,
-                       rmm::device_async_resource_ref mr)
+/// here and a corresponding `prepare_<codec>_data`.
+std::unique_ptr<decode_run_launcher> prepare_data_run(gpu_codec_run const& run,
+                                                      uint8_t* d_output,
+                                                      cudf::data_type type,
+                                                      uint32_t type_size,
+                                                      decode_descriptor_arena& arena,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr)
 {
   switch (run.codec) {
     case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
-      decode_uncompressed_data(run, d_output, type_size, stream, mr);
-      return;
+      return prepare_uncompressed_data(run, d_output, type_size, arena);
     case duckdb::CompressionType::COMPRESSION_CONSTANT:
-      decode_constant_data(run, d_output, type, type_size, stream);
-      return;
+      return prepare_constant_data(run, d_output, type, type_size);
     case duckdb::CompressionType::COMPRESSION_RLE:
-      decode_rle_data(run, d_output, type, type_size, stream, mr);
-      return;
+      return prepare_rle_data(run, d_output, type, type_size, arena, stream, mr);
     case duckdb::CompressionType::COMPRESSION_BITPACKING:
-      decode_bitpacking_data(run, d_output, type, type_size, stream, mr);
-      return;
+      return prepare_bitpacking_data(run, d_output, type, type_size, arena, stream, mr);
     case duckdb::CompressionType::COMPRESSION_ALP:
-      decode_alp_data(run, d_output, type, type_size, stream, mr);
-      return;
+      return prepare_alp_data(run, d_output, type, type_size, arena, stream, mr);
     case duckdb::CompressionType::COMPRESSION_ALPRD:
-      decode_alprd_data(run, d_output, type, type_size, stream, mr);
-      return;
+      return prepare_alprd_data(run, d_output, type, type_size, arena, stream, mr);
     default:
       throw std::runtime_error("gpu_decode_table: viability invariant violated — data codec " +
                                std::to_string(static_cast<int>(run.codec)) + " not implemented");
@@ -393,10 +387,43 @@ void dispatch_data_run(gpu_codec_run const& run,
 // upstream and arrive at this dispatcher as plain validity bytes.
 //===----------------------------------------------------------------------===//
 
-void dispatch_validity_run(gpu_codec_run const& run,
-                           uint8_t* d_mask,
-                           rmm::cuda_stream_view stream,
-                           rmm::device_async_resource_ref mr)
+/// Deferred multi-segment validity overlay: one `cub::DeviceMemcpy::Batched`
+/// over the src / dst / size arrays staged in the arena at prepare time.
+class validity_batched_copy_launcher final : public decode_run_launcher {
+ public:
+  validity_batched_copy_launcher(decode_descriptor_arena const& arena,
+                                 arena_slot src,
+                                 arena_slot dst,
+                                 arena_slot sizes)
+    : _arena(&arena), _src(src), _dst(dst), _sizes(sizes)
+  {
+  }
+
+  void launch(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) override
+  {
+    auto const* d_src   = _arena->device_ptr<void const*>(_src);
+    auto const* d_dst   = _arena->device_ptr<void*>(_dst);
+    auto const* d_sizes = _arena->device_ptr<size_t>(_sizes);
+    auto const n        = static_cast<int64_t>(_src.count);
+
+    size_t tmp_bytes = 0;
+    RMM_CUDA_TRY(
+      cub::DeviceMemcpy::Batched(nullptr, tmp_bytes, d_src, d_dst, d_sizes, n, stream.value()));
+    rmm::device_buffer d_tmp(tmp_bytes, stream, mr);
+    RMM_CUDA_TRY(cub::DeviceMemcpy::Batched(
+      d_tmp.data(), tmp_bytes, d_src, d_dst, d_sizes, n, stream.value()));
+  }
+
+ private:
+  decode_descriptor_arena const* _arena;
+  arena_slot _src;
+  arena_slot _dst;
+  arena_slot _sizes;
+};
+
+std::unique_ptr<decode_run_launcher> prepare_validity_run(gpu_codec_run const& run,
+                                                          uint8_t* d_mask,
+                                                          decode_descriptor_arena& arena)
 {
   if (run.codec != duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
     throw std::runtime_error("gpu_decode_table: viability invariant violated — validity codec " +
@@ -428,135 +455,62 @@ void dispatch_validity_run(gpu_codec_run const& run,
 
   auto const n_live_segments = h_src.size();
   //===----------0 live segments----------===//
-  if (n_live_segments == 0) return;
+  if (n_live_segments == 0) return nullptr;
 
   //===----------1 live segment----------===//
   if (n_live_segments == 1) {
-    RMM_CUDA_TRY(
-      cudaMemcpyAsync(h_dst[0], h_src[0], h_sizes[0], cudaMemcpyDeviceToDevice, stream.value()));
-    return;
+    return std::make_unique<single_memcpy_launcher>(h_dst[0], h_src[0], h_sizes[0]);
   }
 
   //===---------->1 live segments----------===//
-  rmm::device_uvector<void const*> d_src(n_live_segments, stream, mr);
-  rmm::device_uvector<void*> d_dst(n_live_segments, stream, mr);
-  rmm::device_uvector<size_t> d_sizes(n_live_segments, stream, mr);
-  RMM_CUDA_TRY(cudaMemcpyAsync(d_src.data(),
-                               h_src.data(),
-                               n_live_segments * sizeof(void const*),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
-  RMM_CUDA_TRY(cudaMemcpyAsync(d_dst.data(),
-                               h_dst.data(),
-                               n_live_segments * sizeof(void*),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
-  RMM_CUDA_TRY(cudaMemcpyAsync(d_sizes.data(),
-                               h_sizes.data(),
-                               n_live_segments * sizeof(size_t),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
-
-  size_t tmp_bytes = 0;
-  RMM_CUDA_TRY(cub::DeviceMemcpy::Batched(nullptr,
-                                          tmp_bytes,
-                                          d_src.data(),
-                                          d_dst.data(),
-                                          d_sizes.data(),
-                                          static_cast<int64_t>(n_live_segments),
-                                          stream.value()));
-  rmm::device_buffer d_tmp(tmp_bytes, stream, mr);
-  RMM_CUDA_TRY(cub::DeviceMemcpy::Batched(d_tmp.data(),
-                                          tmp_bytes,
-                                          d_src.data(),
-                                          d_dst.data(),
-                                          d_sizes.data(),
-                                          static_cast<int64_t>(n_live_segments),
-                                          stream.value()));
-}
-
-//===----------------------------------------------------------------------===//
-// Per-column decode helpers.
-//===----------------------------------------------------------------------===//
-
-/// Allocates the column's data buffer, validates type metadata, and runs
-/// every codec_run in `col.data` into the buffer.
-rmm::device_buffer decode_column_data(gpu_column_decode_input const& col,
-                                      rmm::cuda_stream_view stream,
-                                      rmm::device_async_resource_ref mr)
-{
-  // Refuse non-fixed-width types up front — `cudf::size_of` itself throws on
-  // strings/lists/structs, so the diagnostic must fire before we call it.
-  //
-  // This is NOT a catch-all for DuckDB → cudf type narrowing. A HUGEINT that
-  // upstream maps to INT64 still satisfies `is_fixed_width`; the resulting
-  // 8-byte stride would mismatch the 16-byte segment layout. The viability
-  // walker upstream is responsible for refusing those columns; this throw
-  // only catches the obvious cases (variable-width types).
-  if (!cudf::is_fixed_width(col.out_type)) {
-    throw std::runtime_error(
-      "gpu_decode_table: viability invariant violated — non-fixed-width type id " +
-      std::to_string(static_cast<int>(col.out_type.id())));
-  }
-  auto type_size = static_cast<uint32_t>(cudf::size_of(col.out_type));
-  validate_segment_bounds(col.data, col.total_rows, "data");
-
-  rmm::device_buffer data_buf(size_t{col.total_rows} * type_size, stream, mr);
-  auto* d_output = static_cast<uint8_t*>(data_buf.data());
-  for (auto const& run : col.data) {
-    dispatch_data_run(run, d_output, col.out_type, type_size, stream, mr);
-  }
-  return data_buf;
-}
-
-/// Builds the column's null mask: starts from an all-valid bitmask, then
-/// overlays each validity codec_run onto it. Null counting is deferred to a
-/// single batched `cudf::batch_null_count` call in `gpu_decode_table`.
-///
-/// Returns an empty buffer when the column has no rows, doesn't carry nulls,
-/// or carries no validity runs (the empty buffer signals "no nulls" downstream
-/// and avoids an unnecessary mask allocation + popcount).
-rmm::device_buffer decode_column_validity(gpu_column_decode_input const& col,
-                                          rmm::cuda_stream_view stream,
-                                          rmm::device_async_resource_ref mr)
-{
-  if (!col.has_nulls || col.total_rows == 0 || col.validity.empty()) {
-    return rmm::device_buffer{};
-  }
-  validate_segment_bounds(col.validity, col.total_rows, "validity");
-
-  // create_null_mask gives us a buffer pre-filled with all-1s, sized to
-  // cudf's bitmask layout (Arrow-compatible 64-byte padding). Validity
-  // segments overwrite specific byte ranges below; rows no segment covers
-  // remain implicitly valid.
-  rmm::device_buffer null_mask = cudf::create_null_mask(
-    static_cast<cudf::size_type>(col.total_rows), cudf::mask_state::ALL_VALID, stream, mr);
-  for (auto const& run : col.validity) {
-    dispatch_validity_run(run, static_cast<uint8_t*>(null_mask.data()), stream, mr);
-  }
-  return null_mask;
+  auto const src_slot   = arena.stage(h_src.data(), n_live_segments);
+  auto const dst_slot   = arena.stage(h_dst.data(), n_live_segments);
+  auto const sizes_slot = arena.stage(h_sizes.data(), n_live_segments);
+  return std::make_unique<validity_batched_copy_launcher>(arena, src_slot, dst_slot, sizes_slot);
 }
 
 }  // anonymous namespace
 
 //===----------------------------------------------------------------------===//
-// Public API.
+// prepare / launch phases.
 //===----------------------------------------------------------------------===//
 
-std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_input> const& cols,
-                                              rmm::cuda_stream_view stream,
-                                              rmm::device_async_resource_ref mr)
-{
-  size_t num_cols = cols.size();
-  if (num_cols == 0) {
-    return std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
-  }
+struct prepared_table_decode::impl {
+  struct column_state {
+    cudf::data_type out_type;
+    rmm::device_buffer data_buf;
+    rmm::device_buffer null_mask;  ///< empty when the column carries no validity runs
+    std::vector<std::unique_ptr<decode_run_launcher>> launchers;
+  };
 
-  // A `gpu_decode_table` call decodes one row-group slice — every column
-  // covers the same row range. `cudf::batch_null_count` (used below to
-  // compute null counts in one batched call) takes a single uniform
-  // [start, stop), so this is the natural place to enforce the invariant.
-  uint32_t common_rows = cols[0].total_rows;
+  decode_descriptor_arena const* arena = nullptr;
+  std::vector<column_state> columns;
+  uint32_t common_rows = 0;
+};
+
+prepared_table_decode::prepared_table_decode(std::unique_ptr<impl> state) : _impl(std::move(state))
+{
+}
+prepared_table_decode::prepared_table_decode(prepared_table_decode&&) noexcept            = default;
+prepared_table_decode& prepared_table_decode::operator=(prepared_table_decode&&) noexcept = default;
+prepared_table_decode::~prepared_table_decode()                                           = default;
+
+prepared_table_decode prepare_table_decode(std::span<gpu_column_decode_input const> cols,
+                                           decode_descriptor_arena& arena,
+                                           rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr)
+{
+  auto state   = std::make_unique<prepared_table_decode::impl>();
+  state->arena = &arena;
+
+  size_t const num_cols = cols.size();
+  if (num_cols == 0) { return prepared_table_decode{std::move(state)}; }
+
+  // A table decode covers one row-group slice — every column spans the same
+  // row range. `cudf::batch_null_count` (used at launch to compute null
+  // counts in one batched call) takes a single uniform [start, stop), so this
+  // is the natural place to enforce the invariant.
+  uint32_t const common_rows = cols[0].total_rows;
   for (size_t ci = 1; ci < num_cols; ++ci) {
     if (cols[ci].total_rows != common_rows) {
       throw std::runtime_error("gpu_decode_table: all columns must share the same total_rows");
@@ -568,36 +522,105 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_inpu
     throw std::runtime_error("gpu_decode_table: total_rows (" + std::to_string(common_rows) +
                              ") > cudf::size_type max");
   }
+  state->common_rows = common_rows;
+  state->columns.reserve(num_cols);
 
-  std::vector<rmm::device_buffer> data_bufs;
-  std::vector<rmm::device_buffer> null_masks;
-  data_bufs.reserve(num_cols);
-  null_masks.reserve(num_cols);
-  for (size_t ci = 0; ci < num_cols; ++ci) {
-    data_bufs.emplace_back(decode_column_data(cols[ci], stream, mr));
-    null_masks.emplace_back(decode_column_validity(cols[ci], stream, mr));
+  for (auto const& col : cols) {
+    auto& cs    = state->columns.emplace_back();
+    cs.out_type = col.out_type;
+
+    // Refuse non-fixed-width types up front — `cudf::size_of` itself throws on
+    // strings/lists/structs, so the diagnostic must fire before we call it.
+    //
+    // This is NOT a catch-all for DuckDB → cudf type narrowing. A HUGEINT that
+    // upstream maps to INT64 still satisfies `is_fixed_width`; the resulting
+    // 8-byte stride would mismatch the 16-byte segment layout. The viability
+    // walker upstream is responsible for refusing those columns; this throw
+    // only catches the obvious cases (variable-width types).
+    if (!cudf::is_fixed_width(col.out_type)) {
+      throw std::runtime_error(
+        "gpu_decode_table: viability invariant violated — non-fixed-width type id " +
+        std::to_string(static_cast<int>(col.out_type.id())));
+    }
+    auto const type_size = static_cast<uint32_t>(cudf::size_of(col.out_type));
+    validate_segment_bounds(col.data, col.total_rows, "data");
+
+    cs.data_buf    = rmm::device_buffer(size_t{col.total_rows} * type_size, stream, mr);
+    auto* d_output = static_cast<uint8_t*>(cs.data_buf.data());
+    for (auto const& run : col.data) {
+      if (auto launcher =
+            prepare_data_run(run, d_output, col.out_type, type_size, arena, stream, mr)) {
+        cs.launchers.push_back(std::move(launcher));
+      }
+    }
+
+    // Null mask: only when the column has rows and carries validity runs
+    // (the empty buffer signals "no nulls" downstream and avoids an
+    // unnecessary mask allocation + popcount). create_null_mask gives a
+    // buffer pre-filled with all-1s, sized to cudf's bitmask layout
+    // (Arrow-compatible 64-byte padding); validity segments overwrite
+    // specific byte ranges at launch and rows no segment covers remain
+    // implicitly valid.
+    if (col.has_nulls && col.total_rows > 0 && !col.validity.empty()) {
+      validate_segment_bounds(col.validity, col.total_rows, "validity");
+      cs.null_mask = cudf::create_null_mask(
+        static_cast<cudf::size_type>(col.total_rows), cudf::mask_state::ALL_VALID, stream, mr);
+      auto* d_mask = static_cast<uint8_t*>(cs.null_mask.data());
+      for (auto const& run : col.validity) {
+        if (auto launcher = prepare_validity_run(run, d_mask, arena)) {
+          cs.launchers.push_back(std::move(launcher));
+        }
+      }
+    }
+  }
+
+  return prepared_table_decode{std::move(state)};
+}
+
+std::unique_ptr<cudf::table> prepared_table_decode::launch(rmm::cuda_stream_view stream,
+                                                           rmm::device_async_resource_ref mr)
+{
+  auto& state = *_impl;
+  if (!state.columns.empty() && !state.arena->flushed()) {
+    throw std::logic_error("prepared_table_decode::launch before the descriptor arena was flushed");
+  }
+
+  size_t const num_cols = state.columns.size();
+  if (num_cols == 0) {
+    return std::make_unique<cudf::table>(std::vector<std::unique_ptr<cudf::column>>{});
+  }
+
+  for (auto& cs : state.columns) {
+    for (auto& launcher : cs.launchers) {
+      launcher->launch(stream, mr);
+    }
   }
 
   // One batched popcount across every null mask in the table. Columns that
-  // didn't allocate a mask (no nulls or zero rows) pass nullptr; cudf's
-  // batch_null_count returns 0 for those without launching kernel work for
-  // them. The call also performs the single D2H sync we need before
-  // building the cudf::table.
+  // didn't allocate a mask (no nulls or zero rows) pass nullptr; when NO
+  // column allocated one the call — and its device-to-host sync — is skipped
+  // entirely, since every null count is host-known zero.
   std::vector<cudf::bitmask_type const*> mask_ptrs(num_cols, nullptr);
+  bool any_mask = false;
   for (size_t ci = 0; ci < num_cols; ++ci) {
-    mask_ptrs[ci] = static_cast<cudf::bitmask_type const*>(null_masks[ci].data());
+    mask_ptrs[ci] = static_cast<cudf::bitmask_type const*>(state.columns[ci].null_mask.data());
+    any_mask      = any_mask || mask_ptrs[ci] != nullptr;
   }
-  std::vector<cudf::size_type> null_counts =
-    cudf::batch_null_count(mask_ptrs, 0, static_cast<cudf::size_type>(common_rows), stream);
+  std::vector<cudf::size_type> null_counts(num_cols, 0);
+  if (any_mask) {
+    null_counts =
+      cudf::batch_null_count(mask_ptrs, 0, static_cast<cudf::size_type>(state.common_rows), stream);
+  }
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(num_cols);
   for (size_t ci = 0; ci < num_cols; ++ci) {
-    columns.push_back(std::make_unique<cudf::column>(cols[ci].out_type,
-                                                     static_cast<cudf::size_type>(common_rows),
-                                                     std::move(data_bufs[ci]),
-                                                     std::move(null_masks[ci]),
-                                                     null_counts[ci]));
+    columns.push_back(
+      std::make_unique<cudf::column>(state.columns[ci].out_type,
+                                     static_cast<cudf::size_type>(state.common_rows),
+                                     std::move(state.columns[ci].data_buf),
+                                     std::move(state.columns[ci].null_mask),
+                                     null_counts[ci]));
   }
 
   // Catch any sticky kernel-launch error from the work above. Synchronous
@@ -605,6 +628,20 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_inpu
   // launch-side failures (bad grid size, out-of-resources, etc.).
   RMM_CUDA_TRY(cudaPeekAtLastError());
   return std::make_unique<cudf::table>(std::move(columns));
+}
+
+//===----------------------------------------------------------------------===//
+// Public API.
+//===----------------------------------------------------------------------===//
+
+std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_input> const& cols,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  decode_descriptor_arena arena;
+  auto prepared = prepare_table_decode(cols, arena, stream, mr);
+  arena.flush(stream, mr);
+  return prepared.launch(stream, mr);
 }
 
 }  // namespace sirius::cuda::scan

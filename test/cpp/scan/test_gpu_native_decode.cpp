@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <limits>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
 
 using duckdb::CompressionType;
@@ -397,4 +398,183 @@ TEST_CASE_METHOD(decode_env,
   col.data.push_back({CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, 0, 1)}});
 
   REQUIRE_THROWS_WITH(decode({col}), Catch::Contains("cudf::size_type max"));
+}
+
+//===----------------------------------------------------------------------===//
+// Descriptor arena (P11): packed descriptor staging + prepare/launch phases.
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(decode_env,
+                 "decode_descriptor_arena - staged arrays round-trip through the device blob",
+                 "[scan][decode][arena]")
+{
+  sirius::cuda::scan::decode_descriptor_arena arena;
+
+  std::vector<uint32_t> a = {1u, 2u, 3u};
+  std::vector<uint64_t> b = {40u, 50u};
+  // A deliberately odd-sized third array so the 16-byte slot alignment is exercised.
+  std::vector<uint8_t> c = {7u, 8u, 9u, 10u, 11u};
+
+  auto const slot_a = arena.stage(a.data(), a.size());
+  auto const slot_b = arena.stage(b.data(), b.size());
+  auto const slot_c = arena.stage(c.data(), c.size());
+  auto const empty  = arena.stage(static_cast<uint32_t const*>(nullptr), 0);
+
+  REQUIRE_FALSE(arena.flushed());
+  REQUIRE_THROWS_AS(static_cast<void>(arena.device_ptr<uint32_t>(slot_a)), std::logic_error);
+
+  arena.flush(stream.view(), mr);
+  REQUIRE(arena.flushed());
+
+  REQUIRE(download<uint32_t>(arena.device_ptr<uint32_t>(slot_a), a.size(), stream.value()) == a);
+  REQUIRE(download<uint64_t>(arena.device_ptr<uint64_t>(slot_b), b.size(), stream.value()) == b);
+  REQUIRE(download<uint8_t>(arena.device_ptr<uint8_t>(slot_c), c.size(), stream.value()) == c);
+  REQUIRE(arena.device_ptr<uint32_t>(empty) == nullptr);
+
+  // Slot starts honor the arena's 16-byte alignment.
+  auto const base = reinterpret_cast<uintptr_t>(arena.device_ptr<uint32_t>(slot_a));
+  REQUIRE(reinterpret_cast<uintptr_t>(arena.device_ptr<uint64_t>(slot_b)) % 16 == 0);
+  REQUIRE((reinterpret_cast<uintptr_t>(arena.device_ptr<uint8_t>(slot_c)) - base) % 16 == 0);
+
+  // The staging protocol is stage -> flush -> resolve; violations throw.
+  REQUIRE_THROWS_AS(arena.stage(a.data(), a.size()), std::logic_error);
+  REQUIRE_THROWS_AS(arena.flush(stream.view(), mr), std::logic_error);
+}
+
+TEST_CASE_METHOD(decode_env,
+                 "decode_descriptor_arena - slab growth preserves earlier staged descriptors",
+                 "[scan][decode][arena]")
+{
+  // Stage well past the initial slab size (1 MiB) so the arena has to grow and
+  // relocate its packed bytes at least once mid-staging.
+  sirius::cuda::scan::decode_descriptor_arena arena;
+  constexpr size_t N_ARRAYS = 40;
+  constexpr size_t N_ELEMS  = 16 * 1024;  // 128 KiB per array
+  std::vector<sirius::cuda::scan::arena_slot> slots;
+  std::vector<std::vector<uint64_t>> arrays;
+  for (size_t k = 0; k < N_ARRAYS; ++k) {
+    auto& arr = arrays.emplace_back(N_ELEMS);
+    std::iota(arr.begin(), arr.end(), k * N_ELEMS);
+    slots.push_back(arena.stage(arr.data(), arr.size()));
+  }
+  arena.flush(stream.view(), mr);
+  for (size_t k = 0; k < N_ARRAYS; ++k) {
+    REQUIRE(download<uint64_t>(arena.device_ptr<uint64_t>(slots[k]), N_ELEMS, stream.value()) ==
+            arrays[k]);
+  }
+}
+
+TEST_CASE_METHOD(decode_env,
+                 "prepare/launch - one arena packs mixed codec runs across prepared tables",
+                 "[scan][decode][arena]")
+{
+  // Two prepared table decodes share one arena: a column mixing an
+  // UNCOMPRESSED multi-segment run with a CONSTANT run (two runs, two
+  // descriptor families), a nullable column, and a second single-column table.
+  // Everything must decode correctly from the single flushed blob.
+  std::vector<int32_t> a(300), b(200);
+  std::iota(a.begin(), a.end(), 0);
+  std::iota(b.begin(), b.end(), 300);
+  std::vector<int32_t> k = {-7};
+  auto da = upload(a, stream.view()), db = upload(b, stream.view());
+  auto dk = upload(k, stream.view());
+
+  gpu_column_decode_input mixed;
+  mixed.out_type   = I32;
+  mixed.total_rows = 1000;
+  mixed.has_nulls  = false;
+  mixed.data.push_back(
+    {CompressionType::COMPRESSION_UNCOMPRESSED, {segment(da, 0, 300), segment(db, 300, 200)}});
+  mixed.data.push_back({CompressionType::COMPRESSION_CONSTANT, {segment(dk, 500, 500)}});
+
+  std::vector<bool> valid(1000, true);
+  for (size_t i = 0; i < valid.size(); i += 3)
+    valid[i] = false;
+  auto valid_bytes = pack_validity(valid);
+  std::vector<int64_t> big(1000, 11);
+  auto d_big = upload(big, stream.view());
+  rmm::device_buffer d_validity(valid_bytes.data(), valid_bytes.size(), stream.view());
+  auto nullable = one_codec_column(
+    I64, 1000, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d_big, 0, 1000)}, true);
+  nullable.validity.push_back(
+    {CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d_validity, 0, 1000)}});
+
+  std::vector<double> dv(64, 2.5);
+  auto d_dv                                      = upload(dv, stream.view());
+  std::vector<gpu_column_decode_input> table_two = {
+    one_codec_column(F64, 64, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d_dv, 0, 64)})};
+
+  std::vector<gpu_column_decode_input> table_one = {std::move(mixed), std::move(nullable)};
+
+  sirius::cuda::scan::decode_descriptor_arena arena;
+  auto prep_one = sirius::cuda::scan::prepare_table_decode(table_one, arena, stream.view(), mr);
+  auto prep_two = sirius::cuda::scan::prepare_table_decode(table_two, arena, stream.view(), mr);
+  arena.flush(stream.view(), mr);
+  auto t_one = prep_one.launch(stream.view(), mr);
+  auto t_two = prep_two.launch(stream.view(), mr);
+
+  auto o0 = download<int32_t>(t_one->get_column(0).view().data<int32_t>(), 1000, stream.value());
+  for (size_t i = 0; i < 500; ++i)
+    REQUIRE(o0[i] == static_cast<int32_t>(i));
+  for (size_t i = 500; i < 1000; ++i)
+    REQUIRE(o0[i] == -7);
+
+  size_t null_count = 0;
+  for (auto v : valid)
+    if (!v) ++null_count;
+  REQUIRE(t_one->get_column(1).null_count() == static_cast<cudf::size_type>(null_count));
+
+  auto o2 = download<double>(t_two->get_column(0).view().data<double>(), 64, stream.value());
+  for (auto x : o2)
+    REQUIRE(x == 2.5);
+}
+
+TEST_CASE_METHOD(decode_env,
+                 "prepare/launch - launching before the arena flush throws",
+                 "[scan][decode][arena]")
+{
+  std::vector<int32_t> a(8, 1);
+  auto da                                   = upload(a, stream.view());
+  std::vector<gpu_column_decode_input> cols = {
+    one_codec_column(I32, 8, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(da, 0, 8)})};
+  sirius::cuda::scan::decode_descriptor_arena arena;
+  auto prep = sirius::cuda::scan::prepare_table_decode(cols, arena, stream.view(), mr);
+  REQUIRE_THROWS_AS(prep.launch(stream.view(), mr), std::logic_error);
+}
+
+TEST_CASE_METHOD(decode_env,
+                 "gpu_decode_table - zero validity runs skip the null count without corrupting it",
+                 "[scan][decode]")
+{
+  // With no column staging validity runs the batched null count (and its
+  // device-to-host sync) is skipped; the null counts must still be exactly
+  // zero. A second decode mixing a nullable and a non-nullable column pins
+  // that the skip only fires when NO mask exists.
+  std::vector<int32_t> a(100);
+  std::iota(a.begin(), a.end(), 0);
+  std::vector<int64_t> b(100, 4);
+  auto da = upload(a, stream.view()), db = upload(b, stream.view());
+  std::vector<gpu_column_decode_input> no_nulls = {
+    one_codec_column(I32, 100, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(da, 0, 100)}),
+    one_codec_column(I64, 100, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(db, 0, 100)})};
+  auto t = decode(no_nulls);
+  REQUIRE(t->get_column(0).null_count() == 0);
+  REQUIRE(t->get_column(1).null_count() == 0);
+  REQUIRE(download<int32_t>(t->get_column(0).view().data<int32_t>(), 100, stream.value()) == a);
+
+  std::vector<bool> valid(100, true);
+  valid[3]         = false;
+  valid[97]        = false;
+  auto valid_bytes = pack_validity(valid);
+  rmm::device_buffer d_validity(valid_bytes.data(), valid_bytes.size(), stream.view());
+  auto nullable = one_codec_column(
+    I32, 100, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(da, 0, 100)}, true);
+  nullable.validity.push_back(
+    {CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d_validity, 0, 100)}});
+  std::vector<gpu_column_decode_input> mixed_nulls = {
+    std::move(nullable),
+    one_codec_column(I64, 100, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(db, 0, 100)})};
+  auto t2 = decode(mixed_nulls);
+  REQUIRE(t2->get_column(0).null_count() == 2);
+  REQUIRE(t2->get_column(1).null_count() == 0);
 }

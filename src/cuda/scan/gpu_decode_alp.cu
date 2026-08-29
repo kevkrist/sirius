@@ -393,13 +393,12 @@ __global__ void kernel_decode_alp(detail::cta_block_desc const* __restrict__ des
   }
 }
 
-//! @brief HOST-side ALP decoding kernel dispatcher.
+//! @brief HOST-side ALP decoding kernel dispatcher over device-resident descriptors.
 template <typename T>
-void launch_alp_typed(detail::cta_block_desc const* h_descs,
+void launch_alp_typed(detail::cta_block_desc const* d_descs,
                       size_t num_vecs,
                       T* d_output,
-                      rmm::cuda_stream_view stream,
-                      rmm::device_async_resource_ref mr)
+                      rmm::cuda_stream_view stream)
 {
   constexpr uint32_t MAX_PACKED_BYTES = duckdb::AlpConstants::ALP_VECTOR_SIZE * sizeof(T);
   // Two guard words past the live data for the 64-bit straddle case.
@@ -407,16 +406,9 @@ void launch_alp_typed(detail::cta_block_desc const* h_descs,
 
   if (num_vecs == 0) return;
 
-  rmm::device_uvector<detail::cta_block_desc> d_descs(num_vecs, stream, mr);
-  RMM_CUDA_TRY(cudaMemcpyAsync(d_descs.data(),
-                               h_descs,
-                               num_vecs * sizeof(detail::cta_block_desc),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
-
   kernel_decode_alp<MAX_PACKED_WORDS, T>
     <<<static_cast<uint32_t>(num_vecs), ALP_BLOCK_DIM, 0, stream.value()>>>(
-      d_descs.data(), d_output, static_cast<uint32_t>(num_vecs));
+      d_descs, d_output, static_cast<uint32_t>(num_vecs));
 }
 
 //===----------------------------------------------------------------------===//
@@ -625,13 +617,12 @@ __global__ void kernel_decode_alprd(detail::cta_block_desc const* __restrict__ d
   }
 }
 
-//! @brief HOST-side ALPRD decoding kernel dispatcher.
+//! @brief HOST-side ALPRD decoding kernel dispatcher over device-resident descriptors.
 template <typename T>
-void launch_alprd_typed(detail::cta_block_desc const* h_descs,
+void launch_alprd_typed(detail::cta_block_desc const* d_descs,
                         size_t num_vecs,
                         T* d_output,
-                        rmm::cuda_stream_view stream,
-                        rmm::device_async_resource_ref mr)
+                        rmm::cuda_stream_view stream)
 {
   // Live shmem: left stream (left_bw ≤ MAX_DICTIONARY_BIT_WIDTH) + right
   // stream (right_bw ≤ sizeof(T)*8). Two guard words past each region for
@@ -645,16 +636,66 @@ void launch_alprd_typed(detail::cta_block_desc const* h_descs,
 
   if (num_vecs == 0) return;
 
-  rmm::device_uvector<detail::cta_block_desc> d_descs(num_vecs, stream, mr);
-  RMM_CUDA_TRY(cudaMemcpyAsync(d_descs.data(),
-                               h_descs,
-                               num_vecs * sizeof(detail::cta_block_desc),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
-
   kernel_decode_alprd<SHMEM_WORDS, T>
     <<<static_cast<uint32_t>(num_vecs), ALP_BLOCK_DIM, 0, stream.value()>>>(
-      d_descs.data(), d_output, static_cast<uint32_t>(num_vecs));
+      d_descs, d_output, static_cast<uint32_t>(num_vecs));
+}
+
+/// Deferred ALP / ALPRD launch over per-vector descriptors staged in the arena at prepare time.
+class alp_run_launcher final : public decode_run_launcher {
+ public:
+  alp_run_launcher(decode_descriptor_arena const& arena,
+                   arena_slot descs,
+                   uint8_t* d_output,
+                   uint32_t type_size,
+                   bool is_alprd)
+    : _arena(&arena), _descs(descs), _d_output(d_output), _type_size(type_size), _is_alprd(is_alprd)
+  {
+  }
+
+  void launch(rmm::cuda_stream_view stream, rmm::device_async_resource_ref /*mr*/) override
+  {
+    auto const* d_descs = _arena->device_ptr<detail::cta_block_desc>(_descs);
+    auto const n        = _descs.count;
+    if (_is_alprd) {
+      if (_type_size == 4) {
+        launch_alprd_typed<float>(d_descs, n, reinterpret_cast<float*>(_d_output), stream);
+      } else {
+        launch_alprd_typed<double>(d_descs, n, reinterpret_cast<double*>(_d_output), stream);
+      }
+    } else {
+      if (_type_size == 4) {
+        launch_alp_typed<float>(d_descs, n, reinterpret_cast<float*>(_d_output), stream);
+      } else {
+        launch_alp_typed<double>(d_descs, n, reinterpret_cast<double*>(_d_output), stream);
+      }
+    }
+  }
+
+ private:
+  decode_descriptor_arena const* _arena;
+  arena_slot _descs;
+  uint8_t* _d_output;
+  uint32_t _type_size;
+  bool _is_alprd;
+};
+
+std::unique_ptr<decode_run_launcher> prepare_alp_family(gpu_codec_run const& run,
+                                                        uint8_t* d_output,
+                                                        uint32_t type_size,
+                                                        decode_descriptor_arena& arena,
+                                                        bool is_alprd)
+{
+  if (type_size != 4 && type_size != 8) {
+    throw std::runtime_error(std::string(is_alprd ? "[gpu_decode_alprd]" : "[gpu_decode_alp]") +
+                             ": type_size " + std::to_string(type_size) + " is invalid for " +
+                             (is_alprd ? "ALPRD" : "ALP") + " decoding.");
+  }
+  auto const descs = detail::build_block_descs<ALP_VECTOR_SIZE>(run);
+  if (descs.empty()) return nullptr;
+
+  auto const slot = arena.stage(descs.data(), descs.size());
+  return std::make_unique<alp_run_launcher>(arena, slot, d_output, type_size, is_alprd);
 }
 
 }  // anonymous namespace
@@ -662,7 +703,7 @@ void launch_alprd_typed(detail::cta_block_desc const* h_descs,
 //===----------------------------------------------------------------------===//
 // Public Entry Points for ALP(RD) Decoding
 //===----------------------------------------------------------------------===//
-//! @brief Decode a set of ALP-encoded segments into a contiguous output buffer.
+//! @brief Prepare the decode of a set of ALP-encoded segments into a contiguous output buffer.
 //!
 //! One CTA decodes one 1024-row vector; segments are split across vectors via
 //! `build_block_descs`. Each segment writes to `d_output` at its own
@@ -673,36 +714,36 @@ void launch_alprd_typed(detail::cta_block_desc const* h_descs,
 //! @param d_output   Device-side output buffer, sized for `run.total_rows * type_size` bytes.
 //! @param type       Output element type (unused; `type_size` alone selects the kernel).
 //! @param type_size  Output element width in bytes — must be 4 (float) or 8 (double).
-//! @param stream     CUDA stream for the descriptor upload and kernel launches.
-//! @param mr         Device memory resource for the per-launch descriptor buffer.
+//! @param arena      Descriptor arena the per-vector descriptors are staged into.
+//! @param stream     Unused; kept for signature parity with the other codec prepare entries.
+//! @param mr         Unused; kept for signature parity with the other codec prepare entries.
 //!
 //! @throws std::runtime_error if `type_size` is not 4 or 8.
+std::unique_ptr<decode_run_launcher> prepare_alp_data(gpu_codec_run const& run,
+                                                      uint8_t* d_output,
+                                                      cudf::data_type /*type*/,
+                                                      uint32_t type_size,
+                                                      decode_descriptor_arena& arena,
+                                                      rmm::cuda_stream_view /*stream*/,
+                                                      rmm::device_async_resource_ref /*mr*/)
+{
+  return prepare_alp_family(run, d_output, type_size, arena, /*is_alprd=*/false);
+}
+
 void decode_alp_data(gpu_codec_run const& run,
                      uint8_t* d_output,
-                     cudf::data_type /*type*/,
+                     cudf::data_type type,
                      uint32_t type_size,
                      rmm::cuda_stream_view stream,
                      rmm::device_async_resource_ref mr)
 {
-  auto const descs = detail::build_block_descs<ALP_VECTOR_SIZE>(run);
-  if (descs.empty()) return;
-
-  switch (type_size) {
-    case 4:
-      launch_alp_typed<float>(
-        descs.data(), descs.size(), reinterpret_cast<float*>(d_output), stream, mr);
-      break;
-    case 8:
-      launch_alp_typed<double>(
-        descs.data(), descs.size(), reinterpret_cast<double*>(d_output), stream, mr);
-      break;
-    default:
-      throw std::runtime_error("[gpu_decode_alp]: type_size " + std::to_string(type_size) +
-                               " is invalid for ALP decoding.");
-  }
+  decode_descriptor_arena arena;
+  auto launcher = prepare_alp_data(run, d_output, type, type_size, arena, stream, mr);
+  arena.flush(stream, mr);
+  if (launcher) { launcher->launch(stream, mr); }
 }
 
-//! @brief Decode a set of ALPRD-encoded segments into a contiguous output buffer.
+//! @brief Prepare the decode of a set of ALPRD-encoded segments into a contiguous output buffer.
 //!
 //! One CTA decodes one 1024-row vector; segments are split across vectors via
 //! `build_block_descs`. Each segment writes to `d_output` at its own
@@ -713,33 +754,33 @@ void decode_alp_data(gpu_codec_run const& run,
 //! @param d_output   Device-side output buffer, sized for `run.total_rows * type_size` bytes.
 //! @param type       Output element type (unused; `type_size` alone selects the kernel).
 //! @param type_size  Output element width in bytes — must be 4 (float) or 8 (double).
-//! @param stream     CUDA stream for the descriptor upload and kernel launches.
-//! @param mr         Device memory resource for the per-launch descriptor buffer.
+//! @param arena      Descriptor arena the per-vector descriptors are staged into.
+//! @param stream     Unused; kept for signature parity with the other codec prepare entries.
+//! @param mr         Unused; kept for signature parity with the other codec prepare entries.
 //!
 //! @throws std::runtime_error if `type_size` is not 4 or 8.
+std::unique_ptr<decode_run_launcher> prepare_alprd_data(gpu_codec_run const& run,
+                                                        uint8_t* d_output,
+                                                        cudf::data_type /*type*/,
+                                                        uint32_t type_size,
+                                                        decode_descriptor_arena& arena,
+                                                        rmm::cuda_stream_view /*stream*/,
+                                                        rmm::device_async_resource_ref /*mr*/)
+{
+  return prepare_alp_family(run, d_output, type_size, arena, /*is_alprd=*/true);
+}
+
 void decode_alprd_data(gpu_codec_run const& run,
                        uint8_t* d_output,
-                       cudf::data_type /*type*/,
+                       cudf::data_type type,
                        uint32_t type_size,
                        rmm::cuda_stream_view stream,
                        rmm::device_async_resource_ref mr)
 {
-  auto const descs = detail::build_block_descs<ALP_VECTOR_SIZE>(run);
-  if (descs.empty()) return;
-
-  switch (type_size) {
-    case 4:
-      launch_alprd_typed<float>(
-        descs.data(), descs.size(), reinterpret_cast<float*>(d_output), stream, mr);
-      break;
-    case 8:
-      launch_alprd_typed<double>(
-        descs.data(), descs.size(), reinterpret_cast<double*>(d_output), stream, mr);
-      break;
-    default:
-      throw std::runtime_error("[gpu_decode_alprd]: type_size " + std::to_string(type_size) +
-                               " is invalid for ALPRD decoding.");
-  }
+  decode_descriptor_arena arena;
+  auto launcher = prepare_alprd_data(run, d_output, type, type_size, arena, stream, mr);
+  arena.flush(stream, mr);
+  if (launcher) { launcher->launch(stream, mr); }
 }
 
 }  // namespace sirius::cuda::scan
