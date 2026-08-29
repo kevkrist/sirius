@@ -477,6 +477,70 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
   return true;
 }
 
+static bool can_use_tiny_domain_sum_input(duckdb::LogicalType const& type)
+{
+  if (type.id() == duckdb::LogicalTypeId::DECIMAL) {
+    switch (type.InternalType()) {
+      case duckdb::PhysicalType::INT16:
+      case duckdb::PhysicalType::INT32:
+      case duckdb::PhysicalType::INT64: return true;
+      default: return false;
+    }
+  }
+  switch (type.InternalType()) {
+    case duckdb::PhysicalType::INT8:
+    case duckdb::PhysicalType::INT16:
+    case duckdb::PhysicalType::INT32:
+    case duckdb::PhysicalType::UINT8:
+    case duckdb::PhysicalType::UINT16:
+    case duckdb::PhysicalType::UINT32: return true;
+    default: return false;
+  }
+}
+
+static bool can_use_tiny_domain_aggregate(duckdb::LogicalAggregate const& op)
+{
+  if (op.groups.empty() || op.groups.size() > 2 || op.grouping_sets.size() > 1 ||
+      !op.grouping_functions.empty()) {
+    return false;
+  }
+
+  for (auto const& group : op.groups) {
+    switch (group->return_type.InternalType()) {
+      case duckdb::PhysicalType::INT8:
+      case duckdb::PhysicalType::UINT8:
+      case duckdb::PhysicalType::VARCHAR: break;
+      default: return false;
+    }
+  }
+
+  for (auto const& expression : op.expressions) {
+    auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+    if (aggregate.IsDistinct() || aggregate.filter || aggregate.order_bys ||
+        !aggregate.function.combine) {
+      return false;
+    }
+    auto const aggregate_id = sirius::from_duckdb_aggregate_name(aggregate.function.name);
+    if (!aggregate_id) { return false; }
+    switch (*aggregate_id) {
+      case sirius::aggregate_id::sum:
+      case sirius::aggregate_id::sum_no_overflow:
+      case sirius::aggregate_id::avg:
+        if (aggregate.children.size() != 1 ||
+            !can_use_tiny_domain_sum_input(aggregate.children[0]->return_type)) {
+          return false;
+        }
+        break;
+      case sirius::aggregate_id::count:
+      case sirius::aggregate_id::count_star:
+      case sirius::aggregate_id::min:
+      case sirius::aggregate_id::max: break;
+      case sirius::aggregate_id::first: return false;
+    }
+  }
+  return true;
+}
+
 static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
                                            duckdb::LogicalAggregate& op,
                                            duckdb::vector<std::size_t>& bits_per_group)
@@ -607,6 +671,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
 
+  // Sorted-aggregate binding below clears order_bys after wrapping the function, while filter
+  // expressions are hoisted and retained only as references. The Sirius aggregate AST does not
+  // carry either semantic, so remember the original shape and fail closed for the custom path.
+  bool const tiny_domain_has_plain_aggregate_semantics =
+    std::ranges::all_of(op.expressions, [](auto const& expression) {
+      auto const& aggregate = expression->template Cast<duckdb::BoundAggregateExpression>();
+      return !aggregate.filter && !aggregate.order_bys;
+    });
   auto plan = create_plan(*op.children[0]);
 
   plan = extract_aggregate_expressions(
@@ -650,6 +722,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
   // use a partitioned or perfect hash aggregate if possible
   duckdb::vector<duckdb::column_t> partition_columns;
   duckdb::vector<std::size_t> required_bits;
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  bool const enable_tiny_domain =
+    sirius_ctx &&
+    sirius_ctx->get_config().get_operator_params().enable_tiny_domain_grouped_aggregate;
   if (can_use_simple_aggregation &&
       can_use_partitioned_aggregate(context, op, *plan, partition_columns)) {
     auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
@@ -662,6 +740,25 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
       op.estimated_cardinality,
       group_validity,
       op.distinct_validity);
+    group_by->children.push_back(std::move(plan));
+    return group_by;
+  }
+
+  if (can_use_simple_aggregation && enable_tiny_domain &&
+      tiny_domain_has_plain_aggregate_semantics && can_use_tiny_domain_aggregate(op)) {
+    SIRIUS_LOG_INFO(
+      "[sirius_plan_aggregate] selecting guarded tiny-domain local aggregate candidate");
+    auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
+                                           sirius::op::sirius_physical_grouped_aggregate>(
+      sirius::from_duckdb_vec(op.types),
+      translate_expressions(std::move(op.expressions)),
+      translate_expressions(std::move(op.groups)),
+      std::move(op.grouping_sets),
+      std::move(op.grouping_functions),
+      op.estimated_cardinality,
+      group_validity,
+      op.distinct_validity,
+      true);
     group_by->children.push_back(std::move(plan));
     return group_by;
   }

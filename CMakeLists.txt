@@ -455,6 +455,7 @@ set(EXTENSION_SOURCES
 set(CUDA_SOURCES
     src/op/partition/crc32_partition_hash.cu
     src/cuda/dense_count_join_impl.cu
+    src/cuda/tiny_domain_grouped_aggregate_impl.cu
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
@@ -792,6 +793,7 @@ set(TEST_SOURCES
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_group_key_labels.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
+    test/cpp/operator/aggregate/test_tiny_domain_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
     test/cpp/operator/test_crc32_partition_hash.cpp

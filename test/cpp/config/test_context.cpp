@@ -326,6 +326,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
+    REQUIRE(setting_count(con, "enable_tiny_domain_grouped_aggregate") == 0);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
   }
@@ -342,6 +343,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 1);
+    REQUIRE(setting_count(con, "enable_tiny_domain_grouped_aggregate") == 1);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
@@ -387,6 +389,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET enable_dense_count_join");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_tiny_domain_grouped_aggregate = true");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_tiny_domain_grouped_aggregate");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET dense_count_join_max_bytes = 1024");
@@ -1892,4 +1900,25 @@ TEST_CASE("Sirius configuration enables dense count join by default and accepts 
     invalid_budget.load_from_file(data_dir / "invalid_dense_count_join_engine_policy.yaml"),
     Catch::Contains("sirius.operator_params.dense_count_join_max_bytes") &&
       Catch::Contains("internal engine policy") && Catch::Contains("remove this key"));
+}
+
+TEST_CASE("Sirius tiny-domain grouped aggregate is default-off and accepts a YAML override",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config defaults;
+  REQUIRE_FALSE(defaults.get_operator_params().enable_tiny_domain_grouped_aggregate);
+  REQUIRE_FALSE(sirius::config::DEFAULT_ENABLE_TINY_DOMAIN_GROUPED_AGGREGATE);
+
+  sirius::sirius_config enabled;
+  REQUIRE_NOTHROW(enabled.load_from_file(data_dir / "valid_tiny_domain_aggregate_enable.yaml"));
+  REQUIRE(enabled.get_operator_params().enable_tiny_domain_grouped_aggregate);
+
+  sirius::sirius_config invalid_type;
+  REQUIRE_THROWS_WITH(
+    invalid_type.load_from_file(data_dir / "invalid_tiny_domain_aggregate_enable_type.yaml"),
+    Catch::Contains("operator_params.enable_tiny_domain_grouped_aggregate") &&
+      Catch::Contains("bad conversion"));
 }

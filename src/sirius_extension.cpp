@@ -2893,6 +2893,17 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
   params->enable_dense_count_join = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
 }
+static void SetEnableTinyDomainGroupedAggregate(ClientContext& context,
+                                                SetScope scope,
+                                                Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                    = lock_operator_params_slot(context);
+  params->enable_tiny_domain_grouped_aggregate = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_TINY_DOMAIN_GROUPED_AGGREGATE to {}",
+                   params->enable_tiny_domain_grouped_aggregate);
+}
 
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
@@ -3178,6 +3189,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_dense_count_join),
                     SetEnableDenseCountJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_tiny_domain_grouped_aggregate",
+                    "runtime override for guarded tiny-domain grouped aggregation",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_tiny_domain_grouped_aggregate),
+                    SetEnableTinyDomainGroupedAggregate);
+
   add_sirius_option(config,
                     option_visibility::internal,
                     "dense_count_join_max_bytes",

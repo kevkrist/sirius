@@ -29,6 +29,7 @@
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <atomic>
 #include <memory>
 #include <numeric>
 
@@ -44,7 +45,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   sirius_physical_grouped_aggregate(duckdb::vector<sirius::logical_type> types,
                                     duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
                                     duckdb::vector<std::unique_ptr<sirius::ast::node>> groups,
-                                    std::size_t estimated_cardinality);
+                                    std::size_t estimated_cardinality,
+                                    bool enable_tiny_domain_strategy = false);
 
   sirius_physical_grouped_aggregate(
     duckdb::vector<sirius::logical_type> types,
@@ -54,7 +56,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions,
     std::size_t estimated_cardinality,
     duckdb::TupleDataValidityType group_validity,
-    duckdb::TupleDataValidityType distinct_validity);
+    duckdb::TupleDataValidityType distinct_validity,
+    bool enable_tiny_domain_strategy = false);
 
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
 
@@ -98,6 +101,20 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   //! carry LIST sets; MERGE_GROUP_BY later converts those sets to the declared BIGINT count.
   [[nodiscard]] duckdb::vector<sirius::logical_type> get_count_distinct_local_output_types() const;
 
+  [[nodiscard]] bool tiny_domain_strategy_enabled() const noexcept
+  {
+    return _enable_tiny_domain_strategy;
+  }
+
+  [[nodiscard]] uint64_t tiny_domain_activation_count() const noexcept
+  {
+    return _tiny_domain_activations.load(std::memory_order_relaxed);
+  }
+  [[nodiscard]] uint64_t tiny_domain_fallback_count() const noexcept
+  {
+    return _tiny_domain_fallbacks.load(std::memory_order_relaxed);
+  }
+
   // Source interface
   bool is_source() const override { return true; }
 
@@ -113,6 +130,11 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+ private:
+  bool _enable_tiny_domain_strategy = false;
+  std::atomic<uint64_t> _tiny_domain_activations{0};
+  std::atomic<uint64_t> _tiny_domain_fallbacks{0};
 };
 
 }  // namespace op

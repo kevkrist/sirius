@@ -18,8 +18,10 @@
 
 #include "config.hpp"
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "op/aggregate/tiny_domain_grouped_aggregate_impl.hpp"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -30,7 +32,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
   duckdb::vector<std::unique_ptr<sirius::ast::node>> groups_p,
-  std::size_t estimated_cardinality)
+  std::size_t estimated_cardinality,
+  bool enable_tiny_domain_strategy)
   : sirius_physical_grouped_aggregate(std::move(types),
                                       std::move(expressions),
                                       std::move(groups_p),
@@ -38,7 +41,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
                                       {},
                                       estimated_cardinality,
                                       duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
-                                      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)
+                                      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+                                      enable_tiny_domain_strategy)
 {
 }
 
@@ -57,10 +61,12 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<duckdb::unsafe_vector<std::size_t>> grouping_functions_p,
   std::size_t estimated_cardinality,
   duckdb::TupleDataValidityType /*group_validity*/,
-  duckdb::TupleDataValidityType /*distinct_validity*/)
+  duckdb::TupleDataValidityType /*distinct_validity*/,
+  bool enable_tiny_domain_strategy)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
-    grouping_sets(std::move(grouping_sets_p))
+    grouping_sets(std::move(grouping_sets_p)),
+    _enable_tiny_domain_strategy(enable_tiny_domain_strategy)
 {
   auto cudf_defs                    = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
   group_idx                         = std::move(cudf_defs.group_idx);
@@ -100,6 +106,34 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
+    if (_enable_tiny_domain_strategy) {
+      auto attempt = try_tiny_domain_grouped_aggregate(get_cudf_table_view(input_batch),
+                                                       group_idx,
+                                                       cudf_aggregates,
+                                                       cudf_aggregate_idx,
+                                                       stream,
+                                                       space->get_default_allocator());
+      if (attempt) {
+        auto const activation =
+          _tiny_domain_activations.fetch_add(1, std::memory_order_relaxed) + 1;
+        SIRIUS_LOG_DEBUG(
+          "[tiny_domain_grouped_aggregate] activated: groups={} states={} strategy={} "
+          "preflight={} register_fallback={} activation={}",
+          attempt.num_groups,
+          cudf_aggregates.size(),
+          attempt.used_register_private ? "q1_register_private" : "wide",
+          attempt.used_sampled_preflight ? "sampled" : "full",
+          attempt.register_private_attempted && !attempt.used_register_private,
+          activation);
+        results.push_back(
+          make_data_batch(std::move(attempt.table), *space, stream, batch_telemetry()));
+        continue;
+      }
+      auto const fallback = _tiny_domain_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+      SIRIUS_LOG_DEBUG("[tiny_domain_grouped_aggregate] fallback: reason='{}' fallback={}",
+                       attempt.fallback_reason,
+                       fallback);
+    }
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
                                                               group_idx,
                                                               cudf_aggregates,

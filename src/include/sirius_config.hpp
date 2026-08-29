@@ -98,7 +98,8 @@ struct valid_domain_coverage_threshold {
 /// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
-constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
+constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN              = true;
+constexpr bool DEFAULT_ENABLE_TINY_DOMAIN_GROUPED_AGGREGATE = false;
 
 constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
@@ -188,6 +189,8 @@ struct operator_params {
 
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
+  /// Enable the guarded <=64-group local aggregate strategy for eligible byte-packable keys.
+  bool enable_tiny_domain_grouped_aggregate = config::DEFAULT_ENABLE_TINY_DOMAIN_GROUPED_AGGREGATE;
 
   /// Engine-owned histogram budget; declined ranges use exact sparse aggregation.
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
