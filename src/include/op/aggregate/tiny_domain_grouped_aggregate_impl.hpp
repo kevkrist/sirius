@@ -34,10 +34,11 @@ namespace sirius::op {
 struct tiny_domain_grouped_aggregate_attempt {
   std::unique_ptr<cudf::table> table;
   std::string fallback_reason;
-  std::size_t num_groups          = 0;
-  bool register_private_attempted = false;
-  bool used_register_private      = false;
-  bool used_sampled_preflight     = false;
+  std::size_t num_groups                   = 0;
+  std::size_t num_physical_register_states = 0;
+  bool bounded_register_attempted          = false;
+  bool used_bounded_register               = false;
+  bool used_prefix_preflight               = false;
 
   [[nodiscard]] explicit operator bool() const noexcept { return table != nullptr; }
 };
@@ -47,12 +48,12 @@ struct tiny_domain_grouped_aggregate_attempt {
  *
  * The function returns a reason and no table when preflight key shape, carrier type, or group count
  * is outside the bounded strategy; the caller may then run ordinary cuDF groupby over the original
- * input. The exact Q1 specialization may launch after a sampled prefix; a later unseen key or
- * invalid one-byte STRING shape synchronizes, discards speculative output, and returns the same
- * fallback contract. Allocation and CUDA failures propagate. Arithmetic overflow or any invalid
- * post-launch state outside those expected sampled-key conditions throws because falling back after
- * a partial custom reduction could hide an implementation bug. On success, output columns are
- * group keys followed by aggregate carriers in exactly the order of @p aggregates.
+ * input. A bounded register-private strategy is selected only from runtime group cardinality,
+ * aggregate kinds and carriers, nullability, alias-equivalent inputs, and a fixed resource cap.
+ * Inputs outside that generic capability use the exact-wide strategy. Allocation and CUDA failures
+ * propagate. Arithmetic overflow or any invalid post-launch state throws unless a bounded INT64
+ * partial can be recomputed by the exact-wide strategy before publication. On success, output
+ * columns are group keys followed by aggregate carriers in exactly the order of @p aggregates.
  */
 [[nodiscard]] tiny_domain_grouped_aggregate_attempt try_tiny_domain_grouped_aggregate(
   cudf::table_view input,

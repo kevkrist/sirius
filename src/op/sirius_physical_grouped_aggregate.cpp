@@ -117,13 +117,15 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
         auto const activation =
           _tiny_domain_activations.fetch_add(1, std::memory_order_relaxed) + 1;
         SIRIUS_LOG_DEBUG(
-          "[tiny_domain_grouped_aggregate] activated: groups={} states={} strategy={} "
-          "preflight={} register_fallback={} activation={}",
+          "[tiny_domain_grouped_aggregate] activated: groups={} logical_states={} "
+          "physical_states={} "
+          "strategy={} preflight={} register_fallback={} activation={}",
           attempt.num_groups,
           cudf_aggregates.size(),
-          attempt.used_register_private ? "q1_register_private" : "wide",
-          attempt.used_sampled_preflight ? "sampled" : "full",
-          attempt.register_private_attempted && !attempt.used_register_private,
+          attempt.num_physical_register_states,
+          attempt.used_bounded_register ? "bounded_register" : "wide",
+          attempt.used_prefix_preflight ? "prefix" : "full",
+          attempt.bounded_register_attempted && !attempt.used_bounded_register,
           activation);
         results.push_back(
           make_data_batch(std::move(attempt.table), *space, stream, batch_telemetry()));

@@ -31,7 +31,6 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -46,23 +45,26 @@
 namespace sirius::op {
 namespace {
 
-constexpr int k_block_size                   = 256;
-constexpr int k_warps_per_block              = k_block_size / 32;
-constexpr int k_max_groups                   = 64;
-constexpr int k_key_radix                    = 257;  // every byte plus one NULL token
-constexpr int k_null_key_token               = 256;
-constexpr int k_max_key_domain               = k_key_radix * k_key_radix;
-constexpr int k_status_bad_key               = 1;
-constexpr int k_status_overflow              = 2;
-constexpr int k_status_bad_state             = 4;
-constexpr int k_status_register_overflow     = 8;
-constexpr int k_status_sample_miss           = 16;
-constexpr int k_q1_register_groups           = 4;
-constexpr int k_q1_register_sums             = 5;
-constexpr int k_q1_register_states           = 6;
-constexpr int k_q1_logical_states            = 11;
-constexpr int64_t k_q1_preflight_sample_rows = int64_t{1} << 16;
-constexpr std::size_t k_max_dynamic_smem     = 48 * 1024;
+constexpr int k_block_size                         = 256;
+constexpr int k_warps_per_block                    = k_block_size / 32;
+constexpr int k_max_groups                         = 64;
+constexpr int k_key_radix                          = 257;  // every byte plus one NULL token
+constexpr int k_null_key_token                     = 256;
+constexpr int k_max_key_domain                     = k_key_radix * k_key_radix;
+constexpr int k_status_bad_key                     = 1;
+constexpr int k_status_overflow                    = 2;
+constexpr int k_status_bad_state                   = 4;
+constexpr int k_status_bounded_register_overflow   = 8;
+constexpr int k_status_late_key                    = 16;
+constexpr int k_max_bounded_register_groups        = 32;
+constexpr int k_max_bounded_register_states        = 8;
+constexpr int k_max_bounded_register_entries       = 32;
+constexpr int k_min_bounded_register_blocks_per_sm = 2;
+// Direct unmasked 64-bit specializations at or below this live-state count target
+// three resident blocks; larger bins rely on the runtime two-block admission floor.
+constexpr int k_three_block_codegen_entry_limit = 24;
+constexpr int64_t k_preflight_sample_rows       = int64_t{1} << 16;
+constexpr std::size_t k_max_dynamic_smem        = 48 * 1024;
 static_assert(k_block_size % 32 == 0);
 
 enum class key_kind : int32_t { STRING = 0, INT8 = 1, UINT8 = 2 };
@@ -90,14 +92,20 @@ struct aggregate_spec {
   cudf::bitmask_type* output_null_mask;
 };
 
-struct q1_register_sum_spec {
-  int64_t const* input_data;
+struct bounded_register_state_spec {
+  int32_t kind;
+  int32_t input_type;
+  void const* input_data;
   cudf::size_type input_offset;
+  cudf::bitmask_type const* input_null_mask;
+  cudf::size_type input_null_mask_offset;
 };
 
-struct q1_register_plan {
-  std::array<q1_register_sum_spec, k_q1_register_sums> sums;
-  std::array<int8_t, k_q1_logical_states> logical_to_physical;
+struct bounded_register_plan {
+  std::vector<bounded_register_state_spec> states;
+  std::vector<int8_t> logical_to_physical;
+  bool track_sum_validity           = false;
+  bool direct_unmasked_64bit_states = true;
 };
 
 struct alignas(16) wide_value {
@@ -361,47 +369,59 @@ __device__ __forceinline__ bool checked_add_int64(int64_t& target, int64_t incom
   return true;
 }
 
-#define SIRIUS_Q1_DECLARE_GROUP(PREFIX) \
-  int64_t PREFIX##_sum0  = 0;           \
-  int64_t PREFIX##_sum1  = 0;           \
-  int64_t PREFIX##_sum2  = 0;           \
-  int64_t PREFIX##_sum3  = 0;           \
-  int64_t PREFIX##_sum4  = 0;           \
-  int64_t PREFIX##_count = 0
-
-#define SIRIUS_Q1_ACCUMULATE_GROUP(PREFIX)                        \
-  register_overflow |= !checked_add_int64(PREFIX##_sum0, value0); \
-  register_overflow |= !checked_add_int64(PREFIX##_sum1, value1); \
-  register_overflow |= !checked_add_int64(PREFIX##_sum2, value2); \
-  register_overflow |= !checked_add_int64(PREFIX##_sum3, value3); \
-  register_overflow |= !checked_add_int64(PREFIX##_sum4, value4); \
-  ++PREFIX##_count
-
-#define SIRIUS_Q1_STORE_GROUP(GROUP, PREFIX)                                                      \
-  thread_partials[((0 * k_q1_register_groups + GROUP) * total_threads) + thread] = PREFIX##_sum0; \
-  thread_partials[((1 * k_q1_register_groups + GROUP) * total_threads) + thread] = PREFIX##_sum1; \
-  thread_partials[((2 * k_q1_register_groups + GROUP) * total_threads) + thread] = PREFIX##_sum2; \
-  thread_partials[((3 * k_q1_register_groups + GROUP) * total_threads) + thread] = PREFIX##_sum3; \
-  thread_partials[((4 * k_q1_register_groups + GROUP) * total_threads) + thread] = PREFIX##_sum4; \
-  thread_partials[((5 * k_q1_register_groups + GROUP) * total_threads) + thread] = PREFIX##_count
-
-__global__ void accumulate_q1_register_private_kernel(key_spec const* key_specs,
-                                                      int num_keys,
-                                                      int64_t rows,
-                                                      int16_t const* dense_map,
-                                                      q1_register_sum_spec const* sum_specs,
-                                                      int64_t* thread_partials,
-                                                      int32_t* status,
-                                                      bool sampled_preflight)
+__device__ __forceinline__ bool load_bounded_register_value(bounded_register_state_spec const& spec,
+                                                            int64_t row,
+                                                            int64_t& value)
 {
-  SIRIUS_Q1_DECLARE_GROUP(g0);
-  SIRIUS_Q1_DECLARE_GROUP(g1);
-  SIRIUS_Q1_DECLARE_GROUP(g2);
-  SIRIUS_Q1_DECLARE_GROUP(g3);
+  auto const i = spec.input_offset + static_cast<cudf::size_type>(row);
+  switch (static_cast<cudf::type_id>(spec.input_type)) {
+    case cudf::type_id::INT8: value = static_cast<int8_t const*>(spec.input_data)[i]; return true;
+    case cudf::type_id::INT16: value = static_cast<int16_t const*>(spec.input_data)[i]; return true;
+    case cudf::type_id::INT32:
+    case cudf::type_id::DECIMAL32:
+      value = static_cast<int32_t const*>(spec.input_data)[i];
+      return true;
+    case cudf::type_id::INT64:
+    case cudf::type_id::DECIMAL64:
+      value = static_cast<int64_t const*>(spec.input_data)[i];
+      return true;
+    case cudf::type_id::UINT8: value = static_cast<uint8_t const*>(spec.input_data)[i]; return true;
+    case cudf::type_id::UINT16:
+      value = static_cast<uint16_t const*>(spec.input_data)[i];
+      return true;
+    case cudf::type_id::UINT32:
+      value = static_cast<uint32_t const*>(spec.input_data)[i];
+      return true;
+    default: return false;
+  }
+}
 
+template <int GroupCapacity, int NumStates, bool TrackSumValidity, bool Direct64BitSums>
+__global__ __launch_bounds__(
+  k_block_size,
+  Direct64BitSums && GroupCapacity * NumStates <= k_three_block_codegen_entry_limit
+    ? 3
+    : 1) void accumulate_bounded_register_kernel(key_spec const* key_specs,
+                                                 int num_keys,
+                                                 int64_t rows,
+                                                 int16_t const* dense_map,
+                                                 bounded_register_state_spec const* state_specs,
+                                                 int num_groups,
+                                                 int64_t* thread_partials,
+                                                 uint32_t* thread_validity,
+                                                 int32_t* status,
+                                                 bool prefix_preflight)
+{
+  static_assert(GroupCapacity * NumStates <= k_max_bounded_register_entries);
+  __shared__ bounded_register_state_spec shared_specs[NumStates];
+  if (threadIdx.x < NumStates) { shared_specs[threadIdx.x] = state_specs[threadIdx.x]; }
+  __syncthreads();
+
+  int64_t accumulators[GroupCapacity * NumStates]{};
+  uint32_t valid_bits      = 0;
   bool register_overflow   = false;
   bool bad_state           = false;
-  bool sampled_key_miss    = false;
+  bool late_key            = false;
   auto const thread        = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   auto const total_threads = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t row = thread; row < rows; row += total_threads) {
@@ -409,113 +429,325 @@ __global__ void accumulate_q1_register_private_kernel(key_spec const* key_specs,
     if (packed < 0) { continue; }
     auto const group = static_cast<int>(dense_map[packed]);
     if (group < 0) {
-      sampled_key_miss |= sampled_preflight;
-      bad_state |= !sampled_preflight;
+      late_key |= prefix_preflight;
+      bad_state |= !prefix_preflight;
       continue;
     }
-    if (group >= k_q1_register_groups) {
+    if (group >= num_groups || group >= GroupCapacity) {
       bad_state = true;
       continue;
     }
 
-    auto const value0 =
-      sum_specs[0].input_data[sum_specs[0].input_offset + static_cast<cudf::size_type>(row)];
-    auto const value1 =
-      sum_specs[1].input_data[sum_specs[1].input_offset + static_cast<cudf::size_type>(row)];
-    auto const value2 =
-      sum_specs[2].input_data[sum_specs[2].input_offset + static_cast<cudf::size_type>(row)];
-    auto const value3 =
-      sum_specs[3].input_data[sum_specs[3].input_offset + static_cast<cudf::size_type>(row)];
-    auto const value4 =
-      sum_specs[4].input_data[sum_specs[4].input_offset + static_cast<cudf::size_type>(row)];
+#pragma unroll
+    for (int candidate_group = 0; candidate_group < GroupCapacity; ++candidate_group) {
+      if (group != candidate_group) { continue; }
+#pragma unroll
+      for (int state = 0; state < NumStates; ++state) {
+        auto const& spec = shared_specs[state];
+        auto const entry = state * GroupCapacity + candidate_group;
+        if constexpr (Direct64BitSums && !TrackSumValidity) {
+          auto const i        = spec.input_offset + static_cast<cudf::size_type>(row);
+          auto const incoming = spec.input_data == nullptr
+                                  ? int64_t{1}
+                                  : static_cast<int64_t const*>(spec.input_data)[i];
+          register_overflow |= !checked_add_int64(accumulators[entry], incoming);
+        } else {
+          auto const kind  = static_cast<cudf::aggregation::Kind>(spec.kind);
+          bool value_valid = true;
+          bool accumulate  = true;
+          int64_t incoming = 0;
+          if (kind == cudf::aggregation::Kind::SUM) {
+            if constexpr (TrackSumValidity) {
+              value_valid = row_is_valid(spec.input_null_mask, spec.input_null_mask_offset, row);
+            }
+            accumulate = value_valid;
+            if (value_valid) {
+              if constexpr (Direct64BitSums) {
+                auto const i = spec.input_offset + static_cast<cudf::size_type>(row);
+                incoming     = static_cast<int64_t const*>(spec.input_data)[i];
+              } else if (!load_bounded_register_value(spec, row, incoming)) {
+                bad_state  = true;
+                accumulate = false;
+              }
+            }
+          } else if (kind == cudf::aggregation::Kind::COUNT_ALL) {
+            incoming = 1;
+          } else if (kind == cudf::aggregation::Kind::COUNT_VALID) {
+            value_valid = true;
+            accumulate  = row_is_valid(spec.input_null_mask, spec.input_null_mask_offset, row);
+            incoming    = 1;
+          } else {
+            bad_state   = true;
+            value_valid = false;
+            accumulate  = false;
+          }
 
-    switch (group) {
-      case 0: SIRIUS_Q1_ACCUMULATE_GROUP(g0); break;
-      case 1: SIRIUS_Q1_ACCUMULATE_GROUP(g1); break;
-      case 2: SIRIUS_Q1_ACCUMULATE_GROUP(g2); break;
-      case 3: SIRIUS_Q1_ACCUMULATE_GROUP(g3); break;
-      default: break;
+          if constexpr (TrackSumValidity) {
+            if (value_valid) { valid_bits |= uint32_t{1} << entry; }
+          }
+          if (accumulate) {
+            register_overflow |= !checked_add_int64(accumulators[entry], incoming);
+          }
+        }
+      }
     }
   }
 
-  if (register_overflow) { atomicOr(status, k_status_register_overflow); }
+  if (register_overflow) { atomicOr(status, k_status_bounded_register_overflow); }
   if (bad_state) { atomicOr(status, k_status_bad_state); }
-  if (sampled_key_miss) { atomicOr(status, k_status_sample_miss); }
+  if (late_key) { atomicOr(status, k_status_late_key); }
 
-  SIRIUS_Q1_STORE_GROUP(0, g0);
-  SIRIUS_Q1_STORE_GROUP(1, g1);
-  SIRIUS_Q1_STORE_GROUP(2, g2);
-  SIRIUS_Q1_STORE_GROUP(3, g3);
+#pragma unroll
+  for (int state = 0; state < NumStates; ++state) {
+#pragma unroll
+    for (int group = 0; group < GroupCapacity; ++group) {
+      if (group >= num_groups) { continue; }
+      auto const local_entry    = state * GroupCapacity + group;
+      auto const physical_entry = state * num_groups + group;
+      auto const output         = static_cast<int64_t>(physical_entry) * total_threads + thread;
+      thread_partials[output]   = accumulators[local_entry];
+      if constexpr (TrackSumValidity) {
+        thread_validity[output] = (valid_bits >> local_entry) & uint32_t{1};
+      }
+    }
+  }
 }
 
-#undef SIRIUS_Q1_STORE_GROUP
-#undef SIRIUS_Q1_ACCUMULATE_GROUP
-#undef SIRIUS_Q1_DECLARE_GROUP
-
-__global__ void reduce_q1_register_partials_kernel(int64_t const* thread_partials,
-                                                   int num_partial_threads,
-                                                   wide_value* physical_results,
-                                                   int32_t* status)
+__global__ void reduce_bounded_register_partials_kernel(int64_t const* thread_partials,
+                                                        uint32_t const* thread_validity,
+                                                        int num_partial_threads,
+                                                        int num_physical_entries,
+                                                        wide_value* physical_results,
+                                                        uint32_t* physical_validity,
+                                                        int32_t* status)
 {
-  constexpr int physical_entries = k_q1_register_groups * k_q1_register_states;
-  auto const physical_entry      = static_cast<int>(blockIdx.x);
-  if (physical_entry >= physical_entries) { return; }
+  auto const physical_entry = static_cast<int>(blockIdx.x);
+  if (physical_entry >= num_physical_entries) { return; }
 
   wide_value local{};
-  bool overflow = false;
+  bool local_valid = false;
+  bool overflow    = false;
   for (int thread = static_cast<int>(threadIdx.x); thread < num_partial_threads;
        thread += blockDim.x) {
-    wide_value next{};
-    overflow |=
-      add_wide(local,
-               from_signed(thread_partials[physical_entry * num_partial_threads + thread]),
-               false,
-               next);
-    local = next;
+    auto const offset = physical_entry * num_partial_threads + thread;
+    if (thread_validity != nullptr && thread_validity[offset] == 0) { continue; }
+    auto const incoming = from_signed(thread_partials[offset]);
+    if (!local_valid) {
+      local       = incoming;
+      local_valid = true;
+    } else {
+      wide_value next{};
+      overflow |= add_wide(local, incoming, false, next);
+      local = next;
+    }
   }
   if (overflow) { atomicOr(status, k_status_overflow); }
 
-  __shared__ wide_value shared[k_block_size];
-  shared[threadIdx.x] = local;
+  __shared__ wide_value shared_values[k_block_size];
+  __shared__ uint32_t shared_validity[k_block_size];
+  shared_values[threadIdx.x]   = local;
+  shared_validity[threadIdx.x] = local_valid ? uint32_t{1} : uint32_t{0};
   __syncthreads();
 
   for (int stride = k_block_size / 2; stride > 0; stride /= 2) {
-    if (threadIdx.x < stride) {
-      wide_value next{};
-      if (add_wide(shared[threadIdx.x], shared[threadIdx.x + stride], false, next)) {
-        atomicOr(status, k_status_overflow);
+    if (threadIdx.x < stride && shared_validity[threadIdx.x + stride] != 0) {
+      if (shared_validity[threadIdx.x] == 0) {
+        shared_values[threadIdx.x]   = shared_values[threadIdx.x + stride];
+        shared_validity[threadIdx.x] = 1;
+      } else {
+        wide_value next{};
+        if (add_wide(
+              shared_values[threadIdx.x], shared_values[threadIdx.x + stride], false, next)) {
+          atomicOr(status, k_status_overflow);
+        }
+        shared_values[threadIdx.x] = next;
       }
-      shared[threadIdx.x] = next;
     }
     __syncthreads();
   }
-  if (threadIdx.x == 0) { physical_results[physical_entry] = shared[0]; }
+  if (threadIdx.x == 0) {
+    physical_results[physical_entry]  = shared_values[0];
+    physical_validity[physical_entry] = shared_validity[0];
+  }
 }
 
-__global__ void expand_q1_register_results_kernel(wide_value const* physical_results,
-                                                  aggregate_spec const* aggregate_specs,
-                                                  int8_t const* logical_to_physical,
-                                                  int32_t* status)
+__global__ void expand_bounded_register_results_kernel(wide_value const* physical_results,
+                                                       uint32_t const* physical_validity,
+                                                       aggregate_spec const* aggregate_specs,
+                                                       int8_t const* logical_to_physical,
+                                                       int num_logical_states,
+                                                       int num_physical_states,
+                                                       int num_groups,
+                                                       cudf::size_type* output_null_counts,
+                                                       int32_t* status)
 {
-  auto const logical_entry      = static_cast<int>(threadIdx.x);
-  constexpr int logical_entries = k_q1_register_groups * k_q1_logical_states;
-  if (logical_entry >= logical_entries) { return; }
+  if (*status != 0) { return; }
+  auto const logical_entries = num_logical_states * num_groups;
+  for (int logical_entry = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+       logical_entry < logical_entries;
+       logical_entry += static_cast<int>(gridDim.x) * blockDim.x) {
+    auto const logical_state  = logical_entry / num_groups;
+    auto const group          = logical_entry % num_groups;
+    auto const physical_state = static_cast<int>(logical_to_physical[logical_state]);
+    if (physical_state < 0 || physical_state >= num_physical_states) {
+      atomicOr(status, k_status_bad_state);
+      continue;
+    }
 
-  auto const logical_state  = logical_entry / k_q1_register_groups;
-  auto const group          = logical_entry % k_q1_register_groups;
-  auto const physical_state = static_cast<int>(logical_to_physical[logical_state]);
-  if (physical_state < 0 || physical_state >= k_q1_register_states) {
-    atomicOr(status, k_status_bad_state);
-    return;
-  }
+    auto const& spec          = aggregate_specs[logical_state];
+    auto const physical_entry = physical_state * num_groups + group;
+    if (physical_validity[physical_entry] == 0) {
+      if (static_cast<cudf::aggregation::Kind>(spec.kind) != cudf::aggregation::Kind::SUM ||
+          spec.output_null_mask == nullptr) {
+        atomicOr(status, k_status_bad_state);
+      } else {
+        atomicAdd(output_null_counts + logical_state, cudf::size_type{1});
+        clear_validity(spec.output_null_mask, group);
+      }
+      continue;
+    }
 
-  auto const& spec = aggregate_specs[logical_state];
-  auto const value = physical_results[physical_state * k_q1_register_groups + group];
-  if (!output_value_fits(spec, value)) {
-    atomicOr(status, k_status_overflow);
-  } else {
-    write_value(spec, group, value);
+    auto const value = physical_results[physical_entry];
+    if (!output_value_fits(spec, value)) {
+      atomicOr(status, k_status_overflow);
+    } else {
+      write_value(spec, group, value);
+    }
   }
+}
+
+struct bounded_register_launch_args {
+  key_spec const* key_specs;
+  int num_keys;
+  int64_t rows;
+  int16_t const* dense_map;
+  bounded_register_state_spec const* state_specs;
+  int num_groups;
+  int32_t* status;
+  bool prefix_preflight;
+  bool track_sum_validity;
+  bool direct_unmasked_64bit_states;
+};
+
+struct bounded_register_scratch {
+  std::unique_ptr<rmm::device_uvector<int64_t>> partials;
+  std::unique_ptr<rmm::device_uvector<uint32_t>> validity;
+  std::size_t partial_threads = 0;
+};
+
+template <int GroupCapacity, int NumStates, bool TrackSumValidity, bool Direct64BitSums>
+[[nodiscard]] bool launch_bounded_register_mode(bounded_register_launch_args const& args,
+                                                bounded_register_scratch& scratch,
+                                                rmm::cuda_stream_view stream,
+                                                rmm::device_async_resource_ref mr)
+{
+  static_assert(GroupCapacity * NumStates <= k_max_bounded_register_entries);
+  int blocks_per_sm{0};
+  CUDF_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &blocks_per_sm,
+    accumulate_bounded_register_kernel<GroupCapacity, NumStates, TrackSumValidity, Direct64BitSums>,
+    k_block_size,
+    0));
+  if (blocks_per_sm < k_min_bounded_register_blocks_per_sm) { return false; }
+  auto const row_blocks = static_cast<unsigned>(
+    std::max<int64_t>((args.rows + k_block_size - 1) / k_block_size, int64_t{1}));
+  auto const grid = std::min(
+    row_blocks,
+    static_cast<unsigned>(device_attribute<cudaDevAttrMultiProcessorCount>() * blocks_per_sm));
+  scratch.partial_threads = static_cast<std::size_t>(grid) * k_block_size;
+  auto const entries      = static_cast<std::size_t>(args.num_groups) * NumStates;
+  scratch.partials =
+    std::make_unique<rmm::device_uvector<int64_t>>(scratch.partial_threads * entries, stream, mr);
+  if constexpr (TrackSumValidity) {
+    scratch.validity = std::make_unique<rmm::device_uvector<uint32_t>>(
+      scratch.partial_threads * entries, stream, mr);
+  }
+  accumulate_bounded_register_kernel<GroupCapacity, NumStates, TrackSumValidity, Direct64BitSums>
+    <<<grid, k_block_size, 0, stream.value()>>>(
+      args.key_specs,
+      args.num_keys,
+      args.rows,
+      args.dense_map,
+      args.state_specs,
+      args.num_groups,
+      scratch.partials->data(),
+      TrackSumValidity ? scratch.validity->data() : nullptr,
+      args.status,
+      args.prefix_preflight);
+  CUDF_CUDA_TRY(cudaGetLastError());
+  return true;
+}
+
+template <int GroupCapacity, int NumStates>
+[[nodiscard]] bool launch_bounded_register_accumulation(bounded_register_launch_args const& args,
+                                                        bounded_register_scratch& scratch,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref mr)
+{
+  if (args.direct_unmasked_64bit_states) {
+    return launch_bounded_register_mode<GroupCapacity, NumStates, false, true>(
+      args, scratch, stream, mr);
+  }
+  if (args.track_sum_validity) {
+    return launch_bounded_register_mode<GroupCapacity, NumStates, true, false>(
+      args, scratch, stream, mr);
+  }
+  return launch_bounded_register_mode<GroupCapacity, NumStates, false, false>(
+    args, scratch, stream, mr);
+}
+
+template <int GroupCapacity, int MaxStates>
+[[nodiscard]] bool dispatch_bounded_register_states(int num_states,
+                                                    bounded_register_launch_args const& args,
+                                                    bounded_register_scratch& scratch,
+                                                    rmm::cuda_stream_view stream,
+                                                    rmm::device_async_resource_ref mr)
+{
+#define SIRIUS_DISPATCH_STATE_COUNT(N)                                                          \
+  case N:                                                                                       \
+    if constexpr (N <= MaxStates) {                                                             \
+      return launch_bounded_register_accumulation<GroupCapacity, N>(args, scratch, stream, mr); \
+    }                                                                                           \
+    return false
+  switch (num_states) {
+    SIRIUS_DISPATCH_STATE_COUNT(1);
+    SIRIUS_DISPATCH_STATE_COUNT(2);
+    SIRIUS_DISPATCH_STATE_COUNT(3);
+    SIRIUS_DISPATCH_STATE_COUNT(4);
+    SIRIUS_DISPATCH_STATE_COUNT(5);
+    SIRIUS_DISPATCH_STATE_COUNT(6);
+    SIRIUS_DISPATCH_STATE_COUNT(7);
+    SIRIUS_DISPATCH_STATE_COUNT(8);
+    default: return false;
+  }
+#undef SIRIUS_DISPATCH_STATE_COUNT
+}
+
+[[nodiscard]] bool dispatch_bounded_register_accumulation(int num_states,
+                                                          bounded_register_launch_args const& args,
+                                                          bounded_register_scratch& scratch,
+                                                          rmm::cuda_stream_view stream,
+                                                          rmm::device_async_resource_ref mr)
+{
+  if (args.num_groups <= 1) {
+    return dispatch_bounded_register_states<1, 8>(num_states, args, scratch, stream, mr);
+  }
+  if (args.num_groups <= 2) {
+    return dispatch_bounded_register_states<2, 8>(num_states, args, scratch, stream, mr);
+  }
+  if (args.num_groups <= 4) {
+    return dispatch_bounded_register_states<4, 8>(num_states, args, scratch, stream, mr);
+  }
+  if (args.num_groups <= 8) {
+    return dispatch_bounded_register_states<8, 4>(num_states, args, scratch, stream, mr);
+  }
+  if (args.num_groups <= 16) {
+    return dispatch_bounded_register_states<16, 2>(num_states, args, scratch, stream, mr);
+  }
+  if (args.num_groups <= 32) {
+    return dispatch_bounded_register_states<32, 1>(num_states, args, scratch, stream, mr);
+  }
+  return false;
 }
 
 __global__ void accumulate_tiny_domain_kernel(key_spec const* key_specs,
@@ -793,125 +1025,147 @@ __global__ void reduce_tiny_domain_kernel(partial_state const* block_partials,
          lhs.input_null_mask_offset == rhs.input_null_mask_offset;
 }
 
-[[nodiscard]] bool same_sum_state(aggregate_spec const& lhs, aggregate_spec const& rhs)
+[[nodiscard]] bool same_sum_state(aggregate_spec const& lhs,
+                                  aggregate_spec const& rhs,
+                                  cudf::data_type lhs_type,
+                                  cudf::data_type rhs_type)
 {
-  return same_input_source(lhs, rhs) && lhs.kind == rhs.kind && lhs.output_type == rhs.output_type;
+  return lhs_type == rhs_type && same_input_source(lhs, rhs) && lhs.kind == rhs.kind &&
+         lhs.output_type == rhs.output_type;
 }
 
-[[nodiscard]] std::optional<q1_register_plan> make_q1_register_plan(
+[[nodiscard]] bounded_register_state_spec make_bounded_register_state(aggregate_spec const& spec)
+{
+  return bounded_register_state_spec{spec.kind,
+                                     spec.input_type,
+                                     spec.input_data,
+                                     spec.input_offset,
+                                     spec.input_null_mask,
+                                     spec.input_null_mask_offset};
+}
+
+[[nodiscard]] std::optional<bounded_register_plan> make_bounded_register_plan(
   cudf::table_view input,
-  std::vector<int> const& group_idx,
   std::vector<cudf::aggregation::Kind> const& aggregates,
   std::vector<int> const& aggregate_idx,
-  std::vector<aggregate_spec> const& specs,
-  int num_groups)
+  std::vector<aggregate_spec> const& specs)
 {
-  if (num_groups != k_q1_register_groups || group_idx.size() != 2 ||
-      aggregates.size() != k_q1_logical_states || specs.size() != k_q1_logical_states) {
-    return std::nullopt;
-  }
-  if (input.column(group_idx[0]).type().id() != cudf::type_id::STRING ||
-      input.column(group_idx[1]).type().id() != cudf::type_id::STRING) {
+  if (aggregates.empty() || aggregates.size() != aggregate_idx.size() ||
+      aggregates.size() != specs.size()) {
     return std::nullopt;
   }
 
-  q1_register_plan plan{};
-  plan.logical_to_physical.fill(-1);
-  std::array<aggregate_spec const*, k_q1_register_sums> unique_sums{};
-  std::array<int, k_q1_register_sums> unique_sum_input_indices{};
-  std::array<int, k_q1_register_sums> multiplicities{};
-  int num_unique_sums  = 0;
-  int num_logical_sums = 0;
+  bounded_register_plan plan{};
+  plan.logical_to_physical.assign(aggregates.size(), int8_t{-1});
+  std::vector<int> representative_logicals;
+  representative_logicals.reserve(k_max_bounded_register_states);
 
-  for (int logical = 0; logical < k_q1_logical_states; ++logical) {
-    auto const kind = aggregates[logical];
-    if (kind != cudf::aggregation::Kind::SUM) {
-      if (kind != cudf::aggregation::Kind::COUNT_VALID &&
-          kind != cudf::aggregation::Kind::COUNT_ALL) {
-        return std::nullopt;
+  auto add_state = [&](bounded_register_state_spec state, int representative_logical) {
+    if (plan.states.size() == k_max_bounded_register_states) { return -1; }
+    auto const physical = static_cast<int>(plan.states.size());
+    plan.states.push_back(state);
+    representative_logicals.push_back(representative_logical);
+    return physical;
+  };
+  auto count_all_state = [&]() {
+    for (std::size_t physical = 0; physical < plan.states.size(); ++physical) {
+      if (static_cast<cudf::aggregation::Kind>(plan.states[physical].kind) ==
+          cudf::aggregation::Kind::COUNT_ALL) {
+        return static_cast<int>(physical);
       }
-      continue;
     }
+    aggregate_spec state{};
+    state.kind       = static_cast<int32_t>(cudf::aggregation::Kind::COUNT_ALL);
+    state.input_type = static_cast<int32_t>(cudf::type_id::INT8);
+    return add_state(make_bounded_register_state(state), -1);
+  };
 
+  for (std::size_t logical = 0; logical < aggregates.size(); ++logical) {
+    auto const kind  = aggregates[logical];
     auto const& spec = specs[logical];
-    auto const index = aggregate_idx[logical];
-    if (input.column(index).type().id() != cudf::type_id::DECIMAL64 ||
-        input.column(index).null_count() != 0 ||
-        spec.input_type != static_cast<int32_t>(cudf::type_id::DECIMAL64) ||
-        spec.output_type != static_cast<int32_t>(cudf::type_id::DECIMAL128) ||
-        spec.is_unsigned != 0 || spec.input_data == nullptr) {
-      return std::nullopt;
-    }
-
-    int physical = -1;
-    for (int candidate = 0; candidate < num_unique_sums; ++candidate) {
-      if (same_sum_state(spec, *unique_sums[candidate]) &&
-          input.column(index).type() == input.column(unique_sum_input_indices[candidate]).type()) {
-        physical = candidate;
-        break;
-      }
-    }
-    if (physical < 0) {
-      if (num_unique_sums == k_q1_register_sums) { return std::nullopt; }
-      physical                           = num_unique_sums++;
-      unique_sums[physical]              = &spec;
-      unique_sum_input_indices[physical] = index;
-      plan.sums[physical].input_data     = static_cast<int64_t const*>(spec.input_data);
-      plan.sums[physical].input_offset   = spec.input_offset;
-    }
-    ++multiplicities[physical];
-    ++num_logical_sums;
-    plan.logical_to_physical[logical] = static_cast<int8_t>(physical);
-  }
-
-  if (num_unique_sums != k_q1_register_sums || num_logical_sums != 7) { return std::nullopt; }
-  auto sorted_multiplicities = multiplicities;
-  std::sort(sorted_multiplicities.begin(), sorted_multiplicities.end());
-  if (sorted_multiplicities != std::array<int, k_q1_register_sums>{1, 1, 1, 2, 2}) {
-    return std::nullopt;
-  }
-
-  std::array<bool, k_q1_register_sums> counted_sum_sources{};
-  std::array<int, 3> counted_sum_multiplicities{};
-  int num_count_valid = 0;
-  int num_count_all   = 0;
-  for (int logical = 0; logical < k_q1_logical_states; ++logical) {
-    auto const kind = aggregates[logical];
-    if (kind == cudf::aggregation::Kind::SUM) { continue; }
-    auto const& spec = specs[logical];
-    if (kind == cudf::aggregation::Kind::COUNT_ALL) {
-      if (spec.output_type != static_cast<int32_t>(cudf::type_id::INT64)) { return std::nullopt; }
-      ++num_count_all;
-    } else {
-      auto const index = aggregate_idx[logical];
-      if (input.column(index).null_count() != 0 ||
-          spec.output_type != static_cast<int32_t>(cudf::type_id::INT32)) {
-        return std::nullopt;
-      }
-      int sum_source = -1;
-      for (int candidate = 0; candidate < num_unique_sums; ++candidate) {
-        if (same_input_source(spec, *unique_sums[candidate]) &&
-            input.column(index).type() ==
-              input.column(unique_sum_input_indices[candidate]).type()) {
-          sum_source = candidate;
+    int physical     = -1;
+    if (kind == cudf::aggregation::Kind::SUM) {
+      auto const source      = aggregate_idx[logical];
+      auto const source_type = input.column(source).type();
+      plan.direct_unmasked_64bit_states &=
+        source_type.id() == cudf::type_id::INT64 || source_type.id() == cudf::type_id::DECIMAL64;
+      for (std::size_t candidate = 0; candidate < plan.states.size(); ++candidate) {
+        auto const representative = representative_logicals[candidate];
+        if (representative < 0 || static_cast<cudf::aggregation::Kind>(
+                                    plan.states[candidate].kind) != cudf::aggregation::Kind::SUM) {
+          continue;
+        }
+        auto const other_source = aggregate_idx[static_cast<std::size_t>(representative)];
+        if (same_sum_state(spec,
+                           specs[static_cast<std::size_t>(representative)],
+                           source_type,
+                           input.column(other_source).type())) {
+          physical = static_cast<int>(candidate);
           break;
         }
       }
-      if (sum_source < 0 || counted_sum_sources[sum_source] || num_count_valid == 3) {
-        return std::nullopt;
+      if (physical < 0) {
+        auto state = make_bounded_register_state(spec);
+        if (input.column(source).null_count() == 0) {
+          state.input_null_mask        = nullptr;
+          state.input_null_mask_offset = 0;
+        } else {
+          plan.track_sum_validity = true;
+        }
+        physical = add_state(state, static_cast<int>(logical));
       }
-      counted_sum_sources[sum_source]               = true;
-      counted_sum_multiplicities[num_count_valid++] = multiplicities[sum_source];
+    } else if (kind == cudf::aggregation::Kind::COUNT_ALL) {
+      physical = count_all_state();
+    } else if (kind == cudf::aggregation::Kind::COUNT_VALID) {
+      auto const column = input.column(aggregate_idx[logical]);
+      if (!column.nullable() || column.null_count() == 0) {
+        physical = count_all_state();
+      } else {
+        for (std::size_t candidate = 0; candidate < plan.states.size(); ++candidate) {
+          auto const& state = plan.states[candidate];
+          if (static_cast<cudf::aggregation::Kind>(state.kind) ==
+                cudf::aggregation::Kind::COUNT_VALID &&
+              state.input_null_mask == spec.input_null_mask &&
+              state.input_null_mask_offset == spec.input_null_mask_offset) {
+            physical = static_cast<int>(candidate);
+            break;
+          }
+        }
+        if (physical < 0) {
+          auto state         = make_bounded_register_state(spec);
+          state.input_type   = static_cast<int32_t>(cudf::type_id::INT8);
+          state.input_data   = nullptr;
+          state.input_offset = 0;
+          physical           = add_state(state, static_cast<int>(logical));
+        }
+      }
+    } else {
+      return std::nullopt;
     }
-    plan.logical_to_physical[logical] = k_q1_register_sums;
-  }
 
-  std::sort(counted_sum_multiplicities.begin(), counted_sum_multiplicities.end());
-  if (num_count_valid != 3 || num_count_all != 1 ||
-      counted_sum_multiplicities != std::array<int, 3>{1, 2, 2}) {
-    return std::nullopt;
+    if (physical < 0) { return std::nullopt; }
+    plan.logical_to_physical[logical] = static_cast<int8_t>(physical);
   }
+  plan.direct_unmasked_64bit_states &=
+    std::all_of(plan.states.begin(), plan.states.end(), [](auto const& state) {
+      return state.input_null_mask == nullptr;
+    });
   return plan;
+}
+
+[[nodiscard]] bool bounded_register_shape_fits(int num_groups, int num_states)
+{
+  if (num_groups <= 0 || num_groups > k_max_bounded_register_groups || num_states <= 0 ||
+      num_states > k_max_bounded_register_states) {
+    return false;
+  }
+  auto const group_capacity = num_groups <= 1    ? 1
+                              : num_groups <= 2  ? 2
+                              : num_groups <= 4  ? 4
+                              : num_groups <= 8  ? 8
+                              : num_groups <= 16 ? 16
+                                                 : 32;
+  return group_capacity * num_states <= k_max_bounded_register_entries;
 }
 
 [[nodiscard]] std::string status_reason(int status)
@@ -923,11 +1177,11 @@ __global__ void reduce_tiny_domain_kernel(partial_state const* block_partials,
     return "aggregate arithmetic exceeded its exact carrier";
   }
   if ((status & k_status_bad_key) != 0) { return "a non-null STRING key is not exactly one byte"; }
-  if ((status & k_status_sample_miss) != 0) {
-    return "sampled Q1 preflight missed a grouping key outside its prefix";
+  if ((status & k_status_late_key) != 0) {
+    return "prefix preflight missed a grouping key outside its sampled rows";
   }
-  if ((status & k_status_register_overflow) != 0) {
-    return "register-private partial exceeded its INT64 carrier";
+  if ((status & k_status_bounded_register_overflow) != 0) {
+    return "bounded register partial exceeded its INT64 carrier";
   }
   return "tiny-domain kernel reported an invalid internal state";
 }
@@ -972,7 +1226,7 @@ tiny_domain_grouped_aggregate_attempt try_tiny_domain_grouped_aggregate(
 
   // Match the generic grouped-aggregate local-state schema exactly. cuDF produces INT32 counts;
   // the legacy path widens only a request containing a single COUNT. Aggregates sharing an input
-  // column are combined into one request, including COUNT(*)'s column-zero placeholder.
+  // column are combined into one request, including COUNT(*) column-zero placeholder.
   std::vector<std::size_t> request_multiplicity(static_cast<std::size_t>(input.num_columns()), 0);
   for (auto const index : aggregate_idx) {
     if (index < 0 || index >= input.num_columns()) {
@@ -1024,13 +1278,12 @@ tiny_domain_grouped_aggregate_attempt try_tiny_domain_grouped_aggregate(
       output_null_mask};
   };
 
-  std::vector<aggregate_spec> q1_shape_specs;
-  q1_shape_specs.reserve(aggregates.size());
+  std::vector<aggregate_spec> planning_specs;
+  planning_specs.reserve(aggregates.size());
   for (std::size_t i = 0; i < aggregates.size(); ++i) {
-    q1_shape_specs.push_back(make_host_aggregate_spec(i, nullptr, nullptr));
+    planning_specs.push_back(make_host_aggregate_spec(i, nullptr, nullptr));
   }
-  auto const q1_shape_plan = make_q1_register_plan(
-    input, group_idx, aggregates, aggregate_idx, q1_shape_specs, k_q1_register_groups);
+  auto bounded_plan = make_bounded_register_plan(input, aggregates, aggregate_idx, planning_specs);
 
   auto const domain = group_idx.size() == 1 ? k_key_radix : k_max_key_domain;
   rmm::device_uvector<key_spec> device_key_specs(host_key_specs.size(), stream, mr);
@@ -1069,17 +1322,22 @@ tiny_domain_grouped_aggregate_attempt try_tiny_domain_grouped_aggregate(
     stream.synchronize();
   };
 
-  bool const prefix_is_sample =
-    q1_shape_plan.has_value() && input.num_rows() > k_q1_preflight_sample_rows;
-  run_preflight(prefix_is_sample ? k_q1_preflight_sample_rows : input.num_rows());
+  bool const prefix_is_candidate =
+    bounded_plan.has_value() && input.num_rows() > k_preflight_sample_rows;
+  run_preflight(prefix_is_candidate ? k_preflight_sample_rows : input.num_rows());
   if (host_status != 0) { return fallback(status_reason(host_status)); }
-  auto const sample_groups          = static_cast<int>(std::count_if(host_representatives.begin(),
-                                                            host_representatives.end(),
-                                                            [](int32_t row) { return row >= 0; }));
-  bool const used_sampled_preflight = prefix_is_sample && sample_groups == k_q1_register_groups;
-  if (prefix_is_sample && !used_sampled_preflight) {
+  auto observed_groups = static_cast<int>(std::count_if(host_representatives.begin(),
+                                                        host_representatives.end(),
+                                                        [](int32_t row) { return row >= 0; }));
+  bool const used_prefix_preflight =
+    prefix_is_candidate &&
+    bounded_register_shape_fits(observed_groups, static_cast<int>(bounded_plan->states.size()));
+  if (prefix_is_candidate && !used_prefix_preflight) {
     run_preflight(input.num_rows());
     if (host_status != 0) { return fallback(status_reason(host_status)); }
+    observed_groups = static_cast<int>(std::count_if(host_representatives.begin(),
+                                                     host_representatives.end(),
+                                                     [](int32_t row) { return row >= 0; }));
   }
 
   std::vector<cudf::size_type> selected_rows;
@@ -1095,6 +1353,13 @@ tiny_domain_grouped_aggregate_attempt try_tiny_domain_grouped_aggregate(
   }
   if (selected_rows.empty()) { return fallback("key preflight found no occupied group"); }
   auto const num_groups = static_cast<int>(selected_rows.size());
+  if (!bounded_plan ||
+      !bounded_register_shape_fits(num_groups, static_cast<int>(bounded_plan->states.size()))) {
+    bounded_plan.reset();
+  }
+  if (used_prefix_preflight && !bounded_plan) {
+    return fallback("prefix preflight lost bounded-register resource eligibility");
+  }
 
   rmm::device_uvector<int16_t> device_dense_map(domain, stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(device_dense_map.data(),
@@ -1139,18 +1404,7 @@ tiny_domain_grouped_aggregate_attempt try_tiny_domain_grouped_aggregate(
   auto const entries = static_cast<std::size_t>(num_groups) * aggregates.size();
   constexpr auto state_bytes_per_entry =
     k_warps_per_block * (sizeof(wide_value) + sizeof(uint32_t));
-  if (entries > k_max_dynamic_smem / state_bytes_per_entry) {
-    return fallback("block-private aggregate state exceeds the shared-memory budget");
-  }
   auto const smem_bytes = entries * state_bytes_per_entry;
-  if (smem_bytes >
-      static_cast<std::size_t>(device_attribute<cudaDevAttrMaxSharedMemoryPerBlock>())) {
-    return fallback("block-private aggregate state exceeds the shared-memory budget");
-  }
-  auto const aggregate_grid =
-    resident_grid_for(input.num_rows(), accumulate_tiny_domain_kernel, smem_bytes);
-  auto const reduction_grid =
-    static_cast<unsigned>(std::max<std::size_t>((entries + k_block_size - 1) / k_block_size, 1));
   rmm::device_uvector<cudf::size_type> device_null_counts(aggregates.size(), stream, mr);
   std::unique_ptr<rmm::device_uvector<partial_state>> block_partials;
 
@@ -1162,6 +1416,15 @@ tiny_domain_grouped_aggregate_attempt try_tiny_domain_grouped_aggregate(
                                   stream.value()));
   };
   auto launch_wide = [&] {
+    if (entries > k_max_dynamic_smem / state_bytes_per_entry ||
+        smem_bytes >
+          static_cast<std::size_t>(device_attribute<cudaDevAttrMaxSharedMemoryPerBlock>())) {
+      return false;
+    }
+    auto const aggregate_grid =
+      resident_grid_for(input.num_rows(), accumulate_tiny_domain_kernel, smem_bytes);
+    auto const reduction_grid =
+      static_cast<unsigned>(std::max<std::size_t>((entries + k_block_size - 1) / k_block_size, 1));
     block_partials = std::make_unique<rmm::device_uvector<partial_state>>(
       static_cast<std::size_t>(aggregate_grid) * entries, stream, mr);
     accumulate_tiny_domain_kernel<<<aggregate_grid, k_block_size, smem_bytes, stream.value()>>>(
@@ -1184,68 +1447,95 @@ tiny_domain_grouped_aggregate_attempt try_tiny_domain_grouped_aggregate(
       device_null_counts.data(),
       device_status.data());
     CUDF_CUDA_TRY(cudaGetLastError());
+    return true;
   };
 
-  auto const q1_plan = make_q1_register_plan(
-    input, group_idx, aggregates, aggregate_idx, host_aggregate_specs, num_groups);
-  if (used_sampled_preflight && !q1_plan) {
-    return fallback("sampled Q1 preflight lost exact register-plan eligibility");
-  }
-  bool const register_private_attempted = q1_plan.has_value();
-  bool used_register_private            = false;
-  std::unique_ptr<rmm::device_uvector<q1_register_sum_spec>> device_q1_sum_specs;
-  std::unique_ptr<rmm::device_uvector<int8_t>> device_q1_logical_map;
-  std::unique_ptr<rmm::device_uvector<int64_t>> q1_thread_partials;
-  std::unique_ptr<rmm::device_uvector<wide_value>> q1_physical_results;
+  bool bounded_register_attempted = false;
+  bool used_bounded_register      = false;
+  std::unique_ptr<rmm::device_uvector<bounded_register_state_spec>> device_register_states;
+  std::unique_ptr<rmm::device_uvector<int8_t>> device_logical_map;
+  std::unique_ptr<rmm::device_uvector<wide_value>> physical_results;
+  std::unique_ptr<rmm::device_uvector<uint32_t>> physical_validity;
+  bounded_register_scratch register_scratch;
 
   reset_status();
-  if (q1_plan) {
-    device_q1_sum_specs =
-      std::make_unique<rmm::device_uvector<q1_register_sum_spec>>(q1_plan->sums.size(), stream, mr);
-    device_q1_logical_map = std::make_unique<rmm::device_uvector<int8_t>>(
-      q1_plan->logical_to_physical.size(), stream, mr);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(device_q1_sum_specs->data(),
-                                  q1_plan->sums.data(),
-                                  q1_plan->sums.size() * sizeof(q1_register_sum_spec),
+  if (bounded_plan) {
+    device_register_states = std::make_unique<rmm::device_uvector<bounded_register_state_spec>>(
+      bounded_plan->states.size(), stream, mr);
+    device_logical_map = std::make_unique<rmm::device_uvector<int8_t>>(
+      bounded_plan->logical_to_physical.size(), stream, mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(device_register_states->data(),
+                                  bounded_plan->states.data(),
+                                  bounded_plan->states.size() * sizeof(bounded_register_state_spec),
                                   cudaMemcpyHostToDevice,
                                   stream.value()));
-    CUDF_CUDA_TRY(cudaMemcpyAsync(device_q1_logical_map->data(),
-                                  q1_plan->logical_to_physical.data(),
-                                  q1_plan->logical_to_physical.size() * sizeof(int8_t),
+    CUDF_CUDA_TRY(cudaMemcpyAsync(device_logical_map->data(),
+                                  bounded_plan->logical_to_physical.data(),
+                                  bounded_plan->logical_to_physical.size() * sizeof(int8_t),
                                   cudaMemcpyHostToDevice,
                                   stream.value()));
 
-    auto const q1_grid = resident_grid_for(input.num_rows(), accumulate_q1_register_private_kernel);
-    auto const partial_threads = static_cast<std::size_t>(q1_grid) * k_block_size;
-    q1_thread_partials         = std::make_unique<rmm::device_uvector<int64_t>>(
-      partial_threads * k_q1_register_groups * k_q1_register_states, stream, mr);
-    constexpr auto physical_entries = k_q1_register_groups * k_q1_register_states;
-    q1_physical_results =
+    auto const physical_entries = static_cast<int>(bounded_plan->states.size()) * num_groups;
+    physical_results =
       std::make_unique<rmm::device_uvector<wide_value>>(physical_entries, stream, mr);
-    accumulate_q1_register_private_kernel<<<q1_grid, k_block_size, 0, stream.value()>>>(
-      device_key_specs.data(),
-      static_cast<int>(group_idx.size()),
-      input.num_rows(),
-      device_dense_map.data(),
-      device_q1_sum_specs->data(),
-      q1_thread_partials->data(),
-      device_status.data(),
-      used_sampled_preflight);
-    CUDF_CUDA_TRY(cudaGetLastError());
-    reduce_q1_register_partials_kernel<<<physical_entries, k_block_size, 0, stream.value()>>>(
-      q1_thread_partials->data(),
-      static_cast<int>(partial_threads),
-      q1_physical_results->data(),
-      device_status.data());
-    CUDF_CUDA_TRY(cudaGetLastError());
-    expand_q1_register_results_kernel<<<1, k_block_size, 0, stream.value()>>>(
-      q1_physical_results->data(),
-      device_aggregate_specs.data(),
-      device_q1_logical_map->data(),
-      device_status.data());
-    CUDF_CUDA_TRY(cudaGetLastError());
-  } else {
-    launch_wide();
+    physical_validity =
+      std::make_unique<rmm::device_uvector<uint32_t>>(physical_entries, stream, mr);
+    bounded_register_attempted = dispatch_bounded_register_accumulation(
+      static_cast<int>(bounded_plan->states.size()),
+      bounded_register_launch_args{device_key_specs.data(),
+                                   static_cast<int>(group_idx.size()),
+                                   input.num_rows(),
+                                   device_dense_map.data(),
+                                   device_register_states->data(),
+                                   num_groups,
+                                   device_status.data(),
+                                   used_prefix_preflight,
+                                   bounded_plan->track_sum_validity,
+                                   bounded_plan->direct_unmasked_64bit_states},
+      register_scratch,
+      stream,
+      mr);
+    if (!bounded_register_attempted) {
+      if (used_prefix_preflight) {
+        return fallback("bounded-register specialization is below the resident-block floor");
+      }
+      physical_results.reset();
+      physical_validity.reset();
+      device_register_states.reset();
+      device_logical_map.reset();
+      bounded_plan.reset();
+      if (!launch_wide()) {
+        return fallback("block-private aggregate state exceeds the shared-memory budget");
+      }
+    } else {
+      reduce_bounded_register_partials_kernel<<<physical_entries,
+                                                k_block_size,
+                                                0,
+                                                stream.value()>>>(
+        register_scratch.partials->data(),
+        register_scratch.validity ? register_scratch.validity->data() : nullptr,
+        static_cast<int>(register_scratch.partial_threads),
+        physical_entries,
+        physical_results->data(),
+        physical_validity->data(),
+        device_status.data());
+      CUDF_CUDA_TRY(cudaGetLastError());
+      auto const expansion_grid = static_cast<unsigned>(
+        std::max<std::size_t>((entries + k_block_size - 1) / k_block_size, 1));
+      expand_bounded_register_results_kernel<<<expansion_grid, k_block_size, 0, stream.value()>>>(
+        physical_results->data(),
+        physical_validity->data(),
+        device_aggregate_specs.data(),
+        device_logical_map->data(),
+        static_cast<int>(aggregates.size()),
+        static_cast<int>(bounded_plan->states.size()),
+        num_groups,
+        device_null_counts.data(),
+        device_status.data());
+      CUDF_CUDA_TRY(cudaGetLastError());
+    }
+  } else if (!launch_wide()) {
+    return fallback("block-private aggregate state exceeds the shared-memory budget");
   }
 
   std::vector<cudf::size_type> host_null_counts(aggregates.size());
@@ -1264,25 +1554,29 @@ tiny_domain_grouped_aggregate_attempt try_tiny_domain_grouped_aggregate(
   };
   fetch_status();
 
-  constexpr int expected_sampled_status =
-    k_status_bad_key | k_status_sample_miss | k_status_register_overflow;
-  auto const has_late_key_status = (host_status & (k_status_bad_key | k_status_sample_miss)) != 0;
-  if (used_sampled_preflight && has_late_key_status &&
-      (host_status & ~expected_sampled_status) == 0) {
+  constexpr int expected_prefix_status =
+    k_status_bad_key | k_status_late_key | k_status_bounded_register_overflow;
+  auto const has_late_key_status = (host_status & (k_status_bad_key | k_status_late_key)) != 0;
+  if (used_prefix_preflight && has_late_key_status &&
+      (host_status & ~expected_prefix_status) == 0) {
     return fallback(status_reason(host_status));
   }
-  if (register_private_attempted && host_status == k_status_register_overflow) {
-    // fetch_status synchronized the stream, so release register-only scratch before allocating
-    // the larger exact-wide fallback state.
-    q1_thread_partials.reset();
-    q1_physical_results.reset();
-    device_q1_sum_specs.reset();
-    device_q1_logical_map.reset();
+  if (bounded_register_attempted && host_status == k_status_bounded_register_overflow) {
+    // fetch_status synchronized the stream, so release register scratch before allocating the
+    // larger exact-wide fallback state.
+    register_scratch.partials.reset();
+    register_scratch.validity.reset();
+    physical_results.reset();
+    physical_validity.reset();
+    device_register_states.reset();
+    device_logical_map.reset();
     reset_status();
-    launch_wide();
+    if (!launch_wide()) {
+      return fallback("exact-wide overflow retry exceeds the shared-memory budget");
+    }
     fetch_status();
-  } else if (register_private_attempted && host_status == 0) {
-    used_register_private = true;
+  } else if (bounded_register_attempted && host_status == 0) {
+    used_bounded_register = true;
   }
   if ((host_status & k_status_overflow) != 0) {
     throw std::overflow_error("tiny-domain aggregate invariant failed: " +
@@ -1319,9 +1613,10 @@ tiny_domain_grouped_aggregate_attempt try_tiny_domain_grouped_aggregate(
     std::make_unique<cudf::table>(std::move(output_columns)),
     {},
     selected_rows.size(),
-    register_private_attempted,
-    used_register_private,
-    used_sampled_preflight};
+    bounded_plan ? bounded_plan->states.size() : 0,
+    bounded_register_attempted,
+    used_bounded_register,
+    used_prefix_preflight};
 }
 
 }  // namespace sirius::op
