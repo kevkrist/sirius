@@ -35,6 +35,8 @@
 #include <duckdb/storage/storage_manager.hpp>
 
 // cudf
+#include <cudf/binaryop.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -342,13 +344,38 @@ std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t
 
 }  // namespace
 
+std::unique_ptr<cudf::column> fold_membership_probes_into_mask(std::unique_ptr<cudf::column> mask,
+                                                               cudf::table_view const& input,
+                                                               membership_snapshot const& snapshot,
+                                                               rmm::cuda_stream_view stream,
+                                                               rmm::device_async_resource_ref mr)
+{
+  auto const n_slots =
+    std::min(snapshot.probes.size(), static_cast<std::size_t>(input.num_columns()));
+  for (std::size_t slot = 0; slot < n_slots; ++slot) {
+    for (auto const& probe : snapshot.probes[slot]) {
+      auto member = probe.probe(input.column(static_cast<cudf::size_type>(slot)), stream, mr);
+      // A null mask means the probe declined this key column (incompatible carrier) —
+      // skip it, exactly as the downstream cascade does.
+      if (!member) { continue; }
+      mask = cudf::binary_operation(mask->view(),
+                                    member->view(),
+                                    cudf::binary_operator::LOGICAL_AND,
+                                    cudf::data_type{cudf::type_id::BOOL8},
+                                    stream,
+                                    mr);
+    }
+  }
+  return mask;
+}
+
 std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream,
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
-  std::unique_ptr<cudf::column>* /*survivors*/,
+  std::unique_ptr<cudf::column>* survivors,
   std::span<std::size_t const> elided)
 {
   auto const output_arity = _info->output_types.size();
@@ -371,7 +398,49 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
                                       sirius::expression_evaluator::default_min_ast_size,
                                       like_swar_fastpath,
                                       std::move(like_cache));
-    if (projection_required) {
+    // Dynamic-filter membership fold: with a published join-filter snapshot on top of the
+    // static filter this branch is already evaluating, AND the membership masks into the
+    // static mask so the split gathers ONCE at final selectivity, instead of gathering at
+    // static selectivity here and again in the downstream dynamic-filter operator. Purely a
+    // non-blocking query of the channel's publish state — an unwired channel (q1/q6), an
+    // unpublished one, or a snapshot with no mask-capable probes all take the paths below
+    // unchanged. A deferring scan (survivors requested) also keeps today's path: this
+    // ingestible never answers survivors (see can_report_survivors), and the fold must not
+    // change which rows a late-materialization consumer believes a filter dropped.
+    membership_snapshot fold_probes;
+    if (survivors == nullptr && _info->sirius_dynamic_filters &&
+        _info->sirius_dynamic_filters->has_filters() && input.table.num_rows() > 0) {
+      fold_probes =
+        snapshot_membership_probes(*_info->sirius_dynamic_filters,
+                                   std::min<std::size_t>(output_arity, input.table.n_columns()));
+    }
+    if (fold_probes.attached_probes > 0) {
+      auto const in_view = input.table.view();
+      // For the singular filter expression, evaluate()'s single output column IS the BOOL8
+      // predicate mask select() gathers with (expression_evaluator::compute_mask); taking it
+      // here lets the membership masks join it ahead of the one gather.
+      auto mask_columns = exec.evaluate(in_view)->release();
+      auto mask         = fold_membership_probes_into_mask(
+        std::move(mask_columns.front()), in_view, fold_probes, stream, mr_ref);
+      auto gather_view = in_view;
+      std::vector<cudf::size_type> output_indices;
+      if (projection_required) {
+        // Same projection fold as the select() path: pure-filter columns are never gathered.
+        output_indices.resize(output_arity);
+        std::iota(output_indices.begin(), output_indices.end(), cudf::size_type{0});
+        gather_view = in_view.select(output_indices.begin(), output_indices.end());
+      }
+      final_table =
+        owning_table_view{cudf::apply_boolean_mask(gather_view, mask->view(), stream, mr_ref)};
+      SIRIUS_LOG_DEBUG(
+        "[duckdb_native_gpu_ingestible::post_filter_and_project] dynamic-filter fold: probes={} "
+        "generation={} skipped_non_maskable={} rows {} -> {}",
+        fold_probes.attached_probes,
+        fold_probes.generation,
+        fold_probes.skipped_non_mask,
+        in_view.num_rows(),
+        final_table.view().num_rows());
+    } else if (projection_required) {
       // Fold the projection into the filter gather so pure-filter columns are never materialized.
       std::vector<cudf::size_type> output_indices(output_arity);
       std::iota(output_indices.begin(), output_indices.end(), cudf::size_type{0});
