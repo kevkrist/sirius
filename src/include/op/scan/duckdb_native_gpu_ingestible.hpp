@@ -32,6 +32,9 @@
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 
+// rmm
+#include <rmm/resource_ref.hpp>
+
 // standard library
 #include <atomic>
 #include <cstddef>
@@ -65,9 +68,11 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
-  /// wired. The ingestible installs the consumer column remap on the channel; the downstream
-  /// dynamic-filter operator applies the filters post-decode (the native scan has no read-time
-  /// dynamic path).
+  /// wired. When the scan also carries a static pushed-down filter,
+  /// @c duckdb_native_gpu_ingestible::post_filter_and_project folds any membership filters
+  /// already published here into its filter gather (see @ref fold_membership_probes_into_mask);
+  /// otherwise — and for filters published after a split's post-filter ran — the downstream
+  /// dynamic-filter operator applies them post-decode.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
@@ -238,5 +243,39 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
 std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(
   std::unique_ptr<duckdb_native_ingestible_table_info> info);
+
+//===----------------------------------------------------------------------===//
+// fold_membership_probes_into_mask
+//===----------------------------------------------------------------------===//
+struct membership_snapshot;  // op/scan/sirius_gpu_scan_operator_data.hpp
+
+/**
+ * @brief AND every mask-capable dynamic-filter probe of @p snapshot into a scan's static
+ * predicate @p mask, so one @c cudf::apply_boolean_mask gathers at final selectivity.
+ *
+ * The fold half of the scan-side dynamic-filter composition:
+ * `duckdb_native_gpu_ingestible::post_filter_and_project` calls this between evaluating its static
+ * filter mask and gathering, when the scan's `sirius_dynamic_filters` channel has published
+ * filters. Slot `i` of `snapshot` probes column `i` of `input` — the `snapshot_membership_probes`
+ * mapping invariant (output columns first, in output order) — so `snapshot` must be taken over at
+ * most the scan's output arity. Each probe is the publishing filter's own `compute_mask` closure,
+ * keeping NULL and join semantics identical to the downstream dynamic-filter operator's apply; a
+ * probe that declines its key column (returns null) is skipped, exactly as that cascade skips it.
+ * The AND uses plain cudf null propagation, so a NULL in either mask drops the row under
+ * `cudf::apply_boolean_mask` — the same rows the downstream cascade of per-mask applies would drop.
+ *
+ * @param mask BOOL8 predicate mask over @p input's rows ("true keeps"); consumed.
+ * @param input The materialized split the probes read their key columns from.
+ * @param snapshot Published membership probes, per output-column slot.
+ * @param stream Task-local CUDA stream.
+ * @param mr Device memory resource for the probe masks and the combined mask.
+ * @return The combined BOOL8 keep mask.
+ */
+[[nodiscard]] std::unique_ptr<cudf::column> fold_membership_probes_into_mask(
+  std::unique_ptr<cudf::column> mask,
+  cudf::table_view const& input,
+  membership_snapshot const& snapshot,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::op::scan
