@@ -80,8 +80,8 @@ sirius:
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
   executor:
-    scan_manager: { num_threads: 4, use_sirius_datasource: true, uring_n_reactors: 1, enable_prefetch_cache: false }
-    pipeline:     { num_threads: 4 }
+    scan_manager: { num_threads: 4, use_sirius_datasource: true, enable_prefetch_cache: false }
+    pipeline:     { num_threads: 4 }   # scan_manager.uring_n_reactors derives from this (min(threads, 8))
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
   operator_params:
@@ -283,7 +283,9 @@ configurations that still contain either key must delete it.
 
 ### `sirius.executor.pipeline`
 
-Thread pool only (default `num_threads: 4`). No extra keys.
+Thread pool only (default `num_threads: 4`). No extra keys. The default uring reactor count of the
+scan manager derives from this pool's size (see
+[Scan Manager & IO Configuration](#scan-manager--io-configuration)).
 
 ### `sirius.executor.downgrade`
 
@@ -301,12 +303,25 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other pools (1 downgrade + 1 task_creator + the effective pipeline threads + the effective uring reactors), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
-| `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
+| `uring_n_reactors` | int (**> 0**) | min(pipeline threads, 8) | Number of io_uring reactor threads for local-disk reads. Derived from the effective `executor.pipeline.num_threads` after the whole executor block is parsed; an explicit value always wins (set `1` to restore single-reactor behavior) and may exceed the cap of 8. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |
+
+Uring reactors execute the page-cache-to-pinned-buffer copies of local-disk reads inline (~5 GB/s
+per reactor thread), so the reactor count bounds scan IO/copy throughput exactly as the pipeline
+thread count bounds the number of scan splits in flight -- which is why the default pairs them. On
+GB-class machines, raise them together: a GB300 TPC-H SF1000 sweep measured the hot cache-served
+suite at 5.60 s with 8 reactors x 8 pipeline threads versus 5.04 s at 16x16, so past 8 the return
+is marginal and the derivation caps there. Each reactor pre-allocates a 64 x 1 MiB pinned bounce
+buffer from the first host memory space at startup, so high explicit counts add startup cost and
+pinned-pool pressure. When sizing `memory.host.initial_number_pools` alongside a larger reactor
+count, keep node-0 RAM minus the pinned pre-fault (`initial_number_pools x pool_size x
+block_size`) comfortably above the scan working set, or hot iterations lose page-cache retention
+and become disk-bound regardless of the reactor count (see the example in
+`test/tpch_performance/run.md`).
 
 Five optional nested sub-configs tune the individual backends, caches, and the memory prefetcher:
 

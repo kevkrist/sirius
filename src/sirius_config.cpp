@@ -238,9 +238,22 @@ static void from_yaml(const YAML::Node& node, scan_manager::memory_prefetcher_co
   r.reject_unknown();
 }
 
-static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config& opt)
+/// Which scan_manager yaml keys were set explicitly. Needed by finalize_scan_manager_concurrency:
+/// parsing overwrites the struct defaults in place, so without these flags an explicit yaml value
+/// that happens to equal a default (e.g. `uring_n_reactors: 1`) could not be told apart from an
+/// absent key and would be clobbered by the derived default.
+struct scan_manager_explicit_keys {
+  bool num_threads{false};
+  bool uring_n_reactors{false};
+};
+
+static void from_yaml(const YAML::Node& node,
+                      scan_manager::scan_manager_config& opt,
+                      scan_manager_explicit_keys& explicit_keys)
 {
   yaml::reader r(node, "scan_manager");
+  explicit_keys.num_threads      = r.has_value("num_threads");
+  explicit_keys.uring_n_reactors = r.has_value("uring_n_reactors");
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{2});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("use_sirius_datasource", opt.use_sirius_datasource);
@@ -253,6 +266,24 @@ static void from_yaml(const YAML::Node& node, scan_manager::scan_manager_config&
   if (auto n = r.optional_node("object_store")) sirius::from_yaml(*n, opt.object_store);
   if (auto n = r.optional_node("memory_prefetcher")) from_yaml(*n, opt.memory_prefetcher);
   r.reject_unknown();
+}
+
+/// Post-parse finalize for the scan_manager concurrency defaults. The default reactor count is
+/// derived from the effective pipeline thread count and the default scan-manager pool size must
+/// account for the derived reactor count, but the scan_manager block parses before the pipeline
+/// block, so neither default can be resolved inside from_yaml. Runs after both executor sub-blocks
+/// are parsed; explicit yaml values always win.
+static void finalize_scan_manager_concurrency(scan_manager::scan_manager_config& scan_config,
+                                              const exec::thread_pool_config& gpu_pipeline,
+                                              scan_manager_explicit_keys explicit_keys)
+{
+  if (!explicit_keys.uring_n_reactors) {
+    scan_config.uring_n_reactors = scan_manager::derive_uring_n_reactors(gpu_pipeline.num_threads);
+  }
+  if (!explicit_keys.num_threads) {
+    scan_config.thread_pool.num_threads = scan_manager::scan_manager_num_threads_for(
+      gpu_pipeline.num_threads, scan_config.uring_n_reactors);
+  }
 }
 
 static void from_yaml(const YAML::Node& node, operator_params& opt)
@@ -685,14 +716,19 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     }
 
     // Executors
+    scan_manager_explicit_keys scan_manager_explicit{};
     if (auto exec_node = r.optional_node("executor")) {
       yaml::reader er(*exec_node, "sirius.executor");
       if (auto n = er.optional_node("task_creator")) from_yaml(*n, _task_creator_config);
-      if (auto n = er.optional_node("scan_manager")) from_yaml(*n, _scan_manager_config);
+      if (auto n = er.optional_node("scan_manager")) {
+        from_yaml(*n, _scan_manager_config, scan_manager_explicit);
+      }
       if (auto n = er.optional_node("pipeline")) from_yaml(*n, _gpu_pipeline_executor_config);
       if (auto n = er.optional_node("downgrade")) from_yaml(*n, _downgrade_executor_config);
       er.reject_unknown();
     }
+    finalize_scan_manager_concurrency(
+      _scan_manager_config, _gpu_pipeline_executor_config, scan_manager_explicit);
 
     // Preserve the node until memory-space capacities are resolved below. Explicit
     // values are applied after capacity-derived defaults so they always win.
