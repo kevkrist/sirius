@@ -39,6 +39,7 @@
 #include <duckdb/common/vector_size.hpp>
 
 #include <cstdint>
+#include <memory>
 
 namespace sirius::cuda::scan {
 
@@ -65,12 +66,22 @@ enum class BitpackingMode : uint8_t {
   FOR            = 5
 };
 
-//! Decode a bitpacking codec run into `d_output`. Every segment in `run` is
-//! split into its metadata groups; one CTA decodes one group in a single
-//! batched kernel launch.
+//! @brief Prepare a bitpacking codec run: stage its per-group descriptors into @p arena. Returns
+//! nullptr when the run has no live groups. The returned launcher enqueues one batched kernel
+//! (one CTA per metadata group).
 //!
 //! `d_output` must be sized for the column's full row count; each segment
 //! writes `seg.row_count` rows starting at `seg.row_offset * type_size`.
+std::unique_ptr<decode_run_launcher> prepare_bitpacking_data(gpu_codec_run const& run,
+                                                             uint8_t* d_output,
+                                                             cudf::data_type type,
+                                                             uint32_t type_size,
+                                                             decode_descriptor_arena& arena,
+                                                             rmm::cuda_stream_view stream,
+                                                             rmm::device_async_resource_ref mr);
+
+//! @brief Decode a bitpacking codec run into `d_output` in one call (prepare + flush + launch
+//! against a private arena).
 void decode_bitpacking_data(gpu_codec_run const& run,
                             uint8_t* d_output,
                             cudf::data_type type,

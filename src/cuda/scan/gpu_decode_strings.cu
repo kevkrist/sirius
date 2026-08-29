@@ -17,20 +17,23 @@
 //===----------------------------------------------------------------------===//
 // String column decode — orchestrator.
 //
-// gpu_decode_strings_column decodes one VARCHAR column. The four string codecs
-// each live in strings/<codec>.cu and expose host wrappers:
+// A VARCHAR column decodes in two phases. prepare_strings_column_decode runs
+// the per-codec prepares and stages their descriptors into the caller's
+// decode_descriptor_arena:
 //   prepare_*         build per-run descriptors (some also run on-device prep,
 //                     e.g. FSST symbol tables, DICT_FSST dictionary predecode)
-//   launch_*_lengths  phase 1: write each row's decoded byte length
-//   launch_*_gather   phase 2: copy each row's decoded bytes to the output
-//
-// All codecs share one two-phase flow:
+// After the arena is flushed, prepared_strings_column_decode::launch drives
+// the shared two-phase flow:
 //   1. each codec writes its rows' lengths into a single d_lengths array
+//      (launch_*_lengths)
 //   2. one exclusive scan turns d_lengths into the column's d_offsets
 //   3. each codec gathers its bytes into d_chars at those offsets
+//      (launch_*_gather)
 // then the cudf strings column is assembled (offsets + chars + null mask).
+// gpu_decode_strings_column wraps both phases around a private arena.
 //
-// Each codec's on-disk segment layout is documented at the top of its file.
+// Each codec's on-disk segment layout is documented at the top of its file
+// (strings/<codec>.cu).
 //===----------------------------------------------------------------------===//
 
 #include "cuda/scan/gpu_decode_strings.cuh"
@@ -56,8 +59,10 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius::cuda::scan {
@@ -65,7 +70,7 @@ namespace sirius::cuda::scan {
 namespace {
 
 /// Overlays an UNCOMPRESSED validity run onto the null mask (sibling to
-/// `dispatch_validity_run` in gpu_native_decode.cu).
+/// `prepare_validity_run` in gpu_native_decode.cu).
 void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_stream_view stream)
 {
   if (run.codec != duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
@@ -94,19 +99,64 @@ void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_s
 
 }  // namespace
 
-/// Decodes one VARCHAR column via the shared two-phase flow (see file banner):
-/// aggregate per-codec prepared state, write per-row lengths, scan to offsets,
-/// gather bytes, then build the cudf strings column.
-std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
-                                                        rmm::cuda_stream_view stream,
-                                                        rmm::device_async_resource_ref mr)
+struct prepared_strings_column_decode::impl {
+  decode_descriptor_arena const* arena = nullptr;
+  uint32_t total_rows                  = 0;
+  bool has_nulls                       = false;
+  std::vector<gpu_codec_run> validity;  ///< copied from the input for the launch-phase overlay
+
+  // Staged descriptor slots. Counts double as the kernel launch sizes.
+  arena_slot uncomp_chunks;
+  arena_slot dict_chunks_short;
+  arena_slot dict_chunks_long;
+  arena_slot dict_fsst_chunks;
+  arena_slot fsst_length_descs;
+  arena_slot fsst_gather_chunks;
+  arena_slot fsst_row_starts;
+  arena_slot dict_fsst_descs;
+  arena_slot dict_fsst_decoders;
+  arena_slot dict_fsst_byte_offsets;
+  arena_slot dict_fsst_decoded_offsets;
+
+  uint32_t total_fsst_row_count  = 0;
+  bool any_inline_nulls          = false;
+  uint32_t total_predecode_bytes = 0;
+  size_t cum_chars_upper         = 0;
+  bool needs_exact_total         = false;
+};
+
+prepared_strings_column_decode::prepared_strings_column_decode(std::unique_ptr<impl> state)
+  : _impl(std::move(state))
 {
+}
+prepared_strings_column_decode::prepared_strings_column_decode(
+  prepared_strings_column_decode&&) noexcept = default;
+prepared_strings_column_decode& prepared_strings_column_decode::operator=(
+  prepared_strings_column_decode&&) noexcept                      = default;
+prepared_strings_column_decode::~prepared_strings_column_decode() = default;
+
+/// Phase one (see file banner): aggregate per-codec prepared state and stage every kernel
+/// descriptor array into @p arena. DICT_FSST's `prepare_dict_fsst` keeps its inherent on-device
+/// header/results round trips (with their own syncs); only its resulting host descriptor arrays
+/// join the packed blob.
+prepared_strings_column_decode prepare_strings_column_decode(
+  gpu_string_column_decode_input const& col,
+  decode_descriptor_arena& arena,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto state   = std::make_unique<prepared_strings_column_decode::impl>();
+  state->arena = &arena;
+
   uint32_t const total_rows = col.total_rows;
-  if (total_rows == 0) { return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}); }
+  if (total_rows == 0) { return prepared_strings_column_decode{std::move(state)}; }
   if (total_rows > static_cast<uint32_t>(std::numeric_limits<cudf::size_type>::max())) {
     throw std::runtime_error("gpu_decode_strings_column: total_rows (" +
                              std::to_string(total_rows) + ") > cudf::size_type max");
   }
+  state->total_rows = total_rows;
+  state->has_nulls  = col.has_nulls;
+  state->validity   = col.validity;
 
   prepared_uncomp prep_uncomp;
   prepared_dict prep_dict;
@@ -190,11 +240,6 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
     }
   }
 
-  // Allocate output and intermediate buffers.
-  rmm::device_uvector<uint32_t> d_lengths(size_t{total_rows} + 1, stream, mr);
-  rmm::device_uvector<int32_t> d_offsets(size_t{total_rows} + 1, stream, mr);
-  rmm::device_buffer d_comp_offsets(prep_fsst.total_fsst_row_count * sizeof(uint32_t), stream, mr);
-
   // Per-row kernels take chunked descriptors; predecode + mark_nulls stay
   // per-segment via prep_dict_fsst.descs.
   auto const target_ctas       = get_target_ctas();
@@ -203,92 +248,106 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   auto const dict_chunks_long  = expand_chunks(prep_dict.descs_long, target_ctas);
   auto const dict_fsst_chunks  = expand_chunks(prep_dict_fsst.descs, target_ctas);
 
-  auto upload = [&](void const* src, size_t bytes) {
-    rmm::device_buffer buf(bytes, stream, mr);
-    if (bytes > 0) {
-      RMM_CUDA_TRY(cudaMemcpyAsync(buf.data(), src, bytes, cudaMemcpyHostToDevice, stream.value()));
-    }
-    return buf;
-  };
-  rmm::device_buffer d_uncomp_chunks_buf =
-    upload(uncomp_chunks.data(), uncomp_chunks.size() * sizeof(string_chunk_desc));
-  rmm::device_buffer d_dict_short_buf =
-    upload(dict_chunks_short.data(), dict_chunks_short.size() * sizeof(string_chunk_desc));
-  rmm::device_buffer d_dict_long_buf =
-    upload(dict_chunks_long.data(), dict_chunks_long.size() * sizeof(string_chunk_desc));
-  rmm::device_buffer d_dict_fsst_chunks_buf =
-    upload(dict_fsst_chunks.data(), dict_fsst_chunks.size() * sizeof(dict_fsst_desc));
-  rmm::device_buffer d_fsst_lengths_buf = upload(
-    prep_fsst.length_descs.data(), prep_fsst.length_descs.size() * sizeof(string_chunk_desc));
-  rmm::device_buffer d_fsst_chunks_buf = upload(
-    prep_fsst.gather_chunks.data(), prep_fsst.gather_chunks.size() * sizeof(fsst_chunk_desc));
-  rmm::device_buffer d_fsst_starts_buf =
-    upload(prep_fsst.row_starts.data(), prep_fsst.row_starts.size() * sizeof(uint32_t));
-  rmm::device_buffer d_fsst_decoders_buf =
-    upload(prep_fsst.decoders.data(), prep_fsst.decoders.size() * sizeof(fsst_decoder_compact));
-  rmm::device_buffer d_dict_fsst_descs_buf =
-    upload(prep_dict_fsst.descs.data(), prep_dict_fsst.descs.size() * sizeof(dict_fsst_desc));
-  rmm::device_buffer d_dict_fsst_decoders_buf = upload(
-    prep_dict_fsst.decoders.data(), prep_dict_fsst.decoders.size() * sizeof(fsst_decoder_compact));
-  rmm::device_buffer d_byte_offsets_buf = upload(
-    prep_dict_fsst.byte_offsets.data(), prep_dict_fsst.byte_offsets.size() * sizeof(uint32_t));
-  rmm::device_buffer d_decoded_offsets_buf =
-    upload(prep_dict_fsst.decoded_offsets.data(),
-           prep_dict_fsst.decoded_offsets.size() * sizeof(uint32_t));
+  state->uncomp_chunks     = arena.stage(uncomp_chunks.data(), uncomp_chunks.size());
+  state->dict_chunks_short = arena.stage(dict_chunks_short.data(), dict_chunks_short.size());
+  state->dict_chunks_long  = arena.stage(dict_chunks_long.data(), dict_chunks_long.size());
+  state->dict_fsst_chunks  = arena.stage(dict_fsst_chunks.data(), dict_fsst_chunks.size());
+  state->fsst_length_descs =
+    arena.stage(prep_fsst.length_descs.data(), prep_fsst.length_descs.size());
+  state->fsst_gather_chunks =
+    arena.stage(prep_fsst.gather_chunks.data(), prep_fsst.gather_chunks.size());
+  state->fsst_row_starts = arena.stage(prep_fsst.row_starts.data(), prep_fsst.row_starts.size());
+  state->dict_fsst_descs = arena.stage(prep_dict_fsst.descs.data(), prep_dict_fsst.descs.size());
+  state->dict_fsst_decoders =
+    arena.stage(prep_dict_fsst.decoders.data(), prep_dict_fsst.decoders.size());
+  state->dict_fsst_byte_offsets =
+    arena.stage(prep_dict_fsst.byte_offsets.data(), prep_dict_fsst.byte_offsets.size());
+  state->dict_fsst_decoded_offsets =
+    arena.stage(prep_dict_fsst.decoded_offsets.data(), prep_dict_fsst.decoded_offsets.size());
 
-  // Pageable host sources — sync before kernels consume to avoid free-mid-copy.
-  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  state->total_fsst_row_count  = prep_fsst.total_fsst_row_count;
+  state->any_inline_nulls      = prep_dict_fsst.any_inline_nulls;
+  state->total_predecode_bytes = prep_dict_fsst.total_predecode_bytes;
+  state->cum_chars_upper       = cum_chars_upper;
+  state->needs_exact_total     = needs_exact_total;
 
-  auto* d_comp_offsets_p     = static_cast<uint32_t*>(d_comp_offsets.data());
-  auto* d_uncomp_chunks_p    = static_cast<string_chunk_desc*>(d_uncomp_chunks_buf.data());
-  auto* d_dict_short_p       = static_cast<string_chunk_desc*>(d_dict_short_buf.data());
-  auto* d_dict_long_p        = static_cast<string_chunk_desc*>(d_dict_long_buf.data());
-  auto* d_fsst_lengths_p     = static_cast<string_chunk_desc*>(d_fsst_lengths_buf.data());
-  auto* d_fsst_chunks_p      = static_cast<fsst_chunk_desc*>(d_fsst_chunks_buf.data());
-  auto* d_fsst_starts_p      = static_cast<uint32_t*>(d_fsst_starts_buf.data());
-  auto* d_fsst_decs_p        = static_cast<fsst_decoder_compact*>(d_fsst_decoders_buf.data());
-  auto* d_dict_fsst_p        = static_cast<dict_fsst_desc*>(d_dict_fsst_descs_buf.data());
-  auto* d_dict_fsst_chunks_p = static_cast<dict_fsst_desc*>(d_dict_fsst_chunks_buf.data());
-  auto* d_dict_fsst_decs_p   = static_cast<fsst_decoder_compact*>(d_dict_fsst_decoders_buf.data());
-  auto* d_byte_off_p         = static_cast<uint32_t*>(d_byte_offsets_buf.data());
-  auto* d_decoded_off_p      = static_cast<uint32_t*>(d_decoded_offsets_buf.data());
+  return prepared_strings_column_decode{std::move(state)};
+}
+
+std::unique_ptr<cudf::column> prepared_strings_column_decode::launch(
+  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+{
+  auto& state               = *_impl;
+  uint32_t const total_rows = state.total_rows;
+  if (total_rows == 0) { return cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}); }
+  if (!state.arena->flushed()) {
+    throw std::logic_error(
+      "prepared_strings_column_decode::launch before the descriptor arena was flushed");
+  }
+
+  // Allocate output and intermediate buffers. The FSST decoder array is a device-built scratch
+  // output (kernel_build_fsst_decoders fills it from each segment's symbol-table bytes), so it is
+  // allocated here rather than staged in the arena; one slot per FSST length descriptor.
+  rmm::device_uvector<uint32_t> d_lengths(size_t{total_rows} + 1, stream, mr);
+  rmm::device_uvector<int32_t> d_offsets(size_t{total_rows} + 1, stream, mr);
+  rmm::device_buffer d_comp_offsets(state.total_fsst_row_count * sizeof(uint32_t), stream, mr);
+  rmm::device_buffer d_fsst_decoders_buf(
+    state.fsst_length_descs.count * sizeof(fsst_decoder_compact), stream, mr);
+
+  // Descriptor device pointers resolve into the flushed arena blob. No host
+  // sync is needed before the kernels consume them: the sources are pinned
+  // arena memory whose reuse is gated on the upload's completion event.
+  auto* d_comp_offsets_p        = static_cast<uint32_t*>(d_comp_offsets.data());
+  auto const* d_uncomp_chunks_p = state.arena->device_ptr<string_chunk_desc>(state.uncomp_chunks);
+  auto const* d_dict_short_p = state.arena->device_ptr<string_chunk_desc>(state.dict_chunks_short);
+  auto const* d_dict_long_p  = state.arena->device_ptr<string_chunk_desc>(state.dict_chunks_long);
+  auto const* d_fsst_lengths_p =
+    state.arena->device_ptr<string_chunk_desc>(state.fsst_length_descs);
+  auto const* d_fsst_chunks_p = state.arena->device_ptr<fsst_chunk_desc>(state.fsst_gather_chunks);
+  auto const* d_fsst_starts_p = state.arena->device_ptr<uint32_t>(state.fsst_row_starts);
+  auto* d_fsst_decs_p         = static_cast<fsst_decoder_compact*>(d_fsst_decoders_buf.data());
+  auto const* d_dict_fsst_p   = state.arena->device_ptr<dict_fsst_desc>(state.dict_fsst_descs);
+  auto const* d_dict_fsst_chunks_p =
+    state.arena->device_ptr<dict_fsst_desc>(state.dict_fsst_chunks);
+  auto const* d_dict_fsst_decs_p =
+    state.arena->device_ptr<fsst_decoder_compact>(state.dict_fsst_decoders);
+  auto const* d_byte_off_p    = state.arena->device_ptr<uint32_t>(state.dict_fsst_byte_offsets);
+  auto const* d_decoded_off_p = state.arena->device_ptr<uint32_t>(state.dict_fsst_decoded_offsets);
 
   // Pass 1: lengths. Same kernel for short/long DICTIONARY — only gather forks.
   launch_uncomp_lengths(
-    d_uncomp_chunks_p, d_lengths.data(), static_cast<uint32_t>(uncomp_chunks.size()), stream);
+    d_uncomp_chunks_p, d_lengths.data(), static_cast<uint32_t>(state.uncomp_chunks.count), stream);
   launch_dict_lengths(
-    d_dict_short_p, d_lengths.data(), static_cast<uint32_t>(dict_chunks_short.size()), stream);
+    d_dict_short_p, d_lengths.data(), static_cast<uint32_t>(state.dict_chunks_short.count), stream);
   launch_dict_lengths(
-    d_dict_long_p, d_lengths.data(), static_cast<uint32_t>(dict_chunks_long.size()), stream);
+    d_dict_long_p, d_lengths.data(), static_cast<uint32_t>(state.dict_chunks_long.count), stream);
   launch_fsst_lengths(d_fsst_decs_p,
                       d_comp_offsets_p,
                       d_lengths.data(),
                       d_fsst_lengths_p,
                       d_fsst_starts_p,
                       d_fsst_chunks_p,
-                      static_cast<uint32_t>(prep_fsst.length_descs.size()),
-                      static_cast<uint32_t>(prep_fsst.gather_chunks.size()),
+                      static_cast<uint32_t>(state.fsst_length_descs.count),
+                      static_cast<uint32_t>(state.fsst_gather_chunks.count),
                       stream);
   // Predecode buffer holds decoded dict bytes for mode-1 segments.
   rmm::device_buffer d_predecode_buf(
-    prep_dict_fsst.total_predecode_bytes > 0 ? prep_dict_fsst.total_predecode_bytes : 1u,
-    stream,
-    mr);
+    state.total_predecode_bytes > 0 ? state.total_predecode_bytes : 1u, stream, mr);
   auto* d_predecode_p = static_cast<uint8_t*>(d_predecode_buf.data());
 
   // Lengths chunk for SM-fill; predecode stays per-segment (one decode/dict).
   launch_dict_fsst_lengths(d_dict_fsst_chunks_p,
                            d_lengths.data(),
                            d_decoded_off_p,
-                           static_cast<uint32_t>(dict_fsst_chunks.size()),
+                           static_cast<uint32_t>(state.dict_fsst_chunks.count),
                            stream);
   launch_dict_fsst_predecode(d_dict_fsst_p,
                              d_byte_off_p,
                              d_decoded_off_p,
                              d_dict_fsst_decs_p,
                              d_predecode_p,
-                             static_cast<uint32_t>(prep_dict_fsst.descs.size()),
-                             prep_dict_fsst.total_predecode_bytes,
+                             static_cast<uint32_t>(state.dict_fsst_descs.count),
+                             state.total_predecode_bytes,
                              stream);
 
   // Prefix-sum lengths → byte offsets per row.
@@ -310,13 +369,13 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
 
   // cudf strings offsets are int32; reject up front if the upper bound exceeds it.
   constexpr auto INT32_MAX_SIZE = static_cast<size_t>(std::numeric_limits<int32_t>::max());
-  if (!needs_exact_total && cum_chars_upper > INT32_MAX_SIZE) {
+  if (!state.needs_exact_total && state.cum_chars_upper > INT32_MAX_SIZE) {
     throw std::runtime_error("gpu_decode_strings_column: estimated total_chars (" +
-                             std::to_string(cum_chars_upper) + ") exceeds int32 max");
+                             std::to_string(state.cum_chars_upper) + ") exceeds int32 max");
   }
   size_t alloc_chars = 0;
-  if (!needs_exact_total && cum_chars_upper <= HOST_UPPER_BOUND_LIMIT) {
-    alloc_chars = cum_chars_upper;
+  if (!state.needs_exact_total && state.cum_chars_upper <= HOST_UPPER_BOUND_LIMIT) {
+    alloc_chars = state.cum_chars_upper;
   } else {
     RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
     uint32_t total_chars_u = 0;
@@ -336,24 +395,24 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   launch_uncomp_gather(d_uncomp_chunks_p,
                        d_offsets.data(),
                        d_chars_p,
-                       static_cast<uint32_t>(uncomp_chunks.size()),
+                       static_cast<uint32_t>(state.uncomp_chunks.count),
                        stream);
   launch_dict_gather_short(d_dict_short_p,
                            d_offsets.data(),
                            d_chars_p,
-                           static_cast<uint32_t>(dict_chunks_short.size()),
+                           static_cast<uint32_t>(state.dict_chunks_short.count),
                            stream);
   launch_dict_gather_long(d_dict_long_p,
                           d_offsets.data(),
                           d_chars_p,
-                          static_cast<uint32_t>(dict_chunks_long.size()),
+                          static_cast<uint32_t>(state.dict_chunks_long.count),
                           stream);
   launch_fsst_gather(d_fsst_chunks_p,
                      d_offsets.data(),
                      d_chars_p,
                      d_comp_offsets_p,
                      d_fsst_decs_p,
-                     static_cast<uint32_t>(prep_fsst.gather_chunks.size()),
+                     static_cast<uint32_t>(state.fsst_gather_chunks.count),
                      stream);
   launch_dict_fsst_gather(d_dict_fsst_chunks_p,
                           d_offsets.data(),
@@ -362,23 +421,23 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
                           d_decoded_off_p,
                           d_predecode_p,
                           d_dict_fsst_decs_p,
-                          static_cast<uint32_t>(dict_fsst_chunks.size()),
+                          static_cast<uint32_t>(state.dict_fsst_chunks.count),
                           stream);
 
   // All-valid → overlay UNCOMPRESSED validity → fold in DICT_FSST inline NULLs.
   rmm::device_buffer null_mask{};
   cudf::size_type null_count = 0;
-  bool need_mask             = col.has_nulls || prep_dict_fsst.any_inline_nulls;
+  bool need_mask             = state.has_nulls || state.any_inline_nulls;
   if (need_mask) {
     null_mask = cudf::create_null_mask(
       static_cast<cudf::size_type>(total_rows), cudf::mask_state::ALL_VALID, stream, mr);
-    for (auto const& run : col.validity) {
+    for (auto const& run : state.validity) {
       overlay_validity_run(run, static_cast<uint8_t*>(null_mask.data()), stream);
     }
-    if (prep_dict_fsst.any_inline_nulls) {
+    if (state.any_inline_nulls) {
       launch_dict_fsst_mark_nulls(d_dict_fsst_p,
                                   static_cast<uint8_t*>(null_mask.data()),
-                                  static_cast<uint32_t>(prep_dict_fsst.descs.size()),
+                                  static_cast<uint32_t>(state.dict_fsst_descs.count),
                                   stream);
     }
     null_count = cudf::null_count(static_cast<cudf::bitmask_type const*>(null_mask.data()),
@@ -399,6 +458,16 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
                                    std::move(d_chars),
                                    null_count,
                                    std::move(null_mask));
+}
+
+std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref mr)
+{
+  decode_descriptor_arena arena;
+  auto prepared = prepare_strings_column_decode(col, arena, stream, mr);
+  arena.flush(stream, mr);
+  return prepared.launch(stream, mr);
 }
 
 }  // namespace sirius::cuda::scan

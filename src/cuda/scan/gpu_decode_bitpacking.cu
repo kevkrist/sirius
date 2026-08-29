@@ -353,11 +353,10 @@ __global__ void kernel_decode_bitpacking(detail::cta_block_desc const* __restric
 //===----------------------------------------------------------------------===//
 
 template <typename T>
-void launch_typed(detail::cta_block_desc const* h_descs,
+void launch_typed(detail::cta_block_desc const* d_descs,
                   size_t num_groups,
                   T* d_output,
-                  rmm::cuda_stream_view stream,
-                  rmm::device_async_resource_ref mr)
+                  rmm::cuda_stream_view stream)
 {
   // The +1 guard word satisfies `unpack_value`'s 3-word read contract for
   // 64-bit types when a value spans words [w, w+1, w+2].
@@ -368,17 +367,49 @@ void launch_typed(detail::cta_block_desc const* h_descs,
 
   if (num_groups == 0) return;
 
-  rmm::device_uvector<detail::cta_block_desc> d_descs(num_groups, stream, mr);
-  RMM_CUDA_TRY(cudaMemcpyAsync(d_descs.data(),
-                               h_descs,
-                               num_groups * sizeof(detail::cta_block_desc),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
-
   kernel_decode_bitpacking<T, SHMEM_BYTES>
     <<<static_cast<uint32_t>(num_groups), BITPACK_BLOCK_DIM, 0, stream.value()>>>(
-      d_descs.data(), d_output, static_cast<uint32_t>(num_groups));
+      d_descs, d_output, static_cast<uint32_t>(num_groups));
 }
+
+/// Deferred bitpacking launch over descriptors staged in the arena at prepare time.
+class bitpacking_run_launcher final : public decode_run_launcher {
+ public:
+  bitpacking_run_launcher(decode_descriptor_arena const& arena,
+                          arena_slot descs,
+                          uint8_t* d_output,
+                          uint32_t type_size)
+    : _arena(&arena), _descs(descs), _d_output(d_output), _type_size(type_size)
+  {
+  }
+
+  void launch(rmm::cuda_stream_view stream, rmm::device_async_resource_ref /*mr*/) override
+  {
+    auto const* d_descs = _arena->device_ptr<detail::cta_block_desc>(_descs);
+    auto const n        = _descs.count;
+    switch (_type_size) {
+      case 1: launch_typed<uint8_t>(d_descs, n, _d_output, stream); break;
+      case 2:
+        launch_typed<uint16_t>(d_descs, n, reinterpret_cast<uint16_t*>(_d_output), stream);
+        break;
+      case 4:
+        launch_typed<uint32_t>(d_descs, n, reinterpret_cast<uint32_t*>(_d_output), stream);
+        break;
+      case 8:
+        launch_typed<uint64_t>(d_descs, n, reinterpret_cast<uint64_t*>(_d_output), stream);
+        break;
+      default:
+        // Unreachable — guarded by the type_size check in prepare_bitpacking_data.
+        break;
+    }
+  }
+
+ private:
+  decode_descriptor_arena const* _arena;
+  arena_slot _descs;
+  uint8_t* _d_output;
+  uint32_t _type_size;
+};
 
 }  // anonymous namespace
 
@@ -391,39 +422,41 @@ void launch_typed(detail::cta_block_desc const* h_descs,
 // Kept in the signature for parity with the dispatcher's other codec entries.
 //===----------------------------------------------------------------------===//
 
+std::unique_ptr<decode_run_launcher> prepare_bitpacking_data(gpu_codec_run const& run,
+                                                             uint8_t* d_output,
+                                                             cudf::data_type /*type*/,
+                                                             uint32_t type_size,
+                                                             decode_descriptor_arena& arena,
+                                                             rmm::cuda_stream_view /*stream*/,
+                                                             rmm::device_async_resource_ref /*mr*/)
+{
+  if (type_size != 1 && type_size != 2 && type_size != 4 && type_size != 8) {
+    // The kernel reads up to 3*sizeof(T) bytes of header per group; widths
+    // outside {1,2,4,8} would also need a different `unpack_value`
+    // instantiation. Upstream viability is expected to keep them out;
+    // throw rather than silently return with the buffer untouched.
+    throw std::runtime_error(
+      "gpu_decode_table: viability invariant violated — BITPACKING type_size " +
+      std::to_string(type_size));
+  }
+  auto const descs = detail::build_block_descs<BP_META_GROUP_SIZE>(run);
+  if (descs.empty()) return nullptr;
+
+  auto const slot = arena.stage(descs.data(), descs.size());
+  return std::make_unique<bitpacking_run_launcher>(arena, slot, d_output, type_size);
+}
+
 void decode_bitpacking_data(gpu_codec_run const& run,
                             uint8_t* d_output,
-                            cudf::data_type /*type*/,
+                            cudf::data_type type,
                             uint32_t type_size,
                             rmm::cuda_stream_view stream,
                             rmm::device_async_resource_ref mr)
 {
-  auto descs = detail::build_block_descs<BP_META_GROUP_SIZE>(run);
-  if (descs.empty()) return;
-
-  switch (type_size) {
-    case 1: launch_typed<uint8_t>(descs.data(), descs.size(), d_output, stream, mr); break;
-    case 2:
-      launch_typed<uint16_t>(
-        descs.data(), descs.size(), reinterpret_cast<uint16_t*>(d_output), stream, mr);
-      break;
-    case 4:
-      launch_typed<uint32_t>(
-        descs.data(), descs.size(), reinterpret_cast<uint32_t*>(d_output), stream, mr);
-      break;
-    case 8:
-      launch_typed<uint64_t>(
-        descs.data(), descs.size(), reinterpret_cast<uint64_t*>(d_output), stream, mr);
-      break;
-    default:
-      // The kernel reads up to 3*sizeof(T) bytes of header per group; widths
-      // outside {1,2,4,8} would also need a different `unpack_value`
-      // instantiation. Upstream viability is expected to keep them out;
-      // throw rather than silently return with the buffer untouched.
-      throw std::runtime_error(
-        "gpu_decode_table: viability invariant violated — BITPACKING type_size " +
-        std::to_string(type_size));
-  }
+  decode_descriptor_arena arena;
+  auto launcher = prepare_bitpacking_data(run, d_output, type, type_size, arena, stream, mr);
+  arena.flush(stream, mr);
+  if (launcher) { launcher->launch(stream, mr); }
 }
 
 }  // namespace sirius::cuda::scan

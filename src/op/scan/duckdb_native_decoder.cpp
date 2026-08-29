@@ -79,12 +79,17 @@ namespace sirius::op::scan {
 
 namespace {
 
+using ::sirius::cuda::scan::decode_descriptor_arena;
 using ::sirius::cuda::scan::gpu_codec_run;
 using ::sirius::cuda::scan::gpu_column_decode_input;
 using ::sirius::cuda::scan::gpu_segment_desc;
 using ::sirius::cuda::scan::gpu_string_codec_run;
 using ::sirius::cuda::scan::gpu_string_column_decode_input;
 using ::sirius::cuda::scan::gpu_string_segment_desc;
+using ::sirius::cuda::scan::prepare_strings_column_decode;
+using ::sirius::cuda::scan::prepare_table_decode;
+using ::sirius::cuda::scan::prepared_strings_column_decode;
+using ::sirius::cuda::scan::prepared_table_decode;
 
 constexpr char const* kTag = "[sirius_gpu_duckdb_native_scan]";
 
@@ -1099,10 +1104,9 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     submit_host_only_and_await(device_buf, staging, stream);
   }
 
-  // Group fixed-width columns for a single gpu_decode_table call; varchar
-  // columns each go through gpu_decode_strings_column separately; array
-  // columns decode child data as fixed-width, then wrap into cudf LIST
-  // with offsets child.
+  // Group fixed-width columns for a single prepared table decode; varchar
+  // columns each prepare separately; array columns decode child data as
+  // fixed-width, then wrap into cudf LIST with offsets child.
   std::vector<gpu_column_decode_input> fw_inputs;
   std::vector<std::size_t> fw_to_final_idx;
   std::vector<gpu_string_column_decode_input> vc_inputs;
@@ -1147,28 +1151,68 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     }
   }
 
-  std::vector<std::unique_ptr<cudf::column>> fw_cols;
-  if (!fw_inputs.empty()) {
-    auto fw_table = ::sirius::cuda::scan::gpu_decode_table(fw_inputs, stream, mr_ref);
-    fw_cols       = fw_table->release();
+  // Prepare every column's decode (fixed-width table, varchar columns, array children and
+  // array-level validity) so their kernel descriptors pack into one pinned blob, upload that blob
+  // with a single H2D, then launch all decode kernels. DICT_FSST's prepare keeps its own internal
+  // device round trips (see gpu_decode_strings.cuh). The arena outlives every launch below; its
+  // pinned slab is released through a completion event, never a host wait.
+  decode_descriptor_arena arena;
+
+  std::optional<prepared_table_decode> fw_prep;
+  if (!fw_inputs.empty()) { fw_prep = prepare_table_decode(fw_inputs, arena, stream, mr_ref); }
+
+  std::vector<prepared_strings_column_decode> vc_preps;
+  vc_preps.reserve(vc_inputs.size());
+  for (auto const& vc : vc_inputs) {
+    vc_preps.push_back(prepare_strings_column_decode(vc, arena, stream, mr_ref));
   }
 
+  // Each array child prepares on its own as different columns might have different array sizes
+  // (and therefore different child row counts).
+  std::vector<prepared_table_decode> child_preps;
+  child_preps.reserve(array_child_inputs.size());
+  for (auto const& child_input : array_child_inputs) {
+    child_preps.push_back(prepare_table_decode(
+      std::span<gpu_column_decode_input const>(&child_input, 1), arena, stream, mr_ref));
+  }
+
+  // Array-level validity masks decode as throwaway BOOL8 columns.
+  // TODO: this wastes a throwaway BOOL8 column just to grab the null mask. If
+  // decode_column_validity() were exposed in gpu_native_decode.cuh, we could
+  // decode the array-level mask directly.
+  std::vector<std::optional<prepared_table_decode>> array_validity_preps(array_to_final_idx.size());
+  for (std::size_t ai = 0; ai < array_to_final_idx.size(); ++ai) {
+    auto const& staged = staged_cols[array_to_final_idx[ai]];
+    if (staged.has_nulls && !staged.validity.empty()) {
+      gpu_column_decode_input validity_input;
+      validity_input.out_type   = cudf::data_type{cudf::type_id::BOOL8};  // dummy type
+      validity_input.total_rows = static_cast<uint32_t>(staged.total_rows);
+      validity_input.has_nulls  = true;
+      fill_fixed_width_runs(staged.validity, device_buf, validity_input.validity);
+      array_validity_preps[ai] = prepare_table_decode(
+        std::span<gpu_column_decode_input const>(&validity_input, 1), arena, stream, mr_ref);
+    }
+  }
+
+  arena.flush(stream, mr_ref);
+
+  std::vector<std::unique_ptr<cudf::column>> fw_cols;
+  if (fw_prep) { fw_cols = fw_prep->launch(stream, mr_ref)->release(); }
+
   std::vector<std::unique_ptr<cudf::column>> vc_cols;
-  vc_cols.reserve(vc_inputs.size());
-  for (auto const& vc : vc_inputs) {
-    vc_cols.push_back(::sirius::cuda::scan::gpu_decode_strings_column(vc, stream, mr_ref));
+  vc_cols.reserve(vc_preps.size());
+  for (auto& vc_prep : vc_preps) {
+    vc_cols.push_back(vc_prep.launch(stream, mr_ref));
   }
 
   // Decode ARRAY child data as fixed-width columns, then wrap into LIST with offsets
   std::vector<std::unique_ptr<cudf::column>> array_cols;
   array_cols.reserve(array_child_inputs.size());
   if (!array_child_inputs.empty()) {
-    // Decode each child column on its own as different columns might have different array sizes
     std::vector<std::unique_ptr<cudf::column>> child_cols;
-    child_cols.reserve(array_child_inputs.size());
-    for (auto const& child_input : array_child_inputs) {
-      auto child_table = ::sirius::cuda::scan::gpu_decode_table({child_input}, stream, mr_ref);
-      auto cols        = child_table->release();
+    child_cols.reserve(child_preps.size());
+    for (auto& child_prep : child_preps) {
+      auto cols = child_prep.launch(stream, mr_ref)->release();
       child_cols.push_back(std::move(cols[0]));
     }
 
@@ -1183,23 +1227,11 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
       auto step_scalar = cudf::numeric_scalar<cudf::size_type>(array_size, true, stream, mr_ref);
       auto offsets     = cudf::sequence(total_rows + 1, init_scalar, step_scalar, stream, mr_ref);
 
-      // Decode array-level validity from staged.validity segments
+      // Decode array-level validity from the prepared dummy BOOL8 column.
       rmm::device_buffer parent_null_mask(0, stream, mr_ref);
       cudf::size_type parent_null_count = 0;
-      if (staged.has_nulls && !staged.validity.empty()) {
-        // Temporary decode input for the array validity mask
-        gpu_column_decode_input validity_input;
-        validity_input.out_type   = cudf::data_type{cudf::type_id::BOOL8};  // dummy type
-        validity_input.total_rows = total_rows;
-        validity_input.has_nulls  = true;
-        fill_fixed_width_runs(staged.validity, device_buf, validity_input.validity);
-        // Decode a dummy BOOL8 column to get the null mask
-        // TODO: this wastes a throwaway BOOL8 column just to grab the null mask. If
-        // decode_column_validity() were exposed in gpu_native_decode.cuh, we could
-        // decode the array-level mask directly.
-        auto validity_table =
-          ::sirius::cuda::scan::gpu_decode_table({validity_input}, stream, mr_ref);
-        auto validity_cols = validity_table->release();
+      if (array_validity_preps[ai]) {
+        auto validity_cols = array_validity_preps[ai]->launch(stream, mr_ref)->release();
         parent_null_count  = validity_cols[0]->null_count();
         auto released      = validity_cols[0]->release();
         parent_null_mask   = std::move(*released.null_mask);

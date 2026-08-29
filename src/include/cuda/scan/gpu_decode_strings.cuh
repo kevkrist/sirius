@@ -64,10 +64,48 @@ struct gpu_string_column_decode_input {
   bool has_nulls;
 };
 
-/// Decode one varchar column to a cudf strings column. Async modulo at most
-/// one host sync (the chars-buffer sizing read-back, which only fires when
-/// the per-segment length upper bound is unknown or pathological). Throws
-/// on malformed segment metadata or unsupported codecs.
+/// A varchar column decode split into its two phases, mirroring
+/// `prepared_table_decode`: `prepare_strings_column_decode` runs the per-codec host prepares
+/// (including DICT_FSST's on-device predecode, which keeps its own internal round trips) and
+/// stages every kernel descriptor array into the caller's `decode_descriptor_arena`; `launch`
+/// then runs the shared two-phase length / scan / gather flow and builds the cudf strings column.
+/// The split lets `decode_duckdb_native_split` upload the descriptors of every column in a scan
+/// split with one host-to-device copy.
+class prepared_strings_column_decode {
+ public:
+  prepared_strings_column_decode(prepared_strings_column_decode&&) noexcept;
+  prepared_strings_column_decode& operator=(prepared_strings_column_decode&&) noexcept;
+  ~prepared_strings_column_decode();
+
+  /// Enqueues the column's decode kernels and builds the strings column. The arena passed to
+  /// `prepare_strings_column_decode` must have been flushed and must outlive the enqueued
+  /// kernels. Host syncs: the chars-buffer sizing read-back when the per-segment length upper
+  /// bound is unknown or exceeds the stat-bound gate, and the null-count when the column carries
+  /// nulls; otherwise none.
+  std::unique_ptr<cudf::column> launch(rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr);
+
+ private:
+  friend prepared_strings_column_decode prepare_strings_column_decode(
+    gpu_string_column_decode_input const& col,
+    decode_descriptor_arena& arena,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+  struct impl;
+  explicit prepared_strings_column_decode(std::unique_ptr<impl> state);
+  std::unique_ptr<impl> _impl;
+};
+
+/// Phase one of a varchar column decode (see `prepared_strings_column_decode`). Throws on
+/// malformed segment metadata or unsupported codecs.
+prepared_strings_column_decode prepare_strings_column_decode(
+  gpu_string_column_decode_input const& col,
+  decode_descriptor_arena& arena,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/// Decode one varchar column to a cudf strings column in one call: prepares against a private
+/// arena, flushes it, and launches.
 std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
                                                         rmm::cuda_stream_view stream,
                                                         rmm::device_async_resource_ref mr);

@@ -462,18 +462,86 @@ __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs
   }
 }
 
+/// Deferred two-pass RLE launch: prepare staged both descriptor arrays and allocated the
+/// prefix-sum working buffers; launch enqueues the build kernel then the expand kernel.
+class rle_run_launcher final : public decode_run_launcher {
+ public:
+  rle_run_launcher(decode_descriptor_arena const& arena,
+                   arena_slot build_descs,
+                   arena_slot expand_descs,
+                   rmm::device_uvector<uint32_t> segment_prefix_sums,
+                   rmm::device_uvector<uint32_t> entry_counts,
+                   uint8_t* d_output,
+                   uint32_t type_size)
+    : _arena(&arena),
+      _build_descs(build_descs),
+      _expand_descs(expand_descs),
+      _segment_prefix_sums(std::move(segment_prefix_sums)),
+      _entry_counts(std::move(entry_counts)),
+      _d_output(d_output),
+      _type_size(type_size)
+  {
+  }
+
+  void launch(rmm::cuda_stream_view stream, rmm::device_async_resource_ref /*mr*/) override
+  {
+    auto const num_live_segments = static_cast<uint32_t>(_build_descs.count);
+    auto const* d_build_descs    = _arena->device_ptr<rle_segment_desc>(_build_descs);
+    auto const* d_expand_descs   = _arena->device_ptr<rle_chunk_desc>(_expand_descs);
+    auto const n_ctas            = static_cast<uint32_t>(_expand_descs.count);
+
+    //===----------Pass 1: Build----------===//
+    kernel_build_rle<RLE_BLOCK_DIM, BUILD_VALUES_PER_THREAD, RLE_BUILD_MAX_ENTRIES>
+      <<<num_live_segments, RLE_BLOCK_DIM, 0, stream.value()>>>(
+        d_build_descs, num_live_segments, _segment_prefix_sums.data(), _entry_counts.data());
+
+    //===----------Pass 2: Expand----------===//
+    switch (_type_size) {
+      case 1:
+        kernel_expand_rle<VALUES_PER_THREAD, uint8_t><<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(
+          d_expand_descs, n_ctas, _entry_counts.data(), _d_output);
+        break;
+      case 2:
+        kernel_expand_rle<VALUES_PER_THREAD, uint16_t>
+          <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(
+            d_expand_descs, n_ctas, _entry_counts.data(), reinterpret_cast<uint16_t*>(_d_output));
+        break;
+      case 4:
+        kernel_expand_rle<VALUES_PER_THREAD, uint32_t>
+          <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(
+            d_expand_descs, n_ctas, _entry_counts.data(), reinterpret_cast<uint32_t*>(_d_output));
+        break;
+      case 8:
+        kernel_expand_rle<VALUES_PER_THREAD, uint64_t>
+          <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(
+            d_expand_descs, n_ctas, _entry_counts.data(), reinterpret_cast<uint64_t*>(_d_output));
+        break;
+      default:
+        // Unreachable — guarded by the type_size check in prepare_rle_data.
+        break;
+    }
+  }
+
+ private:
+  decode_descriptor_arena const* _arena;
+  arena_slot _build_descs;
+  arena_slot _expand_descs;
+  rmm::device_uvector<uint32_t> _segment_prefix_sums;
+  rmm::device_uvector<uint32_t> _entry_counts;
+  uint8_t* _d_output;
+  uint32_t _type_size;
+};
+
 }  // anonymous namespace
 
 //===----------------------------------------------------------------------===//
 // Public entry.
 //===----------------------------------------------------------------------===//
 
-//! @brief Decode all RLE-encoded segments in @p run into @p d_output.
-//!
-//! Runs the two-pass pipeline: a per-segment prefix-sum build kernel that
-//! computes the cumulative row counts and the per-segment entry count,
-//! followed by a per-chunk expand kernel that scatters run values to their
-//! output positions. Malformed segments are zero-filled.
+//! @brief Prepare the two-pass RLE pipeline for @p run: a per-segment prefix-sum build kernel
+//! that computes the cumulative row counts and the per-segment entry count, followed by a
+//! per-chunk expand kernel that scatters run values to their output positions. Malformed segments
+//! are zero-filled by the kernels.
 //!
 //! @param run        Column of segments sharing the RLE codec.
 //! @param d_output   Device pointer to the output column buffer; must hold
@@ -482,15 +550,17 @@ __global__ void kernel_expand_rle(rle_chunk_desc const* __restrict__ chunk_descs
 //!                   parity with the dispatcher's other codec entry points).
 //! @param type_size  Width of one output value in bytes. Must be 1, 2, 4, or
 //!                   8; otherwise the function throws.
-//! @param stream     Stream on which all kernels and allocations are issued.
-//! @param mr         Memory resource for the transient prefix-sum / descriptor
-//!                   buffers allocated during decode.
-void decode_rle_data(gpu_codec_run const& run,
-                     uint8_t* d_output,
-                     cudf::data_type /*type*/,
-                     uint32_t type_size,
-                     rmm::cuda_stream_view stream,
-                     rmm::device_async_resource_ref mr)
+//! @param arena      Descriptor arena the build and expand descriptors are staged into.
+//! @param stream     Stream on which the prefix-sum working buffers are allocated (and on which
+//!                   the launcher later enqueues its kernels).
+//! @param mr         Memory resource for the prefix-sum working buffers.
+std::unique_ptr<decode_run_launcher> prepare_rle_data(gpu_codec_run const& run,
+                                                      uint8_t* d_output,
+                                                      cudf::data_type /*type*/,
+                                                      uint32_t type_size,
+                                                      decode_descriptor_arena& arena,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr)
 {
   if (type_size != 1 && type_size != 2 && type_size != 4 && type_size != 8) {
     throw std::runtime_error("[gpu_decode_table]: viability invariant violated — RLE type_size " +
@@ -503,7 +573,7 @@ void decode_rle_data(gpu_codec_run const& run,
     if (seg.row_count == 0) continue;
     live_segments.push_back(&seg);
   }
-  if (live_segments.empty()) return;
+  if (live_segments.empty()) return nullptr;
   auto const num_live_segments = live_segments.size();
 
   // Build per-segment build descriptors.
@@ -519,22 +589,9 @@ void decode_rle_data(gpu_codec_run const& run,
   rmm::device_uvector<uint32_t> d_segment_prefix_sums(
     num_live_segments * RLE_BUILD_MAX_ENTRIES, stream, mr);
   rmm::device_uvector<uint32_t> d_entry_counts(num_live_segments, stream, mr);
-  rmm::device_uvector<rle_segment_desc> d_build_descs(num_live_segments, stream, mr);
-  RMM_CUDA_TRY(cudaMemcpyAsync(d_build_descs.data(),
-                               h_build_descs.data(),
-                               num_live_segments * sizeof(rle_segment_desc),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
 
-  //===----------Pass 1: Build----------===//
-  kernel_build_rle<RLE_BLOCK_DIM, BUILD_VALUES_PER_THREAD, RLE_BUILD_MAX_ENTRIES>
-    <<<static_cast<uint32_t>(num_live_segments), RLE_BLOCK_DIM, 0, stream.value()>>>(
-      d_build_descs.data(),
-      static_cast<uint32_t>(num_live_segments),
-      d_segment_prefix_sums.data(),
-      d_entry_counts.data());
-
-  // Build per-chunk expand descriptors.
+  // Build per-chunk expand descriptors; their prefix-sum pointers reference the working buffer
+  // allocated above, so it must be allocated before the descriptors are staged.
   size_t total_chunks = 0;
   for (auto const* seg : live_segments) {
     total_chunks += ::cuda::ceil_div(seg->row_count, RLE_ROWS_PER_CHUNK);
@@ -560,48 +617,29 @@ void decode_rle_data(gpu_codec_run const& run,
                                 static_cast<uint32_t>(i)});
     }
   }
-  if (h_expand_descs.empty()) return;
 
-  rmm::device_uvector<rle_chunk_desc> d_expand_descs(h_expand_descs.size(), stream, mr);
-  RMM_CUDA_TRY(cudaMemcpyAsync(d_expand_descs.data(),
-                               h_expand_descs.data(),
-                               h_expand_descs.size() * sizeof(rle_chunk_desc),
-                               cudaMemcpyHostToDevice,
-                               stream.value()));
+  auto const build_slot  = arena.stage(h_build_descs.data(), h_build_descs.size());
+  auto const expand_slot = arena.stage(h_expand_descs.data(), h_expand_descs.size());
+  return std::make_unique<rle_run_launcher>(arena,
+                                            build_slot,
+                                            expand_slot,
+                                            std::move(d_segment_prefix_sums),
+                                            std::move(d_entry_counts),
+                                            d_output,
+                                            type_size);
+}
 
-  auto const n_ctas = static_cast<uint32_t>(h_expand_descs.size());
-
-  //===----------Pass 2: Expand----------===//
-  switch (type_size) {
-    case 1:
-      kernel_expand_rle<VALUES_PER_THREAD, uint8_t><<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(
-        d_expand_descs.data(), n_ctas, d_entry_counts.data(), d_output);
-      break;
-    case 2:
-      kernel_expand_rle<VALUES_PER_THREAD, uint16_t>
-        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
-                                                       n_ctas,
-                                                       d_entry_counts.data(),
-                                                       reinterpret_cast<uint16_t*>(d_output));
-      break;
-    case 4:
-      kernel_expand_rle<VALUES_PER_THREAD, uint32_t>
-        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
-                                                       n_ctas,
-                                                       d_entry_counts.data(),
-                                                       reinterpret_cast<uint32_t*>(d_output));
-      break;
-    case 8:
-      kernel_expand_rle<VALUES_PER_THREAD, uint64_t>
-        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
-                                                       n_ctas,
-                                                       d_entry_counts.data(),
-                                                       reinterpret_cast<uint64_t*>(d_output));
-      break;
-    default:
-      // Unreachable — guarded by the type_size check at function entry.
-      break;
-  }
+void decode_rle_data(gpu_codec_run const& run,
+                     uint8_t* d_output,
+                     cudf::data_type type,
+                     uint32_t type_size,
+                     rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr)
+{
+  decode_descriptor_arena arena;
+  auto launcher = prepare_rle_data(run, d_output, type, type_size, arena, stream, mr);
+  arena.flush(stream, mr);
+  if (launcher) { launcher->launch(stream, mr); }
 }
 
 }  // namespace sirius::cuda::scan
