@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include "helper/logical_type.hpp"
-
 #include <cudf/aggregation.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -25,32 +23,12 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
-#include <array>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace sirius::op {
-
-enum class tiny_domain_q1_value_source : int8_t {
-  independent_sum,
-  price,
-  discount,
-  discounted_price,
-  charge,
-};
-
-/** Name-independent input plan proven by the Q1 projection-fusion planner. */
-struct tiny_domain_q1_projection_plan {
-  std::array<int, 2> group_input_idx;
-  std::array<int, 4> decimal_input_idx;
-  std::array<sirius::logical_type, 4> decimal_input_types;
-  std::array<sirius::logical_type, 5> physical_sum_types;
-  std::array<tiny_domain_q1_value_source, 5> physical_value_sources;
-  std::array<int8_t, 11> logical_to_physical;
-};
 
 /** Result of attempting the bounded tiny-domain local GROUP BY path. */
 struct tiny_domain_grouped_aggregate_attempt {
@@ -81,14 +59,6 @@ struct tiny_domain_grouped_aggregate_attempt {
   std::vector<int> const& group_idx,
   std::vector<cudf::aggregation::Kind> const& aggregates,
   std::vector<int> const& aggregate_idx,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr);
-
-/** Attempt fused Q1 projection/aggregation over pre-projection input without partial publish. */
-[[nodiscard]] tiny_domain_grouped_aggregate_attempt try_tiny_domain_q1_projection_aggregate(
-  cudf::table_view input,
-  tiny_domain_q1_projection_plan const& plan,
-  std::vector<cudf::aggregation::Kind> const& aggregates,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 

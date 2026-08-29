@@ -27,13 +27,11 @@
 #include "duckdb/storage/data_table.hpp"
 #include "expression/ast/node.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
-#include "op/aggregate/tiny_domain_grouped_aggregate_impl.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <atomic>
 #include <memory>
 #include <numeric>
-#include <optional>
 
 namespace sirius {
 namespace op {
@@ -117,27 +115,6 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     return _tiny_domain_fallbacks.load(std::memory_order_relaxed);
   }
 
-  void install_tiny_domain_projection_fusion(
-    tiny_domain_q1_projection_plan plan,
-    std::vector<duckdb::unique_ptr<sirius_physical_operator>> fallback_stages);
-
-  [[nodiscard]] bool tiny_domain_projection_fusion_enabled() const noexcept
-  {
-    return _tiny_domain_projection_plan.has_value();
-  }
-  [[nodiscard]] std::size_t tiny_domain_projection_fallback_stage_count() const noexcept
-  {
-    return _tiny_domain_projection_fallback_stages.size();
-  }
-  [[nodiscard]] uint64_t tiny_domain_projection_activation_count() const noexcept
-  {
-    return _tiny_domain_projection_activations.load(std::memory_order_relaxed);
-  }
-  [[nodiscard]] uint64_t tiny_domain_projection_fallback_count() const noexcept
-  {
-    return _tiny_domain_projection_fallbacks.load(std::memory_order_relaxed);
-  }
-
   // Source interface
   bool is_source() const override { return true; }
 
@@ -154,19 +131,10 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline) override;
-
  private:
-  std::unique_ptr<operator_data> execute_projected(const operator_data& input_data,
-                                                   rmm::cuda_stream_view stream);
-
   bool _enable_tiny_domain_strategy = false;
   std::atomic<uint64_t> _tiny_domain_activations{0};
   std::atomic<uint64_t> _tiny_domain_fallbacks{0};
-  std::optional<tiny_domain_q1_projection_plan> _tiny_domain_projection_plan;
-  std::vector<duckdb::unique_ptr<sirius_physical_operator>> _tiny_domain_projection_fallback_stages;
-  std::atomic<uint64_t> _tiny_domain_projection_activations{0};
-  std::atomic<uint64_t> _tiny_domain_projection_fallbacks{0};
 };
 
 }  // namespace op
