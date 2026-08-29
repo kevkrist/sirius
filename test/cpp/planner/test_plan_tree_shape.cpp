@@ -350,6 +350,30 @@ class dynamic_filter_switch_guard {
   bool _original = true;
 };
 
+class tiny_domain_switch_guard {
+ public:
+  tiny_domain_switch_guard(Connection& con, bool enabled)
+    : _state(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"))
+  {
+    REQUIRE(_state != nullptr);
+    auto& params                                = _state->get_config().get_operator_params();
+    _original                                   = params.enable_tiny_domain_grouped_aggregate;
+    params.enable_tiny_domain_grouped_aggregate = enabled;
+  }
+
+  ~tiny_domain_switch_guard()
+  {
+    _state->get_config().get_operator_params().enable_tiny_domain_grouped_aggregate = _original;
+  }
+
+  tiny_domain_switch_guard(const tiny_domain_switch_guard&)            = delete;
+  tiny_domain_switch_guard& operator=(const tiny_domain_switch_guard&) = delete;
+
+ private:
+  duckdb::shared_ptr<duckdb::SiriusContext> _state;
+  bool _original = false;
+};
+
 struct plan_tree_shape_fixture {
   plan_tree_shape_fixture()
   {
@@ -955,6 +979,22 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     REQUIRE(partition->children.size() == 1);
     CHECK(partition->children[0]->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+  }
+
+  SECTION("three group keys remain on the generic path when tiny-domain is enabled")
+  {
+    tiny_domain_switch_guard switch_on(*con, /*enabled=*/true);
+    auto plan =
+      generate_sirius_plan(*con,
+                           "SELECT CAST(id AS TINYINT) AS k1, CAST(val AS TINYINT) AS k2, "
+                           "CAST(id + val AS TINYINT) AS k3, sum(CAST(val AS SMALLINT)) "
+                           "FROM big_left GROUP BY k1, k2, k3");
+    INFO(tree_to_string(plan.get()));
+
+    auto* local = find_first(plan.get(), SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    REQUIRE(local != nullptr);
+    CHECK_FALSE(
+      local->Cast<sirius::op::sirius_physical_grouped_aggregate>().tiny_domain_strategy_enabled());
   }
 
   SECTION("COUNT(DISTINCT) records LIST locally and BIGINT after merge")
