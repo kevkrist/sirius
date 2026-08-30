@@ -28,6 +28,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <variant>
 
 using namespace sirius;
@@ -695,5 +696,107 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
   CHECK_FALSE(cfg.get_operator_params().enable_dynamic_filter);
 
   std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("uring reactor derivation is min(pipeline threads, cap) clamped to at least 1",
+          "[config_opt][scan_manager][uring_reactors]")
+{
+  using scan_manager::derive_uring_n_reactors;
+  using scan_manager::max_derived_uring_n_reactors;
+
+  // One reactor per in-flight split below the cap.
+  STATIC_REQUIRE(derive_uring_n_reactors(1) == 1);
+  STATIC_REQUIRE(derive_uring_n_reactors(4) == 4);
+  STATIC_REQUIRE(derive_uring_n_reactors(7) == 7);
+
+  // Capped above: extra reactors were measured as marginal and cost pinned bounce buffers.
+  STATIC_REQUIRE(derive_uring_n_reactors(8) == max_derived_uring_n_reactors);
+  STATIC_REQUIRE(derive_uring_n_reactors(9) == max_derived_uring_n_reactors);
+  STATIC_REQUIRE(derive_uring_n_reactors(16) == max_derived_uring_n_reactors);
+  STATIC_REQUIRE(derive_uring_n_reactors(std::numeric_limits<int>::max()) ==
+                 max_derived_uring_n_reactors);
+
+  // Clamped below: zero reactors would build an empty reactor pool and hang IO dispatch.
+  STATIC_REQUIRE(derive_uring_n_reactors(0) == 1);
+  STATIC_REQUIRE(derive_uring_n_reactors(-3) == 1);
+
+  // The compile-time default is the derivation applied to the default pipeline thread count, and
+  // the default sizing budget accounts for the derived reactor count.
+  STATIC_REQUIRE(scan_manager::default_uring_n_reactors ==
+                 derive_uring_n_reactors(exec::default_gpu_pipeline_num_threads));
+  CHECK(scan_manager::default_scan_manager_num_threads() ==
+        scan_manager::scan_manager_num_threads_for(exec::default_gpu_pipeline_num_threads,
+                                                   scan_manager::default_uring_n_reactors));
+  CHECK(scan_manager::default_scan_manager_num_threads() >= 4);
+}
+
+TEST_CASE("scan_manager concurrency defaults are finalized from the effective pipeline threads",
+          "[config_opt][scan_manager][uring_reactors]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_scan_manager_finalize.yaml";
+  auto write_yaml = [&](std::string_view body) {
+    std::ofstream out(path);
+    out << body;
+  };
+  std::error_code ec;
+
+  SECTION("absent keys derive from the yaml pipeline thread count parsed after scan_manager")
+  {
+    write_yaml(
+      "sirius:\n"
+      "  executor:\n"
+      "    scan_manager:\n"
+      "      enable_prefetch_cache: false\n"
+      "    pipeline:\n"
+      "      num_threads: 6\n");
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_scan_manager_config().uring_n_reactors == 6);
+    CHECK(cfg.get_scan_manager_config().thread_pool.num_threads ==
+          scan_manager::scan_manager_num_threads_for(6, 6));
+  }
+
+  SECTION("an explicit uring_n_reactors equal to the old default survives the finalize")
+  {
+    write_yaml(
+      "sirius:\n"
+      "  executor:\n"
+      "    scan_manager:\n"
+      "      uring_n_reactors: 1\n"
+      "    pipeline:\n"
+      "      num_threads: 8\n");
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_scan_manager_config().uring_n_reactors == 1);
+    // The derived pool budget accounts for the explicit reactor count.
+    CHECK(cfg.get_scan_manager_config().thread_pool.num_threads ==
+          scan_manager::scan_manager_num_threads_for(8, 1));
+  }
+
+  SECTION("an explicit num_threads survives the finalize while reactors still derive")
+  {
+    write_yaml(
+      "sirius:\n"
+      "  executor:\n"
+      "    scan_manager:\n"
+      "      num_threads: 5\n"
+      "    pipeline:\n"
+      "      num_threads: 3\n");
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_scan_manager_config().thread_pool.num_threads == 5);
+    CHECK(cfg.get_scan_manager_config().uring_n_reactors == 3);
+  }
+
+  SECTION("no executor block at all still yields the derived defaults")
+  {
+    write_yaml("sirius:\n  telemetry:\n    enable_quent: false\n");
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_scan_manager_config().uring_n_reactors ==
+          scan_manager::derive_uring_n_reactors(exec::default_gpu_pipeline_num_threads));
+  }
+
   std::filesystem::remove(path, ec);
 }

@@ -29,17 +29,51 @@
 
 namespace sirius::scan_manager {
 
-/// Default uring reactor count; counted in the scan-manager sizing budget below.
-inline constexpr std::size_t default_uring_n_reactors = 1;
+/// Upper bound on the derived uring reactor count. Measured on a GB300 TPC-H SF1000 sweep:
+/// 16 reactors x 16 pipeline threads was only marginally faster than 8x8 (5.04 s vs 5.60 s on the
+/// cache-served hot suite) while every reactor pre-allocates a 64 x 1 MiB pinned bounce buffer at
+/// startup, so the derivation caps at 8. An explicit yaml `uring_n_reactors` can exceed the cap.
+inline constexpr std::size_t max_derived_uring_n_reactors = 8;
+
+/// Derive the default uring reactor count from the GPU pipeline thread count -- the number of scan
+/// splits that can be in flight concurrently, and therefore the useful degree of IO/copy
+/// parallelism (reactors execute the page-cache-to-pinned copies inline, ~5 GB/s per thread).
+/// Clamped to [1, max_derived_uring_n_reactors]: zero reactors would build an empty reactor pool
+/// and hang IO dispatch, and the cap bounds the pinned bounce-buffer cost. The pipeline thread
+/// count is the single task-scheduler config; under multi-GPU the concurrent-split count can
+/// exceed it, which the cap absorbs.
+[[nodiscard]] constexpr std::size_t derive_uring_n_reactors(int gpu_pipeline_num_threads) noexcept
+{
+  auto const in_flight_splits = static_cast<std::size_t>(std::max(gpu_pipeline_num_threads, 1));
+  return std::min(in_flight_splits, max_derived_uring_n_reactors);
+}
+
+/// Default uring reactor count; counted in the scan-manager sizing budget below. Derived from the
+/// default pipeline thread count here so that a default-constructed config is self-consistent;
+/// sirius_config re-derives it from the effective (possibly yaml-overridden) pipeline thread count
+/// in its post-parse finalize unless yaml sets `uring_n_reactors` explicitly.
+inline constexpr std::size_t default_uring_n_reactors =
+  derive_uring_n_reactors(exec::default_gpu_pipeline_num_threads);
+
+/// Scan-manager pool size for the given companion pool sizes: every core left after the other
+/// pools (downgrade, task_creator, pipeline, uring reactors), never below 4. sirius_config's
+/// post-parse finalize calls this with the effective pipeline-thread and reactor counts when yaml
+/// does not set `scan_manager.num_threads` explicitly.
+[[nodiscard]] inline int scan_manager_num_threads_for(int gpu_pipeline_num_threads,
+                                                      std::size_t uring_n_reactors)
+{
+  int const reserved = exec::default_downgrade_num_threads +
+                       creator::default_task_creator_num_threads + gpu_pipeline_num_threads +
+                       static_cast<int>(uring_n_reactors);
+  return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
+}
 
 /// Default scan-manager pool size: every core left after the other default pools
-/// (downgrade, task_creator, pipeline, uring reactor), never below 4.
+/// (downgrade, task_creator, pipeline, uring reactors), never below 4.
 [[nodiscard]] inline int default_scan_manager_num_threads()
 {
-  constexpr int reserved =
-    exec::default_downgrade_num_threads + creator::default_task_creator_num_threads +
-    exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_n_reactors);
-  return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
+  return scan_manager_num_threads_for(exec::default_gpu_pipeline_num_threads,
+                                      default_uring_n_reactors);
 }
 
 /**

@@ -179,7 +179,8 @@ The Sirius config file (e.g. `~/.sirius/sirius.yaml`) controls:
 - **GPU memory**: `usage_limit_fraction`, `reservation_limit_fraction`, `downgrade_trigger_fraction`, `downgrade_stop_fraction`
 - **Host memory**: `capacity_bytes`, `initial_number_pools`, `pool_size`, `block_size`
   - Initial allocation = `initial_number_pools * pool_size * block_size`
-- **Thread pools**: `pipeline`, `task_creator`, `downgrade` thread counts
+- **Thread pools**: `pipeline`, `task_creator`, `downgrade` thread counts (the scan manager's
+  `uring_n_reactors` defaults to `min(pipeline num_threads, 8)`)
 - **Operator params**: `scan_task_batch_size`, `hash_partition_bytes`, `concat_batch_bytes`
 - **Telemetry**: `telemetry.enable_quent`, `telemetry.output_directory`, `telemetry.engine_name`
 
@@ -197,12 +198,12 @@ sirius:
       downgrade_stop_fraction: 0.6
     host:
       capacity_bytes: 471200000000       # ~471 GB
-      initial_number_pools: 785
+      initial_number_pools: 60           # ~32 GB pre-fault; grows on demand up to capacity_bytes
       pool_size: 512
       block_size: 1048576                # 1 MB
   executor:
     pipeline:
-      num_threads: 4
+      num_threads: 8                     # uring_n_reactors follows: min(pipeline threads, 8)
     downgrade:
       num_threads: 1
     task_creator:
@@ -217,3 +218,22 @@ sirius:
     output_directory: telemetry_data
     engine_name: siriusDB
 ```
+
+Two sizing rules matter for hot-iteration performance on GB-class machines:
+
+- **Pair pipeline threads with IO reactors.** Hot iterations of a local-disk run are bound by the
+  page-cache-to-pinned copies that the scan manager's uring reactor threads execute inline
+  (~5 GB/s each), so reactors must scale with the number of scan splits the pipeline can have in
+  flight. The default does this automatically (`uring_n_reactors = min(pipeline num_threads, 8)`);
+  only set `executor.scan_manager.uring_n_reactors` explicitly to pin a different count. Measured
+  on GB300 SF1000: q19 hot time fell from 15.06 s at 1 reactor to 2.98 s at 8 reactors x 8
+  pipeline threads; 16x16 was only marginally better than 8x8 on the cache-served suite (5.04 s vs
+  5.60 s), which is why the derivation caps at 8.
+- **Leave page-cache headroom for the scan working set.** `initial_number_pools x pool_size x
+  block_size` of pinned host memory is pre-faulted at startup and never returned to the OS. Size it
+  so node-0 RAM minus that pre-fault comfortably exceeds the hot scan working set, or the page
+  cache cannot retain the dataset between iterations and hot runs flip unpredictably between
+  cache-served (memcpy-bound) and disk-bound modes. On the 498 GB-per-node GB300, the earlier
+  `initial_number_pools: 785` (~421 GB pre-fault) left only ~85 GB of cache against a ~98 GB
+  SF1000 working set (q19 72 GB + q1 26 GB); 60 pools (~32 GB) leave ample margin, and the pool
+  still grows on demand up to `capacity_bytes`.
