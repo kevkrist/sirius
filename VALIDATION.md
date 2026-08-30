@@ -1,12 +1,41 @@
 # VALIDATION — PROTO-A (P11 descriptor packing + P2 read/H2D overlap)
 
-Branch `proto-a-decode-overlap`, base `1ad67e7f`. Two commits, each independently benchmarkable:
+Branch `proto-a-decode-overlap`, base `1ad67e7f`. Two benchmarkable stages plus one teardown fix:
 
 - **Commit 1 (stage 1, P11)**: `perf(scan): pack decode descriptor uploads into one pinned blob per split (P11)`
 - **Commit 2 (stage 2, P2)**: sub-batched read -> H2D overlap + event-gated pinned-staging release
+- **Commit 3 (fix)**: noexcept swallow-and-leak teardown for the two thread-local caches (see
+  "R2' exit-abort fix" below); benchmark either at commit 2 or commit 3 — the fix is
+  teardown-only and does not touch any measured path.
 
 Nothing here was run on a GPU by the implementer. Everything below is what the orchestrator
 should run and what outcome proves each path fired.
+
+## R2' exit-abort fix (commit 3)
+
+Observed by the orchestrator: R2' (gpu-tier pin) processes aborted AT EXIT
+(`__call_tls_dtors -> _Unwind_Resume -> __cxa_call_terminate`) — an exception escaping a
+thread-local destructor during process teardown. The CUDA runtime calls in those destructors are
+C APIs and cannot throw; the throw-capable path was `~deferred_staging_release` destroying its
+entries, whose cucascade releases (`multiple_blocks_allocation` -> FSMR chunk return,
+`reservation` -> arena notify) run C++ code that can throw (or hit UB that surfaces as a throw)
+once the memory managers have begun tearing down. Fix, per the coordinator directive:
+
+- `deferred_staging_release::~deferred_staging_release()` (duckdb_native_decoder.cpp) is
+  `noexcept`, deliberately LEAKS the entries' blocks + reservations (`unique_ptr::release()`),
+  and `(void)`-swallows the event destroys. Entries only survive to thread exit on the shutdown
+  path (every next split drains them first), so the leak is shutdown-only in practice; the OS
+  reclaims at process exit. Normal-lifetime releases stay in `drain()` / `reap_completed()`.
+- `pinned_slab_pool::~pinned_slab_pool()` (decode_descriptor_arena.cu) is `noexcept` with every
+  CUDA call `(void)`-swallowed; on `cudaErrorCudartUnloading` the slab leaks deliberately.
+
+Re-run to confirm: the R2' validation suite plus one R2' block — every process must exit rc=0.
+Residual to watch: if any R2' pin-serving thread exits MID-lifetime (not at shutdown) after
+running native decode splits, its last split's staging blocks leak from the 196 GB pinned pool
+(bounded at one split per thread exit). The clean structural home for that case is a
+process-lifetime registry owned by `SiriusContext` (normal teardown frees while the managers are
+alive, TLS destructor stays as the swallow-and-leak fallback) — `sirius_context.*` is outside
+this contract's owned surface, so it is left to the hunt lead as a follow-up.
 
 ## What to run
 

@@ -771,16 +771,25 @@ class deferred_staging_release {
     _entries.clear();
   }
 
-  ~deferred_staging_release()
+  ~deferred_staging_release() noexcept
   {
-    // Thread teardown: best effort -- the CUDA context may already be gone, and an error here
-    // has no better recovery than proceeding with the release.
+    // Thread-local teardown can run after the CUDA driver and the cucascade memory managers
+    // have begun (or finished) shutting down, so nothing here may assume a live context and no
+    // exception may escape (a throwing TLS destructor is std::terminate). CUDA runtime calls
+    // are C APIs that error-return rather than throw, so they are safe to attempt and swallow;
+    // the cucascade releases (blocks back to the FSMR, reservation against its arena) are C++
+    // paths that can throw against torn-down managers, so the entries' payloads are leaked
+    // deliberately instead -- entries only survive to thread exit on the shutdown path, and the
+    // OS reclaims the memory at process exit. Normal-lifetime releases happen in drain() /
+    // reap_completed(), never here.
     for (auto& e : _entries) {
-      cudaEventSynchronize(e.event);
+      (void)e.blocks.release();       // deliberate leak
+      (void)e.reservation.release();  // deliberate leak
+      (void)cudaEventDestroy(e.event);
     }
     _entries.clear();
     for (auto* ev : _free_events) {
-      cudaEventDestroy(ev);
+      (void)cudaEventDestroy(ev);
     }
   }
 

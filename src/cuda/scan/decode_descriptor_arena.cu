@@ -92,11 +92,16 @@ class pinned_slab_pool {
     s.in_use = false;
   }
 
-  ~pinned_slab_pool()
+  ~pinned_slab_pool() noexcept
   {
+    // Thread-local teardown can run after the CUDA driver has begun (or finished) shutting
+    // down, so no live context may be assumed and nothing may escape (a throwing TLS destructor
+    // is std::terminate). The calls below are CUDA runtime C APIs that error-return
+    // (cudaErrorCudartUnloading) rather than throw; failures are swallowed and the slab is
+    // deliberately leaked -- the OS reclaims it at process exit.
     for (auto& s : _slabs) {
-      if (s.ready != nullptr) { cudaEventDestroy(s.ready); }
-      if (s.ptr != nullptr) { cudaFreeHost(s.ptr); }
+      if (s.ready != nullptr) { (void)cudaEventDestroy(s.ready); }
+      if (s.ptr != nullptr) { (void)cudaFreeHost(s.ptr); }
     }
   }
 
