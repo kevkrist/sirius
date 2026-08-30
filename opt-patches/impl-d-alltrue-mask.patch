@@ -1,0 +1,841 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f1b032b4..263a28d5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -864,6 +864,7 @@ set(TEST_SOURCES
+     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
+     test/cpp/scan/test_duckdb_native_empty_split_decode.cpp
+     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
++    test/cpp/scan/test_duckdb_native_post_filter.cpp
+     test/cpp/scan/test_duckdb_native_walker.cpp
+     test/cpp/scan/test_dynamic_filter_merge.cpp
+     test/cpp/scan/test_gpu_decode_alp.cpp
+diff --git a/src/expression_evaluator/expression_evaluator.cpp b/src/expression_evaluator/expression_evaluator.cpp
+index 53724b61..5c7d7cf8 100644
+--- a/src/expression_evaluator/expression_evaluator.cpp
++++ b/src/expression_evaluator/expression_evaluator.cpp
+@@ -36,6 +36,7 @@
+ #include <rmm/resource_ref.hpp>
+ 
+ // standard library
++#include <cstdint>
+ #include <memory>
+ #include <numeric>
+ #include <variant>
+@@ -399,6 +400,22 @@ std::unique_ptr<cudf::table> expression_evaluator::select_with_survivors(
+   return selected;
+ }
+ 
++std::unique_ptr<cudf::column> expression_evaluator::survivor_indices(cudf::table_view input)
++{
++  auto mask = compute_mask(input);
++  // Compacting a row-index sequence through apply_boolean_mask keeps the null convention (and
++  // the single output-size readback) identical to select()'s gather while touching only 4 bytes
++  // per row instead of every output column.
++  auto positions = cudf::sequence(input.num_rows(),
++                                  cudf::numeric_scalar<std::int32_t>(0, true, _stream, _mr),
++                                  cudf::numeric_scalar<std::int32_t>(1, true, _stream, _mr),
++                                  _stream,
++                                  _mr);
++  auto surviving =
++    cudf::apply_boolean_mask(cudf::table_view{{positions->view()}}, mask->view(), _stream, _mr);
++  return std::move(surviving->release().front());
++}
++
+ std::unique_ptr<cudf::table> expression_evaluator::select(cudf::table_view input)
+ {
+   auto mask = compute_mask(input);
+diff --git a/src/include/expression_evaluator/expression_evaluator.hpp b/src/include/expression_evaluator/expression_evaluator.hpp
+index ab15a5f4..f2c27ecb 100644
+--- a/src/include/expression_evaluator/expression_evaluator.hpp
++++ b/src/include/expression_evaluator/expression_evaluator.hpp
+@@ -361,6 +361,23 @@ class expression_evaluator {
+     std::span<cudf::size_type const> output_indices,
+     std::unique_ptr<cudf::column>& survivors);
+ 
++  /**
++   * @brief The positions of the rows select() would keep, without gathering any data column.
++   *
++   * Evaluates the executor's (singular) boolean predicate over @p input and returns an INT32
++   * column holding the input row index of each surviving row, ascending. A row survives only
++   * when the predicate result is both valid and true -- the same convention select() inherits
++   * from cudf::apply_boolean_mask, where a null predicate result drops the row.
++   *
++   * The returned column's size() is the survivor count, already resolved on the host: it costs
++   * the one device-to-host size readback that select()'s internal gather performs, so a caller
++   * that compacts rows itself (e.g. with cudf::gather over the returned indices) replaces
++   * select()'s synchronization one-for-one instead of adding to it. This lets
++   * `duckdb_native_gpu_ingestible::post_filter_and_project` branch on all-rows-survive /
++   * no-rows-survive before deciding whether any gather is needed at all.
++   */
++  std::unique_ptr<cudf::column> survivor_indices(cudf::table_view input);
++
+   /**
+    * @brief Selects rows from the input batch based on the executor's (singular) expression.
+    *
+diff --git a/src/include/op/scan/owning_table_view.hpp b/src/include/op/scan/owning_table_view.hpp
+index b3bbff79..c5f0b411 100644
+--- a/src/include/op/scan/owning_table_view.hpp
++++ b/src/include/op/scan/owning_table_view.hpp
+@@ -154,6 +154,14 @@ class my_view {
+     return _model->materialize(_selection, stream, mr);
+   }
+ 
++  /// True when @ref materialize will move the owner's column buffers (the owner is
++  /// @ref no_alloc_materializable); false when it takes the copying path, which also
++  /// synchronizes the stream.
++  [[nodiscard]] bool is_no_alloc_materializable() const
++  {
++    return _model->is_no_alloc_materializable();
++  }
++
+   void record_reader_event(rmm::cuda_stream_view stream) { _model->record_reader_event(stream); }
+ 
+  private:
+@@ -167,6 +175,8 @@ class my_view {
+       rmm::cuda_stream_view stream,
+       rmm::device_async_resource_ref mr) = 0;
+ 
++    [[nodiscard]] virtual bool is_no_alloc_materializable() const = 0;
++
+     virtual void record_reader_event(rmm::cuda_stream_view) {}
+   };
+ 
+@@ -213,6 +223,11 @@ class my_view {
+       }
+     }
+ 
++    [[nodiscard]] bool is_no_alloc_materializable() const override
++    {
++      return no_alloc_materializable<Owner>;
++    }
++
+     void record_reader_event([[maybe_unused]] rmm::cuda_stream_view stream) override
+     {
+       if constexpr (reader_event_recording<Owner>) { _owner.record_reader_event(stream); }
+@@ -330,6 +345,14 @@ class owning_table_view {
+   /// them. No-op unless the owner tracks reader events.
+   void record_reader_event(rmm::cuda_stream_view stream) const;
+ 
++  /// True when @ref materialize / @ref release move the underlying column
++  /// buffers without allocating device memory or synchronizing the stream: the
++  /// handle owns a @c cudf::table outright, its type-erased owner satisfies
++  /// @ref detail::no_alloc_materializable, or it is empty (release() returns
++  /// nullptr). False only for a view over a generic owner, whose
++  /// materialization deep-copies and synchronizes.
++  [[nodiscard]] bool is_no_alloc_materializable() const;
++
+   /// Realize a view state into an owned table. No-op if already materialized or
+   /// empty. May allocate (copying path) depending on the underlying owner.
+   void materialize(rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+diff --git a/src/op/scan/duckdb_native_gpu_ingestible.cpp b/src/op/scan/duckdb_native_gpu_ingestible.cpp
+index 345b38a0..9c7a4720 100644
+--- a/src/op/scan/duckdb_native_gpu_ingestible.cpp
++++ b/src/op/scan/duckdb_native_gpu_ingestible.cpp
+@@ -35,6 +35,7 @@
+ #include <duckdb/storage/storage_manager.hpp>
+ 
+ // cudf
++#include <cudf/copying.hpp>
+ #include <cudf/table/table.hpp>
+ #include <cudf/types.hpp>
+ #include <cudf/utilities/memory_resource.hpp>
+@@ -371,25 +372,65 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
+                                       sirius::expression_evaluator::default_min_ast_size,
+                                       like_swar_fastpath,
+                                       std::move(like_cache));
++    // Fold the projection into the row compaction so pure-filter columns are never
++    // materialized. When nothing needs projecting away, or output_arity == 0 (count(*)),
++    // keep all columns so the surviving row count is carried.
++    std::vector<cudf::size_type> output_indices;
+     if (projection_required) {
+-      // Fold the projection into the filter gather so pure-filter columns are never materialized.
+-      std::vector<cudf::size_type> output_indices(output_arity);
++      output_indices.resize(output_arity);
+       std::iota(output_indices.begin(), output_indices.end(), cudf::size_type{0});
+-      final_table = owning_table_view{exec.select(input.table.view(), output_indices)};
++    }
++    if (input.table.is_no_alloc_materializable()) {
++      // Owned input (a fresh decode or a stolen per-query table): resolve the survivor
++      // positions first, then branch. The survivor readback is the same single stream
++      // synchronization the folded select() gather pays inside apply_boolean_mask, so no
++      // branch here synchronizes more than the view-backed path below.
++      auto const num_rows  = input.table.num_rows();
++      auto const survivors = exec.survivor_indices(input.table.view());
++      if (survivors->size() == num_rows) {
++        // Every row survives: keep the decoded columns as-is instead of re-copying the
++        // whole batch through a gather. The projection below trims the trailing
++        // pure-filter columns without touching the survivors' buffers.
++        input.table.record_reader_event(stream);
++        final_table = std::move(input.table);
++      } else if (survivors->size() == 0) {
++        // No row survives: emit the 0-row batch with the decoded schema (the shape the
++        // all-pruned scan emits) and let the projection below trim it to output arity.
++        final_table = owning_table_view{cudf::empty_like(input.table.view())};
++        input.table.record_reader_event(stream);
++      } else {
++        auto const view = input.table.view();
++        auto gathered   = cudf::gather(projection_required ? view.select(output_indices) : view,
++                                     survivors->view(),
++                                     cudf::out_of_bounds_policy::DONT_CHECK,
++                                     stream,
++                                     mr_ref);
++        input.table.record_reader_event(stream);
++        final_table = owning_table_view{std::move(gathered)};
++      }
+     } else {
+-      // Nothing to project away, or output_arity == 0 (count(*)) — keep all columns.
+-      final_table = owning_table_view{exec.select(input.table.view())};
++      // View-backed input (a cache-served chunk): the shortcut above cannot move columns
++      // out of the shared owner -- release() would deep-copy and synchronize on top of
++      // the survivor readback -- so keep the folded filter gather.
++      if (projection_required) {
++        final_table = owning_table_view{exec.select(input.table.view(), output_indices)};
++      } else {
++        final_table = owning_table_view{exec.select(input.table.view())};
++      }
++      // The select only enqueued its reads; record before input.table's read-lock owner is
++      // dropped.
++      input.table.record_reader_event(stream);
+     }
+-    // The select only enqueued its reads; record before input.table's read-lock owner is dropped.
+-    input.table.record_reader_event(stream);
+   } else {
+     final_table = std::move(input.table);
+   }
+ 
+   //===----------Projection----------===//
+-  // No filter was applied, but pure-filter columns may still have been decoded (e.g. a pinned
+-  // column-superset scan): drop the trailing columns. This is a no-op after the folded filter
+-  // gather above, which already produced exactly output_arity columns.
++  // Drop the trailing pure-filter columns wherever the compaction above did not already fold
++  // the projection: the ROW_FILTERED / no-filter passthrough (e.g. a pinned column-superset
++  // scan), the all-true move, and the all-false empty batch. A no-op after the mixed-mask
++  // gather and the view-backed select() paths, which already produced exactly output_arity
++  // columns.
+   if (projection_required &&
+       static_cast<std::size_t>(final_table.view().num_columns()) > output_arity) {
+     std::vector<size_t> selected_cols(output_arity);
+diff --git a/src/op/scan/owning_table_view.cpp b/src/op/scan/owning_table_view.cpp
+index 8f146927..e4323525 100644
+--- a/src/op/scan/owning_table_view.cpp
++++ b/src/op/scan/owning_table_view.cpp
+@@ -114,6 +114,14 @@ void owning_table_view::record_reader_event(rmm::cuda_stream_view stream) const
+   }
+ }
+ 
++bool owning_table_view::is_no_alloc_materializable() const
++{
++  if (auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state)) {
++    return (*view)->is_no_alloc_materializable();
++  }
++  return true;  // owned table (pure move) or empty (release() returns nullptr)
++}
++
+ void owning_table_view::materialize(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+ {
+   if (auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state)) {
+diff --git a/test/cpp/expression_evaluator/test_expression_evaluator.cpp b/test/cpp/expression_evaluator/test_expression_evaluator.cpp
+index 148a6721..889c8ce7 100644
+--- a/test/cpp/expression_evaluator/test_expression_evaluator.cpp
++++ b/test/cpp/expression_evaluator/test_expression_evaluator.cpp
+@@ -1196,6 +1196,86 @@ TEMPLATE_TEST_CASE("select filters rows and handles edge cases",
+   }
+ }
+ 
++// ---------------------------------------------------------------------------
++// survivor_indices: positions of select()'s survivors, no data gather
++// ---------------------------------------------------------------------------
++
++TEMPLATE_TEST_CASE("survivor_indices reports surviving row positions",
++                   "[expression_evaluator]",
++                   mat_strategy,
++                   ast_interpret_strategy,
++                   ast_jit_strategy)
++{
++  constexpr auto strategy = TestType::value;
++  auto* space             = get_default_gpu_space();
++  REQUIRE(space != nullptr);
++
++  auto run_survivors = [&](std::shared_ptr<data_batch> const& input_batch,
++                           std::unique_ptr<ast_node> node) {
++    exp_executor executor(*node, get_resource_ref(*space), cudf::get_default_stream(), strategy);
++    auto input_ro  = input_batch->to_read_only();
++    auto& in_repr  = input_ro.get_data()->cast<gpu_table_representation>();
++    auto positions = executor.survivor_indices(in_repr.get_table_view());
++    REQUIRE(positions != nullptr);
++    REQUIRE(positions->type().id() == cudf::type_id::INT32);
++    return positions;
++  };
++
++  std::vector<int32_t> values(64);
++  std::iota(values.begin(), values.end(), 0);
++  std::vector<bool> all_valid(values.size(), true);
++
++  SECTION("all rows survive: identity positions")
++  {
++    auto input = make_int32_batch_with_nulls(*space, values, all_valid);
++    auto positions =
++      run_survivors(input, make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(-1)));
++    std::vector<int32_t> expected(values.size());
++    std::iota(expected.begin(), expected.end(), 0);
++    REQUIRE(copy_column_to_host<int32_t>(positions->view()) == expected);
++  }
++
++  SECTION("no row survives: empty positions")
++  {
++    auto input     = make_int32_batch_with_nulls(*space, values, all_valid);
++    auto positions = run_survivors(
++      input, make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(1000)));
++    REQUIRE(positions->size() == 0);
++  }
++
++  SECTION("mixed mask: ascending positions of the passing rows")
++  {
++    auto input = make_int32_batch_with_nulls(*space, values, all_valid);
++    auto positions =
++      run_survivors(input, make_cmp(sirius::comparison_type::ge, make_ref(0), make_int_const(32)));
++    std::vector<int32_t> expected(32);
++    std::iota(expected.begin(), expected.end(), 32);
++    REQUIRE(copy_column_to_host<int32_t>(positions->view()) == expected);
++  }
++
++  SECTION("null predicate results drop the row, matching select()")
++  {
++    // Every valid value passes the predicate; null rows must still be dropped,
++    // proving the count is (value && valid) rather than the raw true count.
++    std::vector<int32_t> vals = {10, 20, 30, 40, 50};
++    std::vector<bool> valids  = {true, false, true, false, true};
++    auto input                = make_int32_batch_with_nulls(*space, vals, valids);
++    auto positions =
++      run_survivors(input, make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(0)));
++    REQUIRE(copy_column_to_host<int32_t>(positions->view()) == std::vector<int32_t>{0, 2, 4});
++  }
++
++  SECTION("all predicate results null: empty positions")
++  {
++    std::vector<int32_t> vals = {10, 20, 30};
++    std::vector<bool> valids  = {false, false, false};
++    auto input                = make_int32_batch_with_nulls(*space, vals, valids);
++    auto positions =
++      run_survivors(input, make_cmp(sirius::comparison_type::gt, make_ref(0), make_int_const(0)));
++    REQUIRE(positions->size() == 0);
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ // Arithmetic functions (AST-capable): col + const, col * col
+ // ---------------------------------------------------------------------------
+diff --git a/test/cpp/scan/test_duckdb_native_post_filter.cpp b/test/cpp/scan/test_duckdb_native_post_filter.cpp
+new file mode 100644
+index 00000000..1a4b1d67
+--- /dev/null
++++ b/test/cpp/scan/test_duckdb_native_post_filter.cpp
+@@ -0,0 +1,473 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Tests for duckdb_native_gpu_ingestible::post_filter_and_project's survivor-count
++// branches: an all-true mask must MOVE the decoded columns to the output (no gather,
++// verified by device-pointer identity), an all-false mask must emit the schema-correct
++// empty batch, a mixed mask must gather exactly the surviving rows, and a view-backed
++// (cache-served) input must keep the folded filter gather instead of the move shortcut.
++
++#include "test_utils.hpp"
++
++#include <op/scan/duckdb_native_gpu_ingestible.hpp>
++#include <op/scan/duckdb_native_metadata.hpp>
++#include <op/scan/gpu_ingestible_types.hpp>
++#include <op/scan/owning_table_view.hpp>
++
++// duckdb
++#include <duckdb.hpp>
++#include <duckdb/catalog/catalog.hpp>
++#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
++#include <duckdb/common/column_index.hpp>
++#include <duckdb/common/types/value.hpp>
++#include <duckdb/planner/filter/constant_filter.hpp>
++#include <duckdb/planner/table_filter.hpp>
++#include <duckdb/storage/data_table.hpp>
++
++// cudf
++#include <cudf/column/column_factories.hpp>
++#include <cudf/null_mask.hpp>
++#include <cudf/table/table.hpp>
++#include <cudf/types.hpp>
++
++// rmm
++#include <rmm/cuda_stream.hpp>
++
++#include <cuda_runtime_api.h>
++
++#include <catch.hpp>
++#include <unistd.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <memory>
++#include <numeric>
++#include <string>
++#include <utility>
++#include <vector>
++
++using namespace sirius;
++using namespace sirius::op::scan;
++
++namespace {
++
++void exec_ok(duckdb::Connection& con, const std::string& q)
++{
++  auto result = con.Query(q);
++  REQUIRE(result);
++  if (result->HasError()) {
++    INFO("query failed: " << q << "\n  error: " << result->GetError());
++    REQUIRE_FALSE(result->HasError());
++  }
++}
++
++/// File-backed database; the ingestible requires a SingleFileBlockManager.
++struct post_filter_test_db {
++  std::string path;
++  std::unique_ptr<duckdb::DuckDB> db;
++  std::unique_ptr<duckdb::Connection> con;
++
++  post_filter_test_db()
++  {
++    static int counter = 0;
++    path               = "/tmp/sirius_post_filter_test_" + std::to_string(::getpid()) + "_" +
++           std::to_string(counter++) + ".db";
++    std::remove(path.c_str());
++    std::remove((path + ".wal").c_str());
++    db  = std::make_unique<duckdb::DuckDB>(path);
++    con = std::make_unique<duckdb::Connection>(*db);
++    con->Query("SET gpu_execution = false;");
++  }
++
++  ~post_filter_test_db()
++  {
++    con.reset();
++    db.reset();
++    std::remove(path.c_str());
++    std::remove((path + ".wal").c_str());
++  }
++};
++
++/// Requires an active transaction on @p con (catalog access needs one).
++duckdb::DataTable& resolve_storage(duckdb::Connection& con, const std::string& table_name)
++{
++  auto& ctx     = *con.context;
++  auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
++  duckdb::CatalogTransaction txn(catalog, ctx);
++  auto& schema = catalog.GetSchema(txn, "main");
++  auto entry   = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
++  REQUIRE(entry);
++  return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
++}
++
++projected_column real_col(duckdb::idx_t col_id)
++{
++  projected_column pc;
++  pc.storage_idx = duckdb::StorageIndex(col_id);
++  pc.is_rowid    = false;
++  return pc;
++}
++
++/// An ingestible over t(id INTEGER, val INTEGER) whose baked-in filter is
++/// `val >= threshold` (val is the trailing column, so with output_arity == 1 it
++/// is a pure-filter column the projection must drop).
++std::shared_ptr<duckdb_native_gpu_ingestible> make_filtering_ingestible(duckdb::DataTable& storage,
++                                                                        duckdb::ClientContext& ctx,
++                                                                        std::int32_t threshold,
++                                                                        std::size_t output_arity)
++{
++  auto const int_type = sirius::logical_type::make(sirius::type_id::INTEGER);
++
++  auto info             = std::make_unique<duckdb_native_ingestible_table_info>();
++  info->storage         = &storage;
++  info->context         = &ctx;
++  info->projected_cols  = {real_col(0), real_col(1)};
++  info->projected_types = {int_type, int_type};
++  info->returned_types.push_back(int_type);
++  info->returned_types.push_back(int_type);
++  info->column_ids.push_back(duckdb::ColumnIndex(0));
++  info->column_ids.push_back(duckdb::ColumnIndex(1));
++  for (std::size_t i = 0; i < output_arity; ++i) {
++    info->output_types.push_back(int_type);
++  }
++
++  auto filters = duckdb::make_uniq<duckdb::TableFilterSet>();
++  filters->PushFilter(
++    duckdb::ColumnIndex(1),
++    duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO,
++                                              duckdb::Value::INTEGER(threshold)));
++  info->table_filters = std::move(filters);
++  return make_ingestible(std::move(info));
++}
++
++std::unique_ptr<cudf::column> make_int32_column(std::vector<std::int32_t> const& values,
++                                                rmm::cuda_stream_view stream,
++                                                rmm::device_async_resource_ref mr)
++{
++  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
++                                       static_cast<cudf::size_type>(values.size()),
++                                       cudf::mask_state::UNALLOCATED,
++                                       stream,
++                                       mr);
++  if (!values.empty()) {
++    cudaMemcpy(col->mutable_view().data<std::int32_t>(),
++               values.data(),
++               sizeof(std::int32_t) * values.size(),
++               cudaMemcpyHostToDevice);
++  }
++  return col;
++}
++
++std::unique_ptr<cudf::column> make_int32_column_with_nulls(std::vector<std::int32_t> const& values,
++                                                           std::vector<bool> const& valids,
++                                                           rmm::cuda_stream_view stream,
++                                                           rmm::device_async_resource_ref mr)
++{
++  auto const size = static_cast<cudf::size_type>(values.size());
++  auto null_mask  = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
++  auto* mask_ptr  = static_cast<cudf::bitmask_type*>(null_mask.data());
++  cudf::size_type null_count = 0;
++  for (cudf::size_type i = 0; i < size; ++i) {
++    if (!valids[static_cast<std::size_t>(i)]) {
++      cudf::set_null_mask(mask_ptr, i, i + 1, false, stream);
++      ++null_count;
++    }
++  }
++  auto col = cudf::make_numeric_column(
++    cudf::data_type{cudf::type_id::INT32}, size, std::move(null_mask), null_count, stream, mr);
++  cudaMemcpy(col->mutable_view().data<std::int32_t>(),
++             values.data(),
++             sizeof(std::int32_t) * values.size(),
++             cudaMemcpyHostToDevice);
++  return col;
++}
++
++std::unique_ptr<cudf::table> make_id_val_table(std::vector<std::int32_t> const& id,
++                                               std::vector<std::int32_t> const& val,
++                                               rmm::cuda_stream_view stream,
++                                               rmm::device_async_resource_ref mr)
++{
++  std::vector<std::unique_ptr<cudf::column>> cols;
++  cols.push_back(make_int32_column(id, stream, mr));
++  cols.push_back(make_int32_column(val, stream, mr));
++  return std::make_unique<cudf::table>(std::move(cols));
++}
++
++std::vector<std::int32_t> download_int32(cudf::column_view const& col, rmm::cuda_stream_view stream)
++{
++  std::vector<std::int32_t> out(static_cast<std::size_t>(col.size()));
++  cudaMemcpyAsync(out.data(),
++                  col.data<std::int32_t>(),
++                  out.size() * sizeof(std::int32_t),
++                  cudaMemcpyDeviceToHost,
++                  stream.value());
++  cudaStreamSynchronize(stream.value());
++  return out;
++}
++
++std::vector<std::int32_t> iota_values(std::size_t n)
++{
++  std::vector<std::int32_t> v(n);
++  std::iota(v.begin(), v.end(), 0);
++  return v;
++}
++
++/// A keep-alive owner that does NOT satisfy no_alloc_materializable, standing in
++/// for the cache-served read-lock owner (D-2's view-backed shape).
++struct table_keepalive {
++  std::unique_ptr<cudf::table> table;
++};
++
++/// One environment per TEST_CASE: DB + storage + memory manager + stream.
++struct post_filter_fixture {
++  post_filter_test_db env;
++  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> mem_mgr;
++  cucascade::memory::memory_space* gpu_space = nullptr;
++  rmm::cuda_stream stream;
++  duckdb::DataTable* storage = nullptr;
++
++  post_filter_fixture()
++  {
++    exec_ok(*env.con, "SET force_compression='uncompressed'");
++    exec_ok(*env.con, "CREATE TABLE t(id INTEGER, val INTEGER)");
++    exec_ok(*env.con, "INSERT INTO t SELECT i::INTEGER, i::INTEGER FROM range(1000) tbl(i)");
++    exec_ok(*env.con, "CHECKPOINT");
++    exec_ok(*env.con, "BEGIN TRANSACTION");
++    storage = &resolve_storage(*env.con, "t");
++
++    mem_mgr   = initialize_memory_manager();
++    gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
++    REQUIRE(gpu_space != nullptr);
++  }
++
++  [[nodiscard]] rmm::device_async_resource_ref mr() const
++  {
++    return gpu_space->get_default_allocator();
++  }
++
++  std::unique_ptr<cudf::table> run(std::shared_ptr<duckdb_native_gpu_ingestible> const& ingestible,
++                                   filtered_table&& input)
++  {
++    return ingestible->post_filter_and_project(std::move(input),
++                                               *gpu_space,
++                                               stream.view(),
++                                               /*like_swar_fastpath=*/false,
++                                               /*like_cache=*/nullptr,
++                                               /*survivors=*/nullptr,
++                                               /*elided=*/{});
++  }
++};
++
++}  // namespace
++
++TEST_CASE("post_filter all-true mask moves the decoded columns (no gather)",
++          "[scan][duckdb_native_post_filter]")
++{
++  post_filter_fixture fx;
++  auto ingestible =
++    make_filtering_ingestible(*fx.storage, *fx.env.con->context, /*threshold=*/0, /*arity=*/1);
++
++  auto const n = std::size_t{100};
++  auto table =
++    make_id_val_table(iota_values(n), std::vector<std::int32_t>(n, 50), fx.stream.view(), fx.mr());
++  auto const* id_ptr = table->view().column(0).head();
++
++  auto out = fx.run(ingestible,
++                    filtered_table{.table = owning_table_view{std::move(table)},
++                                   .state = filter_state::UNFILTERED});
++  REQUIRE(out != nullptr);
++  REQUIRE(out->num_columns() == 1);  // pure-filter column dropped
++  REQUIRE(static_cast<std::size_t>(out->num_rows()) == n);
++  REQUIRE(download_int32(out->view().column(0), fx.stream.view()) == iota_values(n));
++  // The decisive fast-path observation: the output column reuses the decoded buffer.
++  REQUIRE(out->view().column(0).head() == id_ptr);
++}
++
++TEST_CASE("post_filter all-true mask without projection keeps every column moved",
++          "[scan][duckdb_native_post_filter]")
++{
++  post_filter_fixture fx;
++  auto ingestible =
++    make_filtering_ingestible(*fx.storage, *fx.env.con->context, /*threshold=*/0, /*arity=*/2);
++
++  auto const n = std::size_t{100};
++  auto table =
++    make_id_val_table(iota_values(n), std::vector<std::int32_t>(n, 50), fx.stream.view(), fx.mr());
++  auto const* id_ptr  = table->view().column(0).head();
++  auto const* val_ptr = table->view().column(1).head();
++
++  auto out = fx.run(ingestible,
++                    filtered_table{.table = owning_table_view{std::move(table)},
++                                   .state = filter_state::UNFILTERED});
++  REQUIRE(out->num_columns() == 2);
++  REQUIRE(static_cast<std::size_t>(out->num_rows()) == n);
++  REQUIRE(out->view().column(0).head() == id_ptr);
++  REQUIRE(out->view().column(1).head() == val_ptr);
++}
++
++TEST_CASE("post_filter all-false mask emits the schema-correct empty batch",
++          "[scan][duckdb_native_post_filter]")
++{
++  post_filter_fixture fx;
++  auto ingestible =
++    make_filtering_ingestible(*fx.storage, *fx.env.con->context, /*threshold=*/1000, /*arity=*/1);
++
++  auto const n = std::size_t{100};
++  auto table =
++    make_id_val_table(iota_values(n), std::vector<std::int32_t>(n, 50), fx.stream.view(), fx.mr());
++
++  auto out = fx.run(ingestible,
++                    filtered_table{.table = owning_table_view{std::move(table)},
++                                   .state = filter_state::UNFILTERED});
++  REQUIRE(out != nullptr);
++  REQUIRE(out->num_columns() == 1);
++  REQUIRE(out->num_rows() == 0);
++  REQUIRE(out->view().column(0).type().id() == cudf::type_id::INT32);
++}
++
++TEST_CASE("post_filter mixed mask gathers exactly the surviving rows",
++          "[scan][duckdb_native_post_filter]")
++{
++  post_filter_fixture fx;
++  auto ingestible =
++    make_filtering_ingestible(*fx.storage, *fx.env.con->context, /*threshold=*/50, /*arity=*/1);
++
++  auto const n       = std::size_t{100};
++  auto table         = make_id_val_table(iota_values(n), iota_values(n), fx.stream.view(), fx.mr());
++  auto const* id_ptr = table->view().column(0).head();
++
++  auto out = fx.run(ingestible,
++                    filtered_table{.table = owning_table_view{std::move(table)},
++                                   .state = filter_state::UNFILTERED});
++  REQUIRE(out->num_columns() == 1);
++  REQUIRE(out->num_rows() == 50);
++  std::vector<std::int32_t> expected(50);
++  std::iota(expected.begin(), expected.end(), 50);
++  REQUIRE(download_int32(out->view().column(0), fx.stream.view()) == expected);
++  REQUIRE(out->view().column(0).head() != id_ptr);  // gathered, not moved
++}
++
++TEST_CASE("post_filter null mask entries drop the row (count is value AND valid)",
++          "[scan][duckdb_native_post_filter]")
++{
++  post_filter_fixture fx;
++  auto ingestible =
++    make_filtering_ingestible(*fx.storage, *fx.env.con->context, /*threshold=*/0, /*arity=*/1);
++
++  auto const n = std::size_t{10};
++  // Every VALID val passes the predicate, but even rows are NULL: were the count the
++  // raw true count, this would wrongly take the all-true move path.
++  std::vector<bool> valids(n);
++  std::vector<std::int32_t> expected;
++  for (std::size_t i = 0; i < n; ++i) {
++    valids[i] = (i % 2) != 0;
++    if (valids[i]) { expected.push_back(static_cast<std::int32_t>(i)); }
++  }
++  std::vector<std::unique_ptr<cudf::column>> cols;
++  cols.push_back(make_int32_column(iota_values(n), fx.stream.view(), fx.mr()));
++  cols.push_back(make_int32_column_with_nulls(
++    std::vector<std::int32_t>(n, 100), valids, fx.stream.view(), fx.mr()));
++  auto table = std::make_unique<cudf::table>(std::move(cols));
++
++  auto out = fx.run(ingestible,
++                    filtered_table{.table = owning_table_view{std::move(table)},
++                                   .state = filter_state::UNFILTERED});
++  REQUIRE(out->num_columns() == 1);
++  REQUIRE(download_int32(out->view().column(0), fx.stream.view()) == expected);
++}
++
++TEST_CASE("post_filter all-null mask emits the empty batch", "[scan][duckdb_native_post_filter]")
++{
++  post_filter_fixture fx;
++  auto ingestible =
++    make_filtering_ingestible(*fx.storage, *fx.env.con->context, /*threshold=*/0, /*arity=*/1);
++
++  auto const n = std::size_t{10};
++  std::vector<std::unique_ptr<cudf::column>> cols;
++  cols.push_back(make_int32_column(iota_values(n), fx.stream.view(), fx.mr()));
++  cols.push_back(make_int32_column_with_nulls(
++    std::vector<std::int32_t>(n, 100), std::vector<bool>(n, false), fx.stream.view(), fx.mr()));
++  auto table = std::make_unique<cudf::table>(std::move(cols));
++
++  auto out = fx.run(ingestible,
++                    filtered_table{.table = owning_table_view{std::move(table)},
++                                   .state = filter_state::UNFILTERED});
++  REQUIRE(out->num_columns() == 1);
++  REQUIRE(out->num_rows() == 0);
++}
++
++TEST_CASE("post_filter view-backed input keeps the folded gather on an all-true mask",
++          "[scan][duckdb_native_post_filter]")
++{
++  post_filter_fixture fx;
++  auto ingestible =
++    make_filtering_ingestible(*fx.storage, *fx.env.con->context, /*threshold=*/0, /*arity=*/1);
++
++  auto const n = std::size_t{100};
++  auto table =
++    make_id_val_table(iota_values(n), std::vector<std::int32_t>(n, 50), fx.stream.view(), fx.mr());
++  auto const* id_ptr   = table->view().column(0).head();
++  auto const base_view = table->view();
++
++  // Type-erase behind a generic owner: is_no_alloc_materializable() is false, so the
++  // move shortcut must NOT engage and the folded select() gather runs as before.
++  auto out =
++    fx.run(ingestible,
++           filtered_table{.table = owning_table_view{table_keepalive{std::move(table)}, base_view},
++                          .state = filter_state::UNFILTERED});
++  REQUIRE(out->num_columns() == 1);
++  REQUIRE(static_cast<std::size_t>(out->num_rows()) == n);
++  REQUIRE(download_int32(out->view().column(0), fx.stream.view()) == iota_values(n));
++  REQUIRE(out->view().column(0).head() != id_ptr);  // gathered into fresh buffers
++}
++
++TEST_CASE("post_filter ROW_FILTERED input skips the filter and only projects",
++          "[scan][duckdb_native_post_filter]")
++{
++  post_filter_fixture fx;
++  // Threshold that would drop every row if the filter (wrongly) ran.
++  auto ingestible =
++    make_filtering_ingestible(*fx.storage, *fx.env.con->context, /*threshold=*/1000, /*arity=*/1);
++
++  auto const n = std::size_t{100};
++  auto table =
++    make_id_val_table(iota_values(n), std::vector<std::int32_t>(n, 50), fx.stream.view(), fx.mr());
++  auto const* id_ptr = table->view().column(0).head();
++
++  auto out = fx.run(ingestible,
++                    filtered_table{.table = owning_table_view{std::move(table)},
++                                   .state = filter_state::ROW_FILTERED});
++  REQUIRE(out->num_columns() == 1);
++  REQUIRE(static_cast<std::size_t>(out->num_rows()) == n);
++  REQUIRE(out->view().column(0).head() == id_ptr);
++}
++
++TEST_CASE("post_filter zero-row input takes the move branch with the decoded schema",
++          "[scan][duckdb_native_post_filter]")
++{
++  post_filter_fixture fx;
++  auto ingestible =
++    make_filtering_ingestible(*fx.storage, *fx.env.con->context, /*threshold=*/0, /*arity=*/1);
++
++  auto table = make_id_val_table({}, {}, fx.stream.view(), fx.mr());
++  auto out   = fx.run(ingestible,
++                    filtered_table{.table = owning_table_view{std::move(table)},
++                                     .state = filter_state::UNFILTERED});
++  REQUIRE(out != nullptr);
++  REQUIRE(out->num_columns() == 1);
++  REQUIRE(out->num_rows() == 0);
++  REQUIRE(out->view().column(0).type().id() == cudf::type_id::INT32);
++}
+diff --git a/test/cpp/scan/test_owning_table_view.cpp b/test/cpp/scan/test_owning_table_view.cpp
+index 5e92bb1f..ad28fec8 100644
+--- a/test/cpp/scan/test_owning_table_view.cpp
++++ b/test/cpp/scan/test_owning_table_view.cpp
+@@ -278,6 +278,29 @@ TEST_CASE("owning_table_view generic owner materializes by copy", "[owning_table
+   REQUIRE(result_ptrs[1] != original_ptrs[2]);
+ }
+ 
++TEST_CASE("owning_table_view is_no_alloc_materializable reflects the release path",
++          "[owning_table_view]")
++{
++  // Empty handle: release() returns nullptr without device work.
++  owning_table_view empty;
++  REQUIRE(empty.is_no_alloc_materializable());
++
++  // Owned table: release() is a pure move.
++  owning_table_view owned{tagged_table({10, 20})};
++  REQUIRE(owned.is_no_alloc_materializable());
++
++  // Demoting an owned table to a view (column selection) keeps the moving path.
++  std::array<std::size_t, 1> drop{0};
++  owned.drop_columns(drop);
++  REQUIRE(owned.is_no_alloc_materializable());
++
++  // A generic owner forces the copying (and synchronizing) materialization.
++  auto table     = tagged_table({30, 40});
++  auto base_view = table->view();
++  owning_table_view generic{table_keepalive{std::move(table)}, base_view};
++  REQUIRE_FALSE(generic.is_no_alloc_materializable());
++}
++
+ // Stream-ordering regression: the copying materialization path must not let the
+ // caller reclaim the source memory while the copy is still in flight.
+ namespace {

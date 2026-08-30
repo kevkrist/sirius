@@ -1,0 +1,750 @@
+diff --git a/src/cuda/scan/gpu_native_decode.cu b/src/cuda/scan/gpu_native_decode.cu
+index a6e2f835..f41fbba4 100644
+--- a/src/cuda/scan/gpu_native_decode.cu
++++ b/src/cuda/scan/gpu_native_decode.cu
+@@ -26,7 +26,7 @@
+ // dispatch_data_run routes a run by codec:
+ //
+ //   UNCOMPRESSED   device-to-device copy                   (this file)
+-//   CONSTANT       broadcast one value to every row        (this file)
++//   CONSTANT       one table-wide batched broadcast        (this file)
+ //   RLE            prefix-sum build + value scatter        (gpu_decode_rle.cu)
+ //   BITPACKING     bit-unpack per 2048-row group           (gpu_decode_bitpacking.cu)
+ //   ALP / ALPRD    bit-unpack + float reconstruction       (gpu_decode_alp.cu)
+@@ -101,62 +101,81 @@ void validate_segment_bounds(std::vector<gpu_codec_run> const& runs,
+ }
+ 
+ //===----------------------------------------------------------------------===//
+-// CONSTANT broadcast — write one device-resident value across the column.
++// CONSTANT broadcast — batched across every CONSTANT run of a table decode.
++//
++// Per-column dispatch only *collects* work: each CONSTANT segment is validated
++// host-side and split into chunk descriptors while its destination buffer
++// materializes. `gpu_decode_table` then uploads all descriptors in one H2D and
++// broadcasts every run of the whole table in a single kernel launch, instead
++// of one launch per segment.
+ //===----------------------------------------------------------------------===//
+ 
+-/// Writes `*src` to every position in `dest[0, rows)` via `detail::vec_fill`.
++/// One unit of broadcast work for `kernel_batched_broadcast_constant`. A
++/// segment larger than `COPY_CHUNK_BYTES` is split into multiple chunks; chunk
++/// boundaries are multiples of `width`, so every chunk starts and ends on a
++/// value boundary.
++struct constant_fill_chunk {
++  uint8_t* dst;        ///< first output byte this chunk fills
++  uint8_t const* src;  ///< device pointer to the segment's single value
++  uint32_t bytes;      ///< chunk length in bytes (a multiple of `width`)
++  uint32_t width;      ///< value width in bytes (1, 2, 4, 8, or 16)
++};
++
++/// Fills one chunk's output range with its value via `detail::vec_fill`,
++/// block-strided across the calling CTA.
+ template <typename T>
+-__global__ void kernel_broadcast_constant(T* __restrict__ dest, T const* __restrict__ src, int rows)
++__device__ __forceinline__ void fill_chunk_as(constant_fill_chunk const& c)
+ {
+-  T const val      = *src;
+-  int const tid    = blockIdx.x * blockDim.x + threadIdx.x;
+-  int const stride = gridDim.x * blockDim.x;
+-  detail::vec_fill<T>(dest, rows, tid, stride, [val](int) { return val; });
++  T const val = *reinterpret_cast<T const*>(c.src);
++  detail::vec_fill<T>(reinterpret_cast<T*>(c.dst),
++                      static_cast<int>(c.bytes / sizeof(T)),
++                      static_cast<int>(threadIdx.x),
++                      static_cast<int>(blockDim.x),
++                      [val](int) { return val; });
+ }
+ 
+-/// `cudf::type_dispatcher` functor. Projects each cudf type to its on-device
+-/// storage type (`device_storage_type_t<T>`, e.g. decimal128 -> __int128_t) so
+-/// the broadcast stride matches the column's physical width.
+-struct broadcast_dispatch {
+-  template <typename T, std::enable_if_t<cudf::is_fixed_width<T>(), int> = 0>
+-  void operator()(uint8_t* d_dest,
+-                  uint8_t const* d_val_src,
+-                  uint32_t row_count,
+-                  rmm::cuda_stream_view stream) const
+-  {
+-    using StorageT = cudf::device_storage_type_t<T>;
+-    constexpr uint32_t TPV =
+-      (sizeof(StorageT) <= 8 && 16u % sizeof(StorageT) == 0) ? 16u / sizeof(StorageT) : 1u;
+-    uint32_t blocks = std::max(1u, (row_count / TPV + DECODE_BLOCK_DIM - 1) / DECODE_BLOCK_DIM);
+-    kernel_broadcast_constant<StorageT><<<blocks, DECODE_BLOCK_DIM, 0, stream.value()>>>(
+-      reinterpret_cast<StorageT*>(d_dest), reinterpret_cast<StorageT const*>(d_val_src), row_count);
+-  }
+-  // Strings, lists, structs etc. should never reach here — the public entry
+-  // refuses non-fixed-width types up front. Defensive throw in case it does.
+-  template <typename T, std::enable_if_t<!cudf::is_fixed_width<T>(), int> = 0>
+-  void operator()(uint8_t*, uint8_t const*, uint32_t, rmm::cuda_stream_view) const
+-  {
+-    throw std::runtime_error(
+-      "gpu_decode_table: viability invariant violated — CONSTANT on non-fixed-width type");
+-  }
+-};
+-
+-void launch_broadcast_constant(uint8_t* d_dest,
+-                               uint8_t const* d_val_src,
+-                               cudf::data_type type,
+-                               uint32_t row_count,
+-                               rmm::cuda_stream_view stream)
++/// Each block broadcasts one chunk. `width` selects the store type; widths are
++/// validated host-side in `collect_constant_fill_chunks`, so the default case
++/// can only be 16 (decimal128).
++__global__ void kernel_batched_broadcast_constant(constant_fill_chunk const* __restrict__ chunks,
++                                                  uint32_t n_chunks)
+ {
+-  cudf::type_dispatcher(type, broadcast_dispatch{}, d_dest, d_val_src, row_count, stream);
++  uint32_t cid = blockIdx.x;
++  if (cid >= n_chunks) return;
++  auto const c = chunks[cid];
++  switch (c.width) {
++    case 1: fill_chunk_as<uint8_t>(c); break;
++    case 2: fill_chunk_as<uint16_t>(c); break;
++    case 4: fill_chunk_as<uint32_t>(c); break;
++    case 8: fill_chunk_as<uint64_t>(c); break;
++    default: fill_chunk_as<__int128_t>(c); break;
++  }
+ }
+ 
+-/// @todo [KEVIN]: consider batching to align execution and design here.
+-void decode_constant_data(gpu_codec_run const& run,
+-                          uint8_t* d_output,
+-                          cudf::data_type type,
+-                          uint32_t type_size,
+-                          rmm::cuda_stream_view stream)
++/// Validates each CONSTANT segment host-side and appends its broadcast work to
++/// `out_chunks`, split into <= `COPY_CHUNK_BYTES` units so per-block work stays
++/// uniform. No device work happens here; the fill runs later in the single
++/// `launch_batched_broadcast_constant` call at the end of the table decode.
++void collect_constant_fill_chunks(gpu_codec_run const& run,
++                                  uint8_t* d_output,
++                                  uint32_t type_size,
++                                  std::vector<constant_fill_chunk>& out_chunks)
+ {
++  // Chunk splits must not land mid-value.
++  static_assert(COPY_CHUNK_BYTES % 16 == 0);
++  switch (type_size) {
++    case 1:
++    case 2:
++    case 4:
++    case 8:
++    case 16: break;
++    default:
++      // Every cudf fixed-width storage type has one of the widths above;
++      // defensive backstop mirroring the non-fixed-width refusal upstream.
++      throw std::runtime_error(
++        "gpu_decode_table: viability invariant violated — CONSTANT type width " +
++        std::to_string(type_size));
++  }
+   for (auto const& seg : run.segments) {
+     if (seg.row_count == 0) continue;
+     if (seg.bytes_size < type_size) {
+@@ -164,11 +183,38 @@ void decode_constant_data(gpu_codec_run const& run,
+                                std::to_string(seg.bytes_size) + ") < type_size (" +
+                                std::to_string(type_size) + ")");
+     }
+-    launch_broadcast_constant(
+-      d_output + size_t{seg.row_offset} * type_size, seg.d_bytes, type, seg.row_count, stream);
++    size_t const bytes = size_t{seg.row_count} * type_size;
++    auto* dst          = d_output + size_t{seg.row_offset} * type_size;
++    size_t off         = 0;
++    while (off < bytes) {
++      auto const this_chunk =
++        static_cast<uint32_t>(std::min<size_t>(COPY_CHUNK_BYTES, bytes - off));
++      out_chunks.push_back({dst + off, seg.d_bytes, this_chunk, type_size});
++      off += this_chunk;
++    }
+   }
+ }
+ 
++/// Uploads the collected chunk descriptors in one H2D copy and broadcasts
++/// every CONSTANT run of the table in a single kernel launch.
++void launch_batched_broadcast_constant(std::vector<constant_fill_chunk> const& chunks,
++                                       rmm::cuda_stream_view stream,
++                                       rmm::device_async_resource_ref mr)
++{
++  if (chunks.empty()) return;
++  rmm::device_uvector<constant_fill_chunk> d_chunks(chunks.size(), stream, mr);
++  RMM_CUDA_TRY(cudaMemcpyAsync(d_chunks.data(),
++                               chunks.data(),
++                               chunks.size() * sizeof(constant_fill_chunk),
++                               cudaMemcpyHostToDevice,
++                               stream.value()));
++  kernel_batched_broadcast_constant<<<static_cast<uint32_t>(chunks.size()),
++                                      DECODE_BLOCK_DIM,
++                                      0,
++                                      stream.value()>>>(d_chunks.data(),
++                                                        static_cast<uint32_t>(chunks.size()));
++}
++
+ //===----------------------------------------------------------------------===//
+ // UNCOMPRESSED batched copy.
+ //===----------------------------------------------------------------------===//
+@@ -353,10 +399,13 @@ void decode_uncompressed_data(gpu_codec_run const& run,
+ 
+ /// Routes a data run to its codec impl. Adding a codec means adding one case
+ /// here and a corresponding `decode_<codec>_data` (or batched equivalent).
++/// CONSTANT runs only accumulate into `constant_chunks` here; their fill is
++/// deferred to the single batched launch at the end of `gpu_decode_table`.
+ void dispatch_data_run(gpu_codec_run const& run,
+                        uint8_t* d_output,
+                        cudf::data_type type,
+                        uint32_t type_size,
++                       std::vector<constant_fill_chunk>& constant_chunks,
+                        rmm::cuda_stream_view stream,
+                        rmm::device_async_resource_ref mr)
+ {
+@@ -365,7 +414,7 @@ void dispatch_data_run(gpu_codec_run const& run,
+       decode_uncompressed_data(run, d_output, type_size, stream, mr);
+       return;
+     case duckdb::CompressionType::COMPRESSION_CONSTANT:
+-      decode_constant_data(run, d_output, type, type_size, stream);
++      collect_constant_fill_chunks(run, d_output, type_size, constant_chunks);
+       return;
+     case duckdb::CompressionType::COMPRESSION_RLE:
+       decode_rle_data(run, d_output, type, type_size, stream, mr);
+@@ -480,8 +529,11 @@ void dispatch_validity_run(gpu_codec_run const& run,
+ //===----------------------------------------------------------------------===//
+ 
+ /// Allocates the column's data buffer, validates type metadata, and runs
+-/// every codec_run in `col.data` into the buffer.
++/// every codec_run in `col.data` into the buffer. CONSTANT runs are not
++/// launched here — their chunk descriptors accumulate into `constant_chunks`
++/// against the freshly allocated buffer for the batched table-wide launch.
+ rmm::device_buffer decode_column_data(gpu_column_decode_input const& col,
++                                      std::vector<constant_fill_chunk>& constant_chunks,
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr)
+ {
+@@ -504,7 +556,7 @@ rmm::device_buffer decode_column_data(gpu_column_decode_input const& col,
+   rmm::device_buffer data_buf(size_t{col.total_rows} * type_size, stream, mr);
+   auto* d_output = static_cast<uint8_t*>(data_buf.data());
+   for (auto const& run : col.data) {
+-    dispatch_data_run(run, d_output, col.out_type, type_size, stream, mr);
++    dispatch_data_run(run, d_output, col.out_type, type_size, constant_chunks, stream, mr);
+   }
+   return data_buf;
+ }
+@@ -573,11 +625,17 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_inpu
+   std::vector<rmm::device_buffer> null_masks;
+   data_bufs.reserve(num_cols);
+   null_masks.reserve(num_cols);
++  std::vector<constant_fill_chunk> constant_chunks;
+   for (size_t ci = 0; ci < num_cols; ++ci) {
+-    data_bufs.emplace_back(decode_column_data(cols[ci], stream, mr));
++    data_bufs.emplace_back(decode_column_data(cols[ci], constant_chunks, stream, mr));
+     null_masks.emplace_back(decode_column_validity(cols[ci], stream, mr));
+   }
+ 
++  // Every CONSTANT run across the table fills in one launch. Deferring past
++  // the per-column loop is safe because a column's runs tile disjoint row
++  // ranges — no other codec writes the rows a CONSTANT run owns.
++  launch_batched_broadcast_constant(constant_chunks, stream, mr);
++
+   // One batched popcount across every null mask in the table. Columns that
+   // didn't allocate a mask (no nulls or zero rows) pass nullptr; cudf's
+   // batch_null_count returns 0 for those without launching kernel work for
+diff --git a/src/op/scan/duckdb_native_decoder.cpp b/src/op/scan/duckdb_native_decoder.cpp
+index 88416cb9..06e4d884 100644
+--- a/src/op/scan/duckdb_native_decoder.cpp
++++ b/src/op/scan/duckdb_native_decoder.cpp
+@@ -141,9 +141,10 @@ cudf::data_type sirius_to_cudf_type(sirius::logical_type const& t)
+   return duckdb::GetCudfType(sirius::to_duckdb(t));
+ }
+ 
+-/// @brief Pinned host bytes for a segment (only for CONSTANT and ROARING validity segments for now)
++/// @brief Host bytes for a segment (CPU-produced ROARING/all-null validity and host-backed
++/// segments; CONSTANT data values go through the packed values blob instead).
+ struct pinned_segment_bytes {
+-  std::vector<uint8_t> owned_bytes;  // used for CONSTANT, ROARING, concat
++  std::vector<uint8_t> owned_bytes;  // used for ROARING, all-null validity, concat
+   uint8_t const* host_ptr = nullptr;
+   std::size_t bytes       = 0;
+ };
+@@ -153,7 +154,7 @@ struct pinned_segment_bytes {
+ //
+ // CONSTANT segments have block_id == -1; the constant value lives in the
+ // segment's own statistics, snapshotted onto the descriptor by the walker.
+-// Copy the value into an owned buffer the kernel can read.
++// Copy the value into an owned buffer the staging can pack for upload.
+ //===----------------------------------------------------------------------===//
+ 
+ template <typename T>
+@@ -164,29 +165,27 @@ void store_typed_min(duckdb::BaseStatistics const& stats, std::vector<uint8_t>&
+   std::memcpy(out.data(), &v, sizeof(T));
+ }
+ 
+-pinned_segment_bytes extract_constant_bytes(duckdb::BaseStatistics const& stats,
++std::vector<uint8_t> extract_constant_bytes(duckdb::BaseStatistics const& stats,
+                                             sirius::logical_type const& sirius_type)
+ {
+   auto duckdb_type = sirius::to_duckdb(sirius_type);
+-  pinned_segment_bytes out;
++  std::vector<uint8_t> out;
+   switch (duckdb_type.InternalType()) {
+     case duckdb::PhysicalType::BOOL:
+-    case duckdb::PhysicalType::INT8: store_typed_min<int8_t>(stats, out.owned_bytes); break;
+-    case duckdb::PhysicalType::INT16: store_typed_min<int16_t>(stats, out.owned_bytes); break;
+-    case duckdb::PhysicalType::INT32: store_typed_min<int32_t>(stats, out.owned_bytes); break;
+-    case duckdb::PhysicalType::INT64: store_typed_min<int64_t>(stats, out.owned_bytes); break;
+-    case duckdb::PhysicalType::UINT8: store_typed_min<uint8_t>(stats, out.owned_bytes); break;
+-    case duckdb::PhysicalType::UINT16: store_typed_min<uint16_t>(stats, out.owned_bytes); break;
+-    case duckdb::PhysicalType::UINT32: store_typed_min<uint32_t>(stats, out.owned_bytes); break;
+-    case duckdb::PhysicalType::UINT64: store_typed_min<uint64_t>(stats, out.owned_bytes); break;
+-    case duckdb::PhysicalType::FLOAT: store_typed_min<float>(stats, out.owned_bytes); break;
+-    case duckdb::PhysicalType::DOUBLE: store_typed_min<double>(stats, out.owned_bytes); break;
++    case duckdb::PhysicalType::INT8: store_typed_min<int8_t>(stats, out); break;
++    case duckdb::PhysicalType::INT16: store_typed_min<int16_t>(stats, out); break;
++    case duckdb::PhysicalType::INT32: store_typed_min<int32_t>(stats, out); break;
++    case duckdb::PhysicalType::INT64: store_typed_min<int64_t>(stats, out); break;
++    case duckdb::PhysicalType::UINT8: store_typed_min<uint8_t>(stats, out); break;
++    case duckdb::PhysicalType::UINT16: store_typed_min<uint16_t>(stats, out); break;
++    case duckdb::PhysicalType::UINT32: store_typed_min<uint32_t>(stats, out); break;
++    case duckdb::PhysicalType::UINT64: store_typed_min<uint64_t>(stats, out); break;
++    case duckdb::PhysicalType::FLOAT: store_typed_min<float>(stats, out); break;
++    case duckdb::PhysicalType::DOUBLE: store_typed_min<double>(stats, out); break;
+     default:
+       throw_unsupported("CONSTANT extraction for physical type " +
+                         std::to_string(static_cast<int>(duckdb_type.InternalType())));
+   }
+-  out.host_ptr = out.owned_bytes.data();
+-  out.bytes    = out.owned_bytes.size();
+   return out;
+ }
+ 
+@@ -270,6 +269,10 @@ struct staged_segment {
+   uint32_t row_count         = 0;
+   uint32_t max_string_length = 0;
+   duckdb::CompressionType compression{duckdb::CompressionType::COMPRESSION_AUTO};
++  /// True for CONSTANT values packed into staging_state::constant_values. For those,
++  /// device_offset is blob-relative until decode_duckdb_native_split rebases it once the blob's
++  /// device placement (after the read/host-copy region) is known.
++  bool in_constant_blob = false;
+ };
+ 
+ struct staged_column {
+@@ -302,31 +305,68 @@ struct host_copy_job {
+   std::size_t device_offset;  ///< byte offset in the device buffer to copy into (16B-aligned)
+ };
+ 
++// 16B alignment: kernels cast d_bytes to typed pointers up to uint128.
++constexpr std::size_t SEGMENT_ALIGN = 16;
++
++constexpr std::size_t align_to_segment(std::size_t offset)
++{
++  return (offset + SEGMENT_ALIGN - 1) & ~(SEGMENT_ALIGN - 1);
++}
++
+ /// @brief Per-split staging state: the set of device read jobs and host copy jobs to prepare for a
+ /// single scan task, plus the pinned host memory for all source segments (kept alive until H2D is
+-/// synced).
++/// synced) and the packed CONSTANT-values blob that uploads in one copy per split.
+ struct staging_state {
+   std::vector<device_read_job> reads;
+   std::vector<host_copy_job> host_copies;
+   std::vector<pinned_segment_bytes> pinned_segments;  // keep host_copy_job.host_ptr alive
++  /// Every CONSTANT segment value of the split, packed into SEGMENT_ALIGN-sized slots. The blob
++  /// lands on device after the read/host-copy region (see constant_blob_device_offset).
++  std::vector<uint8_t> constant_values;
+   std::size_t running_offset = 0;
+ };
+ 
++/// @brief Device offset where the packed CONSTANT-values blob lands: aligned to SEGMENT_ALIGN,
++/// after every read/host-copy segment. Meaningful only once staging is complete.
++std::size_t constant_blob_device_offset(staging_state const& s)
++{
++  return align_to_segment(s.running_offset);
++}
++
++/// @brief Total device-buffer bytes the staged split needs, including the CONSTANT-values blob.
++std::size_t total_device_bytes(staging_state const& s)
++{
++  if (s.constant_values.empty()) { return s.running_offset; }
++  return constant_blob_device_offset(s) + s.constant_values.size();
++}
++
+ /// @brief Return the next aligned device offset and advance the staging_state's running_offset by
+ /// the given segment byte size.
+ std::size_t reserve_segment(staging_state& s, std::size_t bytes)
+ {
+-  // 16B alignment: kernels cast d_bytes to typed pointers up to uint128.
+-  constexpr std::size_t SEGMENT_ALIGN = 16;
+-
+   // Align up the current running offset, return the aligned offset, and advance the running offset
+   // by the segment's byte size.
+-  s.running_offset  = (s.running_offset + SEGMENT_ALIGN - 1) & ~(SEGMENT_ALIGN - 1);
++  s.running_offset  = align_to_segment(s.running_offset);
+   auto const offset = s.running_offset;
+   s.running_offset += bytes;
+   return offset;
+ }
+ 
++/// @brief Pack one CONSTANT segment value into the staging_state's constant-values blob. Each
++/// value gets a SEGMENT_ALIGN-sized slot (the blob itself lands SEGMENT_ALIGN-ed on device), so
++/// the decode kernels' typed-pointer casts stay aligned, same as reserve_segment guarantees. The
++/// recorded device_offset is blob-relative; see staged_segment::in_constant_blob.
++void stage_constant_value(staging_state& s,
++                          std::vector<uint8_t> const& value_bytes,
++                          staged_segment& out_seg)
++{
++  out_seg.in_constant_blob = true;
++  out_seg.device_offset    = s.constant_values.size();
++  out_seg.bytes            = value_bytes.size();
++  s.constant_values.insert(s.constant_values.end(), value_bytes.begin(), value_bytes.end());
++  s.constant_values.resize(align_to_segment(s.constant_values.size()), 0);
++}
++
+ /// @brief Add a host_copy_job to the staging_state for the given pinned_segment_bytes, reserving
+ /// device space for the segment's bytes and recording the pinned host memory for lifetime
+ /// management.
+@@ -434,7 +474,7 @@ staged_column stage_one_fixed_width_column(staging_state& s,
+         stage_host_copy(s, {{}, seg.host_ptr, seg.bytes_size}, ss);
+       } else if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+         auto const& stats = constant_segment_stats(seg, col_md.column_id);
+-        stage_host_copy(s, extract_constant_bytes(stats, projected_type), ss);
++        stage_constant_value(s, extract_constant_bytes(stats, projected_type), ss);
+       } else {
+         stage_device_read(s, sf_bm, seg, ss);
+       }
+@@ -621,7 +661,7 @@ staged_column stage_one_array_column(staging_state& s,
+         // The child segment's own stats are child-typed numeric stats, so
+         // they extract directly — no ArrayStats unwrap.
+         auto const& child_stats = constant_segment_stats(seg, col_md.column_id);
+-        stage_host_copy(s, extract_constant_bytes(child_stats, child_type), ss);
++        stage_constant_value(s, extract_constant_bytes(child_stats, child_type), ss);
+       } else {
+         stage_device_read(s, sf_bm, seg, ss);
+       }
+@@ -674,7 +714,8 @@ staged_column stage_one_array_column(staging_state& s,
+ // File-near segment reads are coalesced into large sequential reads (bridging the
+ // per-block header gaps) and dispatched as one batch via host_read_ranges_async_io,
+ // packed into a pinned multiple_blocks_allocation; the 16B device alignment the decode kernels need
+-// is imposed by the per-segment H2D scatter instead.
++// is imposed by the per-segment H2D scatter instead. The packed CONSTANT-values blob rides the
++// same pinned allocation and the same batched H2D, laid out after the read pieces.
+ //===----------------------------------------------------------------------===//
+ 
+ using multiple_blocks_allocation =
+@@ -790,10 +831,29 @@ void submit_and_await(rmm::device_buffer& device_buf,
+     cur_off = p.host_off + (p.file_end - p.file_off);
+   }
+ 
+-  // Reserve and allocate exactly the host bytes the pieces occupy (cur_block + 1 blocks),
+-  // not the device-buffer size, preferring the GPU's local NUMA node. The strategy may fall
+-  // back to another host space; guard that it shares the block size the pieces were laid out
+-  // against, otherwise the per-block offsets would be wrong.
++  // Lay out the packed CONSTANT-values blob after the read pieces so it rides the same pinned
++  // allocation and the same batched H2D below. The blob may straddle pinned-block boundaries;
++  // each block-contiguous chunk becomes one extra batch entry.
++  struct blob_chunk {
++    std::size_t host_block, host_off, blob_off, size;
++  };
++  std::vector<blob_chunk> blob_chunks;
++  for (std::size_t blob_off = 0, remaining = s.constant_values.size(); remaining > 0;) {
++    if (cur_off >= bsz) {
++      ++cur_block;
++      cur_off = 0;
++    }
++    auto const chunk = std::min(bsz - cur_off, remaining);
++    blob_chunks.push_back({cur_block, cur_off, blob_off, chunk});
++    cur_off += chunk;
++    blob_off += chunk;
++    remaining -= chunk;
++  }
++
++  // Reserve and allocate exactly the host bytes the pieces and the blob occupy
++  // (cur_block + 1 blocks), not the device-buffer size, preferring the GPU's local NUMA node.
++  // The strategy may fall back to another host space; guard that it shares the block size the
++  // pieces were laid out against, otherwise the per-block offsets would be wrong.
+   std::size_t const host_bytes = (cur_block + 1) * bsz;
+   ccm::any_memory_space_in_tier_with_preference host_req(ccm::Tier::HOST,
+                                                          static_cast<std::size_t>(host_numa_node));
+@@ -811,6 +871,14 @@ void submit_and_await(rmm::device_buffer& device_buf,
+   }
+   auto host_alloc = host_fsmr->allocate_multiple_blocks(host_bytes, reservation.get());
+ 
++  // Stage the CONSTANT-values blob into its pinned chunks up front so the memcpy overlaps the
++  // disk reads below (the pieces and the blob occupy disjoint pinned ranges).
++  for (auto const& bc : blob_chunks) {
++    std::memcpy(reinterpret_cast<std::uint8_t*>(host_alloc->at(bc.host_block).data()) + bc.host_off,
++                s.constant_values.data() + bc.blob_off,
++                bc.size);
++  }
++
+   // One coalesced range + contiguous dst span per piece.
+   std::vector<io::io_object_segment> ranges;
+   ranges.reserve(pieces.size());
+@@ -843,22 +911,30 @@ void submit_and_await(rmm::device_buffer& device_buf,
+       device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.value()));
+   }
+ 
+-  // Per-segment H2D: host (packed) -> device (16B-aligned), batched. Sync before
+-  // host_alloc / reservation drop so the copies finish reading pinned memory first.
++  // Per-segment H2D: host (packed) -> device (16B-aligned), batched, with the CONSTANT-values
++  // blob chunks appended as extra entries. Sync before host_alloc / reservation drop so the
++  // copies finish reading pinned memory first.
+   {
+     nvtx3::scoped_range nvtx_h2d{"native_h2d"};
++    auto const blob_base = constant_blob_device_offset(s);
+     std::vector<void*> h2d_dst;
+     std::vector<void const*> h2d_src;
+     std::vector<std::size_t> h2d_size;
+-    h2d_dst.reserve(seg_copies.size());
+-    h2d_src.reserve(seg_copies.size());
+-    h2d_size.reserve(seg_copies.size());
++    h2d_dst.reserve(seg_copies.size() + blob_chunks.size());
++    h2d_src.reserve(seg_copies.size() + blob_chunks.size());
++    h2d_size.reserve(seg_copies.size() + blob_chunks.size());
+     for (auto const& c : seg_copies) {
+       h2d_dst.push_back(device_base + c.device_off);
+       h2d_src.push_back(reinterpret_cast<uint8_t*>(host_alloc->at(c.host_block).data()) +
+                         c.host_off);
+       h2d_size.push_back(c.size);
+     }
++    for (auto const& bc : blob_chunks) {
++      h2d_dst.push_back(device_base + blob_base + bc.blob_off);
++      h2d_src.push_back(reinterpret_cast<uint8_t*>(host_alloc->at(bc.host_block).data()) +
++                        bc.host_off);
++      h2d_size.push_back(bc.size);
++    }
+     batched_h2d(h2d_dst, h2d_src, h2d_size, stream);
+     RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+   }
+@@ -866,7 +942,9 @@ void submit_and_await(rmm::device_buffer& device_buf,
+ 
+ /// H2D for a split with no file reads: no io, no pinned staging blocks, no
+ /// SiriusContext. Synchronizes before returning so the caller may drop the
+-/// source buffers' owners, same as submit_and_await.
++/// source buffers' owners, same as submit_and_await. The CONSTANT-values blob
++/// uploads as one pageable copy per split -- fine for this lane, which stages
++/// host-resident bytes (insert delta) or all-CONSTANT projections only.
+ void submit_host_only_and_await(rmm::device_buffer& device_buf,
+                                 staging_state const& s,
+                                 rmm::cuda_stream_view stream)
+@@ -876,6 +954,13 @@ void submit_host_only_and_await(rmm::device_buffer& device_buf,
+     RMM_CUDA_TRY(cudaMemcpyAsync(
+       device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.value()));
+   }
++  if (!s.constant_values.empty()) {
++    RMM_CUDA_TRY(cudaMemcpyAsync(device_base + constant_blob_device_offset(s),
++                                 s.constant_values.data(),
++                                 s.constant_values.size(),
++                                 cudaMemcpyHostToDevice,
++                                 stream.value()));
++  }
+   RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+ }
+ 
+@@ -1063,7 +1148,21 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
+     }
+   }
+ 
+-  rmm::device_buffer device_buf(staging.running_offset, stream, mr_ref);
++  // The packed CONSTANT-values blob lands after the read/host-copy region. Its base is only known
++  // now that every segment is staged, so rebase the blob-relative offsets recorded by
++  // stage_constant_value into absolute device offsets.
++  if (!staging.constant_values.empty()) {
++    auto const blob_base = constant_blob_device_offset(staging);
++    for (auto& col : staged_cols) {
++      for (auto* segs : {&col.data, &col.array_child_data}) {
++        for (auto& seg : *segs) {
++          if (seg.in_constant_blob) { seg.device_offset += blob_base; }
++        }
++      }
++    }
++  }
++
++  rmm::device_buffer device_buf(total_device_bytes(staging), stream, mr_ref);
+   if (!staging.reads.empty()) {
+     if (datasource == nullptr) {
+       throw std::runtime_error(std::string(kTag) +
+@@ -1094,8 +1193,9 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
+                      host_numa,
+                      coalesce_max_gap,
+                      stream);
+-  } else if (!staging.host_copies.empty()) {
+-    // All-host split: no file io, no staging blocks, no SiriusContext needed.
++  } else if (!staging.host_copies.empty() || !staging.constant_values.empty()) {
++    // All-host split: no file io, no staging blocks, no SiriusContext needed. An all-CONSTANT
++    // projection reaches here with empty host_copies, carried entirely by the values blob.
+     submit_host_only_and_await(device_buf, staging, stream);
+   }
+ 
+diff --git a/test/cpp/scan/test_duckdb_native_host_backed_decode.cpp b/test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
+index 0ec2cf1f..5b3507eb 100644
+--- a/test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
++++ b/test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
+@@ -441,3 +441,99 @@ TEST_CASE("materialize_table applies the mvcc keep-mask to metadata splits",
+     REQUIRE_THROWS(ingestible->materialize_table(input, stream.view()));
+   }
+ }
++
++TEST_CASE("multi-segment CONSTANT columns decode from packed stats values with zero file reads",
++          "[scan][duckdb_native_host_backed][duckdb_native_constant]")
++{
++  // CONSTANT data segments have no payload bytes; their value rides the
++  // segment stats snapshotted by the walker. The decoder packs every such
++  // value of a split into one blob and uploads it in a single copy. A column
++  // constant within each row group but different across them checkpoints as
++  // (at least) one CONSTANT segment per row group, giving the multi-segment
++  // shape, and the null datasource proves the split stages zero file reads.
++  constexpr std::size_t N_ROWS   = 130000;  // two row groups: 122,880 + 7,120
++  constexpr std::size_t RG_SPLIT = 122880;
++
++  host_backed_test_db env;
++  exec_ok(*env.con, "CREATE TABLE t(k INTEGER, c BIGINT)");
++  exec_ok(*env.con,
++          "INSERT INTO t SELECT i::INTEGER, (CASE WHEN i < 122880 THEN 7 ELSE -3 END)::BIGINT "
++          "FROM range(130000) tbl(i)");
++  exec_ok(*env.con, "CHECKPOINT");
++  exec_ok(*env.con, "BEGIN TRANSACTION");
++  auto& storage = resolve_storage(*env.con, "t");
++
++  auto mem_mgr    = initialize_memory_manager();
++  auto* gpu_space = sirius::scan_test_utils::get_space(*mem_mgr, cucascade::memory::Tier::GPU);
++  REQUIRE(gpu_space != nullptr);
++  rmm::cuda_stream stream;
++
++  auto require_c_matches = [&](cudf::table const& t, std::size_t c_col_idx) {
++    REQUIRE(static_cast<std::size_t>(t.num_rows()) == N_ROWS);
++    auto out =
++      download<int64_t>(t.get_column(c_col_idx).view().data<int64_t>(), N_ROWS, stream.view());
++    for (std::size_t i = 0; i < N_ROWS; ++i) {
++      auto const want = i < RG_SPLIT ? std::int64_t{7} : std::int64_t{-3};
++      if (out[i] != want) { FAIL("c mismatch at row " << i); }
++    }
++  };
++
++  SECTION("all-CONSTANT projection: the packed values blob is the only upload")
++  {
++    std::vector<projected_column> cols      = {real_col(1)};
++    std::vector<sirius::logical_type> types = {sirius::logical_type::make(sirius::type_id::BIGINT)};
++    auto md                                 = walk_all(storage, *env.con->context, cols, types);
++
++    // Pin the shape the test is about: several CONSTANT data segments, each
++    // carrying its stats-borne value.
++    std::size_t n_constant = 0;
++    for (auto const& rg : md) {
++      for (auto const& s : rg.columns[0].data_segments) {
++        if (s.compression != duckdb::CompressionType::COMPRESSION_CONSTANT) { continue; }
++        REQUIRE(s.segment_stats != nullptr);
++        ++n_constant;
++      }
++    }
++    REQUIRE(n_constant >= 2);
++
++    duckdb_native_ingestible_table_info info;
++    info.storage         = &storage;
++    info.context         = env.con->context.get();
++    info.projected_cols  = cols;
++    info.projected_types = types;
++
++    auto table =
++      decode_duckdb_native_split(md, info, /*datasource=*/nullptr, *gpu_space, stream.view());
++    REQUIRE(table->num_columns() == 1);
++    require_c_matches(*table, 0);
++  }
++
++  SECTION("packed constants coexist with host-backed segments in the reads-empty lane")
++  {
++    std::vector<projected_column> cols      = {real_col(0), real_col(1)};
++    std::vector<sirius::logical_type> types = {sirius::logical_type::make(sirius::type_id::INTEGER),
++                                               sirius::logical_type::make(sirius::type_id::BIGINT)};
++    auto md                                 = walk_all(storage, *env.con->context, cols, types);
++
++    // Host-back k's block-backed segments; c's CONSTANT segments have no
++    // blocks, so they keep their stats-borne values and take the blob lane.
++    std::vector<std::shared_ptr<void>> keepalive;
++    host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/true);
++
++    duckdb_native_ingestible_table_info info;
++    info.storage         = &storage;
++    info.context         = env.con->context.get();
++    info.projected_cols  = cols;
++    info.projected_types = types;
++
++    auto table =
++      decode_duckdb_native_split(md, info, /*datasource=*/nullptr, *gpu_space, stream.view());
++    REQUIRE(table->num_columns() == 2);
++    auto k_out =
++      download<int32_t>(table->get_column(0).view().data<int32_t>(), N_ROWS, stream.view());
++    for (std::size_t i = 0; i < N_ROWS; ++i) {
++      if (k_out[i] != static_cast<int32_t>(i)) { FAIL("k mismatch at row " << i); }
++    }
++    require_c_matches(*table, 1);
++  }
++}
+diff --git a/test/cpp/scan/test_gpu_native_decode.cpp b/test/cpp/scan/test_gpu_native_decode.cpp
+index 4c872453..6eba0237 100644
+--- a/test/cpp/scan/test_gpu_native_decode.cpp
++++ b/test/cpp/scan/test_gpu_native_decode.cpp
+@@ -208,6 +208,69 @@ TEST_CASE_METHOD(decode_env,
+       REQUIRE(bytes[r * 16 + i] == pattern[i]);
+ }
+ 
++TEST_CASE_METHOD(decode_env,
++                 "gpu_decode_table - CONSTANT batched across columns, widths, and copy chunks",
++                 "[scan][decode]")
++{
++  // Every CONSTANT run of the table fills through one batched launch. Three
++  // columns of different value widths share it, and the int64 run's 320,000
++  // bytes exceed COPY_CHUNK_BYTES so its work splits across several chunks.
++  constexpr uint32_t ROWS = 40000;
++  cudf::data_type const I16{cudf::type_id::INT16};
++  std::vector<int64_t> v64  = {0x1122334455667788LL};
++  std::vector<int32_t> v32a = {-7}, v32b = {13};
++  std::vector<int16_t> v16 = {-2};
++  auto d64                 = upload(v64, stream.view());
++  auto d32a                = upload(v32a, stream.view());
++  auto d32b                = upload(v32b, stream.view());
++  auto d16                 = upload(v16, stream.view());
++
++  std::vector<gpu_column_decode_input> cols = {
++    one_codec_column(I64, ROWS, CompressionType::COMPRESSION_CONSTANT, {segment(d64, 0, ROWS)}),
++    one_codec_column(I32,
++                     ROWS,
++                     CompressionType::COMPRESSION_CONSTANT,
++                     {segment(d32a, 0, 1000), segment(d32b, 1000, ROWS - 1000)}),
++    one_codec_column(I16, ROWS, CompressionType::COMPRESSION_CONSTANT, {segment(d16, 0, ROWS)})};
++
++  auto t   = decode(cols);
++  auto o64 = download<int64_t>(t->get_column(0).view().data<int64_t>(), ROWS, stream.value());
++  auto o32 = download<int32_t>(t->get_column(1).view().data<int32_t>(), ROWS, stream.value());
++  auto o16 = download<int16_t>(t->get_column(2).view().data<int16_t>(), ROWS, stream.value());
++  for (uint32_t i = 0; i < ROWS; ++i) {
++    if (o64[i] != 0x1122334455667788LL) FAIL("int64 mismatch at row " << i);
++    if (o32[i] != (i < 1000 ? -7 : 13)) FAIL("int32 mismatch at row " << i);
++    if (o16[i] != -2) FAIL("int16 mismatch at row " << i);
++  }
++}
++
++TEST_CASE_METHOD(decode_env,
++                 "gpu_decode_table - CONSTANT runs interleaved with UNCOMPRESSED in one column",
++                 "[scan][decode]")
++{
++  // The deferred CONSTANT fill launches after every other codec of the table
++  // decode; disjoint per-run row ranges make that reordering safe. Pin it with
++  // CONSTANT [0,600) + UNCOMPRESSED [600,1100) + CONSTANT [1100,1600).
++  std::vector<int32_t> c1 = {42}, c2 = {-9};
++  std::vector<int32_t> mid(500);
++  std::iota(mid.begin(), mid.end(), 1000);
++  auto dc1 = upload(c1, stream.view());
++  auto dc2 = upload(c2, stream.view());
++  auto dm  = upload(mid, stream.view());
++
++  auto col =
++    one_codec_column(I32, 1600, CompressionType::COMPRESSION_CONSTANT, {segment(dc1, 0, 600)});
++  col.data.push_back({CompressionType::COMPRESSION_UNCOMPRESSED, {segment(dm, 600, 500)}});
++  col.data.push_back({CompressionType::COMPRESSION_CONSTANT, {segment(dc2, 1100, 500)}});
++
++  auto t   = decode({col});
++  auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), 1600, stream.value());
++  for (uint32_t i = 0; i < 1600; ++i) {
++    int32_t const want = i < 600 ? 42 : (i < 1100 ? static_cast<int32_t>(1000 + (i - 600)) : -9);
++    if (out[i] != want) FAIL("mismatch at row " << i << " want " << want << " got " << out[i]);
++  }
++}
++
+ TEST_CASE_METHOD(decode_env, "gpu_decode_table - mixed codecs across columns", "[scan][decode]")
+ {
+   std::vector<int32_t> a(500), b(500);

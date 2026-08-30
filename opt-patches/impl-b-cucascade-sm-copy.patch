@@ -1,0 +1,783 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 41b3772..4edf83b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -275,9 +275,14 @@ if(CUCASCADE_WARNINGS_AS_ERRORS)
+   list(APPEND CUCASCADE_CXX_WARNING_FLAGS -Werror)
+ endif()
+ 
+-# Warning flags for CUDA (passed to host compiler via -Xcompiler)
++# Warning flags for CUDA (passed to host compiler via -Xcompiler). -Wpedantic is excluded: the
++# intermediate host code nvcc generates uses non-standard line directives that -Wpedantic
++# diagnoses on every line (fatal under -Werror) -- an upstream nvcc limitation.
+ set(CUCASCADE_CUDA_WARNING_FLAGS)
+ foreach(flag ${CUCASCADE_CXX_WARNING_FLAGS})
++  if(flag STREQUAL "-Wpedantic")
++    continue()
++  endif()
+   list(APPEND CUCASCADE_CUDA_WARNING_FLAGS
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${flag}>")
+ endforeach()
+diff --git a/src/cudf/CMakeLists.txt b/src/cudf/CMakeLists.txt
+index 3302dd9..fb544d7 100644
+--- a/src/cudf/CMakeLists.txt
++++ b/src/cudf/CMakeLists.txt
+@@ -20,6 +20,7 @@ target_sources(
+   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gpu_data_representation.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/host_data_representation.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/bandwidth_profiler.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/batch_gather_copy.cu
+           ${CMAKE_CURRENT_SOURCE_DIR}/representation_converter_builtins.cpp)
+ 
+ # The cudf::io::datasource bridge over the cudf-free io core — only built when
+diff --git a/src/cudf/batch_gather_copy.cu b/src/cudf/batch_gather_copy.cu
+new file mode 100644
+index 0000000..460e852
+--- /dev/null
++++ b/src/cudf/batch_gather_copy.cu
+@@ -0,0 +1,147 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "batch_gather_copy.cuh"
++
++#include <cucascade/error.hpp>
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++
++namespace cucascade::detail {
++
++namespace {
++
++/// Threads per block for the gather-copy kernel.
++constexpr int threads_per_block = 256;
++
++/// Full-grid factor: the launch grid is fraction * blocks_per_sm * SM count blocks (see
++/// max_block_fraction), never more than the entry count.
++constexpr int blocks_per_sm = 4;
++
++/**
++ * @brief Returns the grid-size cap fraction for the gather-copy kernel.
++ *
++ * Bounds SM contention with concurrent compute kernels: the launch grid is capped at
++ * max(1, fraction * blocks_per_sm * SM count) blocks. The default of 0.25 (~1 x SM count blocks)
++ * already saturates the host-to-device link -- the copy is bandwidth-bound, not occupancy-bound
++ * (PQ-10 microbench and the in-engine q1/q19 sweep agree) -- while leaving the remaining SMs to
++ * concurrent compute. The environment variable CUCASCADE_SM_COPY_MAX_BLOCK_FRACTION, a float in
++ * [0, 1], overrides it (1.0 = full grid); unset, empty, or unparsable values mean the default;
++ * out-of-range values are clamped. Read once on first use.
++ */
++float max_block_fraction()
++{
++  constexpr float default_fraction = 0.25f;
++  static const float fraction      = [] {
++    const char* raw = std::getenv("CUCASCADE_SM_COPY_MAX_BLOCK_FRACTION");
++    if (raw == nullptr || *raw == '\0') { return default_fraction; }
++    char* end          = nullptr;
++    const float parsed = std::strtof(raw, &end);
++    if (end == raw || !std::isfinite(parsed)) { return default_fraction; }
++    return std::min(1.0f, std::max(parsed, 0.0f));
++  }();
++  return fraction;
++}
++
++/**
++ * @brief Grid-strided gather copy: block b copies entries b, b + gridDim.x, ...
++ *
++ * Each entry is copied with the widest mutually aligned access: when source and destination share
++ * the same 16-byte phase the body streams 16-byte vectors (after peeling at most one 8-byte head
++ * word), otherwise 8-byte words; thread 0 finishes the sub-word tail. A byte loop covers entries
++ * that violate the 8-byte alignment invariant, as a defensive measure.
++ *
++ * Entries are independent and threads within a block touch disjoint bytes of one entry, so the
++ * kernel needs no synchronization.
++ */
++__global__ void gather_copy_kernel(const batch_copy_entry* __restrict__ entries, std::size_t count)
++{
++  for (std::size_t e = blockIdx.x; e < count; e += gridDim.x) {
++    const batch_copy_entry entry = entries[e];
++    const auto* src              = static_cast<const unsigned char*>(entry.src);
++    auto* dst                    = static_cast<unsigned char*>(entry.dst);
++    const std::size_t bytes      = entry.bytes;
++    const auto src_addr          = reinterpret_cast<std::uintptr_t>(src);
++    const auto dst_addr          = reinterpret_cast<std::uintptr_t>(dst);
++
++    if (((src_addr | dst_addr) & 7u) != 0) {
++      for (std::size_t i = threadIdx.x; i < bytes; i += blockDim.x) {
++        dst[i] = src[i];
++      }
++      continue;
++    }
++
++    std::size_t offset = 0;
++    if (((src_addr ^ dst_addr) & 15u) == 0) {
++      if ((src_addr & 15u) != 0 && bytes >= 8) {
++        if (threadIdx.x == 0) {
++          *reinterpret_cast<unsigned long long*>(dst) =
++            *reinterpret_cast<const unsigned long long*>(src);
++        }
++        offset = 8;
++      }
++      const std::size_t num_vecs = (bytes - offset) / sizeof(ulonglong2);
++      const auto* src16          = reinterpret_cast<const ulonglong2*>(src + offset);
++      auto* dst16                = reinterpret_cast<ulonglong2*>(dst + offset);
++      for (std::size_t i = threadIdx.x; i < num_vecs; i += blockDim.x) {
++        dst16[i] = src16[i];
++      }
++      offset += num_vecs * sizeof(ulonglong2);
++    } else {
++      const std::size_t num_words = bytes / 8;
++      const auto* src8            = reinterpret_cast<const unsigned long long*>(src);
++      auto* dst8                  = reinterpret_cast<unsigned long long*>(dst);
++      for (std::size_t i = threadIdx.x; i < num_words; i += blockDim.x) {
++        dst8[i] = src8[i];
++      }
++      offset = num_words * 8;
++    }
++    if (threadIdx.x == 0) {
++      for (std::size_t i = offset; i < bytes; ++i) {
++        dst[i] = src[i];
++      }
++    }
++  }
++}
++
++}  // namespace
++
++void launch_batch_gather_copy(const batch_copy_entry* device_entries,
++                              std::size_t count,
++                              cudaStream_t stream)
++{
++  if (count == 0) { return; }
++  int device = 0;
++  CUCASCADE_CUDA_TRY(cudaGetDevice(&device));
++  int sm_count = 0;
++  CUCASCADE_CUDA_TRY(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
++  const auto full_grid =
++    static_cast<std::size_t>(blocks_per_sm) * static_cast<std::size_t>(sm_count);
++  const auto capped_grid = std::max<std::size_t>(
++    1, static_cast<std::size_t>(max_block_fraction() * static_cast<float>(full_grid)));
++  const auto blocks = static_cast<unsigned int>(std::min(count, capped_grid));
++  gather_copy_kernel<<<blocks, threads_per_block, 0, stream>>>(device_entries, count);
++  CUCASCADE_CUDA_TRY(cudaGetLastError());
++}
++
++}  // namespace cucascade::detail
+diff --git a/src/cudf/batch_gather_copy.cuh b/src/cudf/batch_gather_copy.cuh
+new file mode 100644
+index 0000000..60c9ece
+--- /dev/null
++++ b/src/cudf/batch_gather_copy.cuh
+@@ -0,0 +1,73 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <cuda_runtime_api.h>
++
++#include <cstddef>
++
++/**
++ * @file batch_gather_copy.cuh
++ * @brief SM gather-copy upload engine used by the host-to-device flush of BatchCopyAccumulator in
++ * `representation_converter_builtins.cpp`.
++ *
++ * The copy-engine path (cudaMemcpyBatchAsync) tops out well below what the SMs achieve when
++ * reading pinned host memory directly, and it blocks the calling thread while the batch drains.
++ * This engine instead uploads the accumulated (src, dst, bytes) entries as a device-resident
++ * descriptor array and launches one grid-strided kernel that performs every copy, returning to
++ * the caller immediately after enqueue.
++ */
++
++namespace cucascade::detail {
++
++/**
++ * @brief One host-to-device copy operation executed by the gather-copy kernel.
++ *
++ * Mirrors one (dst, src, size) triple accumulated by BatchCopyAccumulator. `src` points into a
++ * pinned host block allocated Portable+Mapped, which unified virtual addressing makes readable
++ * from the GPU at the same address; `dst` points into a device buffer on the launch device. Both
++ * pointers are 8-byte aligned (the pin layout invariant of plan_column_copy); `bytes` is
++ * arbitrary.
++ */
++struct batch_copy_entry {
++  const void* src;    ///< Pinned host source, 8-byte aligned.
++  void* dst;          ///< Device destination, 8-byte aligned.
++  std::size_t bytes;  ///< Copy length in bytes, arbitrary.
++};
++
++/**
++ * @brief Launches a grid-strided gather-copy kernel executing @p count copy entries on @p stream.
++ *
++ * Returns immediately after enqueue; entry sources are read stream-ordered by the kernel, not
++ * captured during this call. The caller therefore owns two lifetime obligations: the
++ * @p device_entries array must stay allocated until the kernel completes (free it stream-ordered
++ * on @p stream after this call), and every entry's source block must remain valid until @p stream
++ * has been synchronized. The launch grid defaults to min(count, ~1 x SM count) blocks -- enough
++ * to saturate the host-to-device link while bounding contention with concurrent compute kernels
++ * -- and is adjustable via the CUCASCADE_SM_COPY_MAX_BLOCK_FRACTION environment knob (see the
++ * launcher).
++ *
++ * @param device_entries Device-resident entry array; must never point at host memory.
++ * @param count Number of entries.
++ * @param stream Stream to launch on; must belong to the current device.
++ */
++void launch_batch_gather_copy(const batch_copy_entry* device_entries,
++                              std::size_t count,
++                              cudaStream_t stream);
++
++}  // namespace cucascade::detail
+diff --git a/src/cudf/representation_converter_builtins.cpp b/src/cudf/representation_converter_builtins.cpp
+index b6691d4..067dff7 100644
+--- a/src/cudf/representation_converter_builtins.cpp
++++ b/src/cudf/representation_converter_builtins.cpp
+@@ -15,6 +15,8 @@
+  * limitations under the License.
+  */
+ 
++#include "batch_gather_copy.cuh"
++
+ #include <cucascade/cuda/event.hpp>
+ #include <cucascade/cudf/builtin_converters.hpp>
+ #include <cucascade/cudf/gpu_data_representation.hpp>
+@@ -57,6 +59,7 @@
+ #include <cctype>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
+@@ -64,6 +67,7 @@
+ #include <mutex>
+ #include <sstream>
+ #include <stdexcept>
++#include <string>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -302,15 +306,46 @@ static std::size_t element_size_bytes(const cudf::column_view& col)
+ }
+ 
+ /**
+- * @brief Accumulates (dst, src, size) copy operations for a single cudaMemcpyBatchAsync call.
++ * @brief Returns whether host-to-device flushes use the SM gather-copy kernel.
++ *
++ * Temporary escape hatch so the two upload engines can be A/B-compared on the same binary: set
++ * the environment variable CUCASCADE_CONVERT_H2D_USE_SM_COPY to "0", "false", "off", or "no" to
++ * fall back to cudaMemcpyBatchAsync. Read once on first use; default on.
++ */
++static bool use_sm_copy_for_h2d()
++{
++  static const bool enabled = [] {
++    const char* raw = std::getenv("CUCASCADE_CONVERT_H2D_USE_SM_COPY");
++    if (raw == nullptr || *raw == '\0') { return true; }
++    std::string value{raw};
++    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
++      return static_cast<char>(std::tolower(c));
++    });
++    return value != "0" && value != "false" && value != "off" && value != "no";
++  }();
++  return enabled;
++}
++
++/**
++ * @brief Accumulates (dst, src, size) copy operations and submits them as one batch.
+  *
+- * Collect all copies first, then call flush() once to submit them all to the GPU in one driver
+- * call. This eliminates per-buffer driver overhead versus issuing individual cudaMemcpyAsync calls.
++ * Collect all copies first, then submit them in one shot: flush() issues a single
++ * cudaMemcpyBatchAsync driver call, while flush_h2d() prefers the SM gather-copy kernel (see
++ * `batch_gather_copy.cuh`), which reads the pinned sources from the SMs at well above
++ * copy-engine bandwidth and returns right after enqueue instead of blocking while the batch
++ * drains. Either form eliminates per-buffer driver overhead versus issuing individual
++ * cudaMemcpyAsync calls.
++ *
++ * Lifetime: the accumulator retains the kernel path's host-side descriptor stagings until it is
++ * destroyed (see flush_h2d), so it must outlive stream completion of every flush it issued. All
++ * current call sites satisfy this by synchronizing the stream before the accumulator goes out of
++ * scope.
+  */
+ struct BatchCopyAccumulator {
+   std::vector<void*> dsts;
+   std::vector<const void*> srcs;
+   std::vector<std::size_t> sizes;
++  std::vector<std::vector<detail::batch_copy_entry>> issued_entry_stagings;
+ 
+   void add(void* dst, const void* src, std::size_t size)
+   {
+@@ -352,6 +387,54 @@ struct BatchCopyAccumulator {
+     srcs.clear();
+     sizes.clear();
+   }
++
++  /**
++   * @brief Issues the accumulated copies of a host-to-device flush.
++   *
++   * Default path: uploads the accumulated entries as a device-resident descriptor array
++   * (allocated stream-ordered from @p mr, freed stream-ordered after the kernel) and launches the
++   * gather-copy kernel on @p stream. Unlike the batch API, which captures the pinned sources
++   * during the call, the kernel reads them strictly stream-ordered: callers must synchronize
++   * @p stream before releasing the source blocks. With the escape hatch off (see
++   * use_sm_copy_for_h2d) this delegates to flush() with the previous DuringApiCall semantics.
++   *
++   * May be called multiple times per conversion (each INT32-offset STRING column forces a
++   * mid-batch flush); each call stages and uploads only the entries accumulated since the last
++   * flush.
++   */
++  void flush_h2d(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
++  {
++    if (count() == 0) { return; }
++    if (!use_sm_copy_for_h2d()) {
++      flush(stream, cudaMemcpySrcAccessOrderDuringApiCall);
++      return;
++    }
++    // Interleave the parallel arrays into the descriptor layout the kernel reads.
++    std::vector<detail::batch_copy_entry> staged;
++    staged.reserve(count());
++    for (std::size_t i = 0; i < count(); ++i) {
++      staged.push_back(detail::batch_copy_entry{srcs[i], dsts[i], sizes[i]});
++    }
++    const std::size_t staged_bytes = staged.size() * sizeof(detail::batch_copy_entry);
++    // Device-resident descriptors: the kernel consumes them stream-ordered, long after this
++    // function has cleared the accumulator's vectors, so it must never point at host-side state.
++    rmm::device_buffer device_entries{staged_bytes, stream, mr};
++    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
++      device_entries.data(), staged.data(), staged_bytes, cudaMemcpyHostToDevice, stream.value()));
++    detail::launch_batch_gather_copy(
++      static_cast<const detail::batch_copy_entry*>(device_entries.data()),
++      staged.size(),
++      stream.value());
++    // The staging is pageable host memory, and on cache-coherent platforms the driver may DMA
++    // pageable sources after cudaMemcpyAsync returns. Retaining each flush's staging until the
++    // accumulator is destroyed (which every call site places after a full stream sync) keeps it
++    // valid without per-flush pinned allocations or event waits.
++    issued_entry_stagings.push_back(std::move(staged));
++    dsts.clear();
++    srcs.clear();
++    sizes.clear();
++    // device_entries goes out of scope here, enqueueing its stream-ordered free after the kernel.
++  }
+ };
+ 
+ /**
+@@ -1093,11 +1176,12 @@ static std::unique_ptr<cudf::column> reconstruct_column(
+     }
+     auto offsets_col = reconstruct_column(meta.children[0], alloc, stream, mr, batch);
+     if (offsets_col->type().id() == cudf::type_id::INT32) {
+-      // Flush pending H2D copies so the INT32 offsets buffer has valid data on device
+-      // before the cast reads from it. The cast replaces offsets_col, freeing the old
+-      // INT32 buffer, so batch must not hold dangling pointers to it.
++      // Flush pending H2D copies so the INT32 offsets buffer's data is issued on the stream
++      // ahead of the cast that reads from it (same-stream ordering). The cast replaces
++      // offsets_col, freeing the old INT32 buffer stream-ordered behind the flush's work, so
++      // batch must not hold dangling pointers to it.
+       nvtx_scope cast_range{"hg:offsets_cast"};
+-      batch.flush(stream, cudaMemcpySrcAccessOrderDuringApiCall);
++      batch.flush_h2d(stream, mr);
+       offsets_col =
+         cudf::cast(offsets_col->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+     }
+@@ -1232,10 +1316,17 @@ std::unique_ptr<idata_representation> convert_host_fast_to_gpu(
+   // Source is CPU-written pinned host memory: fully prepared before this call.
+   {
+     nvtx_scope flush_range{"hg:flush_submit"};
+-    batch.flush(target_stream, cudaMemcpySrcAccessOrderDuringApiCall);
++    batch.flush_h2d(target_stream, mr);
+   }
+ 
+   auto new_table = std::make_unique<cudf::table>(std::move(gpu_columns));
++  // LOAD-BEARING SYNC for the SM gather-copy upload path: the kernel reads the pinned source
++  // blocks strictly stream-ordered (the batch API captured them during the API call), and
++  // callers such as data_batch::convert_to may destroy the source representation -- and with it
++  // the pinned blocks -- as soon as this function returns. This synchronize is the only thing
++  // keeping those reads (and the accumulator's descriptor stagings) inside the sources'
++  // lifetime; the recorded writer event below does not cover it. Do not remove without an
++  // equivalent completion guarantee.
+   {
+     nvtx_scope final_sync_range{"hg:final_sync"};
+     target_stream.synchronize();
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 961696b..394b5ee 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -99,6 +99,7 @@ if(NOT CUCASCADE_TOPOLOGY_ONLY AND CUCASCADE_BUILD_CUDF)
+     data/test_disk_host_converters.cpp
+     data/test_gpu_disk_converters.cpp
+     data/test_representation_converter.cpp
++    cudf/test_batch_gather_copy.cpp
+     cudf/test_release_table_stream.cpp
+     # Main test runner
+     unittest.cpp)
+diff --git a/test/cudf/test_batch_gather_copy.cpp b/test/cudf/test_batch_gather_copy.cpp
+new file mode 100644
+index 0000000..1eb238d
+--- /dev/null
++++ b/test/cudf/test_batch_gather_copy.cpp
+@@ -0,0 +1,199 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Private-header test: the gather-copy engine is an implementation detail of the cudf converter
++// library, so the header is included by relative path rather than through the public include dir.
++#include "../../src/cudf/batch_gather_copy.cuh"
++
++#include <cucascade/error.hpp>
++
++#include <rmm/cuda_stream.hpp>
++
++#include <cuda_runtime.h>
++
++#include <catch2/catch_all.hpp>
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <utility>
++#include <vector>
++
++using cucascade::detail::batch_copy_entry;
++using cucascade::detail::launch_batch_gather_copy;
++
++namespace {
++
++constexpr uint8_t guard_byte = 0xEE;
++
++/// One test copy: source/destination offsets are placed at the requested 16-byte phase.
++struct copy_case {
++  std::size_t src_phase;
++  std::size_t dst_phase;
++  std::size_t length;
++};
++
++constexpr std::size_t align_up(std::size_t value, std::size_t alignment)
++{
++  return (value + alignment - 1) / alignment * alignment;
++}
++
++/// RAII pinned host allocation mirroring the converter's source memory (Portable + Mapped).
++struct pinned_buffer {
++  uint8_t* data = nullptr;
++
++  explicit pinned_buffer(std::size_t bytes)
++  {
++    CUCASCADE_CUDA_TRY(cudaHostAlloc(
++      reinterpret_cast<void**>(&data), bytes, cudaHostAllocPortable | cudaHostAllocMapped));
++  }
++  ~pinned_buffer() { cudaFreeHost(data); }
++  pinned_buffer(const pinned_buffer&)            = delete;
++  pinned_buffer& operator=(const pinned_buffer&) = delete;
++};
++
++/// RAII device allocation.
++struct device_buffer_raw {
++  uint8_t* data = nullptr;
++
++  explicit device_buffer_raw(std::size_t bytes)
++  {
++    CUCASCADE_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&data), bytes));
++  }
++  ~device_buffer_raw() { cudaFree(data); }
++  device_buffer_raw(const device_buffer_raw&)            = delete;
++  device_buffer_raw& operator=(const device_buffer_raw&) = delete;
++};
++
++}  // namespace
++
++// Compares the gather-copy kernel's output against a plain host-side memcpy of the same entries,
++// across every alignment shape the kernel distinguishes: matching 16-byte phases (with and
++// without the 8-byte head peel), mismatched 16-byte phases (the 8-byte word path), sub-8-byte
++// alignment (the defensive byte path), and lengths from 0 through a multi-megabyte entry with odd
++// tails. Destination guard bytes around each entry verify the kernel writes exactly the requested
++// ranges and nothing else.
++TEST_CASE("batch gather-copy kernel matches memcpy for scattered entries of odd sizes and phases",
++          "[sm_copy][gather_copy]")
++{
++  const std::vector<std::size_t> lengths = {
++    0, 1, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 255, 1000, 4096, 4097, (1u << 20) + 13};
++  const std::vector<std::pair<std::size_t, std::size_t>> phases = {{0, 0}, {8, 8}, {8, 0}, {0, 8}};
++
++  std::vector<copy_case> cases;
++  for (const auto& [src_phase, dst_phase] : phases) {
++    for (const std::size_t length : lengths) {
++      cases.push_back({src_phase, dst_phase, length});
++    }
++  }
++  // Defensive byte path: starts below 8-byte alignment (never produced by the pin layout).
++  cases.push_back({4, 4, 37});
++  cases.push_back({1, 3, 13});
++  cases.push_back({2, 6, 64});
++
++  // Lay the entries out with 16-byte-aligned bases plus the requested phase, and a guard gap
++  // after each destination range.
++  constexpr std::size_t guard_gap = 32;
++  std::size_t src_cursor          = 0;
++  std::size_t dst_cursor          = guard_gap;
++  std::vector<std::size_t> src_offsets;
++  std::vector<std::size_t> dst_offsets;
++  for (const copy_case& c : cases) {
++    src_cursor = align_up(src_cursor, 16) + c.src_phase;
++    dst_cursor = align_up(dst_cursor, 16) + c.dst_phase;
++    src_offsets.push_back(src_cursor);
++    dst_offsets.push_back(dst_cursor);
++    src_cursor += c.length;
++    dst_cursor += c.length + guard_gap;
++  }
++  const std::size_t src_bytes = src_cursor;
++  const std::size_t dst_bytes = dst_cursor;
++
++  pinned_buffer src{src_bytes};
++  for (std::size_t i = 0; i < src_bytes; ++i) {
++    src.data[i] = static_cast<uint8_t>((i * 131 + 17) & 0xFF);
++  }
++
++  device_buffer_raw dst{dst_bytes};
++  CUCASCADE_CUDA_TRY(cudaMemset(dst.data, guard_byte, dst_bytes));
++
++  std::vector<batch_copy_entry> entries;
++  entries.reserve(cases.size());
++  for (std::size_t i = 0; i < cases.size(); ++i) {
++    entries.push_back({src.data + src_offsets[i], dst.data + dst_offsets[i], cases[i].length});
++  }
++  device_buffer_raw device_entries{entries.size() * sizeof(batch_copy_entry)};
++  CUCASCADE_CUDA_TRY(cudaMemcpy(device_entries.data,
++                                entries.data(),
++                                entries.size() * sizeof(batch_copy_entry),
++                                cudaMemcpyHostToDevice));
++
++  rmm::cuda_stream stream;
++  launch_batch_gather_copy(
++    reinterpret_cast<const batch_copy_entry*>(device_entries.data), entries.size(), stream.value());
++  stream.synchronize();
++
++  // Reference: guard-filled destination with each entry memcpy'd on the host.
++  std::vector<uint8_t> expected(dst_bytes, guard_byte);
++  for (std::size_t i = 0; i < cases.size(); ++i) {
++    std::memcpy(expected.data() + dst_offsets[i], src.data + src_offsets[i], cases[i].length);
++  }
++
++  std::vector<uint8_t> actual(dst_bytes);
++  CUCASCADE_CUDA_TRY(cudaMemcpy(actual.data(), dst.data, dst_bytes, cudaMemcpyDeviceToHost));
++
++  REQUIRE(std::memcmp(actual.data(), expected.data(), dst_bytes) == 0);
++}
++
++// The grid strides over entries block-by-block; an entry count far above the launch grid checks
++// the stride loop and that many tiny entries land intact.
++TEST_CASE("batch gather-copy kernel handles entry counts beyond the launch grid",
++          "[sm_copy][gather_copy]")
++{
++  constexpr std::size_t num_entries = 20'000;
++  constexpr std::size_t entry_bytes = 8;
++
++  pinned_buffer src{num_entries * entry_bytes};
++  for (std::size_t i = 0; i < num_entries * entry_bytes; ++i) {
++    src.data[i] = static_cast<uint8_t>((i * 37 + 5) & 0xFF);
++  }
++  device_buffer_raw dst{num_entries * entry_bytes};
++  CUCASCADE_CUDA_TRY(cudaMemset(dst.data, guard_byte, num_entries * entry_bytes));
++
++  // Reverse the entry order so consecutive descriptors reference non-adjacent memory.
++  std::vector<batch_copy_entry> entries;
++  entries.reserve(num_entries);
++  for (std::size_t i = 0; i < num_entries; ++i) {
++    const std::size_t j = num_entries - 1 - i;
++    entries.push_back({src.data + j * entry_bytes, dst.data + j * entry_bytes, entry_bytes});
++  }
++  device_buffer_raw device_entries{entries.size() * sizeof(batch_copy_entry)};
++  CUCASCADE_CUDA_TRY(cudaMemcpy(device_entries.data,
++                                entries.data(),
++                                entries.size() * sizeof(batch_copy_entry),
++                                cudaMemcpyHostToDevice));
++
++  rmm::cuda_stream stream;
++  launch_batch_gather_copy(
++    reinterpret_cast<const batch_copy_entry*>(device_entries.data), entries.size(), stream.value());
++  stream.synchronize();
++
++  std::vector<uint8_t> actual(num_entries * entry_bytes);
++  CUCASCADE_CUDA_TRY(
++    cudaMemcpy(actual.data(), dst.data, num_entries * entry_bytes, cudaMemcpyDeviceToHost));
++  REQUIRE(std::memcmp(actual.data(), src.data, num_entries * entry_bytes) == 0);
++}
+diff --git a/test/data/test_data_representation.cpp b/test/data/test_data_representation.cpp
+index af29f26..c699fac 100644
+--- a/test/data/test_data_representation.cpp
++++ b/test/data/test_data_representation.cpp
+@@ -2311,6 +2311,127 @@ TEST_CASE("Round-trip fast: empty table (0 rows)", "[fast][roundtrip]")
+   REQUIRE(back->get_table_view().column(0).type().id() == cudf::type_id::INT32);
+ }
+ 
++// =============================================================================
++// SM gather-copy upload engine (flush_h2d kernel path)
++// =============================================================================
++
++namespace {
++
++/// Build a STRING column with `num_strings` rows whose lengths cycle 0..length_cycle-1, chars
++/// filled with a deterministic per-column pattern. The odd total chars size exercises the gather
++/// kernel's tail handling, and the INT32 offsets force a mid-batch flush on reconstruction.
++std::unique_ptr<cudf::column> make_pattern_strings_column(int num_strings,
++                                                          int length_cycle,
++                                                          uint8_t seed,
++                                                          rmm::cuda_stream_view stream,
++                                                          rmm::device_async_resource_ref mr)
++{
++  std::vector<int32_t> offsets;
++  offsets.reserve(static_cast<std::size_t>(num_strings) + 1);
++  offsets.push_back(0);
++  for (int i = 0; i < num_strings; ++i) {
++    offsets.push_back(offsets.back() + (i % length_cycle));
++  }
++  std::vector<uint8_t> chars(static_cast<std::size_t>(offsets.back()));
++  for (std::size_t i = 0; i < chars.size(); ++i) {
++    chars[i] = static_cast<uint8_t>((i * 131 + seed) & 0xFF);
++  }
++
++  rmm::device_buffer offsets_buf(offsets.data(), offsets.size() * sizeof(int32_t), stream, mr);
++  auto offsets_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
++                                                    static_cast<cudf::size_type>(offsets.size()),
++                                                    std::move(offsets_buf),
++                                                    rmm::device_buffer{},
++                                                    0);
++  rmm::device_buffer chars_buf(chars.data(), chars.size(), stream, mr);
++  return cudf::make_strings_column(
++    num_strings, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
++}
++
++}  // namespace
++
++// Exercises the SM gather-copy upload path of convert_host_fast_to_gpu end to end. All columns
++// share num_rows = 300'001 rows, chosen so the pin layout hits every kernel copy shape: the
++// leading INT8 column's 300'001-byte buffer aligns up to 300'008, shifting every following
++// buffer to an 8-byte (non-16-byte) phase; the 2.4 MB INT64 column spans three 1 MiB pinned
++// blocks (one multi-entry buffer with phase-mismatched continuation entries); two INT32-offset
++// STRING columns force two mid-batch flushes ahead of the final flush (three kernel flushes
++// total, validating descriptor staging retention across flushes), with odd chars sizes for the
++// sub-word tails; and a nullable column checks that the separate null-mask path still composes
++// correctly.
++TEST_CASE("Round-trip fast: SM gather-copy preserves multi-block, odd-size, multi-flush tables",
++          "[fast][roundtrip][sm_copy]")
++{
++  memory::memory_reservation_manager mgr(create_conversion_test_configs());
++  representation_converter_registry registry;
++  register_builtin_converters(registry);
++
++  const auto* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
++  const auto* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
++  rmm::cuda_stream stream;
++  auto mr = gpu_space->get_default_allocator();
++
++  constexpr int num_rows = 300'001;
++
++  std::vector<std::unique_ptr<cudf::column>> cols;
++
++  // col0: INT8, 300'001 bytes -- the odd size phase-shifts every subsequent pin offset.
++  {
++    std::vector<int8_t> host_data(num_rows);
++    for (int i = 0; i < num_rows; ++i) {
++      host_data[i] = static_cast<int8_t>((i * 131 + 17) & 0xFF);
++    }
++    rmm::device_buffer buf(host_data.data(), host_data.size(), stream.view(), mr);
++    cols.push_back(std::make_unique<cudf::column>(
++      cudf::data_type{cudf::type_id::INT8}, num_rows, std::move(buf), rmm::device_buffer{}, 0));
++  }
++
++  // col1: INT64, 2'400'008 bytes, spanning three 1 MiB pinned blocks.
++  {
++    std::vector<int64_t> host_data(num_rows);
++    for (int i = 0; i < num_rows; ++i) {
++      host_data[i] = static_cast<int64_t>(i) * 0x9E3779B97F4A7C15LL + 1;
++    }
++    rmm::device_buffer buf(host_data.data(), host_data.size() * sizeof(int64_t), stream.view(), mr);
++    cols.push_back(std::make_unique<cudf::column>(
++      cudf::data_type{cudf::type_id::INT64}, num_rows, std::move(buf), rmm::device_buffer{}, 0));
++  }
++
++  // col2/col3: STRING columns with distinct length cycles and fill patterns.
++  cols.push_back(make_pattern_strings_column(num_rows, 3, 23, stream.view(), mr));
++  cols.push_back(make_pattern_strings_column(num_rows, 5, 101, stream.view(), mr));
++
++  // col4: nullable INT32 with real nulls.
++  {
++    auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
++                                         num_rows,
++                                         cudf::mask_state::ALL_VALID,
++                                         stream.view(),
++                                         mr);
++    CUCASCADE_CUDA_TRY(
++      cudaMemsetAsync(col->mutable_view().head(), 0x5C, num_rows * sizeof(int32_t), stream.view()));
++    cudf::set_null_mask(col->mutable_view().null_mask(), 5, 9, false, stream.view());
++    col->set_null_count(4);
++    cols.push_back(std::move(col));
++  }
++  stream.synchronize();
++
++  gpu_table_representation orig_repr(std::make_unique<cudf::table>(std::move(cols)),
++                                     *const_cast<memory::memory_space*>(gpu_space),
++                                     rmm::cuda_stream_view{});
++
++  auto host = fast_convert(orig_repr, host_space, registry, stream.view());
++  stream.synchronize();
++  REQUIRE(host != nullptr);
++
++  auto back = fast_back_convert(*host, gpu_space, registry, stream.view());
++  stream.synchronize();
++  REQUIRE(back != nullptr);
++
++  cucascade::test::expect_cudf_tables_equal_on_stream(
++    orig_repr.get_table_view(), back->get_table_view(), stream.view());
++}
++
+ // =============================================================================
+ // host_data_representation::slice round-trip
+ // =============================================================================
