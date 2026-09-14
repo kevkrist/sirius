@@ -164,8 +164,10 @@ After a GPU task completes and schedules downstream operators:
 1. The task creator receives `schedule(operator*)` calls
 2. Its manager loop calls `get_operator_for_next_task(operator)` which:
    - Calls `operator->get_next_task_hint()` to check data availability
+   - Enqueues any secondary producer nominations once per source pipeline
    - If `READY`: the operator has data — create a task
    - If `WAITING_FOR_INPUT_DATA`: recursively follow the producer chain
+   - If `NOMINATE_PRODUCERS`: no immediate task is created
 3. Creates a `gpu_pipeline_task` (including for the unified GPU scan source)
 4. Dispatches it to the GPU executor
 

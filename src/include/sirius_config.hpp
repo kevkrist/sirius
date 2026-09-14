@@ -115,6 +115,9 @@ struct operator_params {
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::derived_default_batch_size();
 
+  /// Maximum UNION ALL source arms admitted concurrently.
+  std::size_t union_source_window = 4;
+
   /// Maximum bytes per sort partition (0 = auto based on max_sort_partition_memory_fraction).
   uint64_t max_sort_partition_bytes = 0;
 

@@ -75,7 +75,7 @@ bool install_deferral(op::sirius_physical_operator& scan,
 }  // namespace planner
 namespace op {
 
-enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY, NOMINATE_PRODUCERS };
 
 /**
  * @brief Display name of a memory tier for telemetry attributes.
@@ -95,6 +95,7 @@ enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 struct task_creation_hint {
   TaskCreationHint hint{TaskCreationHint::WAITING_FOR_INPUT_DATA};
   sirius_physical_operator* producer{nullptr};
+  std::vector<sirius_physical_operator*> additional_producers;
 };
 
 /**
@@ -776,6 +777,9 @@ class sirius_physical_operator {
 
   //! Get the input batch
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
+
+  //! Consume a request for the task creator to revisit this operator after input was popped.
+  [[nodiscard]] virtual bool take_task_creation_recheck() { return false; }
 
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();

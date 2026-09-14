@@ -36,6 +36,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::pipeline {
@@ -155,6 +156,12 @@ class task_creator {
    */
   virtual void schedule(op::sirius_physical_operator* request);
 
+  //! Schedule one source-draining request per source pipeline for the current query.
+  void schedule_source(op::sirius_physical_operator* source);
+
+  //! Per-UNION source-window heuristic. This is not a global creator-thread reservation.
+  [[nodiscard]] std::size_t per_union_source_window_capacity() const noexcept;
+
   void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
 
   /**
@@ -179,6 +186,9 @@ class task_creator {
   [[nodiscard]] std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority>
   compute_pipeline_priorities(const sirius::planner::query& query) const;
 
+ private:
+  [[nodiscard]] bool enqueue_active_request(op::sirius_physical_operator* node);
+
  protected:
   /**
    * @brief Stop the worker thread pool.
@@ -187,6 +197,8 @@ class task_creator {
    * idempotent - calling it multiple times has no additional effect.
    */
   void do_stop_thread_pool();
+
+  void reset_source_nominations(bool accept_new_nominations);
 
   /**
    * @brief Find the operator for which to create the next task based on operator hints.
@@ -240,6 +252,10 @@ class task_creator {
   std::unique_ptr<duckdb::ThreadContext> _thread_context;
   std::unique_ptr<duckdb::ExecutionContext> _execution_context;
   std::mutex _global_state_mutex;  // Protect concurrent access to the map
+
+  std::mutex _source_nomination_mutex;
+  std::unordered_set<const pipeline::sirius_pipeline*> _nominated_source_pipelines;
+  bool _accept_source_nominations{false};
 
   /// Shared GPU<->NUMA topology index for NUMA-aware GPU routing (may be null).
   /// Scoped to the memory manager's reserved GPU/HOST spaces:

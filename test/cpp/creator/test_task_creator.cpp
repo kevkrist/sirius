@@ -30,7 +30,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -83,14 +85,28 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
    */
   std::optional<task_creation_hint> get_next_task_hint() override
   {
+    _hint_call_count.fetch_add(1);
+    _hint_call_cv.notify_all();
     if (_use_custom_hint) { return _custom_hint; }
     // Fall back to parent implementation
     return sirius_physical_operator::get_next_task_hint();
   }
 
+  bool wait_for_hint_calls(std::size_t expected)
+  {
+    std::unique_lock<std::mutex> lock(_hint_call_mutex);
+    return _hint_call_cv.wait_for(
+      lock, 5s, [this, expected] { return _hint_call_count.load() >= expected; });
+  }
+
+  [[nodiscard]] std::size_t hint_call_count() const { return _hint_call_count.load(); }
+
  private:
   bool _use_custom_hint;
   std::optional<sirius::op::task_creation_hint> _custom_hint;
+  std::atomic<std::size_t> _hint_call_count{0};
+  std::mutex _hint_call_mutex;
+  std::condition_variable _hint_call_cv;
 };
 
 /**
@@ -205,6 +221,8 @@ class testable_task_creator : public task_creator {
   // Expose protected method for testing
   using task_creator::get_operator_for_next_task;
 
+  void begin_source_nomination_epoch() { reset_source_nominations(true); }
+
  private:
   std::atomic<size_t> _schedule_count{0};
   std::vector<sirius_physical_operator*> _scheduled_nodes;
@@ -264,6 +282,16 @@ class test_fixture {
   task_scheduler pipeline_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
 };
+
+static void wire_source_pipeline(mock_sirius_physical_operator& source,
+                                 const duckdb::shared_ptr<mock_gpu_pipeline>& pipeline)
+{
+  sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*pipeline, source);
+  build_state.set_pipeline_sink(*pipeline, &source, 1);
+  source.set_pipeline(pipeline);
+  source.set_custom_hint(std::nullopt);
+}
 
 //===----------------------------------------------------------------------===//
 // task_creator Thread Pool Tests
@@ -462,6 +490,123 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   // REQUIRE(creator.get_schedule_count() == 1);
   // REQUIRE(scheduled_nodes.size() == 1);
   // REQUIRE(scheduled_nodes[0] == hint_op.get());
+}
+
+TEST_CASE("get_operator_for_next_task schedules secondary producers on READY hints",
+          "[task_creator]")
+{
+  test_fixture fixture;
+  testable_task_creator creator(
+    5, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+
+  auto source_pipeline = fixture.create_mock_pipeline();
+  auto source          = std::make_unique<mock_sirius_physical_operator>();
+  wire_source_pipeline(*source, source_pipeline);
+  auto primary = std::make_unique<mock_sirius_physical_operator>();
+  auto request = std::make_unique<mock_sirius_physical_operator>();
+  request->set_custom_hint(task_creation_hint{.hint                 = TaskCreationHint::READY,
+                                              .producer             = primary.get(),
+                                              .additional_producers = {source.get()}});
+
+  std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
+  creator.begin_source_nomination_epoch();
+  creator.start_thread_pool();
+  REQUIRE(creator.get_operator_for_next_task(request.get(), visited) == primary.get());
+  REQUIRE(source->wait_for_hint_calls(1));
+
+  visited.clear();
+  REQUIRE(creator.get_operator_for_next_task(request.get(), visited) == primary.get());
+  REQUIRE(source->hint_call_count() == 1);
+  creator.stop_thread_pool();
+}
+
+TEST_CASE("get_operator_for_next_task handles nomination-only hints and deduplicates pipelines",
+          "[task_creator]")
+{
+  test_fixture fixture;
+  testable_task_creator creator(
+    5, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+
+  auto source_pipeline = fixture.create_mock_pipeline();
+  auto source_a        = std::make_unique<mock_sirius_physical_operator>();
+  auto source_b        = std::make_unique<mock_sirius_physical_operator>();
+  wire_source_pipeline(*source_a, source_pipeline);
+  source_b->set_pipeline(source_pipeline);
+  source_b->set_custom_hint(std::nullopt);
+
+  auto sentinel_pipeline = fixture.create_mock_pipeline();
+  auto sentinel          = std::make_unique<mock_sirius_physical_operator>();
+  wire_source_pipeline(*sentinel, sentinel_pipeline);
+
+  auto request = std::make_unique<mock_sirius_physical_operator>();
+  request->set_custom_hint(
+    task_creation_hint{.hint                 = TaskCreationHint::NOMINATE_PRODUCERS,
+                       .producer             = nullptr,
+                       .additional_producers = {source_a.get(), source_b.get()}});
+
+  std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
+  creator.begin_source_nomination_epoch();
+  creator.start_thread_pool();
+  REQUIRE(creator.get_operator_for_next_task(request.get(), visited) == nullptr);
+  REQUIRE(source_a->wait_for_hint_calls(1));
+  REQUIRE(source_b->hint_call_count() == 0);
+
+  creator.schedule_source(source_a.get());
+  creator.schedule_source(sentinel.get());
+  REQUIRE(sentinel->wait_for_hint_calls(1));
+  REQUIRE(source_a->hint_call_count() == 1);
+
+  creator.reset();
+  creator.schedule_source(source_a.get());
+
+  creator.begin_source_nomination_epoch();
+  creator.schedule_source(sentinel.get());
+  REQUIRE(sentinel->wait_for_hint_calls(2));
+  REQUIRE(source_a->hint_call_count() == 1);
+
+  creator.schedule_source(source_a.get());
+  REQUIRE(source_a->wait_for_hint_calls(2));
+  creator.stop_thread_pool();
+
+  REQUIRE_NOTHROW(creator.schedule_source(nullptr));
+  creator.start_thread_pool();
+  creator.schedule_source(source_a.get());
+  REQUIRE(source_a->hint_call_count() == 2);
+
+  creator.begin_source_nomination_epoch();
+  creator.schedule_source(source_a.get());
+  REQUIRE(source_a->wait_for_hint_calls(3));
+  creator.stop_thread_pool();
+}
+
+TEST_CASE("task_creator rejects invalid source nominations in an active epoch", "[task_creator]")
+{
+  test_fixture fixture;
+  testable_task_creator creator(
+    5, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+
+  auto source_without_pipeline = std::make_unique<mock_sirius_physical_operator>();
+  creator.begin_source_nomination_epoch();
+  REQUIRE_THROWS_WITH(creator.schedule_source(nullptr), "Cannot nominate a null source operator");
+  REQUIRE_THROWS_WITH(creator.schedule_source(source_without_pipeline.get()),
+                      "Cannot nominate a source operator without a pipeline");
+
+  creator.reset();
+  REQUIRE_NOTHROW(creator.schedule_source(nullptr));
+  REQUIRE_NOTHROW(creator.schedule_source(source_without_pipeline.get()));
+}
+
+TEST_CASE("task_creator reports its per-UNION source-window heuristic", "[task_creator]")
+{
+  test_fixture fixture;
+
+  testable_task_creator single_threaded(
+    1, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+  REQUIRE(single_threaded.per_union_source_window_capacity() == 1);
+
+  testable_task_creator default_sized(
+    5, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+  REQUIRE(default_sized.per_union_source_window_capacity() == 4);
 }
 // WSM TODO continue to fix tests
 // TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[task_creator]")

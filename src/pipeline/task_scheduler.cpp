@@ -217,7 +217,7 @@ std::future<void> task_scheduler::start_query()
     throw std::runtime_error("task_scheduler: query has no schedulable scan sources");
   }
 
-  _task_creator->schedule(scans.front());
+  _task_creator->schedule_source(scans.front());
 
   return _completion_handler->get_awaitable();
 }

@@ -36,6 +36,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
@@ -103,6 +104,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
 
+  reset_source_nominations(false);
   _gpu_operator_global_state_map.clear();
 
   const auto& pipelines = query.get_pipelines();
@@ -140,6 +142,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       _lookahead_queue.push_back(*it);
     }
   }
+  reset_source_nominations(true);
 }
 
 std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority>
@@ -217,6 +220,7 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
 void task_creator::drain_pending_tasks()
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
+  reset_source_nominations(false);
   // Drain any queued task creation requests that haven't been picked up yet
   _task_creation_queue.interrupt();
   _task_creation_queue.drain();
@@ -245,6 +249,7 @@ void task_creator::reset()
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   _gpu_operator_global_state_map.clear();
+  reset_source_nominations(false);
   _thread_context.reset();
   _execution_context.reset();
   {
@@ -264,23 +269,37 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
   auto hint = node->get_next_task_hint();
   if (!hint.has_value()) { return nullptr; }
 
-  if (hint.value().hint == op::TaskCreationHint::READY) {
-    if (hint.value().producer == nullptr) {
+  for (auto* producer : hint->additional_producers) {
+    schedule_source(producer);
+  }
+
+  if (hint->hint == op::TaskCreationHint::READY) {
+    if (hint->producer == nullptr) {
       throw std::runtime_error(
         "During get_operator_for_next_task Producer is nullptr for operator " + node->get_name());
     }
     // WSM TODO: how do we handle other ports that are not default?
-    return hint.value().producer;
-  } else if (hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
-    return get_operator_for_next_task(hint.value().producer, visited_pipelines);
+    return hint->producer;
+  }
+  if (hint->hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
+    return get_operator_for_next_task(hint->producer, visited_pipelines);
   }
   return nullptr;
 }
 
 void task_creator::stop()
 {
+  reset_source_nominations(false);
   _task_creation_queue.interrupt();
   do_stop_thread_pool();
+}
+
+void task_creator::reset_source_nominations(bool accept_new_nominations)
+{
+  std::lock_guard<std::mutex> lock(_source_nomination_mutex);
+  _accept_source_nominations = false;
+  _nominated_source_pipelines.clear();
+  _accept_source_nominations = accept_new_nominations;
 }
 
 void task_creator::start_thread_pool()
@@ -315,14 +334,48 @@ void task_creator::do_stop_thread_pool()
 void task_creator::stop_thread_pool()
 {
   std::lock_guard<std::mutex> lock(_global_state_mutex);
+  reset_source_nominations(false);
   do_stop_thread_pool();
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node)
 {
+  (void)enqueue_active_request(node);
+}
+
+bool task_creator::enqueue_active_request(op::sirius_physical_operator* node)
+{
   auto request  = std::make_unique<task_creation_request>();
   request->node = node;
-  _task_creation_queue.push(std::move(request));
+  return _task_creation_queue.push(std::move(request));
+}
+
+void task_creator::schedule_source(op::sirius_physical_operator* source)
+{
+  std::lock_guard<std::mutex> lock(_source_nomination_mutex);
+  if (!_accept_source_nominations) { return; }
+  if (source == nullptr) { throw std::invalid_argument("Cannot nominate a null source operator"); }
+  auto pipeline = source->get_pipeline();
+  if (!pipeline) {
+    throw std::invalid_argument("Cannot nominate a source operator without a pipeline");
+  }
+
+  auto [nomination, inserted] = _nominated_source_pipelines.insert(pipeline.get());
+  if (!inserted) { return; }
+  try {
+    if (!enqueue_active_request(source)) {
+      throw std::runtime_error("Cannot nominate a source while task creation is stopped");
+    }
+  } catch (...) {
+    _nominated_source_pipelines.erase(nomination);
+    throw;
+  }
+}
+
+std::size_t task_creator::per_union_source_window_capacity() const noexcept
+{
+  const auto num_threads = _config.thread_pool.num_threads;
+  return static_cast<std::size_t>(num_threads > 1 ? num_threads - 1 : 1);
 }
 
 void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
@@ -336,6 +389,13 @@ void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
     if (!hint.has_value()) {
       if (!node->get_pipeline()->is_pipeline_finished()) { return; }
       continue;
+    }
+    for (auto* producer : hint->additional_producers) {
+      schedule_source(producer);
+    }
+    if (hint->hint == op::TaskCreationHint::NOMINATE_PRODUCERS) {
+      ++_index_of_next_lookahead;
+      return;
     }
     if (hint.value().hint == op::TaskCreationHint::READY) {
       SIRIUS_LOG_TRACE("Task Creator: scheduling lookahead for operator {} (id {})",
@@ -575,9 +635,11 @@ void task_creator::manager_loop()
                                                                     gpu_pipeline_task_global_state);
           task_lock.unlock();
           _task_scheduler->schedule(std::move(task));
+          if (node->take_task_creation_recheck()) { schedule(node); }
 
           if (request_kind == request_type::lookahead) { break; }
         }
+        if (node->take_task_creation_recheck()) { schedule(node); }
         // Unconditional re-evaluation at every creation exit: with the
         // source-exhaustion finish guard, "last task completed at T1,
         // connector closed at T2>T1" has no later mark_task_completed() to

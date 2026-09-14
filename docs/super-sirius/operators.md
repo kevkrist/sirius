@@ -28,7 +28,7 @@ An operator's position in a pipeline is determined by `sirius_engine::initialize
 | `sink(output_data, stream)` | Called on the **last** operator after `compute_task()` to push results downstream |
 | `is_source()` | Whether this operator can produce data (has scan state or owns accumulated data) |
 | `is_sink()` | Whether this operator has a `sink()` implementation for pushing data to downstream ports — true for unconditional sinks, or when the tree parent is a sink parent (PARTITION, RIGHT_DELIM_JOIN, DENSE_COUNT_JOIN) |
-| `get_next_task_hint()` | Checks port readiness, returns `READY` or `WAITING_FOR_INPUT_DATA` |
+| `get_next_task_hint()` | Checks port readiness and can return a ready task, an upstream dependency, or secondary source nominations |
 | `get_next_task_input_data()` | Pops one data batch from each input port |
 | `can_create_more_tasks()` / `has_processed_all_tasks()` | Signals task exhaustion |
 
@@ -323,13 +323,15 @@ over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the 
   repository and finish the pipeline while that arm still had rows.
 - **`PASSTHROUGH_SINK -> UNION` is `PARTIAL`**, not the base's `FULL` default, which
   would hold every arm's output in repositories until all arms finished.
-- **Overrides both task-driver methods.** UNION nominates and drains arms sequentially in child
-  order. Only the active arm can be nominated by UNION or popped; a finished empty arm is skipped,
-  and UNION issues one normal draining nomination per live arm. If an arm already has data from
-  startup or one-task lookahead, UNION enqueues that normal nomination while returning ready for its
-  own batch. Popping the final queued batch from a finished non-final arm advances the cursor and
-  schedules UNION once so the next arm is activated even when no producer completion can provide
-  another wakeup. One arm per task also keeps each batch on the GPU that produced it.
+- **Overrides both task-driver methods.** UNION admits at most `union_source_window` not-yet-drained
+  source arms, additionally capped by a per-UNION heuristic (one fewer than the task-creator worker
+  count, with a minimum of one). This leaves a consumer slot when one UNION is active; it is not a
+  global reservation across concurrent UNIONs. Preseeded arms are admitted first; remaining slots
+  follow child order.
+  Live admissions are returned as secondary producer nominations in the task hint, so the task
+  creator owns enqueueing and per-source-pipeline deduplication. Ready batches are popped
+  round-robin across admitted arms. Draining a finished arm requests one creator-owned recheck when
+  dormant work remains, allowing the next arm to enter without coupling UNION to the creator.
 - **`source_order()` is `NO_ORDER`.** `order_preservation_recursive` stops at the first `is_source()`
   operator, so this answer decides the whole plan's.
 - **Arm ports are cached.** Both task-driver methods run on every task-creation walk that reaches

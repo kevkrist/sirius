@@ -39,6 +39,11 @@ sirius_pipeline::sirius_pipeline(const pipeline_build_context& ctx)
 {
 }
 
+std::size_t sirius_pipeline::per_union_source_window_capacity() const noexcept
+{
+  return _task_creator ? _task_creator->per_union_source_window_capacity() : 1;
+}
+
 bool sirius_pipeline::is_order_dependent() const
 {
   if (source) {

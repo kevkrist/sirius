@@ -24,7 +24,7 @@ manager_loop() picks up request
     ↓
 get_operator_for_next_task(operator) — follows hint chain
     ↓
-operator->get_next_task_hint() → READY or WAITING_FOR_INPUT_DATA
+operator->get_next_task_hint() → READY, WAITING_FOR_INPUT_DATA, or NOMINATE_PRODUCERS
     ↓
 Create task (gpu_pipeline_task)
     ↓
@@ -46,16 +46,20 @@ All map access is protected by `_global_state_mutex`.
 **File:** `src/include/op/sirius_physical_operator.hpp`
 
 ```cpp
-enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY, NOMINATE_PRODUCERS };
 
 struct task_creation_hint {
     TaskCreationHint hint{TaskCreationHint::WAITING_FOR_INPUT_DATA};
     sirius_physical_operator* producer{nullptr};
+    std::vector<sirius_physical_operator*> additional_producers;
 };
 ```
 
 - `READY` — operator has sufficient input data, create a task now
 - `WAITING_FOR_INPUT_DATA` — follow `producer` pointer to find upstream operator
+- `NOMINATE_PRODUCERS` — enqueue the listed secondary producers without creating an immediate task
+
+Secondary producers are ordinary active source requests. The task creator deduplicates them by source pipeline for the lifetime of the query; lookahead requests remain separate and limited to one task.
 
 ## `get_operator_for_next_task()` — Recursive Hint Chain
 
@@ -64,16 +68,21 @@ struct task_creation_hint {
 ```
 function get_operator_for_next_task(node):
     hint = node->get_next_task_hint()
+    enqueue each hint.additional_producers once per source pipeline
     if hint is READY:
         return hint.producer  // create task from this operator
     if hint is WAITING_FOR_INPUT_DATA:
         producer = hint.producer
         return get_operator_for_next_task(producer)  // recurse upstream
+    if hint is NOMINATE_PRODUCERS:
+        return nullptr  // secondary source requests were enqueued above
     if no hint:
         return nullptr  // nothing to do
 ```
 
 This recursion ensures data flows from the deepest producers first, respecting pipeline dependencies.
+
+After input is popped, an operator can expose a one-shot `take_task_creation_recheck()` request. The creator consumes that request after dispatch and revisits the operator through the normal hint path. This lets an operator such as `sirius_physical_union` refill a source-admission slot without calling the creator directly.
 
 ## Base Class `get_next_task_hint()`
 

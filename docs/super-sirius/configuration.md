@@ -83,9 +83,10 @@ sirius:
     scan_manager: { num_threads: 4, use_sirius_datasource: true, uring_n_reactors: 1, enable_prefetch_cache: false }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
-    task_creator: { num_threads: 1 }
+    task_creator: { num_threads: 5 }
   operator_params:
     scan_task_batch_size:       805306368   # 768 MiB
+    union_source_window:        4           # concurrent UNION ALL source arms
     max_sort_partition_bytes:   0           # 0 = auto (33% GPU memory)
     hash_partition_bytes:       805306368   # 768 MiB
     concat_batch_bytes:         805306368   # 768 MiB
@@ -274,12 +275,14 @@ hardware-derived exception described below:
 
 ### `sirius.executor.task_creator`
 
-Thread pool (default `num_threads: 1`). Task creation
+Thread pool (default `num_threads: 5`). Task creation
 policy and within-branch priority are internal: Sirius currently creates tasks
 on demand and prioritizes source-side pipelines first. The former
 `sirius.executor.task_creator.strategy` and
 `sirius.executor.task_creator.priority_order` keys have been removed;
 configurations that still contain either key must delete it.
+Five workers let one default-width `UNION ALL` admit four source arms while leaving one worker for
+consumer creation. That is a local sizing heuristic, not a reservation across concurrent UNIONs.
 
 ### `sirius.executor.pipeline`
 
@@ -301,7 +304,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
+| `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 5 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
 | `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
@@ -398,6 +401,7 @@ individually.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `scan_task_batch_size` | Shared physical/effective GPU batch default described above | Target batch size for DuckDB scan tasks; must be greater than zero |
+| `union_source_window` | 4 | Maximum number of not-yet-drained source arms admitted by one `UNION ALL`. Its local effective window is also capped at one fewer than the task-creator thread count, with a minimum of one. This is a per-UNION heuristic, not a global creator-thread reservation. Must be greater than zero. |
 | `enable_compressed_materialization` | true | Store eligible integer and fixed-point DECIMAL values in value-preserving narrower carriers when exact pin-time bounds permit it; restore native carriers at type-sensitive boundaries. |
 | `max_sort_partition_bytes` | 0 (auto) | Max bytes per sort partition. Auto = 33% of GPU memory. |
 | `hash_partition_bytes` | Shared physical/effective GPU batch default described above | Target partition size for hash joins and group-bys; must be greater than zero |
@@ -523,7 +527,7 @@ per-pool extras.
 
 | Pool | YAML block | Default Threads | Thread Name Prefix | Purpose |
 |------|-----------|----------------|-------------------|---------|
-| `task_creator` | `executor.task_creator` | 1 | `task_creator` | Task creation from scheduling requests |
+| `task_creator` | `executor.task_creator` | 5 | `task_creator` | Task creation from scheduling requests |
 | `gpu_pipeline_executor` | `executor.pipeline` | 4 | `gpu_pipeline` | GPU pipeline task execution |
 | `downgrade_executor` | `executor.downgrade` | 1 | `downgrade` | Data tier migration (GPU→Host) |
 | `scan_manager` | `executor.scan_manager` | remaining cores (min 4) | `scan_manager` | Scan metadata production + IO reactor management |

@@ -214,6 +214,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
     return _task_creator;
   }
 
+  //! Per-UNION source-window heuristic exposed without coupling operators to task_creator.
+  [[nodiscard]] std::size_t per_union_source_window_capacity() const noexcept;
+
   //! Returns a scoped lock on the pipeline status mutex.
   //! Callers must hold this lock across the operation that consumes pipeline state
   //! (port data pop, partition claim, etc.) and the task constructor that calls

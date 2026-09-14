@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -55,8 +57,12 @@ class controllable_pipeline final : public sirius_pipeline {
 
 class recording_task_creator final : public sirius::creator::task_creator {
  public:
-  explicit recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr)
-    : task_creator(sirius::creator::task_creator_config{}, mem_mgr)
+  recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                         int num_threads)
+    : task_creator(
+        sirius::creator::task_creator_config{
+          .thread_pool = {.num_threads = num_threads, .thread_name_prefix = "task_creator"}},
+        mem_mgr)
   {
   }
 
@@ -79,16 +85,26 @@ class recording_task_creator final : public sirius::creator::task_creator {
 
 class union_fixture {
  private:
+  static pipeline_build_context make_build_context(std::size_t source_window)
+  {
+    auto params                 = std::make_shared<sirius::operator_params>();
+    params->union_source_window = source_window;
+    return pipeline_build_context{nullptr, true, 1, std::move(params)};
+  }
+
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> _memory_manager;
   recording_task_creator _creator;
+  pipeline_build_context _build_context;
 
  public:
-  explicit union_fixture(std::size_t num_arms)
+  explicit union_fixture(std::size_t num_arms,
+                         std::size_t source_window = 4,
+                         int creator_threads       = 5)
     : _memory_manager(sirius::test::operator_utils::initialize_memory_manager()),
-      _creator(*_memory_manager),
+      _creator(*_memory_manager, creator_threads),
+      _build_context(make_build_context(source_window)),
       union_op({}, 0),
-      union_pipeline(
-        duckdb::make_shared_ptr<sirius_pipeline>(pipeline_build_context{nullptr, true}))
+      union_pipeline(duckdb::make_shared_ptr<sirius_pipeline>(_build_context))
   {
     union_op.set_pipeline(union_pipeline);
     union_pipeline->set_task_creator(&_creator);
@@ -101,8 +117,7 @@ class union_fixture {
       union_op.children.push_back(std::move(producer));
       producers.push_back(producer_ptr);
 
-      auto pipeline =
-        duckdb::make_shared_ptr<controllable_pipeline>(pipeline_build_context{nullptr, true});
+      auto pipeline = duckdb::make_shared_ptr<controllable_pipeline>(_build_context);
       duckdb::vector<std::reference_wrapper<sirius_physical_operator>> operators;
       operators.emplace_back(*producer_ptr);
       build_state.set_pipeline_operators(*pipeline, std::move(operators));
@@ -130,11 +145,19 @@ class union_fixture {
       *gpu_space, {value}, cudf::type_id::INT32);
   }
 
-  std::size_t self_schedule_count() { return _creator.schedule_count(&union_op); }
-
-  std::size_t producer_schedule_count(std::size_t arm)
+  std::size_t regular_schedule_count(const sirius_physical_operator* request)
   {
-    return _creator.schedule_count(producers.at(arm));
+    return _creator.schedule_count(request);
+  }
+
+  recording_task_creator& task_creator() { return _creator; }
+
+  void use_task_creator(recording_task_creator& creator)
+  {
+    union_pipeline->set_task_creator(&creator);
+    for (auto& pipeline : source_pipelines) {
+      pipeline->set_task_creator(&creator);
+    }
   }
 
   sirius_physical_union union_op;
@@ -146,99 +169,183 @@ class union_fixture {
 
 }  // namespace
 
-TEST_CASE("physical_union nominates and drains only its active arm", "[physical_union]")
+TEST_CASE("physical_union configured width one admits arms in child order", "[physical_union]")
 {
-  union_fixture fixture(3);
-  fixture.repositories[1]->add_data_batch(fixture.make_batch(1));
-  fixture.repositories[2]->add_data_batch(fixture.make_batch(2));
+  union_fixture fixture(3, 1);
 
   auto hint = fixture.union_op.get_next_task_hint();
   REQUIRE(hint.has_value());
-  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
-  REQUIRE(hint->producer == fixture.producers[0]);
+  REQUIRE(hint->hint == TaskCreationHint::NOMINATE_PRODUCERS);
+  REQUIRE(hint->producer == nullptr);
+  REQUIRE(hint->additional_producers ==
+          std::vector<sirius_physical_operator*>{fixture.producers[0]});
   REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
 
-  REQUIRE(fixture.union_op.get_next_task_input_data() == nullptr);
-  REQUIRE(fixture.repositories[1]->total_size() == 1);
-  REQUIRE(fixture.repositories[2]->total_size() == 1);
+  fixture.source_pipelines[0]->set_finished(true);
+  hint = fixture.union_op.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::NOMINATE_PRODUCERS);
+  REQUIRE(hint->additional_producers ==
+          std::vector<sirius_physical_operator*>{fixture.producers[1]});
+}
 
+TEST_CASE("physical_union default window admits four arms and refills one slot", "[physical_union]")
+{
+  union_fixture fixture(6);
+
+  auto hint = fixture.union_op.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::NOMINATE_PRODUCERS);
+  REQUIRE(
+    hint->additional_producers ==
+    std::vector<sirius_physical_operator*>{
+      fixture.producers[0], fixture.producers[1], fixture.producers[2], fixture.producers[3]});
+  REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
+
+  fixture.source_pipelines[0]->set_finished(true);
   fixture.repositories[0]->add_data_batch(fixture.make_batch(0));
+  fixture.source_pipelines[1]->set_finished(true);
   hint = fixture.union_op.get_next_task_hint();
   REQUIRE(hint.has_value());
   REQUIRE(hint->hint == TaskCreationHint::READY);
   REQUIRE(hint->producer == &fixture.union_op);
+  REQUIRE(hint->additional_producers ==
+          std::vector<sirius_physical_operator*>{fixture.producers[4]});
 
   REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
-  REQUIRE(fixture.repositories[0]->total_size() == 0);
-  REQUIRE(fixture.repositories[1]->total_size() == 1);
-  REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
-}
+  REQUIRE(fixture.union_op.take_task_creation_recheck());
+  REQUIRE_FALSE(fixture.union_op.take_task_creation_recheck());
 
-TEST_CASE("physical_union skips finished empty arms", "[physical_union]")
-{
-  union_fixture fixture(3);
-  fixture.source_pipelines[0]->set_finished(true);
-  fixture.source_pipelines[1]->set_finished(true);
-
-  auto hint = fixture.union_op.get_next_task_hint();
+  hint = fixture.union_op.get_next_task_hint();
   REQUIRE(hint.has_value());
-  REQUIRE(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
-  REQUIRE(hint->producer == fixture.producers[2]);
-  REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
+  REQUIRE(hint->hint == TaskCreationHint::NOMINATE_PRODUCERS);
+  REQUIRE(hint->additional_producers ==
+          std::vector<sirius_physical_operator*>{fixture.producers[5]});
+  REQUIRE(fixture.regular_schedule_count(&fixture.union_op) == 0);
 }
 
-TEST_CASE("physical_union promotes a pre-seeded batch to one draining producer request",
-          "[physical_union]")
+TEST_CASE("physical_union adopts preseeded arms before child-order admissions", "[physical_union]")
 {
-  union_fixture fixture(1);
-  fixture.repositories[0]->add_data_batch(fixture.make_batch(0));
+  union_fixture fixture(6, 2);
+  fixture.repositories[4]->add_data_batch(fixture.make_batch(4));
+  fixture.repositories[5]->add_data_batch(fixture.make_batch(5));
+  fixture.source_pipelines[5]->set_finished(true);
 
   auto hint = fixture.union_op.get_next_task_hint();
   REQUIRE(hint.has_value());
   REQUIRE(hint->hint == TaskCreationHint::READY);
   REQUIRE(hint->producer == &fixture.union_op);
-  REQUIRE(fixture.producer_schedule_count(0) == 1);
+  REQUIRE(hint->additional_producers ==
+          std::vector<sirius_physical_operator*>{fixture.producers[4]});
 
-  REQUIRE(fixture.union_op.get_next_task_hint()->hint == TaskCreationHint::READY);
-  REQUIRE(fixture.producer_schedule_count(0) == 1);
   REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
-  REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
-  REQUIRE(fixture.producer_schedule_count(0) == 1);
+  REQUIRE(fixture.repositories[4]->total_size() == 0);
+  REQUIRE(fixture.repositories[5]->total_size() == 1);
+  REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
+  REQUIRE(fixture.repositories[5]->total_size() == 0);
+  REQUIRE(fixture.union_op.take_task_creation_recheck());
 }
 
-TEST_CASE("physical_union final pop schedules one handoff without advancing early",
-          "[physical_union]")
+TEST_CASE("physical_union drains admitted arms round-robin", "[physical_union]")
 {
-  union_fixture fixture(2);
-  fixture.source_pipelines[0]->set_finished(true);
-  fixture.repositories[0]->add_data_batch(fixture.make_batch(0));
-  fixture.repositories[0]->add_data_batch(fixture.make_batch(1));
+  union_fixture fixture(3, 3);
+  REQUIRE(fixture.union_op.get_next_task_hint()->additional_producers.size() == 3);
 
-  REQUIRE(fixture.union_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+  fixture.repositories[0]->add_data_batch(fixture.make_batch(0));
+  fixture.repositories[0]->add_data_batch(fixture.make_batch(10));
+  fixture.repositories[1]->add_data_batch(fixture.make_batch(1));
+  fixture.repositories[1]->add_data_batch(fixture.make_batch(11));
+  fixture.repositories[2]->add_data_batch(fixture.make_batch(2));
+  fixture.repositories[2]->add_data_batch(fixture.make_batch(12));
+
   REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
   REQUIRE(fixture.repositories[0]->total_size() == 1);
-  REQUIRE(fixture.self_schedule_count() == 0);
-
+  REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
+  REQUIRE(fixture.repositories[1]->total_size() == 1);
+  REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
+  REQUIRE(fixture.repositories[2]->total_size() == 1);
   REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
   REQUIRE(fixture.repositories[0]->total_size() == 0);
-  REQUIRE(fixture.self_schedule_count() == 1);
-
-  auto handoff = fixture.union_op.get_next_task_hint();
-  REQUIRE(handoff.has_value());
-  REQUIRE(handoff->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
-  REQUIRE(handoff->producer == fixture.producers[1]);
-  REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
-  REQUIRE(fixture.self_schedule_count() == 1);
 }
 
-TEST_CASE("physical_union final arm does not enqueue a handoff", "[physical_union]")
+TEST_CASE("physical_union clamps its window to creator capacity and arm count", "[physical_union]")
+{
+  SECTION("one creator thread")
+  {
+    union_fixture fixture(3, 4, 1);
+    auto hint = fixture.union_op.get_next_task_hint();
+    REQUIRE(hint->additional_producers ==
+            std::vector<sirius_physical_operator*>{fixture.producers[0]});
+  }
+
+  SECTION("fewer arms than the window")
+  {
+    union_fixture fixture(2);
+    auto hint = fixture.union_op.get_next_task_hint();
+    REQUIRE(hint->additional_producers ==
+            std::vector<sirius_physical_operator*>{fixture.producers[0], fixture.producers[1]});
+  }
+}
+
+TEST_CASE("concurrent physical unions keep independent bounded source windows", "[physical_union]")
+{
+  union_fixture left(6, 4, 5);
+  union_fixture right(6, 4, 5);
+  right.use_task_creator(left.task_creator());
+
+  auto left_future =
+    std::async(std::launch::async, [&] { return left.union_op.get_next_task_hint(); });
+  auto right_future =
+    std::async(std::launch::async, [&] { return right.union_op.get_next_task_hint(); });
+  REQUIRE(left_future.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+  REQUIRE(right_future.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+  auto left_hint  = left_future.get();
+  auto right_hint = right_future.get();
+  REQUIRE(left_hint->additional_producers.size() == 4);
+  REQUIRE(right_hint->additional_producers.size() == 4);
+
+  left.source_pipelines[0]->set_finished(true);
+  right.source_pipelines[0]->set_finished(true);
+  left_hint  = left.union_op.get_next_task_hint();
+  right_hint = right.union_op.get_next_task_hint();
+  REQUIRE(left_hint->additional_producers ==
+          std::vector<sirius_physical_operator*>{left.producers[4]});
+  REQUIRE(right_hint->additional_producers ==
+          std::vector<sirius_physical_operator*>{right.producers[4]});
+
+  left.source_pipelines[1]->set_finished(true);
+  right.source_pipelines[1]->set_finished(true);
+  left.repositories[1]->add_data_batch(left.make_batch(1));
+  right.repositories[1]->add_data_batch(right.make_batch(2));
+  REQUIRE(left.union_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+  REQUIRE(right.union_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+  REQUIRE(left.union_op.get_next_task_input_data() != nullptr);
+  REQUIRE(right.union_op.get_next_task_input_data() != nullptr);
+}
+
+TEST_CASE("physical_union skips zero-output arms while filling its window", "[physical_union]")
+{
+  union_fixture fixture(6);
+  for (std::size_t arm = 0; arm < 4; ++arm) {
+    fixture.source_pipelines[arm]->set_finished(true);
+  }
+
+  auto hint = fixture.union_op.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::NOMINATE_PRODUCERS);
+  REQUIRE(hint->additional_producers ==
+          std::vector<sirius_physical_operator*>{fixture.producers[4], fixture.producers[5]});
+}
+
+TEST_CASE("physical_union does not request a recheck after its final arm", "[physical_union]")
 {
   union_fixture fixture(1);
   fixture.source_pipelines[0]->set_finished(true);
   fixture.repositories[0]->add_data_batch(fixture.make_batch(0));
 
-  REQUIRE(fixture.union_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+  auto hint = fixture.union_op.get_next_task_hint();
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  REQUIRE(hint->additional_producers.empty());
   REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
-  REQUIRE(fixture.self_schedule_count() == 0);
-  REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
+  REQUIRE_FALSE(fixture.union_op.take_task_creation_recheck());
 }

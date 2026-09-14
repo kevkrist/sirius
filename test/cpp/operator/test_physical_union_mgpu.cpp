@@ -28,8 +28,8 @@
 // and test_physical_grouped_aggregate_merge_mgpu.cpp pull to force
 // multi-partition execution — the wrong knob here. The lever is
 // `scan_task_batch_size`: small enough that a wide arm produces many batches
-// while a narrow one produces few. This exercises sequential arm draining and
-// the handoff between unequal arms.
+// while a narrow one produces few. This exercises bounded arm admission and
+// slot refill between unequal arms.
 //
 // The shared integration configs cannot express that shape. Both
 // integration.yaml:22 and integration-2gpu.yaml pin scan_task_batch_size at
@@ -40,8 +40,8 @@
 //   1. Unequal arms drain across many batches — SINGLE GPU. The wide arm
 //      produces many scan batches, the narrow one a single batch. Correctness
 //      against a CPU oracle exercises the handoff after a multi-batch arm.
-//   2. Three arms of descending width — SINGLE GPU. Advances the active arm
-//      twice, which the two-arm fixtures cannot.
+//   2. Three arms of descending width — SINGLE GPU. Exercises N-ary bounded
+//      admission with uneven completion order.
 //   3. Balanced arms distribute across two GPUs — needs 2 GPUs.
 //   4. Unequal arms do not strand work on one GPU — needs 2 GPUs. The
 //      stranding failure the hint exists to prevent.
@@ -79,9 +79,9 @@ namespace {
 
 // 1 MB is below the per-file size of every surface here, so the coalescer
 // gives each file its own batch: 8 batches for the wide arm, 2 for the middle
-// one, 1 for the narrow one. That asymmetry exercises the source-at-a-time
-// handoff at a row count that keeps the CPU-oracle comparison cheap enough for
-// CI. Mirrors test/cpp/scan_manager/test_pin_table_multi_gpu.cpp:139.
+// one, 1 for the narrow one. That asymmetry exercises bounded admission and
+// slot refill at a row count that keeps the CPU-oracle comparison cheap enough
+// for CI. Mirrors test/cpp/scan_manager/test_pin_table_multi_gpu.cpp:139.
 // hash_partition_bytes is left at its default: UNION ALL does not partition,
 // so shrinking it would only add noise from the scan side.
 constexpr uint64_t kSmallScanBatchBytes = 1'000'000;
@@ -258,8 +258,8 @@ TEST_CASE("physical_union - unequal arms do not strand work on one GPU",
   write_mgpu_yaml(yaml, make_params(/*num_gpus=*/2));
   REQUIRE(fs::exists(yaml));
 
-  // The asymmetry is the point: sequential dispatch must complete the wide arm
-  // and hand off to the narrow arm without stranding either source.
+  // The asymmetry is the point: bounded dispatch must complete both sources
+  // without stranding the shorter arm.
   auto wide   = tmp / "wide";
   auto narrow = tmp / "narrow";
   generate_wide_arm(wide);

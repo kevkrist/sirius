@@ -88,7 +88,7 @@ inline bool enum_to_string(priority_order order, std::string& s)
 
 /// Default task-creator pool size; counted in the scan-manager sizing budget
 /// (see scan_manager::default_scan_manager_num_threads).
-inline constexpr int default_task_creator_num_threads = 1;
+inline constexpr int default_task_creator_num_threads = 5;
 
 /// Configuration for the task creator.
 /// Embeds the thread pool config plus internal scheduling policy.

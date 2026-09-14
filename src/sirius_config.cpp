@@ -262,6 +262,10 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   if (opt.scan_task_batch_size == 0) {
     throw std::runtime_error("'operator_params.scan_task_batch_size': must be greater than zero");
   }
+  r.optional("union_source_window", opt.union_source_window);
+  if (opt.union_source_window == 0) {
+    throw std::runtime_error("'operator_params.union_source_window': must be greater than zero");
+  }
   r.optional("max_sort_partition_bytes", yaml::bytes(opt.max_sort_partition_bytes));
   r.optional("max_sort_partition_memory_fraction",
              opt.max_sort_partition_memory_fraction,

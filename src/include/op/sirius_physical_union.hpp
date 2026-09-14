@@ -75,9 +75,10 @@ class sirius_physical_union : public sirius_physical_operator {
   [[nodiscard]] MemoryBarrierType input_barrier_for(
     sirius_physical_operator const& producer) const override;
 
-  //! Drains one arm at a time, nominating each arm's producer at most once.
+  //! Admits a bounded window of arms and drains their batches round-robin.
   std::optional<task_creation_hint> get_next_task_hint() override;
   std::unique_ptr<operator_data> get_next_task_input_data() override;
+  [[nodiscard]] bool take_task_creation_recheck() override;
 
   //! Pure forwarder: no device allocation beyond the batches already resident.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
@@ -87,16 +88,29 @@ class sirius_physical_union : public sirius_physical_operator {
   }
 
  private:
+  enum class arm_state { dormant, nominated, finished, drained };
+
   //! Arm ports in arm order, resolved once on first use. Callers must hold `lock`.
   const std::vector<port*>& arm_ports();
 
-  //! The only arm eligible to produce or drain. `children.size()` means every arm is exhausted.
-  //! Guarded by `lock`.
-  std::size_t _active_arm = 0;
+  //! Initialize the per-arm scheduler after pipeline wiring is complete. Caller holds `lock`.
+  void initialize_arm_states();
 
-  //! Whether UNION has issued a normal, draining nomination for the active arm's producer.
-  //! Guarded by `lock`.
-  bool _active_arm_nominated = false;
+  //! Refresh completion state and release slots for empty finished arms. Caller holds `lock`.
+  void refresh_admitted_arms(bool& slot_opened);
+
+  //! Admit one dormant arm and append any live producer nomination. Caller holds `lock`.
+  void admit_arm(std::size_t arm_index,
+                 std::vector<sirius_physical_operator*>& producer_nominations);
+
+  [[nodiscard]] bool has_dormant_arm() const;
+
+  std::vector<arm_state> _arm_states;
+  std::size_t _next_admission_cursor{0};
+  std::size_t _drain_cursor{0};
+  std::size_t _window_occupancy{0};
+  std::size_t _effective_window{0};
+  bool _task_creation_recheck{false};
 
   std::vector<port*> _arm_ports;
 };

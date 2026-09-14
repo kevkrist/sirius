@@ -697,3 +697,42 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }
+
+TEST_CASE("the UNION source window has a validated YAML configuration", "[config_opt][union]")
+{
+  CHECK(operator_params{}.union_source_window == 4);
+  CHECK(creator::task_creator_config{}.thread_pool.num_threads == 5);
+
+  auto const path = std::filesystem::temp_directory_path() / "sirius_union_source_window.yaml";
+  SECTION("explicit window")
+  {
+    {
+      std::ofstream out(path);
+      out << "sirius:\n"
+             "  operator_params:\n"
+             "    union_source_window: 7\n";
+    }
+
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_operator_params().union_source_window == 7);
+  }
+
+  SECTION("zero window")
+  {
+    {
+      std::ofstream out(path);
+      out << "sirius:\n"
+             "  operator_params:\n"
+             "    union_source_window: 0\n";
+    }
+
+    sirius_config cfg;
+    REQUIRE_THROWS_WITH(
+      cfg.load_from_file(path),
+      Catch::Contains("'operator_params.union_source_window': must be greater than zero"));
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}

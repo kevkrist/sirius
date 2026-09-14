@@ -16,13 +16,15 @@
 
 #include "op/sirius_physical_union.hpp"
 
-#include "creator/task_creator.hpp"
 #include "op/sirius_physical_passthrough_sink.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
 #include <nvtx3/nvtx3.hpp>
+
+#include <algorithm>
+#include <utility>
 
 namespace sirius {
 namespace op {
@@ -120,6 +122,76 @@ const std::vector<sirius_physical_operator::port*>& sirius_physical_union::arm_p
   return _arm_ports;
 }
 
+void sirius_physical_union::initialize_arm_states()
+{
+  if (_arm_states.size() == children.size()) { return; }
+
+  _arm_states.assign(children.size(), arm_state::dormant);
+  _next_admission_cursor = 0;
+  _drain_cursor          = 0;
+  _window_occupancy      = 0;
+
+  auto pipeline           = get_pipeline();
+  auto configured_window  = pipeline ? pipeline->get_operator_params().union_source_window : 1;
+  configured_window       = std::max<std::size_t>(configured_window, 1);
+  auto per_union_capacity = pipeline ? pipeline->per_union_source_window_capacity() : 1;
+  _effective_window       = std::min({configured_window, per_union_capacity, children.size()});
+}
+
+void sirius_physical_union::refresh_admitted_arms(bool& slot_opened)
+{
+  const auto& ports_by_arm = arm_ports();
+  for (std::size_t arm = 0; arm < _arm_states.size(); ++arm) {
+    auto& state = _arm_states[arm];
+    auto* p     = ports_by_arm[arm];
+    if (state == arm_state::nominated && p->src_pipeline &&
+        p->src_pipeline->is_pipeline_finished()) {
+      state = arm_state::finished;
+    }
+    if (state == arm_state::finished && (!p->repo || p->repo->total_size() == 0)) {
+      state = arm_state::drained;
+      --_window_occupancy;
+      slot_opened = true;
+    }
+  }
+}
+
+void sirius_physical_union::admit_arm(std::size_t arm_index,
+                                      std::vector<sirius_physical_operator*>& producer_nominations)
+{
+  auto* p = arm_ports()[arm_index];
+  if (!p->src_pipeline) {
+    throw internal_exception("sirius_physical_union::admit_arm: arm port has no source pipeline");
+  }
+  if (!p->repo) {
+    throw internal_exception("sirius_physical_union::admit_arm: arm port has no repository");
+  }
+
+  if (p->src_pipeline->is_pipeline_finished()) {
+    if (p->repo->total_size() > 0) {
+      _arm_states[arm_index] = arm_state::finished;
+      ++_window_occupancy;
+    } else {
+      _arm_states[arm_index] = arm_state::drained;
+    }
+    return;
+  }
+
+  auto producers = p->src_pipeline->get_operators();
+  if (producers.empty()) {
+    throw internal_exception(
+      "sirius_physical_union::admit_arm: source pipeline has no producer operator");
+  }
+  _arm_states[arm_index] = arm_state::nominated;
+  ++_window_occupancy;
+  producer_nominations.push_back(&producers.front().get());
+}
+
+bool sirius_physical_union::has_dormant_arm() const
+{
+  return std::find(_arm_states.begin(), _arm_states.end(), arm_state::dormant) != _arm_states.end();
+}
+
 std::string_view sirius_physical_union::input_port_for(
   sirius_physical_operator const& producer) const
 {
@@ -140,47 +212,44 @@ MemoryBarrierType sirius_physical_union::input_barrier_for(
 std::optional<task_creation_hint> sirius_physical_union::get_next_task_hint()
 {
   std::unique_lock<std::mutex> lg(lock);
+  _task_creation_recheck = false;
 
   const auto& ports_by_arm = arm_ports();
-  while (_active_arm < ports_by_arm.size()) {
-    auto* p                = ports_by_arm[_active_arm];
-    const bool has_data    = p->repo && p->repo->total_size() > 0;
-    const bool is_finished = p->src_pipeline && p->src_pipeline->is_pipeline_finished();
-    if (has_data) {
-      // A queued batch can come from scans.front() or a one-task lookahead request. Promote that
-      // activation to a normal draining request before relying on the nomination latch.
-      sirius_physical_operator* producer_to_schedule = nullptr;
-      creator::task_creator* creator_to_schedule     = nullptr;
-      if (!_active_arm_nominated && !is_finished && p->src_pipeline) {
-        auto producers = p->src_pipeline->get_operators();
-        auto* creator  = p->src_pipeline->get_task_creator();
-        if (!producers.empty() && creator) {
-          _active_arm_nominated = true;
-          producer_to_schedule  = &producers.front().get();
-          creator_to_schedule   = creator;
-        }
-      }
+  initialize_arm_states();
 
-      lg.unlock();
-      if (creator_to_schedule && producer_to_schedule) {
-        creator_to_schedule->schedule(producer_to_schedule);
-      }
-      return task_creation_hint{TaskCreationHint::READY, this};
+  bool slot_opened = false;
+  refresh_admitted_arms(slot_opened);
+
+  std::vector<sirius_physical_operator*> producer_nominations;
+  for (std::size_t arm = 0; arm < _arm_states.size() && _window_occupancy < _effective_window;
+       ++arm) {
+    auto* p = ports_by_arm[arm];
+    if (_arm_states[arm] == arm_state::dormant && p->repo && p->repo->total_size() > 0) {
+      admit_arm(arm, producer_nominations);
     }
+  }
 
-    if (is_finished) {
-      ++_active_arm;
-      _active_arm_nominated = false;
-      continue;
+  while (_window_occupancy < _effective_window && _next_admission_cursor < _arm_states.size()) {
+    const auto arm = _next_admission_cursor++;
+    if (_arm_states[arm] == arm_state::dormant) { admit_arm(arm, producer_nominations); }
+  }
+
+  bool has_ready_arm = false;
+  for (std::size_t arm = 0; arm < _arm_states.size(); ++arm) {
+    const auto state = _arm_states[arm];
+    auto* p          = ports_by_arm[arm];
+    if ((state == arm_state::nominated || state == arm_state::finished) && p->repo &&
+        p->repo->total_size() > 0) {
+      has_ready_arm = true;
+      break;
     }
-
-    if (!_active_arm_nominated && p->src_pipeline) {
-      _active_arm_nominated = true;
-      auto* producer        = &p->src_pipeline->get_operators().front().get();
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
-    }
-
-    return std::nullopt;
+  }
+  if (has_ready_arm) {
+    return task_creation_hint{TaskCreationHint::READY, this, std::move(producer_nominations)};
+  }
+  if (!producer_nominations.empty()) {
+    return task_creation_hint{
+      TaskCreationHint::NOMINATE_PRODUCERS, nullptr, std::move(producer_nominations)};
   }
 
   return std::nullopt;
@@ -191,33 +260,50 @@ std::unique_ptr<operator_data> sirius_physical_union::get_next_task_input_data()
   std::unique_lock<std::mutex> lg(lock);
 
   const auto& ports_by_arm = arm_ports();
-  if (_active_arm >= ports_by_arm.size()) { return nullptr; }
+  initialize_arm_states();
 
-  auto* p = ports_by_arm[_active_arm];
-  if (p->repo == nullptr) { return nullptr; }
+  bool slot_opened = false;
+  refresh_admitted_arms(slot_opened);
 
-  auto batch = p->repo->pop_next_data_batch();
-  if (!batch) { return nullptr; }
+  const auto arm_count = _arm_states.size();
+  for (std::size_t offset = 0; offset < arm_count; ++offset) {
+    const auto arm = (_drain_cursor + offset) % arm_count;
+    auto state     = _arm_states[arm];
+    if (state != arm_state::nominated && state != arm_state::finished) { continue; }
 
-  std::vector<std::shared_ptr<::cucascade::data_batch>> popped;
-  popped.push_back(std::move(batch));
-  auto input = std::make_unique<pipelineable_operator_data>(std::move(popped));
+    auto* p = ports_by_arm[arm];
+    if (!p->repo) { continue; }
+    auto batch = p->repo->pop_next_data_batch();
+    if (!batch) { continue; }
 
-  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline_to_schedule;
-  if (p->repo->total_size() == 0 && p->src_pipeline && p->src_pipeline->is_pipeline_finished()) {
-    ++_active_arm;
-    _active_arm_nominated = false;
-    if (_active_arm < ports_by_arm.size()) { pipeline_to_schedule = get_pipeline(); }
+    _drain_cursor = (arm + 1) % arm_count;
+    if (p->src_pipeline && p->src_pipeline->is_pipeline_finished()) {
+      _arm_states[arm] = arm_state::finished;
+    }
+    if (_arm_states[arm] == arm_state::finished && p->repo->total_size() == 0) {
+      _arm_states[arm] = arm_state::drained;
+      --_window_occupancy;
+      slot_opened = true;
+    }
+    if (slot_opened && _window_occupancy < _effective_window && has_dormant_arm()) {
+      _task_creation_recheck = true;
+    }
+
+    std::vector<std::shared_ptr<::cucascade::data_batch>> popped;
+    popped.push_back(std::move(batch));
+    return std::make_unique<pipelineable_operator_data>(std::move(popped));
   }
 
-  lg.unlock();
-  if (pipeline_to_schedule) {
-    if (auto* creator = pipeline_to_schedule->get_task_creator()) { creator->schedule(this); }
+  if (slot_opened && _window_occupancy < _effective_window && has_dormant_arm()) {
+    _task_creation_recheck = true;
   }
+  return nullptr;
+}
 
-  // pipelineable, not partitioned: with no partition_idx the task creator routes by data
-  // locality, so the batch is processed on the GPU that produced it.
-  return input;
+bool sirius_physical_union::take_task_creation_recheck()
+{
+  std::lock_guard<std::mutex> lg(lock);
+  return std::exchange(_task_creation_recheck, false);
 }
 
 }  // namespace op
