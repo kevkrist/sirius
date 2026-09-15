@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -79,6 +80,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   std::unique_ptr<cudf::table> owned;  // most recent step's product backing `current`
   cudf::table_view current = input;
   auto const cascade_step  = [&](std::unique_ptr<cudf::column> mask) -> double {
+    nvtx3::scoped_range nvtx_step_range{"dynfilter::apply::cascade_step"};
     if (!mask || current.num_rows() == 0) { return 1.0; }
     auto const rows_before = current.num_rows();
     owned                  = cudf::apply_boolean_mask(current, mask->view(), stream, mr);
@@ -120,6 +122,10 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
     sirius::op::sirius_dynamic_filter const* identity;
     std::optional<double> recorded;
   };
+  // Closed explicitly after the sort: the range covers the channel snapshot, gate lookups and
+  // ordering, not the mask cascade that follows.
+  std::optional<nvtx3::scoped_range> nvtx_snapshot_range{std::in_place,
+                                                         "dynfilter::apply::snapshot"};
   // Use one filter-count snapshot for every gate measurement in this pass.
   auto const observed_filter_count = filters.filter_count();
   std::vector<membership_entry> entries;
@@ -137,6 +143,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   std::stable_sort(entries.begin(), entries.end(), [](auto const& a, auto const& b) {
     return a.recorded.value_or(1.0) < b.recorded.value_or(1.0);
   });
+  nvtx_snapshot_range.reset();
 
   for (auto const& e : entries) {
     if (current.num_rows() == 0) { break; }

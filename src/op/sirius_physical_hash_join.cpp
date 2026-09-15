@@ -1741,6 +1741,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
           std::to_string(input_batches.size()) + " batches in operator " +
           std::to_string(this->get_operator_id()));
       }
+      nvtx3::scoped_range nvtx_build_range{"hash_join::build_partition"};
       auto const& build_batch_ro  = input_batches[1];
       auto build_keys_result      = prepare_join_keys(build_batch_ro,
                                                  right_key_col_indices,

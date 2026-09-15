@@ -192,6 +192,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     if (hash_join != nullptr && hash_join->wants_multi_partition_dynamic_filters()) {
       if (auto const task_input_batch_id = input.task_input_batch_id()) {
         // Preparation may replace the physical batch with a fresh-ID cross-GPU clone.
+        nvtx3::scoped_range nvtx_contribute_range{"partition::contribute_call"};
         hash_join->contribute_dynamic_filter_build_batch(
           *task_input_batch_id, get_cudf_table_view(input_batch_ro), stream);
       } else {
@@ -231,13 +232,16 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
             ->record_compressed_materialization_partition_narrow_columns(narrow_columns);
         }
       }
-      partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
-                                                               _partition_keys,
-                                                               _partition_key_cast_types,
-                                                               _num_partitions.value(),
-                                                               stream,
-                                                               *space,
-                                                               batch_telemetry());
+      {
+        nvtx3::scoped_range nvtx_scatter_range{"partition::hash_scatter"};
+        partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
+                                                                 _partition_keys,
+                                                                 _partition_key_cast_types,
+                                                                 _num_partitions.value(),
+                                                                 stream,
+                                                                 *space,
+                                                                 batch_telemetry());
+      }
       break;
     case PartitionType::RANGE:
       throw std::runtime_error("Range partitioning is not implemented yet");

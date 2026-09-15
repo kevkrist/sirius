@@ -21,6 +21,8 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <nvtx3/nvtx3.hpp>
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -127,6 +129,7 @@ inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
         // INT64 offsets promotion of host->GPU reconstruction, and a GPU->GPU copy preserves the
         // source's column types (a GPU-resident source is already normalized — the same-space
         // fast path above depends on that invariant).
+        nvtx3::scoped_range nvtx_clone_range{"pipeline::prepare_clone"};
         auto clone = read_accessor.clone_to<cucascade::gpu_table_representation>(
           registry, sirius::get_next_batch_id(), target_space, stream);
         return clone->to_read_only();

@@ -17,6 +17,7 @@
 #include <rmm/cuda_device.hpp>
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cuda/driver_compat.hpp>
 #include <cucascade/error.hpp>
@@ -28,6 +29,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace sirius::op::detail {
@@ -63,6 +65,10 @@ replica_transfer_route enqueue_replica_copy(
   cucascade::memory::memory_space const& host_staging_space,
   replica_transfer_policy policy)
 {
+  std::string const nvtx_label =
+    "dynfilter::transfer::enqueue_copy src=" + std::to_string(source_space.get_device_id()) +
+    " dst=" + std::to_string(destination_device.value()) + " bytes=" + std::to_string(bytes);
+  nvtx3::scoped_range nvtx_range{nvtx_label};
   if (bytes == 0) { return replica_transfer_route::none; }
   if (destination == nullptr || source == nullptr) {
     throw std::invalid_argument(
@@ -95,6 +101,10 @@ replica_transfer_route enqueue_replica_copy(
     return replica_transfer_route::peer_dma;
   }
 
+  std::string const nvtx_staging_label =
+    "dynfilter::transfer::host_staging src=" + std::to_string(source_device.value()) +
+    " dst=" + std::to_string(destination_device.value()) + " bytes=" + std::to_string(bytes);
+  nvtx3::scoped_range nvtx_staging_range{nvtx_staging_label};
   auto& staging_resource = get_host_staging_resource(host_staging_space);
   auto staging           = staging_resource.allocate_multiple_blocks(bytes);
   auto& allocation       = *staging;

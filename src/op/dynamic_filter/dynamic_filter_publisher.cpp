@@ -627,6 +627,12 @@ struct dynamic_filter_accumulator::impl {
   // between the last expected completion and the terminal state.
   [[nodiscard]] dynamic_filter_accumulation_result publish_locked(int root_device)
   {
+    std::string const nvtx_label =
+      "dynfilter::accum::publish root=" + std::to_string(root_device) + " keys=" +
+      std::to_string(
+        std::count_if(active_keys.begin(), active_keys.end(), [](char key) { return key != 0; })) +
+      " rows=" + std::to_string(build_rows);
+    nvtx3::scoped_range nvtx_range{nvtx_label};
     auto const* root_space = replica_space(root_device);
     if (root_space == nullptr) {
       throw std::logic_error("the final contribution GPU is absent from the replica plan");
@@ -643,6 +649,10 @@ struct dynamic_filter_accumulator::impl {
       try {
         for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
           if (active_keys[key_index] == 0) { continue; }
+          std::string const nvtx_key_label =
+            "dynfilter::accum::reduce_key root=" + std::to_string(root_device) +
+            " key=" + std::to_string(key_index);
+          nvtx3::scoped_range nvtx_key_range{nvtx_key_label};
           if (!root_filters[key_index]) {
             root_filters[key_index] = std::make_shared<sirius_dynamic_bloom_filter>(
               build_types[key_index],
@@ -664,7 +674,12 @@ struct dynamic_filter_accumulator::impl {
               *partial->filters[key_index], *source_space, *root_space, root_stream);
           }
         }
-        root_stream.synchronize();
+        {
+          std::string const nvtx_sync_label =
+            "dynfilter::accum::root_sync root=" + std::to_string(root_device);
+          nvtx3::scoped_range nvtx_sync_range{nvtx_sync_label};
+          root_stream.synchronize();
+        }
       } catch (...) {
         synchronize_after_failure(root_stream, "root reduction");
         throw;
@@ -675,8 +690,13 @@ struct dynamic_filter_accumulator::impl {
           root_filters[key_index]->release_reduction_scratch();
         }
       }
-      for (auto& [device_id, partial] : partials) {
-        if (device_id != root_device) { partial->filters.clear(); }
+      {
+        std::string const nvtx_drop_label =
+          "dynfilter::accum::drop_partials root=" + std::to_string(root_device);
+        nvtx3::scoped_range nvtx_drop_range{nvtx_drop_label};
+        for (auto& [device_id, partial] : partials) {
+          if (device_id != root_device) { partial->filters.clear(); }
+        }
       }
 
       for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
@@ -690,17 +710,23 @@ struct dynamic_filter_accumulator::impl {
       }
     }
 
-    for (auto const& target : plan.probe_targets()) {
-      if (!target_accepts_filters(target)) { continue; }
-      ++outcome.active_targets;
-      for (auto const& binding : target.key_bindings) {
-        auto const key_index = binding.admitted_key_index;
-        if (key_index >= root_filters.size() || active_keys[key_index] == 0 ||
-            !root_filters[key_index]) {
-          continue;
-        }
-        if (target.filter_set->push_filter(binding.channel_push_ordinal, root_filters[key_index])) {
-          ++outcome.filters_pushed;
+    {
+      std::string const nvtx_fanout_label =
+        "dynfilter::accum::fanout root=" + std::to_string(root_device);
+      nvtx3::scoped_range nvtx_fanout_range{nvtx_fanout_label};
+      for (auto const& target : plan.probe_targets()) {
+        if (!target_accepts_filters(target)) { continue; }
+        ++outcome.active_targets;
+        for (auto const& binding : target.key_bindings) {
+          auto const key_index = binding.admitted_key_index;
+          if (key_index >= root_filters.size() || active_keys[key_index] == 0 ||
+              !root_filters[key_index]) {
+            continue;
+          }
+          if (target.filter_set->push_filter(binding.channel_push_ordinal,
+                                             root_filters[key_index])) {
+            ++outcome.filters_pushed;
+          }
         }
       }
     }
@@ -726,6 +752,7 @@ struct dynamic_filter_accumulator::impl {
                                                               cudf::table_view const& build_view,
                                                               rmm::cuda_stream_view stream)
   {
+    nvtx3::scoped_range nvtx_range{"dynfilter::accum::contribute"};
     {
       std::scoped_lock coordinator_lock(mutex);
       if (auto terminal = terminal_result_locked()) { return *terminal; }
@@ -782,6 +809,7 @@ struct dynamic_filter_accumulator::impl {
             auto const column =
               build_view.column(plan.admitted_keys()[key_index].build_key_ordinal);
             if (!partial->filters[key_index]) {
+              nvtx3::scoped_range nvtx_init_range{"dynfilter::accum::partial_init"};
               auto const& space         = *replica_space(device_id);
               auto const durable_stream = space.get_gpu_space().acquire_stream();
               auto filter               = std::make_shared<sirius_dynamic_bloom_filter>(
@@ -794,14 +822,20 @@ struct dynamic_filter_accumulator::impl {
               durable_stream.synchronize();
               partial->filters[key_index] = std::move(filter);
             }
-            partial->filters[key_index]->add(column, stream);
+            {
+              nvtx3::scoped_range nvtx_insert_range{"dynfilter::accum::insert"};
+              partial->filters[key_index]->add(column, stream);
+            }
           }
         }
 
         if (test_hooks.before_insert_sync) { test_hooks.before_insert_sync(batch_id); }
         // Outside the lock: cuco adds are device-scope atomics, so a sibling contribution may
         // submit while this stream drains; completion accounting below still waits for this sync.
-        stream.synchronize();
+        {
+          nvtx3::scoped_range nvtx_sync_range{"dynfilter::accum::insert_sync"};
+          stream.synchronize();
+        }
         if (test_hooks.after_insert_sync) { test_hooks.after_insert_sync(batch_id); }
       }
     } catch (build_type_mismatch const& error) {

@@ -31,6 +31,7 @@
 #include <cuda/std/cstddef>
 #include <cuda/std/limits>
 #include <cuda/stream_ref>
+#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
@@ -357,6 +358,10 @@ sirius_dynamic_bloom_filter::~sirius_dynamic_bloom_filter() = default;
 void sirius_dynamic_bloom_filter::replicate_to_devices(
   std::span<dynamic_filter_replica_space const> spaces)
 {
+  std::string const nvtx_label =
+    "dynfilter::bloom::replicate src=" + std::to_string(_impl ? _impl->source_device : -1) +
+    " targets=" + std::to_string(spaces.size());
+  nvtx3::scoped_range nvtx_range{nvtx_label};
   if (!_impl || _impl->replicas.empty()) { return; }
   auto const* source = _impl->find(_impl->source_device);
   if (!source) { return; }
@@ -380,6 +385,10 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
     if (device_id == _impl->source_device || _impl->find(device_id)) { continue; }
+    std::string const nvtx_target_label =
+      "dynfilter::bloom::replicate_target src=" + std::to_string(_impl->source_device) +
+      " dst=" + std::to_string(device_id);
+    nvtx3::scoped_range nvtx_target_range{nvtx_target_label};
     std::size_t bytes = 0;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
@@ -444,7 +453,12 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.synchronize();
+      {
+        std::string const nvtx_wait_label =
+          "dynfilter::bloom::replicate_wait dst=" + std::to_string(device_id);
+        nvtx3::scoped_range nvtx_wait_range{nvtx_wait_label};
+        stream.synchronize();
+      }
       _impl->replicas.push_back(std::move(replica));
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
@@ -474,6 +488,11 @@ void sirius_dynamic_bloom_filter::merge_from(sirius_dynamic_bloom_filter const& 
                                              dynamic_filter_replica_space const& root_space,
                                              rmm::cuda_stream_view root_stream)
 {
+  std::string const nvtx_label =
+    "dynfilter::bloom::merge_from src=" +
+    std::to_string(source_space.get_gpu_space().get_device_id()) +
+    " root=" + std::to_string(root_space.get_gpu_space().get_device_id());
+  nvtx3::scoped_range nvtx_range{nvtx_label};
   if (!_impl || !source_filter._impl) {
     throw std::logic_error("[sirius_dynamic_bloom_filter::merge_from] missing implementation.");
   }
@@ -515,6 +534,7 @@ void sirius_dynamic_bloom_filter::merge_from(sirius_dynamic_bloom_filter const& 
            word_offset += maximum_words_per_chunk) {
         auto const chunk_words = std::min(maximum_words_per_chunk, word_count - word_offset);
         auto const chunk_bytes = chunk_words * sizeof(word_type);
+        nvtx3::mark("dynfilter::bloom::merge_chunk");
         detail::enqueue_replica_copy(_impl->reduction_scratch->data(),
                                      rmm::cuda_device_id{root_device},
                                      source_bloom->data() + word_offset,
@@ -561,6 +581,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
+  nvtx3::scoped_range nvtx_range{"dynfilter::bloom::compute_mask"};
   if (!supports(probe.type())) { return nullptr; }
   auto const* replica =
     _impl ? _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
