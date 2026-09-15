@@ -44,6 +44,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/cuda/driver_compat.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
@@ -689,34 +690,38 @@ void batched_h2d(std::vector<void*> const& dst,
 {
   if (dst.empty()) { return; }
 #if CUDART_VERSION >= 12080
-  cudaMemcpyAttributes attrs{};
-  attrs.srcAccessOrder  = cudaMemcpySrcAccessOrderStream;
-  attrs.srcLocHint.type = cudaMemLocationTypeHost;
-  attrs.dstLocHint.type = cudaMemLocationTypeDevice;
-  attrs.flags           = 0;
-  std::size_t attrs_idx = 0;  // single attrs entry applies to all copies
+  // The batch API also needs a >= 12.8 driver; under minor-version compatibility on an older
+  // driver it returns cudaErrorCallRequiresNewerDriver, so decide at runtime.
+  if (cucascade::cuda::supports_batched_memcpy()) {
+    cudaMemcpyAttributes attrs{};
+    attrs.srcAccessOrder  = cudaMemcpySrcAccessOrderStream;
+    attrs.srcLocHint.type = cudaMemLocationTypeHost;
+    attrs.dstLocHint.type = cudaMemLocationTypeDevice;
+    attrs.flags           = 0;
+    std::size_t attrs_idx = 0;  // single attrs entry applies to all copies
 #if CUDART_VERSION < 13000
-  std::size_t fail_idx = 0;
-  // The CUDA 12.x batch API takes non-const pointers (it was made const-correct in 13.0).
-  // These arrays are read-only inputs to the copy, so casting away const is safe here.
-  RMM_CUDA_TRY(cudaMemcpyBatchAsync(const_cast<void**>(dst.data()),
-                                    const_cast<void**>(src.data()),
-                                    const_cast<std::size_t*>(size.data()),
-                                    dst.size(),
-                                    &attrs,
-                                    &attrs_idx,
-                                    1,
-                                    &fail_idx,
-                                    stream.value()));
+    std::size_t fail_idx = 0;
+    // The CUDA 12.x batch API takes non-const pointers (it was made const-correct in 13.0).
+    // These arrays are read-only inputs to the copy, so casting away const is safe here.
+    RMM_CUDA_TRY(cudaMemcpyBatchAsync(const_cast<void**>(dst.data()),
+                                      const_cast<void**>(src.data()),
+                                      const_cast<std::size_t*>(size.data()),
+                                      dst.size(),
+                                      &attrs,
+                                      &attrs_idx,
+                                      1,
+                                      &fail_idx,
+                                      stream.value()));
 #else
-  RMM_CUDA_TRY(cudaMemcpyBatchAsync(
-    dst.data(), src.data(), size.data(), dst.size(), &attrs, &attrs_idx, 1, stream.value()));
+    RMM_CUDA_TRY(cudaMemcpyBatchAsync(
+      dst.data(), src.data(), size.data(), dst.size(), &attrs, &attrs_idx, 1, stream.value()));
 #endif
-#else
+    return;
+  }
+#endif
   for (std::size_t i = 0; i < dst.size(); ++i) {
     RMM_CUDA_TRY(cudaMemcpyAsync(dst[i], src[i], size[i], cudaMemcpyHostToDevice, stream.value()));
   }
-#endif
 }
 
 void submit_and_await(rmm::device_buffer& device_buf,

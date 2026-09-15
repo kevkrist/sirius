@@ -18,6 +18,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cucascade/cuda/driver_compat.hpp>
 #include <cucascade/error.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -123,7 +124,7 @@ replica_transfer_route enqueue_replica_copy(
                                          d2h_sizes.front(),
                                          cudaMemcpyDeviceToHost,
                                          source_stream.value()));
-    } else {
+    } else if (cucascade::cuda::supports_batched_memcpy()) {
 #if CUDART_VERSION >= 12080
       cudaMemcpyAttributes attributes{};
       attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
@@ -144,7 +145,9 @@ replica_transfer_route enqueue_replica_copy(
                                               attributes,
                                               source_stream.value()));
 #endif
-#else
+#endif
+    } else {
+      // Toolkit or driver older than CUDA 12.8 (minor-version compatibility): per-block copies.
       for (std::size_t i = 0; i < d2h_sizes.size(); ++i) {
         CUCASCADE_CUDA_TRY(cudaMemcpyAsync(d2h_destinations[i],
                                            d2h_sources[i],
@@ -152,7 +155,6 @@ replica_transfer_route enqueue_replica_copy(
                                            cudaMemcpyDeviceToHost,
                                            source_stream.value()));
       }
-#endif
     }
     CUCASCADE_CUDA_TRY(cudaStreamSynchronize(source_stream.value()));
   }
@@ -181,7 +183,7 @@ replica_transfer_route enqueue_replica_copy(
                                          h2d_sizes.front(),
                                          cudaMemcpyHostToDevice,
                                          destination_stream.value()));
-    } else {
+    } else if (cucascade::cuda::supports_batched_memcpy()) {
 #if CUDART_VERSION >= 12080
       cudaMemcpyAttributes attributes{};
       attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
@@ -202,7 +204,9 @@ replica_transfer_route enqueue_replica_copy(
                                               attributes,
                                               destination_stream.value()));
 #endif
-#else
+#endif
+    } else {
+      // Toolkit or driver older than CUDA 12.8 (minor-version compatibility): per-block copies.
       for (std::size_t i = 0; i < h2d_sizes.size(); ++i) {
         CUCASCADE_CUDA_TRY(cudaMemcpyAsync(h2d_destinations[i],
                                            h2d_sources[i],
@@ -210,7 +214,6 @@ replica_transfer_route enqueue_replica_copy(
                                            cudaMemcpyHostToDevice,
                                            destination_stream.value()));
       }
-#endif
     }
     CUCASCADE_CUDA_TRY(cudaStreamSynchronize(destination_stream.value()));
   }
