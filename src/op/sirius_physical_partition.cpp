@@ -400,6 +400,14 @@ void sirius_physical_partition::on_finalize_operator()
 {
   if (!_is_build || _downstream_consumer_op == nullptr) { return; }
   if (_downstream_consumer_op->finalized.load()) { return; }
+  // Only a hash join under on_partitioned_and_published has anything to re-evaluate at this
+  // point. Under on_build_deposited the fold deposits alone drive the join, so no request is
+  // enqueued and the knob-off schedule is exactly the pre-knob one.
+  auto const* hash_join = dynamic_cast<sirius_physical_hash_join const*>(_downstream_consumer_op);
+  if (hash_join == nullptr || hash_join->get_probe_activation_policy() !=
+                                pipeline::probe_activation_policy::on_partitioned_and_published) {
+    return;
+  }
   // finalize_operator() runs under the finishing pipeline's status mutex; schedule() only enqueues
   // a creation request, so no lock is taken here. The join's hint then observes this pipeline as
   // finished (stored before the finalize pass) and may walk into its probe side.
