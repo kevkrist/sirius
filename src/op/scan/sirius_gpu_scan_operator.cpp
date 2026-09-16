@@ -21,8 +21,10 @@
 #include <data/sirius_converter_registry.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
+#include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
+#include <op/scan/scan_output_operator_data.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -304,6 +306,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   auto const& targets                          = normalization_targets();
   std::vector<carrier_conversion_plan> transactional_plan;
   std::unique_ptr<cudf::table> output_table;
+  scan_dynamic_filter_result dynamic_filters_applied;
   // Only prepare_for_processing arms pending (pipeline contract: prepare runs before execute on
   // the same task), so a non-candidate split skips the builder lambda entirely. A
   // decode-row-filtered split may only bypass post_filter_and_project when the assembly it
@@ -334,8 +337,17 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     // normalize the resulting owned table.
     auto materialized_table = _ingestible->materialize_table(*scan_input, stream);
     if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
-      output_table =
-        _ingestible->post_filter_and_project(std::move(materialized_table), *mem_space, stream);
+      if (_dynamic_filter_scan_gate && _dynamic_filters_channel) {
+        // Fold the channel's membership filters into the split's survivor gather; the
+        // DYNAMIC_FILTER operator downstream passes the reported filters through.
+        scan_dynamic_filter_context const context{*_dynamic_filters_channel,
+                                                  *_dynamic_filter_scan_gate};
+        output_table = _ingestible->filter_and_project_with_dynamic_filters(
+          std::move(materialized_table), *mem_space, stream, context, dynamic_filters_applied);
+      } else {
+        output_table =
+          _ingestible->post_filter_and_project(std::move(materialized_table), *mem_space, stream);
+      }
     } else {
       output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
     }
@@ -354,6 +366,10 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   auto batch =
     sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches{std::move(batch)};
+  if (!dynamic_filters_applied.empty()) {
+    return std::make_unique<scan_output_operator_data>(std::move(batches),
+                                                       std::move(dynamic_filters_applied));
+  }
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
 

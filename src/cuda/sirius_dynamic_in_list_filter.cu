@@ -31,6 +31,7 @@
 #include <cuco/operator.hpp>
 #include <cuco/static_set.cuh>
 #include <cuco/storage.cuh>
+#include <cuda/dynamic_filter_probe_carrier.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
@@ -148,15 +149,22 @@ struct equals_sentinel {
   }
 };
 
-template <class KeyT, class SetRef>
+/// Per-row probe. A narrower carrier (`ProbeT` smaller than `KeyT`) is widened per value; rows
+/// whose stencil entry is false (when a stencil is supplied) are not probed and yield false.
+template <class KeyT, class ProbeT, class SetRef>
 struct contains_or_sentinel {
-  KeyT const* probe;
+  ProbeT const* probe;
+  bool const* stencil;
   bool* out;
   SetRef set;
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
-    auto const& key = probe[idx];
-    out[idx]        = set.contains(key) || equals_sentinel<KeyT>{}(key);
+    if (stencil != nullptr && !stencil[idx]) {
+      out[idx] = false;
+      return;
+    }
+    auto const key = static_cast<KeyT>(probe[idx]);
+    out[idx]       = set.contains(key) || equals_sentinel<KeyT>{}(key);
   }
 };
 
@@ -382,7 +390,17 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  if (probe.type() != _key_type) { return nullptr; }
+  return compute_mask_if(probe, /*stencil=*/nullptr, device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask_if(
+  cudf::column_view const& probe,
+  bool const* stencil,
+  int device_id,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
+  if (!detail::probe_carrier_compatible(probe.type(), _key_type)) { return nullptr; }
   auto const* replica =
     _set ? _set->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica) { return nullptr; }
@@ -396,10 +414,14 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
     [&](auto const& set) {
       using owner_type = std::decay_t<decltype(set)>;
       using key_type   = typename owner_type::element_type::key_type;
-      auto const* d    = probe.data<key_type>();
       auto ref         = set->ref(cuco::contains);
-      cub::DeviceFor::Bulk(
-        n, contains_or_sentinel<key_type, decltype(ref)>{d, outp, ref}, stream.value());
+      detail::dispatch_probe_carrier<key_type>(probe, [&](auto const* d) {
+        using probe_type = std::remove_cv_t<std::remove_pointer_t<decltype(d)>>;
+        cub::DeviceFor::Bulk(
+          n,
+          contains_or_sentinel<key_type, probe_type, decltype(ref)>{d, stencil, outp, ref},
+          stream.value());
+      });
     },
     replica->set);
   if (probe.nullable() && probe.null_count() > 0) {

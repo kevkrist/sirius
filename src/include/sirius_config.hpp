@@ -180,6 +180,14 @@ struct operator_params {
   /// the scan-level gate active.
   double dynamic_filter_keep_threshold = 0.9;
 
+  /// Apply published membership dynamic filters inside the GPU scan: the masks are computed on
+  /// the split before it is materialized (on its stored carriers), ANDed with the scan's own row
+  /// filter, and the split is materialized by a single gather of the survivors. The downstream
+  /// DYNAMIC_FILTER operator then only applies filters published after the scan's snapshot. When
+  /// disabled, the scan materializes every row and the operator filters afterwards. Effective
+  /// only when enable_dynamic_filter is enabled.
+  bool enable_dynamic_filter_in_scan = true;
+
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is

@@ -329,6 +329,18 @@ class expression_evaluator {
   std::unique_ptr<cudf::table> select(cudf::table_view input);
 
   /**
+   * @brief Evaluates the executor's (singular) boolean predicate over @p input as a BOOL8 mask.
+   *
+   * The mask column has one entry per input row (`true` keeps; a null entry is dropped by
+   * `cudf::apply_boolean_mask`). This is the mask both select() overloads gather with; callers
+   * that combine the predicate with other masks before a single gather use it directly.
+   *
+   * @param input The read-only locked input batch against which to evaluate the predicate.
+   * @return The BOOL8 mask column.
+   */
+  std::unique_ptr<cudf::column> compute_mask(cudf::table_view input);
+
+  /**
    * @brief Evaluate a single Sirius AST node and return its execution result.
    *
    * Dispatches via std::visit over @p expr's variant to the matching private
@@ -391,10 +403,6 @@ class expression_evaluator {
   std::vector<restored_reference_cache_entry> _restored_reference_cache;
   std::size_t _restored_reference_cast_count{0};   ///< For observability/testing
   std::size_t _narrow_domain_comparison_count{0};  ///< For observability/testing
-
-  // Evaluate the executor's single boolean predicate over @p input and return the resulting
-  // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.
-  std::unique_ptr<cudf::column> compute_mask(cudf::table_view input);
 
   // Execute the AST tree rooted at the given expression reference and return the result as a
   // column.

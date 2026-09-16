@@ -348,12 +348,14 @@ mask computation:
 - the parquet reader AST merge selects device-local zone-map scalars;
 - the post-decode AST row-mask apply (duckdb-native scans,
   `include_ast_row_masks`) selects device-local zone-map scalars;
-- the post-decode membership apply selects the local raw needles, static set, or
-  Bloom;
+- the membership apply — inside `GPU_SCAN` when `enable_dynamic_filter_in_scan`
+  folds the masks into the split's survivor gather, otherwise post-decode in
+  `DYNAMIC_FILTER` — selects the local raw needles, static set, or Bloom;
 - `is_available_on_device` is checked before every path.
 
 There is no remote kernel dereference and no consumer-side synchronization with
-the producer.
+the producer. The scan-side apply and the operator share one gate per scan, so
+the ACTIVE-terminal argument below holds whichever of the two measures a split.
 
 The scan-level `applicable()` fast path is lock-free. On an actual membership
 apply, per-filter keep-ratio lookups/first-record updates use the ratio-map

@@ -26,9 +26,11 @@
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
 #include <cuco/hash_functions.cuh>
+#include <cuda/dynamic_filter_probe_carrier.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/bit>
 #include <cuda/std/cstddef>
+#include <cuda/std/functional>
 #include <cuda/std/limits>
 #include <cuda/stream_ref>
 #include <nvtx3/nvtx3.hpp>
@@ -581,20 +583,30 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
+  return compute_mask_if(probe, /*stencil=*/nullptr, device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask_if(
+  cudf::column_view const& probe,
+  bool const* stencil,
+  int device_id,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
   nvtx3::scoped_range nvtx_range{"dynfilter::bloom::compute_mask"};
-  if (!supports(probe.type())) { return nullptr; }
   auto const* replica =
     _impl ? _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica || !replica->has_bloom()) { return nullptr; }
 
-  auto const matching_key_type = std::visit(
+  auto const compatible_probe = std::visit(
     [&](auto const& bloom) {
       using owner_type = std::decay_t<decltype(bloom)>;
       using key_type   = typename owner_type::element_type::key_type;
-      return probe.type().id() == key_type_id<key_type>();
+      return detail::probe_carrier_compatible(probe.type(),
+                                              cudf::data_type{key_type_id<key_type>()});
     },
     replica->bloom);
-  if (!matching_key_type) { return nullptr; }
+  if (!compatible_probe) { return nullptr; }
 
   auto const n = probe.size();
   auto out     = cudf::make_numeric_column(
@@ -606,8 +618,15 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
     [&](auto const& bloom) {
       using owner_type = std::decay_t<decltype(bloom)>;
       using key_type   = typename owner_type::element_type::key_type;
-      auto const* d    = probe.data<key_type>();
-      bloom->contains_async(d, d + n, outp, s);
+      // A narrower carrier is widened per probe through the iterator; the key-typed probe passes
+      // its raw pointer through unchanged.
+      detail::with_probe_as_key<key_type>(probe, [&](auto first, auto last) {
+        if (stencil) {
+          bloom->contains_if_async(first, last, stencil, cuda::std::identity{}, outp, s);
+        } else {
+          bloom->contains_async(first, last, outp, s);
+        }
+      });
     },
     replica->bloom);
 

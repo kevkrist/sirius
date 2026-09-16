@@ -18,14 +18,24 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
+#include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
+
+#include <cuda/stream_ref>
+#include <cuda_runtime_api.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/cuda/event.hpp>
+#include <cucascade/error.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -62,13 +72,97 @@ cudf::ast::expression const* merge_dynamic_filters_into_ast(
   return root;
 }
 
+namespace {
+
+/// One membership filter selected for a pass, with the gate's prior measurement when it has one.
+struct membership_entry {
+  std::size_t col_idx;
+  sirius::op::sirius_mask_applicable const* filter;
+  sirius::op::sirius_dynamic_filter const* identity;
+  std::optional<double> recorded;
+};
+
+/**
+ * Snapshots the channel's membership filters usable on @p device_id whose consumer column
+ * satisfies @p column_usable, drops filters the gate already proved useless and filters in
+ * @p already_applied, and orders the rest most-selective-first (unknown last) so each mask sees
+ * the fewest surviving rows.
+ */
+template <class ColumnUsable>
+std::vector<membership_entry> collect_membership_entries(
+  sirius::op::sirius_dynamic_filter_set const& filters,
+  dynamic_filter_gate const* gate,
+  int device_id,
+  std::size_t observed_filter_count,
+  ColumnUsable const& column_usable,
+  std::span<sirius::op::sirius_dynamic_filter const* const> already_applied)
+{
+  // Closed explicitly after the sort: the range covers the channel snapshot, gate lookups and
+  // ordering, not the mask cascade that follows.
+  nvtx3::scoped_range nvtx_snapshot_range{"dynfilter::apply::snapshot"};
+  std::vector<membership_entry> entries;
+  for (auto const col_idx : filters.filtered_columns()) {
+    if (!column_usable(col_idx)) { continue; }
+    for (auto const& f : filters.filters_for_column(col_idx)) {
+      if (!f->is_available_on_device(device_id)) { continue; }
+      if (std::find(already_applied.begin(), already_applied.end(), f.get()) !=
+          already_applied.end()) {
+        continue;
+      }
+      auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(f.get());
+      if (!applicable) { continue; }
+      auto recorded = gate ? gate->filter_keep_ratio(f.get(), observed_filter_count) : std::nullopt;
+      if (recorded && dynamic_filter_gate::filter_skippable(*recorded)) { continue; }
+      entries.push_back({col_idx, applicable, f.get(), recorded});
+    }
+  }
+  std::stable_sort(entries.begin(), entries.end(), [](auto const& a, auto const& b) {
+    return a.recorded.value_or(1.0) < b.recorded.value_or(1.0);
+  });
+  return entries;
+}
+
+/// Pinned host landing zone for the per-step survivor counts. Stream-ordered slab from cuDF's
+/// pinned resource (cucascade's small-pinned pool once Sirius installs it): acquiring and
+/// releasing enqueue at most an event wait/record on @p stream, never a host sync.
+class pinned_counts {
+ public:
+  pinned_counts(std::size_t n, rmm::cuda_stream_view stream)
+    : _mr(cudf::get_pinned_memory_resource()),
+      _stream(stream),
+      _bytes(n * sizeof(cudf::size_type)),
+      _data(static_cast<cudf::size_type*>(
+        _mr.allocate(cuda::stream_ref{_stream.value()}, _bytes, alignof(cudf::size_type))))
+  {
+  }
+  ~pinned_counts() noexcept
+  {
+    _mr.deallocate(cuda::stream_ref{_stream.value()}, _data, _bytes, alignof(cudf::size_type));
+  }
+  pinned_counts(pinned_counts const&)            = delete;
+  pinned_counts& operator=(pinned_counts const&) = delete;
+
+  [[nodiscard]] cudf::size_type* data() noexcept { return _data; }
+  [[nodiscard]] std::size_t bytes() const noexcept { return _bytes; }
+  [[nodiscard]] cudf::size_type operator[](std::size_t i) const noexcept { return _data[i]; }
+
+ private:
+  rmm::host_device_async_resource_ref _mr;
+  rmm::cuda_stream_view _stream;
+  std::size_t _bytes;
+  cudf::size_type* _data;
+};
+
+}  // namespace
+
 std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
   sirius::op::sirius_dynamic_filter_set const& filters,
   rmm::cuda_stream_view stream,
   dynamic_filter_apply_mode mode,
   dynamic_filter_gate* gate,
-  int device_id)
+  int device_id,
+  std::span<sirius::op::sirius_dynamic_filter const* const> already_applied)
 {
   nvtx3::scoped_range nvtx_range{"dynfilter::apply_output"};
   if (input.num_rows() == 0 || input.num_columns() == 0) { return nullptr; }
@@ -116,34 +210,15 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
     }
   }
 
-  struct membership_entry {
-    std::size_t col_idx;
-    sirius::op::sirius_mask_applicable const* filter;
-    sirius::op::sirius_dynamic_filter const* identity;
-    std::optional<double> recorded;
-  };
-  // Closed explicitly after the sort: the range covers the channel snapshot, gate lookups and
-  // ordering, not the mask cascade that follows.
-  std::optional<nvtx3::scoped_range> nvtx_snapshot_range{std::in_place,
-                                                         "dynfilter::apply::snapshot"};
   // Use one filter-count snapshot for every gate measurement in this pass.
   auto const observed_filter_count = filters.filter_count();
-  std::vector<membership_entry> entries;
-  for (auto const col_idx : filters.filtered_columns()) {
-    if (col_idx >= num_cols) { continue; }
-    for (auto const& f : filters.filters_for_column(col_idx)) {
-      if (!f->is_available_on_device(device_id)) { continue; }
-      auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(f.get());
-      if (!applicable) { continue; }
-      auto recorded = gate ? gate->filter_keep_ratio(f.get(), observed_filter_count) : std::nullopt;
-      if (recorded && dynamic_filter_gate::filter_skippable(*recorded)) { continue; }
-      entries.push_back({col_idx, applicable, f.get(), recorded});
-    }
-  }
-  std::stable_sort(entries.begin(), entries.end(), [](auto const& a, auto const& b) {
-    return a.recorded.value_or(1.0) < b.recorded.value_or(1.0);
-  });
-  nvtx_snapshot_range.reset();
+  auto const entries               = collect_membership_entries(
+    filters,
+    gate,
+    device_id,
+    observed_filter_count,
+    [num_cols](std::size_t col_idx) { return col_idx < num_cols; },
+    already_applied);
 
   for (auto const& e : entries) {
     if (current.num_rows() == 0) { break; }
@@ -164,6 +239,146 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
                    input.num_rows(),
                    owned->num_rows());
   return owned;
+}
+
+std::unique_ptr<cudf::table> gather_view_survivors(
+  cudf::table_view const& input,
+  std::span<cudf::size_type const> output_positions,
+  probe_position_fn const& probe_position,
+  std::unique_ptr<cudf::column> residual_mask,
+  sirius::op::sirius_dynamic_filter_set const* filters,
+  dynamic_filter_gate* gate,
+  int device_id,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  scan_dynamic_filter_result* applied)
+{
+  nvtx3::scoped_range nvtx_range{"dynfilter::scan::fused_apply"};
+  auto const num_rows = input.num_rows();
+  if (num_rows == 0 || input.num_columns() == 0) { return nullptr; }
+  if (residual_mask && residual_mask->size() != num_rows) {
+    throw std::invalid_argument(
+      "[gather_view_survivors] the residual mask does not cover the split's rows");
+  }
+  device_id = sirius::op::detail::resolve_dynamic_filter_device_id(device_id);
+
+  // The same admission the DYNAMIC_FILTER operator applies: no filters, or a gate that has
+  // disabled filtering for the channel size it last saw, means no membership masks here.
+  std::size_t observed_filter_count = 0;
+  std::vector<membership_entry> entries;
+  if (filters && (!gate || gate->applicable(*filters))) {
+    observed_filter_count = filters->filter_count();
+    entries               = collect_membership_entries(
+      *filters,
+      gate,
+      device_id,
+      observed_filter_count,
+      [&probe_position](std::size_t col_idx) { return probe_position(col_idx).has_value(); },
+      /*already_applied=*/{});
+  }
+  if (!residual_mask && entries.empty()) { return nullptr; }
+
+  // counts[0] = rows entering the first membership mask (after the residual); counts[i + 1] =
+  // rows surviving entry i. Zeroed on the stream, read back after the gather's own sync.
+  rmm::device_uvector<cudf::size_type> counts(entries.size() + 1, stream, mr);
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(counts.data(), 0, counts.size() * sizeof(cudf::size_type), stream.value()));
+
+  // The running conjunction. Null-free once folded, so it can serve as a cuco stencil and as the
+  // gather's boolean mask directly.
+  std::unique_ptr<cudf::column> conjunction;
+  auto const fold = [&](std::unique_ptr<cudf::column> mask, cudf::size_type* survivor_count) {
+    if (!conjunction) {
+      conjunction = std::move(mask);
+      sirius::op::and_mask_count(*conjunction, std::nullopt, survivor_count, stream);
+      if (conjunction->nullable()) { conjunction->set_null_mask(rmm::device_buffer{}, 0); }
+    } else {
+      sirius::op::and_mask_count(*conjunction, mask->view(), survivor_count, stream);
+    }
+  };
+
+  bool const has_residual = residual_mask != nullptr;
+  if (has_residual) { fold(std::move(residual_mask), counts.data()); }
+
+  std::vector<bool> mask_applied(entries.size(), false);
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    auto const& e       = entries[i];
+    auto const position = *probe_position(e.col_idx);  // present by construction of the entry list
+    auto const& probe   = input.column(position);
+    bool const* const stencil = conjunction ? conjunction->view().data<bool>() : nullptr;
+    auto mask                 = e.filter->compute_mask_if(probe, stencil, device_id, stream, mr);
+    if (!mask) {
+      // Same verdict the cascade records for a probe the filter cannot serve: nothing kept out,
+      // so the filter is not worth attempting again on this scan.
+      if (gate && !e.recorded) {
+        gate->record_filter_keep_ratio(e.identity, 1.0, observed_filter_count);
+      }
+      continue;
+    }
+    fold(std::move(mask), counts.data() + i + 1);
+    mask_applied[i] = true;
+  }
+  if (!conjunction) { return nullptr; }
+
+  // Land the counts in pinned memory before the gather so the gather's internal host sync covers
+  // the copy; the event only guards against a future gather implementation that no longer syncs.
+  pinned_counts host_counts(counts.size(), stream);
+  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(host_counts.data(),
+                                     counts.data(),
+                                     host_counts.bytes(),
+                                     cudaMemcpyDeviceToHost,
+                                     stream.value()));
+  cucascade::cuda::cuda_event counts_ready;
+  counts_ready.record(stream);
+
+  std::unique_ptr<cudf::table> survivors;
+  {
+    nvtx3::scoped_range nvtx_gather_range{"dynfilter::scan::gather"};
+    auto const to_gather = output_positions.empty()
+                             ? input
+                             : input.select(output_positions.begin(), output_positions.end());
+    survivors            = cudf::apply_boolean_mask(to_gather, conjunction->view(), stream, mr);
+  }
+
+  counts_ready.synchronize();
+  cudf::size_type rows_before = has_residual ? host_counts[0] : num_rows;
+  auto const rows_into_masks  = rows_before;
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (!mask_applied[i]) { continue; }
+    auto const rows_after = host_counts[i + 1];
+    // An empty input has no marginal ratio; the cascade stops measuring there too.
+    if (rows_before > 0 && gate && !entries[i].recorded) {
+      gate->record_filter_keep_ratio(
+        entries[i].identity,
+        static_cast<double>(rows_after) / static_cast<double>(rows_before),
+        observed_filter_count);
+    }
+    rows_before = rows_after;
+  }
+  std::size_t masks_applied = 0;
+  if (applied) {
+    applied->applied.clear();
+    applied->observed_filter_count = observed_filter_count;
+  }
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (!mask_applied[i]) { continue; }
+    ++masks_applied;
+    if (applied) { applied->applied.push_back(entries[i].identity); }
+  }
+  if (masks_applied > 0 && gate) {
+    gate->record_keep_ratio(static_cast<std::size_t>(rows_into_masks),
+                            static_cast<std::size_t>(survivors->num_rows()),
+                            observed_filter_count);
+  }
+  SIRIUS_LOG_DEBUG(
+    "[gather_view_survivors] device={} residual={} membership_masks={} rows: {} -> {} -> {}.",
+    device_id,
+    has_residual,
+    masks_applied,
+    num_rows,
+    rows_into_masks,
+    survivors->num_rows());
+  return survivors;
 }
 
 std::optional<double> dynamic_filter_gate::filter_keep_ratio(
@@ -235,13 +450,15 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   dynamic_filter_gate& gate,
   rmm::cuda_stream_view stream,
   dynamic_filter_apply_mode mode,
-  int device_id)
+  int device_id,
+  std::span<sirius::op::sirius_dynamic_filter const* const> already_applied)
 {
   if (!gate.applicable(filters)) { return nullptr; }
   // Attribute the result to the channel-size snapshot used to start this apply.
   auto const observed_filters = filters.filter_count();
   auto const rows_before      = input.num_rows();
-  auto filtered = apply_dynamic_filters_to_view(input, filters, stream, mode, &gate, device_id);
+  auto filtered =
+    apply_dynamic_filters_to_view(input, filters, stream, mode, &gate, device_id, already_applied);
   if (!filtered) { return nullptr; }
   gate.record_keep_ratio(
     rows_before, static_cast<std::size_t>(filtered->num_rows()), observed_filters);
