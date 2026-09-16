@@ -1565,7 +1565,6 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
 void sirius_scan_manager::declare_unique_columns(const std::string& name,
                                                  std::vector<std::string> column_names)
 {
-  note_pinned_registry_mutation();
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) {
     throw std::invalid_argument("[declare_unique_columns] no pinned entry named '" + name + "'");
