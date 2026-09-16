@@ -430,6 +430,92 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 
  private:
+  friend class sirius_dynamic_bloom_publication_pipeline;
+  struct impl;
+  std::unique_ptr<impl> _impl;
+};
+
+/**
+ * @brief Chunk-major pipelined reduction and strict replication of accumulated Bloom partials
+ *
+ * One instance serves one publication rooted on one GPU (the accumulator's final contributor). It
+ * borrows two pooled root streams (copy and OR) and one pooled stream per target, four reusable
+ * root events and a double-buffered root scratch of `2 * sources * chunk` bytes allocated through
+ * the root space's default allocator (so a per-thread task reservation on the root accounts it, as
+ * the serial path's scratch is). Replicas are allocated on the targets through the reservation
+ * path before any DMA is issued.
+ *
+ * `enqueue()` submits one key: per chunk, every remote partial slice is pulled into the scratch on
+ * the copy stream, OR-ed into the root filter on the OR stream, and pulled by every target as soon
+ * as that chunk's OR event fires, so ingress, OR and egress overlap on the full-duplex root link.
+ * Keys enqueue back to back on the same streams. `complete()` performs the only host waits (one per
+ * target), installs the replicas into their filters and enforces the strict all-target contract.
+ * Destroying an instance that was not completed drains every borrowed stream first, so in-flight
+ * DMA never outlives the partials, the scratch or the replicas.
+ *
+ * Requires direct peer DMA on every (target, root) pair in both directions (`supports()`): the
+ * host-staged transfer route synchronizes streams the pipeline does not order, so such plans must
+ * use `merge_from()` + `replicate_to_devices_strict()` instead.
+ */
+class sirius_dynamic_bloom_publication_pipeline final {
+ public:
+  /// One remote partial and the replica space of the GPU that owns it
+  struct source_partial {
+    sirius_dynamic_bloom_filter const* filter = nullptr;
+    dynamic_filter_replica_space const* space = nullptr;
+  };
+
+  /// `chunk_bytes` value selecting `clamp(filter_bytes / 8, 2 MiB, 8 MiB)`
+  static constexpr std::size_t k_auto_chunk_bytes = 0;
+
+  /// True when every non-root space has a working direct peer-DMA route to and from the root
+  [[nodiscard]] static bool supports(dynamic_filter_replica_space const& root_space,
+                                     std::span<dynamic_filter_replica_space const> spaces);
+
+  /// Chunk actually used for a filter of @p filter_bytes: @p requested_chunk_bytes (or the
+  /// automatic size), rounded up to the Bloom block and clamped to the filter footprint
+  [[nodiscard]] static std::size_t resolve_chunk_bytes(std::size_t filter_bytes,
+                                                       std::size_t requested_chunk_bytes) noexcept;
+
+  /**
+   * @brief Borrows the streams, events and target handles for one publication
+   *
+   * @param[in] root_space Replica space of the root GPU; must be one of @p spaces
+   * @param[in] spaces Immutable plan replica spaces; must outlive this object
+   * @param[in] chunk_bytes Requested chunk size, or `k_auto_chunk_bytes`
+   * @throw std::invalid_argument if @p root_space is absent from @p spaces
+   * @throw std::runtime_error if a stream or event cannot be obtained
+   */
+  sirius_dynamic_bloom_publication_pipeline(dynamic_filter_replica_space const& root_space,
+                                            std::span<dynamic_filter_replica_space const> spaces,
+                                            std::size_t chunk_bytes = k_auto_chunk_bytes);
+  ~sirius_dynamic_bloom_publication_pipeline();
+
+  sirius_dynamic_bloom_publication_pipeline(sirius_dynamic_bloom_publication_pipeline const&) =
+    delete;
+  sirius_dynamic_bloom_publication_pipeline& operator=(
+    sirius_dynamic_bloom_publication_pipeline const&) = delete;
+
+  /**
+   * @brief Enqueues the reduction of @p sources into @p root_filter and its replication
+   *
+   * @pre All writes to @p root_filter and every source are complete; @p root_filter holds only its
+   * source replica; every source has equal geometry and lives on a non-root plan GPU; all filters
+   * remain alive until `complete()` returns or this object is destroyed
+   * @throw std::logic_error if a filter, geometry or device does not match the plan
+   * @throw std::runtime_error if a target reservation is denied (before any DMA for this key), a
+   * transfer is not direct peer DMA, or a CUDA call fails
+   */
+  void enqueue(sirius_dynamic_bloom_filter& root_filter, std::span<source_partial const> sources);
+
+  /**
+   * @brief Waits once per target, installs every replica and enforces the strict contract
+   *
+   * @throw std::runtime_error if a target stream fails or a plan GPU ends without a replica
+   */
+  void complete();
+
+ private:
   struct impl;
   std::unique_ptr<impl> _impl;
 };

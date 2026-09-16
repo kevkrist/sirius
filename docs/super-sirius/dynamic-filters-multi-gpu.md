@@ -144,16 +144,37 @@ When `enable_dynamic_filter_multi_partition` is true, a non-broadcast build with
 Each one-batch PARTITION task captures one immutable task-input ID when the original batch is popped. Cross-GPU preparation assigns a fresh physical ID to a clone, and retry can retain that clone, but PARTITION contributes the unchanged task-input ID. Each original batch therefore matches the identity frozen before pop while inserting its admitted INT32/INT64 keys before scatter into a full-global-geometry partial on its producing GPU. Per-device locks allow different GPUs to insert concurrently; in-flight and completed ID sets prevent retries from advancing completion twice.
 
 After all expected IDs complete, the final accepted contribution OR-reduces non-root partials on
-its own GPU. It transfers at most 4 MiB per chunk through PR #1277's peer-DMA/host-staging helper,
-runs the OR kernels on one root stream, drains that stream on success or failure, drops non-root
-partials and scratch, and strictly completes every planned replica before channel fan-out. This
-completion-selected root reuses the task thread's existing source reservation under per-thread
-reservation tracking; strict replication attaches only the other GPU adaptors. Bloom OR is
-associative and commutative, so the selected source does not affect membership. An unknown,
-missing, incompatible, or failed contribution publishes no filter. If every bound probe target
-drains while accumulation is in progress, the next validated contribution instead seals the
-accumulator as complete without building further partials, counted as one skipped-targets-drained
-publication.
+its own GPU and strictly completes every planned replica before channel fan-out, using the
+scheme selected by `dynamic_filter_publication_scheme`:
+
+- `root_pipelined` (default; `sirius_dynamic_bloom_publication_pipeline`): chunk-major. Per
+  chunk (`dynamic_filter_publication_chunk_bytes`, default `clamp(filter_bytes / 8, 2 MiB,
+  8 MiB)`), every remote partial slice is pulled through the peer-DMA transfer helper into a
+  double-buffered root scratch on a pooled root *copy* stream, OR-ed into the root filter on a
+  second pooled root *OR* stream, and pulled by every target — on that target's pooled stream —
+  as soon as the chunk's OR event fires. Ordering is entirely `cudaEventRecord` /
+  `cudaStreamWaitEvent` on four reusable root events (two per buffer role, drawn from a
+  process-lifetime per-device cache so no event is created on the critical path); the only host
+  waits are one per target at the end. Ingress, OR and egress therefore overlap on the root's
+  full-duplex PCIe link (about 2x faster than the serial scheme on 4 GPUs at 20–256 MB). Replicas
+  are allocated on the targets through the reservation path *before* the first DMA, so a denial
+  fails closed with nothing in flight. The scheme requires the direct peer-DMA route on every
+  (target, root) pair in both directions — the host-staged route synchronizes streams the
+  pipeline does not order — and otherwise falls back to `root_serial` with an INFO log. A failure
+  mid-pipeline drains the copy, OR and every target stream before any partial, scratch or replica
+  is released.
+- `root_serial`: transfers at most 4 MiB per chunk through the same helper alternating copy and
+  OR on one root stream, drains that stream on success or failure, then copies the whole filter
+  to every target and waits per target.
+
+Under both schemes the root scratch is allocated through the root space's default allocator on
+the publishing task thread, whose per-thread reservation tracker already owns the root adaptor,
+and non-root partials are dropped only after every copy that reads them has completed. Strict
+replication attaches only the other GPU adaptors. Bloom OR is associative and commutative, so the
+selected source does not affect membership. An unknown, missing, incompatible, or failed
+contribution publishes no filter. If every bound probe target drains while accumulation is in
+progress, the next validated contribution instead seals the accumulator as complete without
+building further partials, counted as one skipped-targets-drained publication.
 
 Accumulation is Bloom-only by design: keys whose storage type Bloom cannot represent are skipped
 and counted (`keys_skipped_bloom_unsupported`), and zone maps are never accumulated. A completion
@@ -229,13 +250,15 @@ denial logs and omits that optional replica. When the scoped reservation
 detaches, unused capacity is returned while the completed allocation remains
 accounted until replica teardown.
 
-That explicit reservation applies to destination replicas. The one-shot source Bloom and accumulator partials allocate through their GPU space's reservation-aware default allocator, so CuCascade accounts and limits them but no capacity is reserved in advance. The per-join Bloom cap is the pre-allocation policy bound for those sources; it does not reserve bytes and does not include transient root-reduction scratch.
+That explicit reservation applies to destination replicas. The one-shot source Bloom and accumulator partials allocate through their GPU space's reservation-aware default allocator, so CuCascade accounts and limits them but no capacity is reserved in advance. The per-join Bloom cap is the pre-allocation policy bound for those sources; it does not reserve bytes and does not include transient root-reduction scratch (4 MiB under `root_serial`; `2 * (GPUs - 1) * chunk`, at most 48 MiB on four GPUs, under `root_pipelined`). Under `root_pipelined` a non-root GPU holds its partial and its replica simultaneously for the duration of the publication, because the partial is read until the last chunk completes; the serial scheme frees partials before allocating replicas.
 
 For every target, the planner pairs its GPU memory space with a NUMA-local HOST
 memory space (falling back to the first Sirius HOST space when topology is
 unknown). Replication selects the GPU and obtains both `acquire_stream()` and
 `get_default_allocator()` from that GPU space. The stream is a non-owning view
-into the space's managed stream pool; no persistent private stream is created.
+into the space's managed stream pool; no persistent private stream is created
+(the pipelined scheme likewise borrows two round-robin picks on the root and one
+per target for the duration of one publication).
 The source representation is already the source GPU's ready local replica; no
 same-device copy is submitted for it. Peer-DMA copies to remote targets are
 submitted before the publisher waits on any target stream, so transfers to
@@ -393,7 +416,15 @@ that stream. This is a cold-path head-of-line tradeoff: it can delay publication
 and therefore the ordered immediate-probe start or the coverage of a transitive
 target, while the managed pool avoids per-filter stream creation/destruction. It
 is not a consumer-side wait or a correctness hazard and does not alter the
-ownership or readiness contracts.
+ownership or readiness contracts. The pipelined scheme is exposed to it on its
+copy, OR and target streams alike; an event recorded behind unrelated queued
+work simply fires later.
+
+Accumulated-publication cost is root-link-bound: `root_serial` moves
+`(GPUs - 1) * filter_bytes` into the root and the same amount out of it in two
+serialized phases, while `root_pipelined` runs both directions concurrently on
+the full-duplex link, so its span approaches `(GPUs - 1) * filter_bytes /
+link_bandwidth` plus one chunk of pipeline fill.
 
 The accumulated publication (reduction, strict replication, fan-out) runs under
 the accumulator's coordinator mutex, so operator finalization arriving during
@@ -447,6 +478,11 @@ Physical multi-GPU functional validation is complete on the four-GB200 host for 
 - Snapshot validation, publication arbitration, accumulation, and terminal statistics:
   `src/include/op/dynamic_filter/dynamic_filter_publisher.hpp`,
   `src/op/dynamic_filter/dynamic_filter_publisher.cpp`
+- Publication scheme selection (`root_pipelined` / `root_serial`):
+  `src/include/op/dynamic_filter/dynamic_filter_publication_scheme.hpp`,
+  `sirius_dynamic_bloom_publication_pipeline` in
+  `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp` /
+  `src/cuda/sirius_dynamic_bloom_filter.cu`
 - PARTITION freezing and hash-join source/routing integration:
   `src/include/op/sirius_physical_partition.hpp`,
   `src/op/sirius_physical_partition.cpp`,

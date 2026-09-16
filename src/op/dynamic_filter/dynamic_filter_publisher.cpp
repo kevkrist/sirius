@@ -623,6 +623,150 @@ struct dynamic_filter_accumulator::impl {
     return completed_result(dynamic_filter_accumulation_result::status::published);
   }
 
+  using root_filter_list = std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>>;
+
+  /// Whether this publication takes the chunk-major pipelined scheme
+  [[nodiscard]] bool use_pipelined_publication(int root_device,
+                                               dynamic_filter_replica_space const& root_space) const
+  {
+    if (plan.publication_scheme() != dynamic_filter_publication_scheme::root_pipelined) {
+      return false;
+    }
+    // The strict-replication hook injects at the serial scheme's replication boundary.
+    if (test_hooks.strict_replicate) { return false; }
+    if (sirius_dynamic_bloom_publication_pipeline::supports(root_space, plan.replica_spaces())) {
+      return true;
+    }
+    invoke_noexcept([&] {
+      SIRIUS_LOG_INFO(
+        "[dynamic_filter_accumulator] pipelined publication unavailable: a (target, root GPU {}) "
+        "pair lacks direct peer DMA in one direction; using the serial scheme.",
+        root_device);
+    });
+    return false;
+  }
+
+  /// Serial scheme: pull-and-OR every partial on one root stream, drain it, then broadcast.
+  void publish_serial_locked(int root_device,
+                             dynamic_filter_replica_space const& root_space,
+                             root_filter_list& root_filters)
+  {
+    auto const root_stream = root_space.get_gpu_space().acquire_stream();
+    try {
+      for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
+        if (active_keys[key_index] == 0) { continue; }
+        std::string const nvtx_key_label =
+          "dynfilter::accum::reduce_key root=" + std::to_string(root_device) +
+          " key=" + std::to_string(key_index);
+        nvtx3::scoped_range nvtx_key_range{nvtx_key_label};
+        if (!root_filters[key_index]) {
+          root_filters[key_index] = std::make_shared<sirius_dynamic_bloom_filter>(
+            build_types[key_index],
+            build_rows,
+            root_stream,
+            root_space.get_gpu_space().get_default_allocator());
+        }
+        for (auto const& [device_id, partial] : partials) {
+          if (device_id == root_device || key_index >= partial->filters.size() ||
+              !partial->filters[key_index]) {
+            continue;
+          }
+          auto const* source_space = replica_space(device_id);
+          if (source_space == nullptr) {
+            throw std::logic_error("a contributing GPU is absent from the immutable replica plan");
+          }
+          root_filters[key_index]->merge_from(
+            *partial->filters[key_index], *source_space, root_space, root_stream);
+        }
+      }
+      {
+        std::string const nvtx_sync_label =
+          "dynfilter::accum::root_sync root=" + std::to_string(root_device);
+        nvtx3::scoped_range nvtx_sync_range{nvtx_sync_label};
+        root_stream.synchronize();
+      }
+    } catch (...) {
+      synchronize_after_failure(root_stream, "root reduction");
+      throw;
+    }
+
+    for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
+      if (active_keys[key_index] != 0 && root_filters[key_index]) {
+        root_filters[key_index]->release_reduction_scratch();
+      }
+    }
+    drop_non_root_partials_locked(root_device);
+
+    for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
+      if (active_keys[key_index] == 0 || !root_filters[key_index]) { continue; }
+      if (test_hooks.strict_replicate) {
+        test_hooks.strict_replicate(*root_filters[key_index], plan.replica_spaces());
+      } else {
+        root_filters[key_index]->replicate_to_devices_strict(plan.replica_spaces());
+      }
+      ++outcome.membership_filters_built;
+    }
+  }
+
+  /// Pipelined scheme: every key's chunks flow pull -> OR -> target pulls on event-chained
+  /// streams; one host wait per target at the end. Partials outlive every copy.
+  void publish_pipelined_locked(int root_device,
+                                dynamic_filter_replica_space const& root_space,
+                                root_filter_list& root_filters)
+  {
+    sirius_dynamic_bloom_publication_pipeline pipeline{
+      root_space, plan.replica_spaces(), static_cast<std::size_t>(plan.publication_chunk_bytes())};
+    std::vector<sirius_dynamic_bloom_publication_pipeline::source_partial> sources;
+    sources.reserve(partials.size());
+    std::size_t keys_enqueued = 0;
+    for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
+      if (active_keys[key_index] == 0) { continue; }
+      std::string const nvtx_key_label =
+        "dynfilter::accum::reduce_key root=" + std::to_string(root_device) +
+        " key=" + std::to_string(key_index);
+      nvtx3::scoped_range nvtx_key_range{nvtx_key_label};
+      if (!root_filters[key_index]) {
+        // Unreachable on the normal path (the final contributor built its own partial for every
+        // key). A fresh root filter must finish its clear before the pipeline ORs into it.
+        auto const stream       = root_space.get_gpu_space().acquire_stream();
+        root_filters[key_index] = std::make_shared<sirius_dynamic_bloom_filter>(
+          build_types[key_index],
+          build_rows,
+          stream,
+          root_space.get_gpu_space().get_default_allocator());
+        stream.synchronize();
+      }
+      sources.clear();
+      for (auto const& [device_id, partial] : partials) {
+        if (device_id == root_device || key_index >= partial->filters.size() ||
+            !partial->filters[key_index]) {
+          continue;
+        }
+        auto const* source_space = replica_space(device_id);
+        if (source_space == nullptr) {
+          throw std::logic_error("a contributing GPU is absent from the immutable replica plan");
+        }
+        sources.push_back({partial->filters[key_index].get(), source_space});
+      }
+      pipeline.enqueue(*root_filters[key_index], sources);
+      ++keys_enqueued;
+    }
+    pipeline.complete();
+    // Every non-root partial was read by the pipeline's copies; release them only now.
+    drop_non_root_partials_locked(root_device);
+    outcome.membership_filters_built += keys_enqueued;
+  }
+
+  void drop_non_root_partials_locked(int root_device)
+  {
+    std::string const nvtx_drop_label =
+      "dynfilter::accum::drop_partials root=" + std::to_string(root_device);
+    nvtx3::scoped_range nvtx_drop_range{nvtx_drop_label};
+    for (auto& [device_id, partial] : partials) {
+      if (device_id != root_device) { partial->filters.clear(); }
+    }
+  }
+
   // Runs under the coordinator mutex so finalization and late contributions cannot observe a gap
   // between the last expected completion and the terminal state.
   [[nodiscard]] dynamic_filter_accumulation_result publish_locked(int root_device)
@@ -643,70 +787,11 @@ struct dynamic_filter_accumulator::impl {
     auto& root_filters = partials.at(root_device)->filters;
     if (has_active_keys) {
       rmm::cuda_set_device_raii root_guard{rmm::cuda_device_id{root_device}};
-      auto const root_stream = root_space->get_gpu_space().acquire_stream();
       root_filters.resize(active_keys.size());
-
-      try {
-        for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
-          if (active_keys[key_index] == 0) { continue; }
-          std::string const nvtx_key_label =
-            "dynfilter::accum::reduce_key root=" + std::to_string(root_device) +
-            " key=" + std::to_string(key_index);
-          nvtx3::scoped_range nvtx_key_range{nvtx_key_label};
-          if (!root_filters[key_index]) {
-            root_filters[key_index] = std::make_shared<sirius_dynamic_bloom_filter>(
-              build_types[key_index],
-              build_rows,
-              root_stream,
-              root_space->get_gpu_space().get_default_allocator());
-          }
-          for (auto const& [device_id, partial] : partials) {
-            if (device_id == root_device || key_index >= partial->filters.size() ||
-                !partial->filters[key_index]) {
-              continue;
-            }
-            auto const* source_space = replica_space(device_id);
-            if (source_space == nullptr) {
-              throw std::logic_error(
-                "a contributing GPU is absent from the immutable replica plan");
-            }
-            root_filters[key_index]->merge_from(
-              *partial->filters[key_index], *source_space, *root_space, root_stream);
-          }
-        }
-        {
-          std::string const nvtx_sync_label =
-            "dynfilter::accum::root_sync root=" + std::to_string(root_device);
-          nvtx3::scoped_range nvtx_sync_range{nvtx_sync_label};
-          root_stream.synchronize();
-        }
-      } catch (...) {
-        synchronize_after_failure(root_stream, "root reduction");
-        throw;
-      }
-
-      for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
-        if (active_keys[key_index] != 0 && root_filters[key_index]) {
-          root_filters[key_index]->release_reduction_scratch();
-        }
-      }
-      {
-        std::string const nvtx_drop_label =
-          "dynfilter::accum::drop_partials root=" + std::to_string(root_device);
-        nvtx3::scoped_range nvtx_drop_range{nvtx_drop_label};
-        for (auto& [device_id, partial] : partials) {
-          if (device_id != root_device) { partial->filters.clear(); }
-        }
-      }
-
-      for (std::size_t key_index = 0; key_index < active_keys.size(); ++key_index) {
-        if (active_keys[key_index] == 0 || !root_filters[key_index]) { continue; }
-        if (test_hooks.strict_replicate) {
-          test_hooks.strict_replicate(*root_filters[key_index], plan.replica_spaces());
-        } else {
-          root_filters[key_index]->replicate_to_devices_strict(plan.replica_spaces());
-        }
-        ++outcome.membership_filters_built;
+      if (use_pipelined_publication(root_device, *root_space)) {
+        publish_pipelined_locked(root_device, *root_space, root_filters);
+      } else {
+        publish_serial_locked(root_device, *root_space, root_filters);
       }
     }
 

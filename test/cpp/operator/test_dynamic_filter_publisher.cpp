@@ -2873,10 +2873,16 @@ TEST_CASE("the final contribution GPU roots strict replication under per-thread 
   constexpr int first_device                  = 0;
   constexpr int final_device                  = 1;
   constexpr std::size_t rows_per_contribution = 3;
-  auto memory_manager                         = make_per_thread_memory_manager(2);
-  auto replica_spaces                         = get_replica_spaces(*memory_manager, 2);
-  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-  auto plan    = make_accumulator_plan_from_spaces(channel, replica_spaces);
+  // Both schemes root on the final contributor; the pipelined one additionally allocates its
+  // scratch on that thread's tracked root adaptor and its replicas through the target adaptors.
+  auto const scheme = GENERATE(sirius::op::dynamic_filter_publication_scheme::root_serial,
+                               sirius::op::dynamic_filter_publication_scheme::root_pipelined);
+  CAPTURE(sirius::op::to_string(scheme));
+  auto memory_manager = make_per_thread_memory_manager(2);
+  auto replica_spaces = get_replica_spaces(*memory_manager, 2);
+  auto channel        = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto plan =
+    make_accumulator_plan_from_spaces(channel, replica_spaces, {.publication_scheme = scheme});
   sirius::op::dynamic_filter_accumulator accumulator(
     plan, make_complete_build_snapshot(2 * rows_per_contribution, {101, 202}));
 

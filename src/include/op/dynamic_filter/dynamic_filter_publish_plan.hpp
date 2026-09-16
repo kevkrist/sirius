@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/dynamic_filter/dynamic_filter_publication_scheme.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
 #include <cudf/types.hpp>
@@ -61,6 +62,11 @@ struct dynamic_filter_publication_policy {
   /// Allocator-accounted budget for one join's multi-partition accumulated Bloom on each GPU;
   /// one-shot publication is not budget-gated
   std::uint64_t max_bloom_bytes_per_gpu = std::numeric_limits<std::uint64_t>::max();
+  /// Root reduction + replication scheme for the multi-partition accumulated Bloom
+  dynamic_filter_publication_scheme publication_scheme =
+    dynamic_filter_publication_scheme::root_pipelined;
+  /// Pipelined-scheme chunk bytes; 0 sizes the chunk automatically from the filter footprint
+  std::uint64_t publication_chunk_bytes = 0;
 };
 
 /**
@@ -159,6 +165,15 @@ class dynamic_filter_publish_plan final {
   [[nodiscard]] std::uint64_t max_bloom_bytes_per_gpu() const noexcept
   {
     return _policy.max_bloom_bytes_per_gpu;
+  }
+  [[nodiscard]] dynamic_filter_publication_scheme publication_scheme() const noexcept
+  {
+    return _policy.publication_scheme;
+  }
+  /// Pipelined-scheme chunk bytes; 0 selects the automatic chunk size
+  [[nodiscard]] std::uint64_t publication_chunk_bytes() const noexcept
+  {
+    return _policy.publication_chunk_bytes;
   }
 
   /**
