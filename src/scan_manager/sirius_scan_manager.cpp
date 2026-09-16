@@ -1562,6 +1562,30 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
   it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
 }
 
+void sirius_scan_manager::declare_unique_columns(const std::string& name,
+                                                 std::vector<std::string> column_names)
+{
+  note_pinned_registry_mutation();
+  auto it = _pinned_entries.find(name);
+  if (it == _pinned_entries.end()) {
+    throw std::invalid_argument("[declare_unique_columns] no pinned entry named '" + name + "'");
+  }
+  auto& entry              = it->second;
+  auto const& cached_names = entry.cache_info.column_names();
+  for (auto const& column_name : column_names) {
+    if (std::find(cached_names.begin(), cached_names.end(), column_name) == cached_names.end()) {
+      throw std::invalid_argument("[declare_unique_columns] column '" + column_name +
+                                  "' is not a cached column of pinned entry '" + name + "'");
+    }
+  }
+  auto& declared = entry.declared_unique_columns;
+  declared.insert(declared.end(),
+                  std::make_move_iterator(column_names.begin()),
+                  std::make_move_iterator(column_names.end()));
+  std::sort(declared.begin(), declared.end());
+  declared.erase(std::unique(declared.begin(), declared.end()), declared.end());
+}
+
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
   _pinned_entries.erase(name);

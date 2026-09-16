@@ -19,6 +19,8 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "log/level.hpp"
+#include "op/dynamic_filter/dynamic_filter_domain_evidence.hpp"
 #include "op/dynamic_filter/dynamic_filter_publication_scheme.hpp"
 #include "scan_manager/config.hpp"
 
@@ -181,8 +183,22 @@ struct operator_params {
   bool enable_dynamic_zone_map_filter = false;
 
   /// Skip a proven-unique key when its complete build meets this known-domain coverage. Values
-  /// above 1 disable the gate.
-  double dynamic_filter_domain_coverage_threshold = 0.9;
+  /// above 1 disable the gate. A build covering about half of a key's domain keeps about half of
+  /// the probe rows; on multi-GPU the Bloom's `add`, reduction and replication (at the PCIe link
+  /// ceiling) then cost more than the halved downstream work saves (TPC-H q21 `o_orderkey` at
+  /// coverage 0.487 measured -31 ms of 163 on 4 GPUs), while builds near 0.3 still pay off. The
+  /// default sits between those points and is tuned on that regime; a marginal-benefit gate
+  /// (rows entering the next operator x per-row cost vs publication cost) is the principled
+  /// successor.
+  double dynamic_filter_domain_coverage_threshold = 0.45;
+
+  /// Where the domain-coverage gate may take its evidence. `catalog_and_pinned` adds the
+  /// pinned-table registry (exact pinned parquet row counts and `pin_table(..., unique_cols)`
+  /// declarations) to the DuckDB catalog; `catalog_only` restricts it to `seq_scan` row bounds and
+  /// PRIMARY KEY constraints. Pinned evidence is consumed only by dynamic-filter key admission,
+  /// never by join-kind selection.
+  op::dynamic_filter_domain_evidence dynamic_filter_domain_evidence =
+    op::dynamic_filter_domain_evidence::catalog_and_pinned;
 
   /// Hash-IN-list size limit as a fraction of the smallest known probe-GPU L2, in [0, 1]. Larger
   /// sets use Bloom; unknown L2 makes the hash IN-list ineligible.

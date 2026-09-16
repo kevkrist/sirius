@@ -440,10 +440,21 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool const build_opaque   = dynamic_filter_enabled && build_relation_is_opaque(*op.children[1]);
   bool const build_evidence = build_filtered || build_opaque;
 
-  // Capture domain and uniqueness evidence before create_plan() moves the logical children.
-  auto condition_domains =
-    build_evidence ? build_key_domain_cardinalities(op, duckdb_base_table_cardinality{context})
-                   : std::vector<std::size_t>{};
+  // Capture domain and uniqueness evidence before create_plan() moves the logical children. The
+  // pinned registry is consulted only under `catalog_and_pinned`; its declared uniqueness feeds
+  // key admission alone (below), never `unique_build_keys`, whose distinct-join contract needs
+  // the catalog proof.
+  std::vector<std::size_t> condition_domains;
+  std::vector<bool> condition_declared_unique;
+  if (build_evidence) {
+    auto const& evidence_params = sirius_context->get_config().get_operator_params();
+    bool const consult_pinned   = evidence_params.dynamic_filter_domain_evidence ==
+                                sirius::op::dynamic_filter_domain_evidence::catalog_and_pinned;
+    duckdb_base_table_evidence const evidence{
+      context, consult_pinned ? &sirius_context->get_scan_manager() : nullptr};
+    condition_domains         = build_key_domain_cardinalities(op, evidence);
+    condition_declared_unique = build_key_unique_flags(op, evidence);
+  }
 
   auto build_side_unique_cols  = prove_unique_columns(*op.children[1]);
   auto left                    = create_plan(*op.children[0]);
@@ -514,8 +525,11 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
       build_side_unique_cols.size() == 1
         ? std::optional<std::size_t>{static_cast<std::size_t>(*build_side_unique_cols.begin())}
         : std::nullopt;
-    auto admitted_keys = admit_dynamic_filter_keys(
-      conditions, condition_key_shapes, condition_domains, build_side_unique_column);
+    auto admitted_keys = admit_dynamic_filter_keys(conditions,
+                                                   condition_key_shapes,
+                                                   condition_domains,
+                                                   build_side_unique_column,
+                                                   condition_declared_unique);
 
     // Prefer scan binding; each key uses one route.
     std::vector<sirius::op::dynamic_filter_publish_plan::probe_target> targets;

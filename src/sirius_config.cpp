@@ -302,6 +302,14 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("dynamic_filter_domain_coverage_threshold",
              opt.dynamic_filter_domain_coverage_threshold,
              config::valid_domain_coverage_threshold{});
+  {
+    std::string evidence{op::to_string(opt.dynamic_filter_domain_evidence)};
+    r.optional("dynamic_filter_domain_evidence", evidence, [](std::string const& value) {
+      if (op::parse_dynamic_filter_domain_evidence(value)) return true;
+      throw std::runtime_error("must be one of catalog_only, catalog_and_pinned");
+    });
+    opt.dynamic_filter_domain_evidence = *op::parse_dynamic_filter_domain_evidence(evidence);
+  }
   r.optional("dynamic_filter_inlist_max_l2_fraction",
              opt.dynamic_filter_inlist_max_l2_fraction,
              yaml::fraction<double>{});

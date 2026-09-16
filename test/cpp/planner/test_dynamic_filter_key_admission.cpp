@@ -342,6 +342,31 @@ TEST_CASE("admission marks only the key whose build ordinal is the proven-unique
     REQUIRE_FALSE(admitted[0].build_key_proven_unique);
     REQUIRE_FALSE(admitted[1].build_key_proven_unique);
   }
+  SECTION("a per-condition declared flag marks its own condition, by condition index")
+  {
+    // Flags are condition-indexed (like domains), not build-ordinal-indexed: flag 0 marks the
+    // key with build ordinal 4, and ordinal 7's key stays unmarked.
+    auto const admitted =
+      admit_dynamic_filter_keys(conditions, shapes, {}, std::nullopt, {true, false});
+
+    REQUIRE(admitted.size() == 2);
+    REQUIRE(admitted[0].build_key_proven_unique);
+    REQUIRE_FALSE(admitted[1].build_key_proven_unique);
+  }
+  SECTION("catalog proof and declared flag combine key by key")
+  {
+    auto const admitted = admit_dynamic_filter_keys(
+      conditions, shapes, {}, std::optional<std::size_t>{7}, {true, false});
+
+    REQUIRE(admitted.size() == 2);
+    REQUIRE(admitted[0].build_key_proven_unique);
+    REQUIRE(admitted[1].build_key_proven_unique);
+  }
+  SECTION("a misaligned flag vector is rejected")
+  {
+    REQUIRE_THROWS_AS(admit_dynamic_filter_keys(conditions, shapes, {}, std::nullopt, {true}),
+                      std::invalid_argument);
+  }
 }
 
 TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_admission]")

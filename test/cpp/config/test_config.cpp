@@ -676,6 +676,49 @@ TEST_CASE("the domain-coverage threshold is validated where it enters the engine
   REQUIRE(value == 0.9);
 }
 
+TEST_CASE("the domain-evidence source is consumed from the operator_params YAML section",
+          "[config_opt][dynamic_filter]")
+{
+  using sirius::op::dynamic_filter_domain_evidence;
+
+  // Engine defaults: pinned evidence on, threshold tuned for the multi-GPU Bloom cost.
+  CHECK(operator_params{}.dynamic_filter_domain_evidence ==
+        dynamic_filter_domain_evidence::catalog_and_pinned);
+  CHECK(operator_params{}.dynamic_filter_domain_coverage_threshold == 0.45);
+
+  auto const path = std::filesystem::temp_directory_path() / "sirius_domain_evidence.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    dynamic_filter_domain_evidence: catalog_only\n";
+  }
+  sirius_config cfg;
+  cfg.load_from_file(path);
+  CHECK(cfg.get_operator_params().dynamic_filter_domain_evidence ==
+        dynamic_filter_domain_evidence::catalog_only);
+  std::filesystem::remove(path);
+
+  // Unknown values are rejected at ingress; the round-trip helpers agree with each other.
+  auto node = YAML::Load("dynamic_filter_domain_evidence: pinned_only");
+  std::string value{"catalog_and_pinned"};
+  yaml::reader r(node);
+  REQUIRE_THROWS_AS(r.optional("dynamic_filter_domain_evidence",
+                               value,
+                               [](std::string const& text) {
+                                 if (sirius::op::parse_dynamic_filter_domain_evidence(text)) {
+                                   return true;
+                                 }
+                                 throw std::runtime_error("unknown");
+                               }),
+                    std::runtime_error);
+  REQUIRE(value == "catalog_and_pinned");
+  REQUIRE(sirius::op::parse_dynamic_filter_domain_evidence(
+            sirius::op::to_string(dynamic_filter_domain_evidence::catalog_only)) ==
+          dynamic_filter_domain_evidence::catalog_only);
+  REQUIRE_FALSE(sirius::op::parse_dynamic_filter_domain_evidence("unknown").has_value());
+}
+
 TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML section",
           "[config_opt][dynamic_filter]")
 {

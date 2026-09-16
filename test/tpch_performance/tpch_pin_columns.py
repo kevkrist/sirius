@@ -203,6 +203,20 @@ QUERY_COLUMNS: dict[int, dict[str, list[str]]] = {
     },
 }
 
+# TPC-H single-column primary keys, mirroring the `PRIMARY KEY` declarations in
+# generate_test_data.py for the duckdb source. Passed to pin_table as `unique_cols` so the
+# planner's dynamic-filter domain-coverage gate can treat a build's row count as key-domain
+# coverage on parquet, which carries no constraints. lineitem and partsupp have composite keys
+# and are deliberately absent.
+TABLE_PRIMARY_KEYS: dict[str, list[str]] = {
+    "customer": ["c_custkey"],
+    "nation": ["n_nationkey"],
+    "orders": ["o_orderkey"],
+    "part": ["p_partkey"],
+    "region": ["r_regionkey"],
+    "supplier": ["s_suppkey"],
+}
+
 
 def detect_pin_glob(parquet_dir: str, table: str) -> str:
     """Return a glob whose expansion matches the file list of the existing CREATE VIEW.
@@ -274,13 +288,23 @@ def _pin_call(table: str, cols: list[str], source: str, data_source: str) -> str
         f"SIRIUS_PIN_TIER_{table.upper()}", os.environ.get("SIRIUS_PIN_TIER", "gpu")
     )
     col_literals = ",".join(f"'{c}'" for c in cols)
+    # Declare the table's primary key when it is pinned: parquet carries no constraints, so this
+    # is the only way the dynamic-filter domain-coverage gate learns the key is unique. Harmless
+    # (redundant) for the duckdb source, whose catalog already declares the same keys.
+    unique = [c for c in TABLE_PRIMARY_KEYS.get(table, []) if c in cols]
+    unique_clause = (
+        ", unique_cols=[" + ",".join(f"'{c}'" for c in unique) + "]" if unique else ""
+    )
     if data_source == "duckdb":
         return (
             f"CALL pin_table(format='duckdb', tier='{tier}', "
-            f"name='{table}', cols=[{col_literals}]);"
+            f"name='{table}', cols=[{col_literals}]{unique_clause});"
         )
     path = detect_pin_glob(source, table)
-    return f"CALL pin_table('{path}', tier='{tier}', name='{table}', cols=[{col_literals}]);"
+    return (
+        f"CALL pin_table('{path}', tier='{tier}', name='{table}', "
+        f"cols=[{col_literals}]{unique_clause});"
+    )
 
 
 def emit_pin(query_num: int, source: str, data_source: str = "parquet") -> str:

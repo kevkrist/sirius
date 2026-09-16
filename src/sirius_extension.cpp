@@ -1164,6 +1164,26 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     result->args.cols = std::move(cols);
   }
 
+  // Declared-unique columns feed only the dynamic-filter domain-coverage gate. Membership in the
+  // pinned column set is enforced here when 'cols' is explicit, and against the resolved schema
+  // when the pin caches every column (scan_manager::declare_unique_columns).
+  auto unique_cols_it = input.named_parameters.find("unique_cols");
+  if (unique_cols_it != input.named_parameters.end() && !unique_cols_it->second.IsNull()) {
+    for (auto& val : ListValue::GetChildren(unique_cols_it->second)) {
+      if (val.IsNull()) {
+        throw BinderException("pin_table 'unique_cols' list cannot contain NULL entries");
+      }
+      auto column = val.ToString();
+      if (result->args.cols && !result->args.cols->empty() &&
+          std::find(result->args.cols->begin(), result->args.cols->end(), column) ==
+            result->args.cols->end()) {
+        throw BinderException("pin_table 'unique_cols' entry '" + column +
+                              "' is not in the pinned 'cols' list");
+      }
+      result->args.unique_cols.push_back(std::move(column));
+    }
+  }
+
   // Resolve the source format: an explicit 'format' parameter, else inferred from
   // the path extension (.parquet -> parquet, .db/.duckdb -> duckdb).
   auto to_lower = [](std::string s) {
@@ -1348,6 +1368,16 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // ingestible_table_info and drives later cache-hit matching + the gather.
   auto cache_info = sirius::scan_manager::cache_entry_info::from(ingestible->table_info());
 
+  // Reject a declaration naming a column this pin does not cache before any data moves, so a
+  // typo cannot leave a materialized entry behind (the bind check only covers an explicit 'cols').
+  for (auto const& column : data.args.unique_cols) {
+    auto const& cached = cache_info.column_names();
+    if (std::find(cached.begin(), cached.end(), column) == cached.end()) {
+      throw InvalidInputException("pin_table 'unique_cols' entry '" + column +
+                                  "' is not a column this pin caches for '" + data.args.name + "'");
+    }
+  }
+
   // Compression config (tier-agnostic): load the per-table plan DSL from the plan
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
@@ -1505,6 +1535,22 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                  std::move(mat.chunk_stats),
                                  std::move(mat.column_storage));
     attach_duckdb_mvcc_metadata(std::move(base_row_count_per_chunk));
+  }
+
+  if (!data.args.unique_cols.empty()) {
+    // After the insert so the declaration is validated against the cached column set and
+    // survives a same-row-count merge (union) but not a replacing re-pin.
+    std::string declared;
+    for (auto const& column : data.args.unique_cols) {
+      declared += declared.empty() ? column : ", " + column;
+    }
+    scan_mgr.declare_unique_columns(data.args.name, data.args.unique_cols);
+    SIRIUS_LOG_INFO(
+      "[pin_table] '{}' tier={}: declared unique column(s) [{}] (dynamic-filter domain gate "
+      "evidence only)",
+      data.args.name,
+      data.args.tier,
+      declared);
   }
 
   output.SetCardinality(1);
@@ -2045,6 +2091,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
     pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
     pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
+    pin_table.named_parameters["unique_cols"] = LogicalType::LIST(LogicalType::VARCHAR);
     pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
     pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
     pin_table_set.AddFunction(std::move(pin_table));
@@ -2521,6 +2568,23 @@ static void SetDynamicFilterDomainCoverageThreshold(ClientContext& context,
                    params->dynamic_filter_domain_coverage_threshold);
 }
 
+static void SetDynamicFilterDomainEvidence(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot           = lock_operator_params_slot(context);
+  auto const text     = parameter.ToString();
+  auto const evidence = sirius::op::parse_dynamic_filter_domain_evidence(text);
+  if (!evidence) {
+    throw InvalidInputException(
+      "dynamic_filter_domain_evidence must be one of catalog_only, catalog_and_pinned; got '%s'",
+      text);
+  }
+  params->dynamic_filter_domain_evidence = *evidence;
+  SIRIUS_LOG_DEBUG("Updated config DYNAMIC_FILTER_DOMAIN_EVIDENCE to {}",
+                   sirius::op::to_string(params->dynamic_filter_domain_evidence));
+}
+
 static void SetDynamicFilterInlistMaxL2Fraction(ClientContext& context,
                                                 SetScope scope,
                                                 Value& parameter)
@@ -2911,6 +2975,15 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.dynamic_filter_domain_coverage_threshold),
     SetDynamicFilterDomainCoverageThreshold);
+
+  config.AddExtensionOption(
+    "dynamic_filter_domain_evidence",
+    "Evidence the domain-coverage gate may use: 'catalog_and_pinned' adds pinned parquet row "
+    "counts and pin_table unique_cols declarations to the DuckDB catalog; 'catalog_only' uses "
+    "seq_scan row bounds and PRIMARY KEY constraints alone",
+    LogicalType::VARCHAR,
+    Value(std::string{sirius::op::to_string(operator_defaults.dynamic_filter_domain_evidence)}),
+    SetDynamicFilterDomainEvidence);
 
   config.AddExtensionOption(
     "dynamic_filter_inlist_max_l2_fraction",

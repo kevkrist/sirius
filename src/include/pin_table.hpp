@@ -37,6 +37,10 @@ struct PinTableArgs {
   std::string tier;
   std::string name;
   std::optional<std::vector<std::string>> cols;
+  /// Columns the caller declares unique (`unique_cols` named parameter). Each must be a pinned
+  /// column. Recorded on the pinned entry for the dynamic-filter domain-coverage gate only; see
+  /// `sirius::scan_manager::pinned_entry::declared_unique_columns` for the trust level.
+  std::vector<std::string> unique_cols;
   /// Resolved at bind time: "parquet" or "duckdb". Chosen from an explicit
   /// `format` named parameter, else inferred from the path extension
   /// (.parquet -> parquet, .db/.duckdb -> duckdb).

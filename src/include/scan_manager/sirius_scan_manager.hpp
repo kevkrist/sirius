@@ -54,6 +54,8 @@ namespace cucascade::memory {
 class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
+#include <algorithm>
+#include <atomic>
 #include <concepts>
 #include <cstdint>
 #include <functional>
@@ -224,6 +226,23 @@ struct pinned_entry {
   /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
   /// for parquet pins (immutable sources need no visibility reconciliation).
   std::unique_ptr<duckdb_mvcc_metadata> mvcc;
+  /// Column names the user declared unique through `pin_table(..., unique_cols => [...])`,
+  /// sorted, without duplicates, each present in @c cache_info.column_names(). Attached by
+  /// @ref sirius_scan_manager::declare_unique_columns right after insert; a same-row-count
+  /// re-pin merge unions the declarations, a replacing re-pin starts from the new pin's list.
+  ///
+  /// Trust level: a declaration, not a proof. Its only consumer is dynamic-filter key admission
+  /// (`build_key_proven_unique`), where a wrong declaration can only skip a filter the join then
+  /// answers exactly; it must never select `cudf::distinct_hash_join`, whose contract a duplicate
+  /// key would break.
+  std::vector<std::string> declared_unique_columns;
+
+  /// True iff @p column_name was declared unique for this entry.
+  [[nodiscard]] bool is_declared_unique(std::string_view column_name) const noexcept
+  {
+    return std::binary_search(
+      declared_unique_columns.begin(), declared_unique_columns.end(), column_name);
+  }
 };
 
 /// Validate that @p entry can serve @p selected_columns (positions into
@@ -582,6 +601,15 @@ class sirius_scan_manager {
   /// materializations whose per-chunk row counts differ from the existing
   /// chunks'. Throws std::invalid_argument when no entry exists for @p name.
   void attach_mvcc_metadata(const std::string& name, duckdb_mvcc_metadata metadata);
+
+  /// \brief Record the columns the user declared unique for the pinned entry @p name.
+  ///
+  /// Called by both pin paths right after insert_pinned_entry*. The declarations are unioned
+  /// into @ref pinned_entry::declared_unique_columns (so a same-row-count re-pin merge keeps the
+  /// earlier pin's declarations; a replacing re-pin starts from an empty set). Every name must be
+  /// a cached column of the entry. Throws std::invalid_argument when no entry exists for @p name
+  /// or a name is not cached. An empty list is a no-op that still counts as a registry mutation.
+  void declare_unique_columns(const std::string& name, std::vector<std::string> column_names);
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);

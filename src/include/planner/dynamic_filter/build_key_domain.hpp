@@ -31,6 +31,11 @@ class LogicalGet;
 class LogicalOperator;
 }  // namespace duckdb
 
+namespace sirius::scan_manager {
+class sirius_scan_manager;
+struct pinned_entry;
+}  // namespace sirius::scan_manager
+
 namespace sirius::planner {
 
 /**
@@ -46,13 +51,52 @@ concept base_table_cardinality_source =
   std::same_as<std::invoke_result_t<Source const&, duckdb::LogicalGet const&>,
                std::optional<std::size_t>>;
 
+/**
+ * @brief Callable answering whether scan-local output column @p scan_ordinal of a base scan holds
+ * distinct values over the whole unfiltered relation
+ *
+ * The ordinal indexes the scan's projected output (after `projection_ids`), the coordinate the
+ * pass-through walk delivers. Implementations answer false for anything they cannot vouch for.
+ */
+template <class Source>
+concept base_table_uniqueness_source =
+  std::invocable<Source const&, duckdb::LogicalGet const&, std::size_t> &&
+  std::same_as<std::invoke_result_t<Source const&, duckdb::LogicalGet const&, std::size_t>, bool>;
+
 namespace detail {
+
+/**
+ * @brief A build-key column traced to its base scan and the scan-local output ordinal it reads
+ */
+struct resolved_scan_column {
+  duckdb::LogicalGet const* scan = nullptr;
+  std::size_t scan_ordinal       = 0;
+};
+
+/**
+ * @brief Traces a column through value-preserving row subsets to its base scan, or returns
+ * `std::nullopt` when unresolved
+ *
+ * Every pass-through step keeps each surviving row's value and never multiplies rows, so a
+ * column that is unique in the base scan is unique at @p output_ordinal, and the base scan's row
+ * count bounds the traced relation's key domain.
+ */
+[[nodiscard]] std::optional<resolved_scan_column> resolve_pass_through_scan_column(
+  duckdb::LogicalOperator const& subtree, std::size_t output_ordinal) noexcept;
 
 /**
  * @brief Traces a column through value-preserving row subsets, or returns null when unresolved
  */
 [[nodiscard]] duckdb::LogicalGet const* resolve_pass_through_scan(
   duckdb::LogicalOperator const& subtree, std::size_t output_ordinal) noexcept;
+
+/**
+ * @brief Returns one traced column per original condition; `scan` is null for an untraceable key
+ *
+ * Call after type and binding resolution and before `create_plan` moves the children.
+ */
+[[nodiscard]] std::vector<resolved_scan_column> resolve_build_key_scan_columns(
+  duckdb::LogicalComparisonJoin const& join);
 
 /**
  * @brief Returns one base scan per original condition, or null for an untraceable build key
@@ -93,19 +137,61 @@ template <base_table_cardinality_source Source>
 }
 
 /**
- * @brief Domain evidence for DuckDB-native scans
+ * @brief Returns one per-condition flag telling whether the build key is unique in its base scan
  *
- * Uses `NodeStatistics::max_cardinality`; unsupported scans and callback failures return
- * `std::nullopt`.
+ * Untraceable keys are false. The flag feeds dynamic-filter key admission only: with a domain
+ * bound it lets the coverage gate read the build's row count as key-domain coverage.
+ *
+ * @pre @p join still owns both logical children; call before `create_plan`
  */
-class duckdb_base_table_cardinality {
+template <base_table_uniqueness_source Source>
+[[nodiscard]] std::vector<bool> build_key_unique_flags(duckdb::LogicalComparisonJoin const& join,
+                                                       Source const& unique_for)
+{
+  auto const columns = detail::resolve_build_key_scan_columns(join);
+  std::vector<bool> flags(columns.size(), false);
+  for (std::size_t condition_index = 0; condition_index < columns.size(); ++condition_index) {
+    auto const& column = columns[condition_index];
+    if (column.scan == nullptr) { continue; }
+    flags[condition_index] = unique_for(*column.scan, column.scan_ordinal);
+  }
+  return flags;
+}
+
+/**
+ * @brief Domain and uniqueness evidence from the DuckDB catalog and the pinned-table registry
+ *
+ * Domain: `seq_scan` answers from `NodeStatistics::max_cardinality`; a parquet-family scan whose
+ * resolved file set is pinned answers the pinned entry's exact row count when a registry was
+ * given. Uniqueness: the pinned entry matching the scan (by file set or by catalog identity)
+ * declared the column unique through `pin_table(..., unique_cols => [...])`. Everything else,
+ * including callback failures, is `std::nullopt` / false. Cardinality estimates are never used.
+ *
+ * Pinned-entry pointers are held only for this object's lifetime, which must stay inside one
+ * planning window (no pin or unpin may interleave).
+ */
+class duckdb_base_table_evidence {
  public:
-  explicit duckdb_base_table_cardinality(duckdb::ClientContext& context) noexcept;
+  /**
+   * @param[in] context Planning connection, for the catalog cardinality callback
+   * @param[in] pinned_registry Registry to consult, or null to restrict evidence to the catalog
+   */
+  duckdb_base_table_evidence(duckdb::ClientContext& context,
+                             scan_manager::sirius_scan_manager const* pinned_registry) noexcept;
 
   [[nodiscard]] std::optional<std::size_t> operator()(duckdb::LogicalGet const& get) const noexcept;
 
+  [[nodiscard]] bool operator()(duckdb::LogicalGet const& get,
+                                std::size_t scan_ordinal) const noexcept;
+
  private:
+  [[nodiscard]] scan_manager::pinned_entry const* pinned_entry_for(
+    duckdb::LogicalGet const& get) const noexcept;
+
   duckdb::ClientContext* _context;
+  scan_manager::sirius_scan_manager const* _pinned_registry;
+  mutable std::vector<std::pair<duckdb::LogicalGet const*, scan_manager::pinned_entry const*>>
+    _pinned_memo;
 };
 
 }  // namespace sirius::planner

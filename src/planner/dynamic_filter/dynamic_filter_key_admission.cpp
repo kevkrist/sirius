@@ -59,7 +59,8 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   op::dynamic_filter_condition_shape shape,
   std::size_t condition_index,
   std::size_t domain_cardinality,
-  std::optional<std::size_t> build_side_unique_column)
+  std::optional<std::size_t> build_side_unique_column,
+  bool build_key_declared_unique)
 {
   // Null-equal keys could turn a pruned LEFT join match into an accepted NULL-padded row.
   if (condition.comparison != sirius::comparison_type::equal) { return std::nullopt; }
@@ -91,6 +92,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
     .key_shape                    = shape,
     .build_key_domain_cardinality = domain_cardinality,
     .build_key_proven_unique =
+      build_key_declared_unique ||
       build_side_unique_column == std::optional{static_cast<std::size_t>(build_key_ordinal)}};
 }
 
@@ -127,7 +129,8 @@ std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_
   duckdb::vector<sirius::join_condition> const& conditions,
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
   std::vector<std::size_t> const& condition_domain_cardinalities,
-  std::optional<std::size_t> build_side_unique_column)
+  std::optional<std::size_t> build_side_unique_column,
+  std::vector<bool> const& condition_build_key_unique)
 {
   if (condition_shapes.size() != conditions.size()) {
     throw std::invalid_argument(
@@ -140,17 +143,26 @@ std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_
       "[dynamic_filter_key_admission] Domain cardinalities must be empty or aligned one-to-one "
       "with the join conditions");
   }
+  if (!condition_build_key_unique.empty() &&
+      condition_build_key_unique.size() != conditions.size()) {
+    throw std::invalid_argument(
+      "[dynamic_filter_key_admission] Build-key uniqueness flags must be empty or aligned "
+      "one-to-one with the join conditions");
+  }
 
   std::vector<op::dynamic_filter_publish_plan::admitted_key> admitted_keys;
   for (std::size_t condition_index = 0; condition_index < conditions.size(); ++condition_index) {
     auto const domain_cardinality = condition_index < condition_domain_cardinalities.size()
                                       ? condition_domain_cardinalities[condition_index]
                                       : 0;
-    auto admitted                 = admit_scan_route_key(conditions[condition_index],
+    bool const declared_unique    = condition_index < condition_build_key_unique.size() &&
+                                 condition_build_key_unique[condition_index];
+    auto admitted = admit_scan_route_key(conditions[condition_index],
                                          condition_shapes[condition_index],
                                          condition_index,
                                          domain_cardinality,
-                                         build_side_unique_column);
+                                         build_side_unique_column,
+                                         declared_unique);
     if (!admitted.has_value()) { continue; }
     admitted_keys.push_back(*std::move(admitted));
   }

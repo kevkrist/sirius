@@ -16,6 +16,8 @@
 
 #include "planner/dynamic_filter/build_key_domain.hpp"
 
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -25,6 +27,8 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 
 namespace sirius::planner {
 
@@ -127,64 +131,153 @@ bool admissible_base_scan(duckdb::LogicalGet const& get, std::size_t ordinal) no
   return ordinal < scan_width;
 }
 
+bool is_parquet_scan(std::string const& function_name) noexcept
+{
+  return function_name == "read_parquet" || function_name == "parquet_scan" ||
+         function_name == "sirius_read_parquet";
+}
+
 }  // namespace
 
 namespace detail {
 
-duckdb::LogicalGet const* resolve_pass_through_scan(duckdb::LogicalOperator const& subtree,
-                                                    std::size_t output_ordinal) noexcept
+std::optional<resolved_scan_column> resolve_pass_through_scan_column(
+  duckdb::LogicalOperator const& subtree, std::size_t output_ordinal) noexcept
 {
   auto const* node = &subtree;
   auto ordinal     = output_ordinal;
   while (node->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
     auto const step = pass_through_origin(*node, ordinal);
-    if (!step || step->child_index >= node->children.size()) { return nullptr; }
+    if (!step || step->child_index >= node->children.size()) { return std::nullopt; }
     node    = node->children[step->child_index].get();
     ordinal = step->child_ordinal;
   }
   auto const& get = node->Cast<duckdb::LogicalGet>();
-  return admissible_base_scan(get, ordinal) ? &get : nullptr;
+  if (!admissible_base_scan(get, ordinal)) { return std::nullopt; }
+  return resolved_scan_column{.scan = &get, .scan_ordinal = ordinal};
 }
 
-std::vector<duckdb::LogicalGet const*> resolve_build_key_scans(
+duckdb::LogicalGet const* resolve_pass_through_scan(duckdb::LogicalOperator const& subtree,
+                                                    std::size_t output_ordinal) noexcept
+{
+  auto const column = resolve_pass_through_scan_column(subtree, output_ordinal);
+  return column ? column->scan : nullptr;
+}
+
+std::vector<resolved_scan_column> resolve_build_key_scan_columns(
   duckdb::LogicalComparisonJoin const& join)
 {
-  std::vector<duckdb::LogicalGet const*> scans(join.conditions.size(), nullptr);
-  if (join.children.size() != 2) { return scans; }
+  std::vector<resolved_scan_column> columns(join.conditions.size());
+  if (join.children.size() != 2) { return columns; }
   for (std::size_t condition_index = 0; condition_index < join.conditions.size();
        ++condition_index) {
     auto const& build_side = *join.conditions[condition_index].right;
     if (build_side.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { continue; }
     auto const ordinal =
       static_cast<std::size_t>(build_side.Cast<duckdb::BoundReferenceExpression>().index);
-    scans[condition_index] = resolve_pass_through_scan(*join.children[1], ordinal);
+    if (auto const column = resolve_pass_through_scan_column(*join.children[1], ordinal)) {
+      columns[condition_index] = *column;
+    }
+  }
+  return columns;
+}
+
+std::vector<duckdb::LogicalGet const*> resolve_build_key_scans(
+  duckdb::LogicalComparisonJoin const& join)
+{
+  auto const columns = resolve_build_key_scan_columns(join);
+  std::vector<duckdb::LogicalGet const*> scans(columns.size(), nullptr);
+  for (std::size_t condition_index = 0; condition_index < columns.size(); ++condition_index) {
+    scans[condition_index] = columns[condition_index].scan;
   }
   return scans;
 }
 
 }  // namespace detail
 
-duckdb_base_table_cardinality::duckdb_base_table_cardinality(
-  duckdb::ClientContext& context) noexcept
-  : _context{&context}
+duckdb_base_table_evidence::duckdb_base_table_evidence(
+  duckdb::ClientContext& context, scan_manager::sirius_scan_manager const* pinned_registry) noexcept
+  : _context{&context}, _pinned_registry{pinned_registry}
 {
 }
 
-std::optional<std::size_t> duckdb_base_table_cardinality::operator()(
+std::optional<std::size_t> duckdb_base_table_evidence::operator()(
   duckdb::LogicalGet const& get) const noexcept
 {
-  // Other table functions may report estimates below the true domain.
-  if (get.function.name != "seq_scan" || !get.function.cardinality || !get.bind_data) {
-    return std::nullopt;
-  }
   try {
-    auto const stats = get.function.cardinality(*_context, get.bind_data.get());
-    if (!stats || !stats->has_max_cardinality) { return std::nullopt; }
-    return static_cast<std::size_t>(stats->max_cardinality);
+    if (get.function.name == "seq_scan") {
+      if (!get.function.cardinality || !get.bind_data) { return std::nullopt; }
+      auto const stats = get.function.cardinality(*_context, get.bind_data.get());
+      if (!stats || !stats->has_max_cardinality) { return std::nullopt; }
+      return static_cast<std::size_t>(stats->max_cardinality);
+    }
+    // Parquet cardinality callbacks report estimates (never `has_max_cardinality`); the pinned
+    // entry's row count is the exact size of the very file set this scan reads.
+    if (is_parquet_scan(get.function.name)) {
+      auto const* entry = pinned_entry_for(get);
+      if (entry != nullptr && entry->num_rows > 0) { return entry->num_rows; }
+    }
+    return std::nullopt;
   } catch (...) {
     // Optional evidence must not fail query planning.
     return std::nullopt;
   }
+}
+
+bool duckdb_base_table_evidence::operator()(duckdb::LogicalGet const& get,
+                                            std::size_t scan_ordinal) const noexcept
+{
+  try {
+    auto const* entry = pinned_entry_for(get);
+    if (entry == nullptr || entry->declared_unique_columns.empty()) { return false; }
+    // Scan-local output ordinal -> column_ids position -> table column -> name.
+    auto const& column_ids      = get.GetColumnIds();
+    std::size_t column_position = scan_ordinal;
+    if (!get.projection_ids.empty()) {
+      if (scan_ordinal >= get.projection_ids.size()) { return false; }
+      column_position = static_cast<std::size_t>(get.projection_ids[scan_ordinal]);
+    }
+    if (column_position >= column_ids.size()) { return false; }
+    auto const& column_index = column_ids[column_position];
+    if (!column_index.HasPrimaryIndex() || column_index.IsRowIdColumn() ||
+        column_index.IsVirtualColumn() || column_index.IsEmptyColumn()) {
+      return false;
+    }
+    auto const primary = static_cast<std::size_t>(column_index.GetPrimaryIndex());
+    if (primary >= get.names.size()) { return false; }
+    return entry->is_declared_unique(get.names[primary]);
+  } catch (...) {
+    return false;
+  }
+}
+
+scan_manager::pinned_entry const* duckdb_base_table_evidence::pinned_entry_for(
+  duckdb::LogicalGet const& get) const noexcept
+{
+  if (_pinned_registry == nullptr) { return nullptr; }
+  auto const hit =
+    std::ranges::find(_pinned_memo, &get, &decltype(_pinned_memo)::value_type::first);
+  if (hit != _pinned_memo.end()) { return hit->second; }
+
+  scan_manager::pinned_entry const* entry = nullptr;
+  try {
+    if (get.function.name == "seq_scan") {
+      auto const* bind = dynamic_cast<duckdb::TableScanBindData const*>(get.bind_data.get());
+      if (bind != nullptr && bind->table.IsDuckTable()) {
+        auto const& table = bind->table.Cast<duckdb::DuckTableEntry>();
+        entry             = _pinned_registry->find_pinned_entry_for_duckdb_table(
+          table.ParentCatalog().GetName(), table.ParentSchema().name, table.name);
+      }
+    } else if (is_parquet_scan(get.function.name)) {
+      auto const files =
+        resolve_parquet_scan_file_paths(get.function.name, get.bind_data.get(), get.parameters);
+      if (!files.empty()) { entry = _pinned_registry->find_pinned_entry_for_parquet_files(files); }
+    }
+  } catch (...) {
+    entry = nullptr;
+  }
+  _pinned_memo.emplace_back(&get, entry);
+  return entry;
 }
 
 }  // namespace sirius::planner

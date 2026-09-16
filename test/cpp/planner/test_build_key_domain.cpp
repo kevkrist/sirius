@@ -700,3 +700,104 @@ TEST_CASE("a refusing evidence source yields zero for every key",
 
   REQUIRE(domains == std::vector<std::size_t>{0});
 }
+
+//===----------------------------------------------------------------------===//
+// Per-key uniqueness flags
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+using sirius::planner::build_key_unique_flags;
+using sirius::planner::detail::resolve_pass_through_scan_column;
+
+// Vouch for exactly one (table, scan-local ordinal) so a wrong coordinate is visible.
+struct single_unique_column_source {
+  duckdb::idx_t table_index;
+  std::size_t scan_ordinal;
+  bool operator()(duckdb::LogicalGet const& get, std::size_t ordinal) const
+  {
+    return get.table_index == table_index && ordinal == scan_ordinal;
+  }
+};
+
+struct refusing_uniqueness_source {
+  bool operator()(duckdb::LogicalGet const&, std::size_t) const { return false; }
+};
+
+// Build child: GET(table 1, width 3) -> PROJECTION([ref 2, ref 0]); the projection permutes the
+// scan ordinals so the delivered coordinate must be the scan's, not the build output's.
+duckdb::unique_ptr<duckdb::LogicalComparisonJoin> make_permuted_build_join(
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> build_sides)
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
+  expressions.push_back(make_ref(2));
+  expressions.push_back(make_ref(0));
+  auto build = make_projection(make_get(/*table_index=*/1, /*width=*/3), std::move(expressions));
+  auto join =
+    make_join(duckdb::JoinType::INNER, make_get(/*table_index=*/0, /*width=*/1), std::move(build));
+  std::size_t probe_at = 90;
+  for (auto& build_side : build_sides) {
+    join->conditions.push_back(make_condition(make_ref(probe_at++), std::move(build_side)));
+  }
+  join->ResolveOperatorTypes();
+  return join;
+}
+
+}  // namespace
+
+TEST_CASE("walk delivers the scan-local ordinal through a permuting projection",
+          "[dynamic_filter][build_key_domain]")
+{
+  auto get        = make_get(/*table_index=*/0, /*width=*/3);
+  auto const* raw = get.get();
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
+  expressions.push_back(make_ref(2));
+  expressions.push_back(make_computed());
+  auto projection = make_projection(std::move(get), std::move(expressions));
+
+  auto filter            = duckdb::make_uniq<duckdb::LogicalFilter>();
+  filter->projection_map = {1, 0};  // filter output 1 reads projection output 0 -> scan ordinal 2
+  filter->children.push_back(std::move(projection));
+  filter->ResolveOperatorTypes();
+
+  auto const traced = resolve_pass_through_scan_column(*filter, 1);
+  REQUIRE(traced.has_value());
+  REQUIRE(traced->scan == raw);
+  REQUIRE(traced->scan_ordinal == 2);
+  REQUIRE_FALSE(resolve_pass_through_scan_column(*filter, 0).has_value());  // the computed column
+}
+
+TEST_CASE("unique flags are keyed on the build scan's own ordinal",
+          "[dynamic_filter][build_key_domain]")
+{
+  // Build output 0 is scan ordinal 2; build output 1 is scan ordinal 0.
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> build_sides;
+  build_sides.push_back(make_ref(0));
+  build_sides.push_back(make_ref(1));
+  build_sides.push_back(make_computed());  // untraceable: never unique
+  auto join = make_permuted_build_join(std::move(build_sides));
+
+  SECTION("the declared scan column marks exactly the key that reads it")
+  {
+    auto const flags = build_key_unique_flags(
+      *join, single_unique_column_source{.table_index = 1, .scan_ordinal = 2});
+    REQUIRE(flags == std::vector<bool>{true, false, false});
+  }
+  SECTION("a build-output coordinate is not mistaken for the scan coordinate")
+  {
+    auto const flags = build_key_unique_flags(
+      *join, single_unique_column_source{.table_index = 1, .scan_ordinal = 0});
+    REQUIRE(flags == std::vector<bool>{false, true, false});
+  }
+  SECTION("the probe table's ordinals are never consulted")
+  {
+    auto const flags = build_key_unique_flags(
+      *join, single_unique_column_source{.table_index = 0, .scan_ordinal = 0});
+    REQUIRE(flags == std::vector<bool>{false, false, false});
+  }
+  SECTION("a refusing source marks nothing")
+  {
+    auto const flags = build_key_unique_flags(*join, refusing_uniqueness_source{});
+    REQUIRE(flags == std::vector<bool>{false, false, false});
+  }
+}

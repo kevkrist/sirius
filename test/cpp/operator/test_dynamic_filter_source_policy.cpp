@@ -20,6 +20,7 @@
  */
 
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
+#include "sirius_config.hpp"
 
 #include <catch.hpp>
 
@@ -259,6 +260,23 @@ TEST_CASE("domain-coverage gate treats a threshold above 1.0 as disabled outrigh
   // Exactly 1.0 remains active and fires at full coverage of a proven-unique key.
   REQUIRE(domain_coverage_gate_fires(100, 100, true, 1.0));
   REQUIRE_FALSE(domain_coverage_gate_fires(99, 100, true, 1.0));
+}
+
+TEST_CASE("domain-coverage gate at the engine default separates the measured TPC-H SF100 keys",
+          "[dynamic_filter][source_policy]")
+{
+  // The default was tuned on these builds (4x L40S, SF100 parquet): the o_orderkey build of q21
+  // (o_orderstatus = 'F', 73.07 M of 150 M orders, keep ratio 0.487) cost more to accumulate and
+  // replicate than its filter saved, while every other proven-unique key stayed at or below 0.30
+  // and pays off. A default that no longer separates them changes the benchmarked behaviour.
+  double const kDefault = sirius::operator_params{}.dynamic_filter_domain_coverage_threshold;
+  REQUIRE(domain_coverage_gate_fires(73'072'502, 150'000'000, true, kDefault));      // q21 join 18
+  REQUIRE_FALSE(domain_coverage_gate_fires(4'500'000, 15'000'000, true, kDefault));  // q5 customer
+  REQUIRE_FALSE(domain_coverage_gate_fires(14'700'000, 150'000'000, true, kDefault));  // q3 orders
+  REQUIRE_FALSE(domain_coverage_gate_fires(2'970'000, 20'000'000, true, kDefault));    // q16 part
+  // q10 o_custkey: 11.48 M build rows over 15 M customers but NOT unique -> row retention is
+  // not coverage; the gate must stay off (that filter is worth about 34 ms).
+  REQUIRE_FALSE(domain_coverage_gate_fires(11'480'000, 15'000'000, false, kDefault));
 }
 
 TEST_CASE("zone-map range gate fires at and above its threshold", "[dynamic_filter][source_policy]")

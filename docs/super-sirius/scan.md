@@ -196,6 +196,13 @@ CALL pin_table('/path/to/lineitem.parquet',
                tier = 'gpu',
                cols = ['l_orderkey', 'l_quantity', 'l_extendedprice', 'l_shipdate']);
 
+-- Declare the key the parquet file cannot: o_orderkey is unique in orders.
+CALL pin_table('/path/to/orders*.parquet',
+               name = 'orders',
+               tier = 'gpu',
+               cols = ['o_orderkey', 'o_custkey', 'o_orderstatus'],
+               unique_cols = ['o_orderkey']);
+
 -- A duckdb-native base table can be pinned too:
 CALL pin_table('my_table', name = 'my_table', format = 'duckdb', tier = 'host');
 
@@ -207,6 +214,17 @@ CALL unpin_table('lineitem');
 ```
 
 `format` is `parquet` or `duckdb`, resolved at bind time from an explicit parameter or inferred from the path extension. `tier` is `gpu` (columns in GPU device memory) or `host` (columns in pinned host memory).
+
+`unique_cols` lists pinned columns the caller declares unique over the whole table. Each must be
+in `cols` (or in the schema when every column is pinned); the declaration is recorded on the pinned
+entry (`pinned_entry::declared_unique_columns`, unioned by a same-row-count re-pin, reset by a
+replacing one) and is read only by the dynamic-filter domain-coverage gate under
+`dynamic_filter_domain_evidence: catalog_and_pinned` — see
+[Dynamic filters](dynamic-filters.md#filter-selection). It is a declaration, not a proof: a wrong
+one can only skip a runtime filter (the join still answers exactly) and never changes join-kind
+selection. The TPC-H harness (`test/tpch_performance/tpch_pin_columns.py`) declares the
+single-column primary keys this way for parquet, mirroring the constraints its duckdb data
+source carries in the catalog.
 
 ### Materializing a pin
 
