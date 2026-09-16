@@ -17,6 +17,7 @@
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
 
 #include "log/logging.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -135,6 +136,11 @@ void dynamic_filter_publish_plan::restrict_replicas_to(std::vector<int> const& a
       "[dynamic_filter_publish_plan] The admitted GPU set holds none of this plan's replica "
       "GPUs; disabling dynamic-filter publication for this join ({} probe target(s) dropped).",
       _probe_targets.size());
+    // The producer registered on these channels at plan time will never publish into them: mark
+    // it terminal so all_producers_terminal() can still hold once the remaining producers finish.
+    for (auto const& target : _probe_targets) {
+      if (target.filter_set) { target.filter_set->mark_producer_terminal(); }
+    }
     _probe_targets.clear();
   }
 }

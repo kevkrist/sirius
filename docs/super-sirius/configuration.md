@@ -439,6 +439,25 @@ temporarily disabled while the cuCollections defect tracked in #1600 remains unr
 engine retains the guarded single-pass `cudf::distinct_hash_join` path for policy-controlled use
 after that dependency is fixed.
 
+## Scheduler (`sirius.scheduler`)
+
+**File:** `src/include/pipeline/scheduler_config.hpp` — `scheduler_config` struct
+
+Task creation is demand-driven (see [task-creator.md](task-creator.md)): `start_query()` seeds the
+plan-order first scan, and every other operator is activated by the hint chain once its input is
+available. This key controls the one point where that chain otherwise serializes work the dynamic
+filters have already made independent: when a `BUILD_PROBE` hash join lets its probe scan start.
+
+```yaml
+sirius:
+  scheduler:
+    probe_activation: on_partitioned_and_published
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `probe_activation` | `on_build_deposited` / `on_partitioned_and_published` | `on_partitioned_and_published` | When a `BUILD_PROBE` hash join lets the hint chain walk into its probe side while partitions still lack their build batch. `on_build_deposited`: only once every partition's folded build batch has been deposited — the probe scan starts after the whole build `CONCAT` shuffle and never overlaps it. `on_partitioned_and_published`: as soon as the build `PARTITION` pipeline has finished (every build row scattered into its slot; only the `CONCAT` fold and the hash-table builds remain) **and** every producer registered on each dynamic-filter channel the join publishes into has reached a terminal publication state (published, failed, or closed). The probe scan then overlaps the shuffle and the builds, and each of its splits still snapshots the complete set of filters it was planned to consume — the gate is the asynchronous alternative to a consumer-side wait. A join that publishes no dynamic filter keeps the deposit rule (the build landing is then the only throttle on how much unfiltered probe output buffers ahead of the hash table), and a join whose publication never reaches a terminal state before its build lands falls back to it. Probe batches that arrive before the build simply wait in the join's probe repository; the hash table is still built by the first task that has both. |
+
 ## Telemetry
 
 ```yaml

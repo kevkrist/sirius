@@ -125,6 +125,12 @@ class sirius_physical_partition : public sirius_physical_operator {
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
+ protected:
+  /// A build-side partition re-schedules its consuming join when its pipeline finishes, so the
+  /// join re-evaluates probe activation (`probe_activation_policy::on_partitioned_and_published`)
+  /// at that moment rather than after the first build CONCAT fold task completes.
+  void on_finalize_operator() override;
+
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
 

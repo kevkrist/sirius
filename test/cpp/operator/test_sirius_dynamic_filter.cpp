@@ -235,6 +235,37 @@ TEST_CASE("sirius_dynamic_filter_set tracks wired producers", "[dynamic_filter]"
   }
 }
 
+TEST_CASE("sirius_dynamic_filter_set tracks terminal producers", "[dynamic_filter]")
+{
+  sirius_dynamic_filter_set set;
+
+  SECTION("a channel without producers is never all-terminal")
+  {
+    REQUIRE_FALSE(set.all_producers_terminal());
+    set.mark_producer_terminal();
+    REQUIRE_FALSE(set.all_producers_terminal());
+  }
+
+  SECTION("every registered producer must mark itself terminal")
+  {
+    set.register_producer({1});
+    set.register_producer({3});
+    REQUIRE_FALSE(set.all_producers_terminal());
+    set.mark_producer_terminal();
+    REQUIRE_FALSE(set.all_producers_terminal());
+    set.mark_producer_terminal();
+    REQUIRE(set.all_producers_terminal());
+  }
+
+  SECTION("terminal producers do not stop the channel from accepting filters")
+  {
+    set.register_producer({0});
+    set.mark_producer_terminal();
+    REQUIRE(set.all_producers_terminal());
+    REQUIRE(set.accepting_filters());
+  }
+}
+
 TEST_CASE("ignore_columns drops pushes for the marked output columns", "[dynamic_filter]")
 {
   // Hive-partition values are path-derived, so their output positions reject filter pushes.

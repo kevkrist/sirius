@@ -22,6 +22,7 @@
 #include "log/level.hpp"
 #include "op/dynamic_filter/dynamic_filter_domain_evidence.hpp"
 #include "op/dynamic_filter/dynamic_filter_publication_scheme.hpp"
+#include "pipeline/scheduler_config.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -348,6 +349,17 @@ struct sirius_config {
     return _gpu_memory_params;
   }
 
+  [[nodiscard]] const pipeline::scheduler_config& get_scheduler_config() const noexcept
+  {
+    return _scheduler_config;
+  }
+
+  /// Mutable access for tests that toggle the scheduling policy on a live context.
+  [[nodiscard]] pipeline::scheduler_config& get_scheduler_config() noexcept
+  {
+    return _scheduler_config;
+  }
+
   /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
   /// Limits each query to the first @c gpus_per_query entries of the sorted
   /// active-GPU list; the rest are left available for future concurrent queries.
@@ -372,6 +384,7 @@ struct sirius_config {
   telemetry_config _telemetry_config;
   compression_config _compression_config;
   gpu_memory_params _gpu_memory_params;
+  pipeline::scheduler_config _scheduler_config;
 };
 
 }  // namespace sirius

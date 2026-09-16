@@ -109,13 +109,15 @@ The core of the task creator's behavior comes from operator-specific overrides:
 
 | Method | Behavior |
 |--------|----------|
-| `get_next_task_hint()` | Tracks build state machine: `NOT_BUILT` → `SCHEDULING` → `SCHEDULED` → `BUILT`. Returns READY when both build and probe data available (NOT_BUILT) or probe data available (BUILT). |
+| `get_next_task_hint()` | Tracks build state machine: `NOT_BUILT` → `SCHEDULING` → `SCHEDULED` → `BUILT`. Returns READY when both build and probe data available (NOT_BUILT) or probe data available (BUILT). While a partition still lacks its build batch it walks into the build producer (`wait_for_build`) — or, under `sirius.scheduler.probe_activation = on_partitioned_and_published` (default), into the probe producer as soon as the build `PARTITION` pipeline has finished and every producer on the join's dynamic-filter target channels is terminal (`probe_may_start_before_build`), so the probe scan overlaps the build `CONCAT` fold and the hash-table builds without losing filter coverage. The build-side `PARTITION` re-schedules the join from its `on_finalize_operator` so this rule is evaluated at that moment rather than after the first fold task completes. |
 | `get_next_task_input_data()` | `get_next_task_input_data_for_build_probe()`: On SCHEDULING → pop one build + one probe batch. On BUILT → pop one probe batch. |
 | Why custom | Build/probe asymmetry: first task needs both sides, subsequent tasks only need probe |
 
 State machine transitions:
 ```
 NOT_BUILT: build_size>0 AND probe_size>0 → SCHEDULING (return READY)
+NOT_BUILT: build_size==0 → WAITING_FOR_INPUT_DATA (build source), or (probe source) once the
+           build PARTITION pipeline finished and the join's filter channels are all-producers-terminal
 SCHEDULING/SCHEDULED: → WAITING_FOR_INPUT_DATA (probe source)
 BUILT: probe_size>0 → READY
 ```

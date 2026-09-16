@@ -17,6 +17,7 @@
 #include "op/sirius_physical_partition.hpp"
 
 #include "config.hpp"
+#include "creator/task_creator.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -393,6 +394,20 @@ std::size_t sirius_physical_partition::slot_for_device(int device_id) const
     "slot_for_device: device_id {} not found in active GPU list, falling back to slot 0",
     device_id);
   return 0;
+}
+
+void sirius_physical_partition::on_finalize_operator()
+{
+  if (!_is_build || _downstream_consumer_op == nullptr) { return; }
+  if (_downstream_consumer_op->finalized.load()) { return; }
+  // finalize_operator() runs under the finishing pipeline's status mutex; schedule() only enqueues
+  // a creation request, so no lock is taken here. The join's hint then observes this pipeline as
+  // finished (stored before the finalize pass) and may walk into its probe side.
+  auto pipeline = get_pipeline();
+  if (!pipeline) { return; }
+  if (auto* task_creator = pipeline->get_task_creator()) {
+    task_creator->schedule(_downstream_consumer_op);
+  }
 }
 
 std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint()

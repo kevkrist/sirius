@@ -1069,12 +1069,24 @@ bool dynamic_filter_publication_session::is_open() const noexcept
   return _state == state::open;
 }
 
+void dynamic_filter_publication_session::mark_targets_terminal_locked() noexcept
+{
+  if (_targets_marked_terminal) { return; }
+  _targets_marked_terminal = true;
+  // Every filter this session published is already pushed (fan-out precedes the terminal
+  // commit), so a consumer that now observes all producers terminal sees the complete set.
+  for (auto const& target : _plan.probe_targets()) {
+    if (target.filter_set) { target.filter_set->mark_producer_terminal(); }
+  }
+}
+
 void dynamic_filter_publication_session::commit_terminal_locked(
   state terminal, dynamic_filter_publication_outcome const& outcome) noexcept
 {
   assert(terminal == state::finished || terminal == state::failed);
   _state = terminal;
   _accumulator.reset();
+  mark_targets_terminal_locked();
   if (_stats == nullptr) { return; }
 
   fold_dynamic_filter_outcome(*_stats, outcome);
@@ -1132,6 +1144,10 @@ bool dynamic_filter_publication_session::try_arm(complete_build_snapshot snapsho
   } catch (std::exception const& error) {
     _accumulator.reset();
     _state = state::failed;
+    // A failed arm is this session's terminal transition: release the target channels like every
+    // other terminal path, or all_producers_terminal() never holds for them and every probe gated
+    // on it falls back to the build deposit for the rest of the query.
+    mark_targets_terminal_locked();
     if (_stats != nullptr) { _stats->publications_failed.fetch_add(1, std::memory_order_relaxed); }
     lock.unlock();
     invoke_noexcept([&] {
@@ -1143,6 +1159,7 @@ bool dynamic_filter_publication_session::try_arm(complete_build_snapshot snapsho
   } catch (...) {
     _accumulator.reset();
     _state = state::failed;
+    mark_targets_terminal_locked();
     if (_stats != nullptr) { _stats->publications_failed.fetch_add(1, std::memory_order_relaxed); }
     lock.unlock();
     invoke_noexcept([] {
@@ -1292,6 +1309,7 @@ void dynamic_filter_publication_session::finalize_or_abort() noexcept
     std::scoped_lock lock(_mutex);
     if (_state == state::open) {
       _state = state::closed;
+      mark_targets_terminal_locked();
       return;
     }
     // A claimed one-shot window is left for its owner's terminal commit (never closed).

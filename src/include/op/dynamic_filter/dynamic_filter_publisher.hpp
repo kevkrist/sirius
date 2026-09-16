@@ -280,6 +280,11 @@ struct dynamic_filter_publication_session_test_hooks {
  * `op_state_mutex` while acquiring the session mutex. Session methods do not acquire the
  * accumulator's coordinator or per-device mutexes while holding the session mutex and never call
  * back into an operator while holding it.
+ *
+ * The first terminal transition (finished, failed, or closed) marks this producer terminal on
+ * every channel of the plan's probe targets (`sirius_dynamic_filter_set::mark_producer_terminal`),
+ * after any filters it published are visible there. Consumers that gate on
+ * `all_producers_terminal()` therefore see the complete set of filters this join will ever push.
  */
 class dynamic_filter_publication_session final {
  public:
@@ -410,6 +415,8 @@ class dynamic_filter_publication_session final {
 
   void commit_terminal_locked(state terminal,
                               dynamic_filter_publication_outcome const& outcome) noexcept;
+  /// Marks this producer terminal on every target channel exactly once (session mutex held).
+  void mark_targets_terminal_locked() noexcept;
   void commit_accumulation_terminal_locked(state terminal,
                                            dynamic_filter_accumulation_result const& result,
                                            std::uint64_t join_operator_id) noexcept;
@@ -422,6 +429,7 @@ class dynamic_filter_publication_session final {
   std::shared_ptr<dynamic_filter_accumulator> _accumulator;
   mutable std::mutex _mutex;
   state _state{state::open};
+  bool _targets_marked_terminal{false};
 };
 
 }  // namespace sirius::op

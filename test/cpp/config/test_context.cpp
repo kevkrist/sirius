@@ -1840,3 +1840,28 @@ TEST_CASE("Per-connection state isolates and expires the transparent capture",
   REQUIRE(after_prepare.successful_rebinds == before_prepare.successful_rebinds);
   REQUIRE(conn_state->take_captured_plan_if_current() == nullptr);
 }
+
+TEST_CASE("Sirius configuration parses the scheduler policy", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  fs::path data_dir        = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config defaults;
+  REQUIRE(defaults.get_scheduler_config().probe_activation ==
+          sirius::pipeline::probe_activation_policy::on_partitioned_and_published);
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_scheduler.yaml"));
+  REQUIRE(config.get_scheduler_config().probe_activation ==
+          sirius::pipeline::probe_activation_policy::on_build_deposited);
+
+  sirius::sirius_config rejected_policy;
+  REQUIRE_THROWS_WITH(
+    rejected_policy.load_from_file(data_dir / "invalid_scheduler_probe_activation.yaml"),
+    Catch::Contains("probe_activation") &&
+      Catch::Contains("one of on_build_deposited, on_partitioned_and_published"));
+
+  sirius::sirius_config rejected_key;
+  REQUIRE_THROWS_WITH(rejected_key.load_from_file(data_dir / "invalid_scheduler_unknown_key.yaml"),
+                      Catch::Contains("unknown config key: 'max_concurrent_scans' in scheduler"));
+}

@@ -560,6 +560,31 @@ class sirius_dynamic_filter_set {
     return _producer_count.load(std::memory_order_acquire) > 0;
   }
 
+  /**
+   * @brief Records that one registered producer will push nothing further into this channel
+   *
+   * Called once per producer when its publication reaches a terminal state (published, failed or
+   * closed without publishing) or when plan narrowing drops the channel from the producer's
+   * targets. Every filter the producer did publish is already visible when this is called.
+   */
+  void mark_producer_terminal() noexcept
+  {
+    _terminal_producer_count.fetch_add(1, std::memory_order_release);
+  }
+
+  /**
+   * @brief True once every registered producer has marked itself terminal
+   *
+   * False for a channel with no producers: consumers of such a channel have nothing to wait for
+   * and callers gate on `has_producers()` separately. Once true, a consumer's snapshot observes
+   * every filter that will ever be published into this channel.
+   */
+  [[nodiscard]] bool all_producers_terminal() const noexcept
+  {
+    auto const producers = _producer_count.load(std::memory_order_acquire);
+    return producers > 0 && _terminal_producer_count.load(std::memory_order_acquire) >= producers;
+  }
+
   // Sorted consumer-output ordinals; meaningful only with producers and no unscoped producer.
   [[nodiscard]] std::vector<std::size_t> planned_target_columns() const;
 
@@ -594,6 +619,7 @@ class sirius_dynamic_filter_set {
   std::set<std::size_t> _planned_target_columns;
   std::atomic<std::size_t> _filter_count{0};
   std::atomic<std::size_t> _producer_count{0};
+  std::atomic<std::size_t> _terminal_producer_count{0};
   std::atomic<bool> _has_unscoped_producer{false};
   std::atomic<bool> _accepting_filters{true};
 };

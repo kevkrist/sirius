@@ -30,6 +30,7 @@
 #include "expression/join_condition.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "pipeline/scheduler_config.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
 
@@ -128,6 +129,12 @@ struct build_probe_decision {
   duckdb::JoinType join_type,
   HASH_JOIN_MODE join_mode,
   double estimated_probe_to_build_ratio);
+
+/// True when every dynamic-filter channel @p plan publishes into has all of its registered
+/// producers terminal (see `sirius_dynamic_filter_set::all_producers_terminal`), so a probe scan
+/// started now snapshots every filter it was planned to consume. False for a disabled plan (no
+/// targets): a join that publishes nothing gives its probe no reason to start early.
+[[nodiscard]] bool dynamic_filter_targets_terminal(dynamic_filter_publish_plan const& plan);
 
 /// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
 /// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
@@ -384,6 +391,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
 
+  /// BUILD_PROBE probe-side activation rule (`sirius.scheduler.probe_activation`). Set at plan
+  /// time; read by `get_next_task_hint`.
+  void set_probe_activation_policy(pipeline::probe_activation_policy policy) noexcept
+  {
+    _probe_activation = policy;
+  }
+  [[nodiscard]] pipeline::probe_activation_policy get_probe_activation_policy() const noexcept
+  {
+    return _probe_activation;
+  }
+
   std::unique_ptr<operator_data> get_next_task_input_data_for_build_probe();
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
@@ -397,6 +415,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// Snapshot each partition's build state and per-partition data availability for the BUILD_PROBE
   /// scheduler (`select_build_probe_action`). Must be called with `op_state_mutex` held.
   std::vector<build_probe_slot_view> snapshot_build_probe_slots();
+
+  /// BUILD_PROBE: whether the probe side may be activated before every partition's build batch
+  /// has been deposited. True under `on_partitioned_and_published` when the build CONCAT's source
+  /// (the build PARTITION pipeline) has finished — so the build is fully scattered and only the
+  /// CONCAT fold / hash-table builds remain — and `dynamic_filter_targets_terminal(plan)` holds.
+  /// Must be called with `op_state_mutex` held.
+  [[nodiscard]] bool probe_may_start_before_build(port const& build_port);
 
   /// Broadcast-mode cleanup: once the probe upstream is finished, any NOT_BUILT slot that holds a
   /// (replicated) build batch but never received probe data is discarded — its build batch is freed
@@ -438,6 +463,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   // Guarded by op_state_mutex.
   bool _build_not_whole_reported = false;
+
+  // See set_probe_activation_policy. Immutable during execution.
+  pipeline::probe_activation_policy _probe_activation =
+    pipeline::probe_activation_policy::on_partitioned_and_published;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)

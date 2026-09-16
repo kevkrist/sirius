@@ -53,6 +53,7 @@
 #include "log/sink.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "operator_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -3048,4 +3049,121 @@ TEST_CASE("null build keys are excluded from Bloom filters on both insertion pat
     REQUIRE(membership_mask(*published.front(), probe->view(), fixture) ==
             std::vector<std::uint8_t>{1, 1, 1, 1, 1, 1});
   }
+}
+
+//===----------------------------------------------------------------------===//
+// Producer-terminal marking on the target channels (probe activation on "partitioned +
+// published" gates on sirius_dynamic_filter_set::all_producers_terminal()).
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("a one-shot publication marks its target channel terminal after the push",
+          "[dynamic_filter][publisher][publication_session]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3);
+  fixture.stream.synchronize();
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  channel->register_producer({kProbeColumnIndex});
+  auto plan = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_stats stats;
+  sirius::op::dynamic_filter_publication_session session(plan, &stats, true);
+  REQUIRE_FALSE(sirius::op::dynamic_filter_targets_terminal(plan));
+
+  REQUIRE(session.try_claim_one_shot());
+  REQUIRE_FALSE(channel->all_producers_terminal());  // a claim is not terminal
+  session.publish_one_shot(fixture.build_view(), fixture.stream);
+
+  REQUIRE(stats.publications_finished.load() == 1);
+  REQUIRE(channel->filter_count() == 1);
+  REQUIRE(channel->all_producers_terminal());
+  REQUIRE(sirius::op::dynamic_filter_targets_terminal(plan));
+}
+
+TEST_CASE("a failed claim and a closed window mark the target channel terminal exactly once",
+          "[dynamic_filter][publisher][publication_session]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column(3);
+  fixture.stream.synchronize();
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  // Two producers on the channel: the session under test and one sibling that never publishes.
+  channel->register_producer({kProbeColumnIndex});
+  channel->register_producer({kProbeColumnIndex});
+  auto plan = make_accumulator_plan(fixture, channel);
+  sirius::op::dynamic_filter_stats stats;
+
+  SECTION("fail_claim")
+  {
+    sirius::op::dynamic_filter_publication_session session(plan, &stats, true);
+    REQUIRE(session.try_claim_one_shot());
+    session.reopen_from_claim();  // reopening is not terminal
+    REQUIRE_FALSE(channel->all_producers_terminal());
+    REQUIRE(session.try_claim_one_shot());
+    session.fail_claim();
+    session.finalize_or_abort();  // a second terminal path must not count twice
+    // One of two producers terminal: the sibling still holds the channel open.
+    REQUIRE_FALSE(channel->all_producers_terminal());
+    channel->mark_producer_terminal();
+    REQUIRE(channel->all_producers_terminal());
+    REQUIRE(sirius::op::dynamic_filter_targets_terminal(plan));
+  }
+
+  SECTION("finalize_or_abort on an open window")
+  {
+    sirius::op::dynamic_filter_publication_session session(plan, &stats, true);
+    session.finalize_or_abort();
+    REQUIRE_FALSE(session.is_open());
+    session.finalize_or_abort();
+    REQUIRE_FALSE(channel->all_producers_terminal());
+    channel->mark_producer_terminal();
+    REQUIRE(channel->all_producers_terminal());
+  }
+}
+
+TEST_CASE("replica restriction that disables a plan marks its dropped channels terminal",
+          "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  channel->register_producer({kProbeColumnIndex});
+  auto plan = make_accumulator_plan(fixture, channel);
+  REQUIRE(plan.enabled());
+
+  plan.restrict_replicas_to({kDeviceId + 1});
+
+  REQUIRE_FALSE(plan.enabled());
+  // The disabled plan gives its join no reason to start the probe early ...
+  REQUIRE_FALSE(sirius::op::dynamic_filter_targets_terminal(plan));
+  // ... but other producers on the same channel are not held back by the vanished one.
+  REQUIRE(channel->all_producers_terminal());
+}
+
+TEST_CASE("dynamic_filter_targets_terminal requires every target channel to be terminal",
+          "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  auto first  = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  auto second = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  first->register_producer({kProbeColumnIndex});
+  second->register_producer({kProbeColumnIndex});
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  for (auto const& channel : {first, second}) {
+    targets.push_back({.filter_set               = channel,
+                       .route_class              = dynamic_filter_route_class::scan,
+                       .accepts_zone_map_filters = false,
+                       .key_bindings             = {{.admitted_key_index   = 0,
+                                                     .channel_push_ordinal = kProbeColumnIndex,
+                                                     .probe_storage_type   = kInt64}}});
+  }
+  dynamic_filter_publish_plan plan{
+    {make_int64_key(0, 0)}, std::move(targets), fixture.replica_spaces};
+
+  REQUIRE_FALSE(sirius::op::dynamic_filter_targets_terminal(plan));
+  first->mark_producer_terminal();
+  REQUIRE_FALSE(sirius::op::dynamic_filter_targets_terminal(plan));
+  second->mark_producer_terminal();
+  REQUIRE(sirius::op::dynamic_filter_targets_terminal(plan));
+
+  dynamic_filter_publish_plan const disabled{};
+  REQUIRE_FALSE(sirius::op::dynamic_filter_targets_terminal(disabled));
 }

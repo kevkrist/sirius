@@ -321,11 +321,16 @@ work is exposed by task hints and completion-driven downstream scheduling — pl
 
 ### Dynamic-filter independence
 
-The scheduler is filter-agnostic: it does not inspect hash joins or reorder queued work to advance
-dynamic-filter publication. Immediate probes remain strictly ordered by synchronous build-CONCAT
-publication in the join pipeline. A scan reached transitively through an intervening join has no
-such edge and samples whatever complete filters are visible at its reader and post-decode
-checkpoints.
+The scheduler does not reorder queued work to advance dynamic-filter publication, and
+`start_query()` still seeds only the plan-order first scan. The filter wiring is consulted at one
+point only: a `BUILD_PROBE` join under `sirius.scheduler.probe_activation =
+on_partitioned_and_published` (default) lets the hint chain walk into its probe side once its build
+`PARTITION` pipeline has finished and every producer on its target channels is terminal
+(`sirius_dynamic_filter_set::all_producers_terminal`). Immediate probes therefore still see the
+completed fan-out — the gate is on publication state, not on the build landing — while overlapping
+the build `CONCAT` shuffle and the hash-table builds. A scan reached transitively through an
+intervening join has no such edge and samples whatever complete filters are visible at its reader
+and post-decode checkpoints.
 
 Issue [#1124](https://github.com/sirius-db/sirius/issues/1124) measured the former build-subtree
 preference. It provided no coverage benefit while costing wall time and run-to-run variance, so it

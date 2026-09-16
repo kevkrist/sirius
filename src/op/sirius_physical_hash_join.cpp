@@ -958,6 +958,33 @@ std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_pro
   return slots;
 }
 
+bool dynamic_filter_targets_terminal(dynamic_filter_publish_plan const& plan)
+{
+  if (!plan.enabled()) { return false; }
+  for (auto const& target : plan.probe_targets()) {
+    if (!target.filter_set || !target.filter_set->all_producers_terminal()) { return false; }
+  }
+  return true;
+}
+
+bool sirius_physical_hash_join::probe_may_start_before_build(port const& build_port)
+{
+  if (_probe_activation != pipeline::probe_activation_policy::on_partitioned_and_published) {
+    return false;
+  }
+  // Every filter the probe was planned to consume — this join's and any other producer's on the
+  // same channels — is visible; a split started now is pruned exactly as one started after the
+  // build lands. A join without filters keeps the deposit rule: the build landing is then the
+  // only throttle on how much unfiltered probe output buffers ahead of the hash table.
+  if (!dynamic_filter_targets_terminal(_dynamic_filter_plan)) { return false; }
+  // The build CONCAT's own source is the build PARTITION pipeline: finished means every build
+  // row has been scattered into its partition slot and the fold tasks are being created.
+  if (!build_port.src_pipeline) { return false; }
+  auto const& fold_operators = build_port.src_pipeline->get_operators();
+  if (fold_operators.empty()) { return false; }
+  return fold_operators[0].get().is_source_pipeline_finished();
+}
+
 std::vector<std::size_t> broadcast_slots_to_discard(std::vector<build_probe_slot_view> const& slots,
                                                     bool probe_finished)
 {
@@ -1038,6 +1065,15 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
       case build_probe_action::schedule_probe:
         return task_creation_hint{TaskCreationHint::READY, this};
       case build_probe_action::wait_for_build: {
+        // Probe activation on "partitioned + published": walk into the probe side now so its scan
+        // overlaps the build CONCAT shuffle and the hash-table builds. The fold tasks are driven by
+        // the PARTITION pipeline's own completion notifications, and each fold deposit re-schedules
+        // this join, so the build still lands and rule 1 (schedule_build) still fires; probe
+        // batches that arrive first simply wait in the probe repository.
+        if (probe_may_start_before_build(*build_port)) {
+          auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
+          return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+        }
         auto* producer = &build_port->src_pipeline->get_operators()[0].get();
         return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
       }

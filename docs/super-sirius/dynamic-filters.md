@@ -120,7 +120,7 @@ The safety model has four invariants:
 
 ### Immediate-probe ordering
 
-Under demand-driven scheduling, build-side `CONCAT` synchronously completes publication before an immediate `BUILD_PROBE` consumer is activated. The immediate probe therefore normally sees the completed fan-out.
+Under demand-driven scheduling an immediate `BUILD_PROBE` probe is activated by its join's hint. With `sirius.scheduler.probe_activation = on_build_deposited`, that happens only after every partition's folded build batch has been deposited, by which time the build-side publication (one-shot at the `CONCAT` delivery, multi-partition before the final `PARTITION` scatter) has completed. With the default `on_partitioned_and_published`, the join walks into its probe side as soon as the build `PARTITION` pipeline has finished **and** every producer registered on each channel the join publishes into has reached a terminal state — the session marks its target channels terminal (`sirius_dynamic_filter_set::mark_producer_terminal`) after its fan-out, on publication, failure, or close, and plan narrowing marks channels it drops. The immediate probe therefore sees the completed fan-out in both modes; the default merely stops waiting for the build `CONCAT` shuffle and the hash-table builds it does not need.
 
 This ordering is specific to `BUILD_PROBE`. Eligible single-partition `STANDARD` or `MIXED_JOIN` builds can also publish, but their probe work is not held behind the same build-before-probe edge.
 
@@ -130,7 +130,7 @@ A scan reached through an intervening join, a non-`BUILD_PROBE` consumer, or wor
 
 | Target relationship | Visibility |
 |---|---|
-| Immediate demand-driven `BUILD_PROBE` probe | Publication normally completes before probe activation |
+| Immediate demand-driven `BUILD_PROBE` probe | Publication completes before probe activation (gated on every producer of the probe's channel being terminal under `on_partitioned_and_published`; on the build deposit otherwise) |
 | Transitive, cross-scheduled, or lookahead target | Opportunistic per-column snapshots at each consumer checkpoint |
 
 Already-processed batches are not revisited. The channel never creates a scheduling dependency, and late filters improve only later work.

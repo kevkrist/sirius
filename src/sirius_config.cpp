@@ -362,6 +362,21 @@ static void from_yaml(const YAML::Node& node, compression_config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node, pipeline::scheduler_config& opt)
+{
+  yaml::reader r(node, "scheduler");
+  std::string policy;
+  r.optional("probe_activation", policy, [](std::string const& value) {
+    pipeline::probe_activation_policy parsed;
+    if (pipeline::string_to_enum(value, parsed)) return true;
+    throw std::runtime_error("must be one of on_build_deposited, on_partitioned_and_published");
+  });
+  if (!policy.empty()) {
+    static_cast<void>(pipeline::string_to_enum(policy, opt.probe_activation));
+  }
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& opt)
 {
   yaml::reader r(node, "downgrade");
@@ -729,6 +744,9 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
 
     // Compression
     if (auto n = r.optional_node("compression")) { sirius::from_yaml(*n, _compression_config); }
+
+    // Probe-activation scheduling policy
+    if (auto n = r.optional_node("scheduler")) { sirius::from_yaml(*n, _scheduler_config); }
 
     // Explicit space configs (low-level API)
     std::vector<cucascade::memory::gpu_memory_space_config> gpu_space_configs;
