@@ -292,9 +292,14 @@ returns the selected route:
    ordered `(source, destination)` pair instead of maintaining a second probe.
 2. Matching CuCascade's established GPU-to-GPU converter, a verified pair uses
    `cudaMemcpyPeerAsync` directly on the destination replica stream. Sirius
-   enables ordinary peer access once during context initialization; neither
-   converter performs a per-allocation memory-pool permission query. An
-   unexpected enqueue failure propagates instead of changing routes.
+   enables ordinary peer access once during context initialization and, unless
+   `sirius.memory.gpu.enable_pool_peer_access` is false, also grants each
+   probe-verified peer `cudaMemPoolSetAccess` on every GPU's cudaMallocAsync
+   pool. The pool grant is what makes the copy a direct DMA: with the legacy
+   enable alone the driver completes it as a host-staged two-leg transfer (no
+   PtoP record, lower bandwidth, host-blocking enqueue). Neither converter
+   performs a per-allocation memory-pool permission query. An unexpected
+   enqueue failure propagates instead of changing routes.
 3. Otherwise the adapter borrows the minimum number of pre-pinned fixed blocks
    from the target's planned CuCascade
    `fixed_size_host_memory_resource`. Because the blocks are noncontiguous, it

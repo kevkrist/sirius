@@ -406,6 +406,7 @@ struct gpu_mem_config {
   std::variant<double, std::uint64_t> reservation_limit{1.0};
   double downgrade_trigger_fraction{0.8};
   double downgrade_stop_fraction{0.6};
+  bool enable_pool_peer_access{gpu_memory_params{}.enable_pool_peer_access};
 
   static void from_yaml(const YAML::Node& node, gpu_mem_config& opt)
   {
@@ -430,9 +431,15 @@ struct gpu_mem_config {
     r.optional(
       "downgrade_trigger_fraction", opt.downgrade_trigger_fraction, yaml::fraction<double>{});
     r.optional("downgrade_stop_fraction", opt.downgrade_stop_fraction, yaml::fraction<double>{});
+    r.optional("enable_pool_peer_access", opt.enable_pool_peer_access);
     r.reject_unknown();
     validate_downgrade_fractions(
       "sirius.memory.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
+  }
+
+  [[nodiscard]] gpu_memory_params to_gpu_memory_params() const noexcept
+  {
+    return gpu_memory_params{.enable_pool_peer_access = enable_pool_peer_access};
   }
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
@@ -629,6 +636,7 @@ void sirius_config::apply_defaults()
   disk_cfg.setup_configurator(builder);
   _memory_space_configs = builder.build(_hw_topology);
   _operator_params      = operator_params{};
+  _gpu_memory_params    = gpu_cfg.to_gpu_memory_params();
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
@@ -680,6 +688,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       }
       mr.reject_unknown();
     }
+    _gpu_memory_params = gpu_cfg.to_gpu_memory_params();
 
     // Executors
     if (auto exec_node = r.optional_node("executor")) {

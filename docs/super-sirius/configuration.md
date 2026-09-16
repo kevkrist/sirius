@@ -77,6 +77,7 @@ sirius:
       reservation_limit_fraction: 1.0
       downgrade_trigger_fraction: 0.8
       downgrade_stop_fraction: 0.6
+      enable_pool_peer_access: true  # cudaMemPoolSetAccess for probe-verified peer GPUs
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
   executor:
@@ -128,6 +129,7 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 | `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
+| `enable_pool_peer_access` | bool | true | Multi-GPU only. At context init, grant every probe-verified peer GPU read/write access to each GPU's cudaMallocAsync pool (`cudaMemPoolSetAccess`), and to its device default pool. Legacy `cudaDeviceEnablePeerAccess` covers only cudaMalloc memory; without the pool grant `cudaMemcpyPeerAsync` between pools completes as a driver-staged two-leg copy (no direct DMA, the enqueue blocks the host) and UVA kernel reads of a peer pool fault. Pairs whose empirical peer-DMA probe fails are skipped and keep host staging. `SiriusContext::is_pool_peer_access_granted(accessor, owner)` reports the per-pair outcome. |
 
 The high-level GPU path keeps per-stream reservation tracking off. The
 diagnostic control remains available only through the explicit low-level

@@ -245,6 +245,17 @@ struct compression_config {
   std::string input_plan_dir{};
 };
 
+/// GPU memory-pool behaviour read from `sirius.memory.gpu` and consumed by SiriusContext (the
+/// capacity/downgrade keys of that section feed the cuCascade configurator instead).
+struct gpu_memory_params {
+  /// At context init, grant every probe-verified peer GPU read/write access to each GPU's
+  /// cudaMallocAsync pool (`cudaMemPoolSetAccess`). Legacy `cudaDeviceEnablePeerAccess` covers
+  /// only cudaMalloc memory; without the pool grant `cudaMemcpyPeerAsync` between pools completes
+  /// as a driver-staged two-leg copy (no direct DMA) and UVA kernel reads of a peer pool fault.
+  /// Pairs whose empirical peer-DMA probe fails are skipped and keep host staging.
+  bool enable_pool_peer_access = true;
+};
+
 struct sirius_config {
   sirius_config();
   ~sirius_config() = default;
@@ -296,6 +307,11 @@ struct sirius_config {
     return _compression_config;
   }
 
+  [[nodiscard]] const gpu_memory_params& get_gpu_memory_params() const noexcept
+  {
+    return _gpu_memory_params;
+  }
+
   /// How many GPUs to allocate per query. 0 = use all active GPUs (default).
   /// Limits each query to the first @c gpus_per_query entries of the sorted
   /// active-GPU list; the rest are left available for future concurrent queries.
@@ -319,6 +335,7 @@ struct sirius_config {
   operator_params _operator_params;
   telemetry_config _telemetry_config;
   compression_config _compression_config;
+  gpu_memory_params _gpu_memory_params;
 };
 
 }  // namespace sirius

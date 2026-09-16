@@ -703,3 +703,30 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
   std::error_code ec;
   std::filesystem::remove(path, ec);
 }
+
+TEST_CASE("the pool peer-access switch is consumed from the memory.gpu YAML section",
+          "[config_opt][pool_peer_access]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_pool_peer_access.yaml";
+  {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  memory:\n"
+           "    gpu:\n"
+           "      enable_pool_peer_access: false\n";
+  }
+
+  CHECK(gpu_memory_params{}.enable_pool_peer_access);
+  CHECK(sirius_config{}.get_gpu_memory_params().enable_pool_peer_access);
+
+  sirius_config cfg;
+  cfg.load_from_file(path);
+  CHECK_FALSE(cfg.get_gpu_memory_params().enable_pool_peer_access);
+
+  // apply_defaults() restores the engine default like it does for operator_params.
+  cfg.apply_defaults();
+  CHECK(cfg.get_gpu_memory_params().enable_pool_peer_access);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}

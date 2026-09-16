@@ -569,3 +569,82 @@ TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1"
   REQUIRE(target_space.get_active_reservation_count() == target_active_before);
   REQUIRE(target_mr->get_total_allocated_bytes() == target_allocated_before);
 }
+
+// Pool-level peer access is what SiriusContext::initialize() grants for every probe-verified
+// pair so that cudaMemcpyPeerAsync between two cudaMallocAsync pools is a direct DMA instead of
+// the driver's host-staged copy. The grant is exercised here on a bare memory manager: the probe
+// GPU's pool must report ProtReadWrite for the build GPU afterwards and a peer pull issued from
+// the build GPU must read the probe GPU's pool memory intact.
+TEST_CASE("pool peer access grant makes the probe GPU's pool reachable from the build GPU",
+          "[dynamic_filter][mgpu][pool_peer_access]")
+{
+  if (!require_two_gpus()) { return; }
+
+  auto memory_manager =
+    sirius::test::operator_utils::initialize_memory_manager(kReplicaDevices.size());
+  auto replica_spaces = get_replica_spaces(*memory_manager);
+  // The grant requires the probe to pass in both directions (the peer may pull from and push into
+  // the pool), so an asymmetric-broken pair must skip rather than fail.
+  if (!cucascade::memory::probe_peer_dma_works(kProbeDevice, kBuildDevice) ||
+      !cucascade::memory::probe_peer_dma_works(kBuildDevice, kProbeDevice)) {
+    WARN("pool peer access test requires direct peer DMA between GPU 0 and GPU 1; skipping");
+    return;
+  }
+
+  auto const& build_space = replica_spaces.front().get_gpu_space();
+  auto const& probe_space = replica_spaces.back().get_gpu_space();
+  auto const* probe_mr =
+    probe_space.get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(probe_mr != nullptr);
+  cudaMemPool_t const probe_pool = probe_mr->pool_handle();
+  REQUIRE(probe_pool != nullptr);
+
+  using cucascade::memory::grant_pool_peer_access;
+  using cucascade::memory::pool_peer_access_status;
+
+  auto const granted = grant_pool_peer_access(probe_pool, kProbeDevice, kBuildDevice);
+  REQUIRE(granted.status == pool_peer_access_status::granted);
+  REQUIRE(granted.error == cudaSuccess);
+
+  cudaMemAccessFlags flags{};
+  cudaMemLocation location{};
+  location.type = cudaMemLocationTypeDevice;
+  location.id   = kBuildDevice;
+  REQUIRE(cudaMemPoolGetAccess(&flags, probe_pool, &location) == cudaSuccess);
+  CHECK(flags == cudaMemAccessFlagsProtReadWrite);
+
+  // Idempotent, and a device trivially has access to its own pool.
+  CHECK(grant_pool_peer_access(probe_pool, kProbeDevice, kBuildDevice).status ==
+        pool_peer_access_status::granted);
+  CHECK(grant_pool_peer_access(probe_pool, kProbeDevice, kProbeDevice).status ==
+        pool_peer_access_status::granted);
+
+  constexpr std::size_t kBytes = 1u << 20;
+  constexpr int kPattern       = 0x5A;
+  std::vector<std::uint8_t> host(kBytes);
+  {
+    rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
+    auto const probe_stream = probe_space.acquire_stream();
+    rmm::device_buffer source(kBytes, probe_stream, probe_space.get_default_allocator());
+    REQUIRE(cudaMemsetAsync(source.data(), kPattern, kBytes, probe_stream.value()) == cudaSuccess);
+    probe_stream.synchronize();
+
+    rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{kBuildDevice}};
+    auto const build_stream = build_space.acquire_stream();
+    rmm::device_buffer destination(kBytes, build_stream, build_space.get_default_allocator());
+    REQUIRE(cudaMemcpyPeerAsync(destination.data(),
+                                kBuildDevice,
+                                source.data(),
+                                kProbeDevice,
+                                kBytes,
+                                build_stream.value()) == cudaSuccess);
+    REQUIRE(
+      cudaMemcpyAsync(
+        host.data(), destination.data(), kBytes, cudaMemcpyDeviceToHost, build_stream.value()) ==
+      cudaSuccess);
+    build_stream.synchronize();
+    // Reverse destruction order frees `destination` with the build GPU current and, once the
+    // inner guard has restored it, `source` with the probe GPU current.
+  }
+  CHECK(std::ranges::all_of(host, [](std::uint8_t byte) { return byte == kPattern; }));
+}
