@@ -1202,20 +1202,6 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::filter_and_project_with_dyn
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   auto const view = input.table.view();
 
-  // Residual as a mask (no gather yet). Same per-batch residual assembly and
-  // "decode enforced every conjunct" reading as post_filter_and_project.
-  std::unique_ptr<cudf::column> residual_mask;
-  if (input.state != filter_state::ROW_FILTERED &&
-      input.state != filter_state::ROW_FILTERED_AND_PROJECTED && !_residual.empty()) {
-    auto sirius_filter_ast = _residual.against(input.predicate_columns, input.predicates_enforced);
-    if (sirius_filter_ast) {
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
-      residual_mask = exec.compute_mask(view);
-    } else {
-      input.state = filter_state::ROW_FILTERED;
-    }
-  }
-
   // Output ordinal -> position in the D-order view (the same mapping
   // assemble_scan_output applies; non-DATA entries cannot occur without
   // partitions, but the guard keeps the resolver total).
@@ -1228,16 +1214,47 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::filter_and_project_with_dyn
   };
   auto const data_positions = output_data_positions(plan);
 
-  auto survivors = gather_view_survivors(view,
-                                         data_positions,
-                                         probe_position,
-                                         std::move(residual_mask),
-                                         &dynamic_filters.filters,
-                                         &dynamic_filters.gate,
-                                         mem_space.get_device_id(),
-                                         stream,
-                                         mr_ref,
-                                         &applied);
+  std::unique_ptr<cudf::table> survivors;
+  try {
+    // Residual as a mask (no gather yet). Same per-batch residual assembly and
+    // "decode enforced every conjunct" reading as post_filter_and_project.
+    std::unique_ptr<cudf::column> residual_mask;
+    if (input.state != filter_state::ROW_FILTERED &&
+        input.state != filter_state::ROW_FILTERED_AND_PROJECTED && !_residual.empty()) {
+      auto sirius_filter_ast =
+        _residual.against(input.predicate_columns, input.predicates_enforced);
+      if (sirius_filter_ast) {
+        sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+        residual_mask = exec.compute_mask(view);
+      } else {
+        input.state = filter_state::ROW_FILTERED;
+      }
+    }
+
+    survivors = gather_view_survivors(view,
+                                      data_positions,
+                                      probe_position,
+                                      std::move(residual_mask),
+                                      &dynamic_filters.filters,
+                                      &dynamic_filters.gate,
+                                      mem_space.get_device_id(),
+                                      stream,
+                                      mr_ref,
+                                      &applied);
+  } catch (...) {
+    // The residual, the membership masks and the gather's count pass enqueue
+    // reads of the view before the allocation that may throw (an OOM on a mask
+    // or on the survivor table). `input` drops the chunk's read lock while this
+    // exception unwinds, and the executor only drains the stream after that, so
+    // order any reclaim of the backing cached chunk after those reads first.
+    try {
+      input.table.record_reader_event(stream);
+    } catch (...) {
+      // record_reader_event synchronizes the reader stream before rethrowing;
+      // the enqueued reads are complete and the original exception stands.
+    }
+    throw;
+  }
   if (!survivors) {
     // Nothing to mask: no residual left and no usable filter. Materialize as
     // before (a move for an owned table, a copy for a cached view).
