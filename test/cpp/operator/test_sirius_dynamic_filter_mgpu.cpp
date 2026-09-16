@@ -813,6 +813,114 @@ TEST_CASE("pipelined publication ORs every partial into bit-identical replicas o
   }
 }
 
+TEST_CASE("pipelined publication keeps keys with different source counts apart in one pipeline",
+          "[dynamic_filter][mgpu][bloom][publication_pipeline]")
+{
+  auto const device_count = pipeline_device_count();
+  if (device_count == 0) { return; }
+  auto const root_device = static_cast<int>(device_count - 1);
+  if (!pipeline_peer_dma_available(device_count, root_device)) { return; }
+  CAPTURE(device_count, root_device);
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(device_count);
+  auto replica_spaces = get_replica_spaces(*memory_manager, device_count);
+
+  // Key A has a partial on every GPU, key B only on GPU 0 and the root. With more than two GPUs
+  // the two keys therefore partition the root scratch differently, and the small chunk lets key
+  // B's first copies be issued while key A's last OR may still be reading the scratch. Neither
+  // key's bits may leak into the other's replicas.
+  constexpr std::size_t keys_per_device = 1 << 17;
+  auto const total_rows                 = keys_per_device * device_count;
+  using bloom_ptr                       = std::unique_ptr<sirius::op::sirius_dynamic_bloom_filter>;
+  auto const make_filter = [&](int device, std::vector<std::vector<std::int64_t>> const& inserts) {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+    auto const& space = replica_spaces[device].get_gpu_space();
+    auto const stream = space.acquire_stream();
+    auto filter       = std::make_unique<sirius::op::sirius_dynamic_bloom_filter>(
+      kInt64Type, total_rows, stream, space.get_default_allocator());
+    for (auto const& keys : inserts) {
+      auto column = make_values<std::int64_t>(keys, kInt64Type, stream);
+      filter->add(column->view(), stream);
+    }
+    stream.synchronize();
+    return filter;
+  };
+
+  std::vector<std::vector<std::int64_t>> keys_a(device_count);
+  std::vector<bloom_ptr> partials_a(device_count);
+  for (std::size_t device = 0; device < device_count; ++device) {
+    keys_a[device]     = pipeline_keys(100 + device, keys_per_device);
+    partials_a[device] = make_filter(static_cast<int>(device), {keys_a[device]});
+  }
+  auto const keys_b_first = pipeline_keys(200, keys_per_device);
+  auto const keys_b_root  = pipeline_keys(201, keys_per_device);
+  auto partial_b_first    = make_filter(0, {keys_b_first});
+  auto root_b             = make_filter(root_device, {keys_b_root});
+  auto reference_a        = make_filter(root_device, keys_a);
+  auto reference_b        = make_filter(root_device, {keys_b_first, keys_b_root});
+
+  {
+    using source_partial = sirius::op::sirius_dynamic_bloom_publication_pipeline::source_partial;
+    std::vector<source_partial> sources_a;
+    for (std::size_t device = 0; device < device_count; ++device) {
+      if (static_cast<int>(device) == root_device) { continue; }
+      sources_a.push_back({partials_a[device].get(), &replica_spaces[device]});
+    }
+    std::array<source_partial, 1> const sources_b{{{partial_b_first.get(), &replica_spaces[0]}}};
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{root_device}};
+    sirius::op::sirius_dynamic_bloom_publication_pipeline pipeline{
+      replica_spaces[root_device], replica_spaces, std::size_t{64} << 10};
+    pipeline.enqueue(*partials_a[root_device], sources_a);
+    pipeline.enqueue(*root_b, sources_b);
+    pipeline.complete();
+  }
+  REQUIRE(partials_a[root_device]->replica_count() == device_count);
+  REQUIRE(root_b->replica_count() == device_count);
+
+  auto const absent = pipeline_keys(300, keys_per_device);
+  auto const check  = [&](sirius::op::sirius_dynamic_bloom_filter const& published,
+                         sirius::op::sirius_dynamic_bloom_filter const& reference,
+                         std::vector<std::vector<std::int64_t>> const& inserted) {
+    std::vector<std::int64_t> probe;
+    for (auto const& keys : inserted) {
+      probe.insert(probe.end(), keys.begin(), keys.end());
+    }
+    auto const inserted_count = static_cast<std::ptrdiff_t>(probe.size());
+    probe.insert(probe.end(), absent.begin(), absent.end());
+    auto const expected =
+      pipeline_mask(reference, probe, root_device, replica_spaces[root_device].get_gpu_space());
+    REQUIRE(std::all_of(expected.begin(), expected.begin() + inserted_count, [](std::uint8_t keep) {
+      return keep != 0;
+    }));
+    // Leaked bits from the other key could only add ones; keep the equality non-vacuous.
+    REQUIRE(std::count(expected.begin() + inserted_count, expected.end(), 0) >
+            static_cast<std::ptrdiff_t>(keys_per_device / 2));
+    for (std::size_t device = 0; device < device_count; ++device) {
+      CAPTURE(device);
+      CHECK(pipeline_mask(
+              published, probe, static_cast<int>(device), replica_spaces[device].get_gpu_space()) ==
+            expected);
+    }
+  };
+  check(*partials_a[root_device], *reference_a, keys_a);
+  check(*root_b, *reference_b, {keys_b_first, keys_b_root});
+
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{root_device}};
+    reference_b.reset();
+    reference_a.reset();
+    root_b.reset();
+  }
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{0}};
+    partial_b_first.reset();
+  }
+  for (std::size_t device = device_count; device-- > 0;) {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{static_cast<int>(device)}};
+    partials_a[device].reset();
+  }
+}
+
 TEST_CASE("pipelined publication with no remote partial still replicates the root filter",
           "[dynamic_filter][mgpu][bloom][publication_pipeline]")
 {

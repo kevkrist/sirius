@@ -771,9 +771,13 @@ struct sirius_dynamic_bloom_publication_pipeline::impl {
   std::vector<pending_key> pending;
   // Counts chunks across keys: buffer (sequence & 1) is reused only after the OR of sequence - 2.
   std::size_t chunk_sequence = 0;
-  std::size_t ingress_bytes  = 0;
-  std::size_t egress_bytes   = 0;
-  bool completed             = false;
+  // `sources * chunk` of the last key that had sources: the two scratch halves are
+  // [0, slot_bytes) and [slot_bytes, 2 * slot_bytes), so the parity WAR wait above only covers
+  // ORs issued under the same layout.
+  std::size_t slot_bytes_in_use = 0;
+  std::size_t ingress_bytes     = 0;
+  std::size_t egress_bytes      = 0;
+  bool completed                = false;
 
   impl(dynamic_filter_replica_space const& root_space,
        std::span<dynamic_filter_replica_space const> spaces,
@@ -953,6 +957,22 @@ struct sirius_dynamic_bloom_publication_pipeline::impl {
     auto* const destination_bytes = reinterpret_cast<std::byte*>(destination_owner->data());
     auto const slot_stride        = chunk_bytes / sizeof(uint4);
     constexpr int threads         = 256;
+
+    if (source_count > 0) {
+      // A key with a different source count or chunk repartitions the scratch halves, so the
+      // previous key's last OR (parity sequence - 1) may still be reading bytes this key's first
+      // copies overwrite. Order those copies after every OR issued so far: one bubble per relayout,
+      // never taken when consecutive keys share the layout (as one publication's keys do).
+      auto const slot_bytes = source_count * chunk_bytes;
+      if (chunk_sequence > 0 && slot_bytes != slot_bytes_in_use) {
+        rmm::cuda_set_device_raii root_guard{rmm::cuda_device_id{root_device}};
+        for (auto const& event : or_done) {
+          cuda_try(cudaStreamWaitEvent(copy_stream.value(), event.get(), 0),
+                   "cudaStreamWaitEvent(copy, or_done relayout)");
+        }
+      }
+      slot_bytes_in_use = slot_bytes;
+    }
 
     for (std::size_t offset = 0; offset < filter_bytes; offset += chunk_bytes, ++chunk_sequence) {
       auto const bytes  = std::min(chunk_bytes, filter_bytes - offset);
