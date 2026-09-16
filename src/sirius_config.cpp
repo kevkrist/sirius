@@ -287,6 +287,17 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional("enable_dynamic_filter_multi_partition", opt.enable_dynamic_filter_multi_partition);
   r.optional("max_dynamic_filter_bloom_bytes_per_gpu",
              yaml::bytes(opt.max_dynamic_filter_bloom_bytes_per_gpu));
+  {
+    std::string scheme{op::to_string(opt.dynamic_filter_publication_scheme)};
+    r.optional("dynamic_filter_publication_scheme", scheme, [](std::string const& value) {
+      if (op::parse_dynamic_filter_publication_scheme(value)) return true;
+      throw std::runtime_error("must be one of root_serial, root_pipelined");
+    });
+    opt.dynamic_filter_publication_scheme = *op::parse_dynamic_filter_publication_scheme(scheme);
+  }
+  // 0 is meaningful here: it selects the automatic chunk size.
+  r.optional("dynamic_filter_publication_chunk_bytes",
+             yaml::bytes(opt.dynamic_filter_publication_chunk_bytes));
   r.optional("enable_dynamic_zone_map_filter", opt.enable_dynamic_zone_map_filter);
   r.optional("dynamic_filter_domain_coverage_threshold",
              opt.dynamic_filter_domain_coverage_threshold,

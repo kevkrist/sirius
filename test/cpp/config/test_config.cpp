@@ -704,6 +704,50 @@ TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML s
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("the dynamic-filter publication scheme and chunk are consumed from operator_params",
+          "[config_opt][dynamic_filter]")
+{
+  using sirius::op::dynamic_filter_publication_scheme;
+  CHECK(operator_params{}.dynamic_filter_publication_scheme ==
+        dynamic_filter_publication_scheme::root_pipelined);
+  CHECK(operator_params{}.dynamic_filter_publication_chunk_bytes == 0);
+
+  auto const path =
+    std::filesystem::temp_directory_path() / "sirius_dynamic_filter_publication.yaml";
+  auto write = [&](char const* scheme) {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    dynamic_filter_publication_scheme: "
+        << scheme
+        << "\n"
+           "    dynamic_filter_publication_chunk_bytes: 4MiB\n";
+  };
+
+  write("root_serial");
+  sirius_config cfg;
+  cfg.load_from_file(path);
+  CHECK(cfg.get_operator_params().dynamic_filter_publication_scheme ==
+        dynamic_filter_publication_scheme::root_serial);
+  CHECK(cfg.get_operator_params().dynamic_filter_publication_chunk_bytes == 4ULL * 1024 * 1024);
+
+  write("root_pipelined");
+  cfg.load_from_file(path);
+  CHECK(cfg.get_operator_params().dynamic_filter_publication_scheme ==
+        dynamic_filter_publication_scheme::root_pipelined);
+
+  write("ring");
+  CHECK_THROWS_WITH(cfg.load_from_file(path), Catch::Contains("dynamic_filter_publication_scheme"));
+
+  cfg.apply_defaults();
+  CHECK(cfg.get_operator_params().dynamic_filter_publication_scheme ==
+        dynamic_filter_publication_scheme::root_pipelined);
+  CHECK(cfg.get_operator_params().dynamic_filter_publication_chunk_bytes == 0);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("the pool peer-access switch is consumed from the memory.gpu YAML section",
           "[config_opt][pool_peer_access]")
 {

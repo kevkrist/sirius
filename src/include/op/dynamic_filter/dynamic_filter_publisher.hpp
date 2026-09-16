@@ -166,7 +166,8 @@ struct dynamic_filter_accumulator_test_hooks {
     after_insert_sync;  ///< Fires once per accepted contribution whose insertion block ran (at
                         ///< least one active key); an inert accumulator never fires it
   std::function<void(sirius_dynamic_bloom_filter&, std::span<dynamic_filter_replica_space const>)>
-    strict_replicate;  ///< Replaces strict replication at the pre-fan-out boundary
+    strict_replicate;  ///< Replaces strict replication at the pre-fan-out boundary; installing it
+                       ///< selects the serial publication scheme, which has that boundary
 };
 }  // namespace detail
 

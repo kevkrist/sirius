@@ -648,3 +648,285 @@ TEST_CASE("pool peer access grant makes the probe GPU's pool reachable from the 
   }
   CHECK(std::ranges::all_of(host, [](std::uint8_t byte) { return byte == kPattern; }));
 }
+
+namespace {
+
+constexpr auto kInt64Type = cudf::data_type{cudf::type_id::INT64};
+
+// Visible GPUs usable as one replica plan (at most four), or 0 when fewer than two are visible.
+std::size_t pipeline_device_count()
+{
+  int count = 0;
+  if (cudaGetDeviceCount(&count) != cudaSuccess || count < 2) {
+    WARN("dynamic-filter pipeline test requires at least two visible GPUs; skipping");
+    return 0;
+  }
+  return static_cast<std::size_t>(std::min(count, 4));
+}
+
+bool pipeline_peer_dma_available(std::size_t device_count, int root_device)
+{
+  for (int device = 0; device < static_cast<int>(device_count); ++device) {
+    if (device == root_device) { continue; }
+    if (!cucascade::memory::probe_peer_dma_works(device, root_device) ||
+        !cucascade::memory::probe_peer_dma_works(root_device, device)) {
+      WARN("dynamic-filter pipeline test requires direct peer DMA with the root GPU; skipping");
+      return false;
+    }
+  }
+  return true;
+}
+
+// Distinct pseudo-random key sets per GPU (xorshift64), so a skipped, duplicated or misplaced
+// chunk changes the OR result.
+std::vector<std::int64_t> pipeline_keys(std::uint64_t seed, std::size_t count)
+{
+  std::vector<std::int64_t> keys(count);
+  std::uint64_t state = 0x9E3779B97F4A7C15ULL * (seed + 1);
+  for (auto& key : keys) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    key = static_cast<std::int64_t>(state >> 1);
+  }
+  return keys;
+}
+
+// Mask of `probe` on `device_id` through `filter`, on a pooled stream of that GPU's space.
+std::vector<std::uint8_t> pipeline_mask(sirius::op::sirius_dynamic_bloom_filter const& filter,
+                                        std::vector<std::int64_t> const& probe,
+                                        int device_id,
+                                        cucascade::memory::memory_space const& space)
+{
+  rmm::cuda_set_device_raii const device{rmm::cuda_device_id{device_id}};
+  auto const stream = space.acquire_stream();
+  auto column       = make_values<std::int64_t>(probe, kInt64Type, stream);
+  auto mask = filter.compute_mask(column->view(), device_id, stream, space.get_default_allocator());
+  REQUIRE(mask != nullptr);
+  return mask_to_host(mask->view(), stream);
+}
+
+}  // namespace
+
+TEST_CASE("pipelined publication ORs every partial into bit-identical replicas on every GPU",
+          "[dynamic_filter][mgpu][bloom][publication_pipeline]")
+{
+  auto const device_count = pipeline_device_count();
+  if (device_count == 0) { return; }
+  // The final contributor roots production publications; use the last GPU so a root-is-GPU-0
+  // assumption cannot pass by accident.
+  auto const root_device = static_cast<int>(device_count - 1);
+  if (!pipeline_peer_dma_available(device_count, root_device)) { return; }
+
+  // Auto (2 MiB for this footprint), many small chunks (exercises double-buffer reuse), and one
+  // chunk larger than the filter.
+  auto const requested_chunk_bytes =
+    GENERATE(std::size_t{0}, std::size_t{64} << 10, std::size_t{1} << 30);
+  CAPTURE(device_count, root_device, requested_chunk_bytes);
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(device_count);
+  auto replica_spaces = get_replica_spaces(*memory_manager, device_count);
+
+  constexpr std::size_t keys_per_device = 1 << 19;  // 4 MB Bloom per filter
+  auto const total_rows                 = keys_per_device * device_count;
+  std::vector<std::vector<std::int64_t>> keys(device_count);
+  std::vector<std::unique_ptr<sirius::op::sirius_dynamic_bloom_filter>> partials(device_count);
+  for (std::size_t device = 0; device < device_count; ++device) {
+    keys[device] = pipeline_keys(device, keys_per_device);
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{static_cast<int>(device)}};
+    auto const& space = replica_spaces[device].get_gpu_space();
+    auto const stream = space.acquire_stream();
+    partials[device]  = std::make_unique<sirius::op::sirius_dynamic_bloom_filter>(
+      kInt64Type, total_rows, stream, space.get_default_allocator());
+    auto column = make_values<std::int64_t>(keys[device], kInt64Type, stream);
+    partials[device]->add(column->view(), stream);
+    stream.synchronize();
+  }
+
+  // Reference: every key inserted into one filter of the same geometry on the root. Bloom
+  // insertion ORs bits, so the reduced filter must be bit-identical to it.
+  std::unique_ptr<sirius::op::sirius_dynamic_bloom_filter> reference;
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{root_device}};
+    auto const& space = replica_spaces[root_device].get_gpu_space();
+    auto const stream = space.acquire_stream();
+    reference         = std::make_unique<sirius::op::sirius_dynamic_bloom_filter>(
+      kInt64Type, total_rows, stream, space.get_default_allocator());
+    for (auto const& device_keys : keys) {
+      auto column = make_values<std::int64_t>(device_keys, kInt64Type, stream);
+      reference->add(column->view(), stream);
+      stream.synchronize();
+    }
+  }
+
+  auto& root = *partials[root_device];
+  {
+    std::vector<sirius::op::sirius_dynamic_bloom_publication_pipeline::source_partial> sources;
+    for (std::size_t device = 0; device < device_count; ++device) {
+      if (static_cast<int>(device) == root_device) { continue; }
+      sources.push_back({partials[device].get(), &replica_spaces[device]});
+    }
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{root_device}};
+    sirius::op::sirius_dynamic_bloom_publication_pipeline pipeline{
+      replica_spaces[root_device], replica_spaces, requested_chunk_bytes};
+    pipeline.enqueue(root, sources);
+    // Nothing is visible before completion.
+    for (std::size_t device = 0; device < device_count; ++device) {
+      CHECK(root.is_available_on_device(static_cast<int>(device)) ==
+            (static_cast<int>(device) == root_device));
+    }
+    pipeline.complete();
+  }
+  REQUIRE(root.replica_count() == device_count);
+
+  // Probe every inserted key (no false negatives anywhere) plus keys nobody inserted; the masks
+  // on every GPU must equal the reference mask exactly.
+  std::vector<std::int64_t> probe;
+  probe.reserve(total_rows + keys_per_device);
+  for (auto const& device_keys : keys) {
+    probe.insert(probe.end(), device_keys.begin(), device_keys.end());
+  }
+  auto const absent = pipeline_keys(device_count + 7, keys_per_device);
+  probe.insert(probe.end(), absent.begin(), absent.end());
+  auto const expected =
+    pipeline_mask(*reference, probe, root_device, replica_spaces[root_device].get_gpu_space());
+  REQUIRE(std::all_of(expected.begin(),
+                      expected.begin() + static_cast<std::ptrdiff_t>(total_rows),
+                      [](std::uint8_t keep) { return keep != 0; }));
+  // A Bloom this size at 16 bits per key rejects most absent keys; a mask of all ones would
+  // make the equality below vacuous.
+  REQUIRE(std::count(expected.begin() + static_cast<std::ptrdiff_t>(total_rows),
+                     expected.end(),
+                     0) > static_cast<std::ptrdiff_t>(keys_per_device / 2));
+  for (std::size_t device = 0; device < device_count; ++device) {
+    CAPTURE(device);
+    REQUIRE(root.is_available_on_device(static_cast<int>(device)));
+    CHECK(pipeline_mask(
+            root, probe, static_cast<int>(device), replica_spaces[device].get_gpu_space()) ==
+          expected);
+  }
+
+  for (std::size_t device = device_count; device-- > 0;) {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{static_cast<int>(device)}};
+    if (static_cast<int>(device) == root_device) { reference.reset(); }
+    partials[device].reset();
+  }
+}
+
+TEST_CASE("pipelined publication with no remote partial still replicates the root filter",
+          "[dynamic_filter][mgpu][bloom][publication_pipeline]")
+{
+  if (!require_two_gpus()) { return; }
+  if (!pipeline_peer_dma_available(2, kBuildDevice)) { return; }
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto replica_spaces = get_replica_spaces(*memory_manager);
+  auto const keys     = pipeline_keys(3, 4096);
+  std::unique_ptr<sirius::op::sirius_dynamic_bloom_filter> filter;
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kBuildDevice}};
+    auto const& space = replica_spaces.front().get_gpu_space();
+    auto const stream = space.acquire_stream();
+    filter            = std::make_unique<sirius::op::sirius_dynamic_bloom_filter>(
+      kInt64Type, keys.size(), stream, space.get_default_allocator());
+    auto column = make_values<std::int64_t>(keys, kInt64Type, stream);
+    filter->add(column->view(), stream);
+    stream.synchronize();
+
+    sirius::op::sirius_dynamic_bloom_publication_pipeline pipeline{replica_spaces.front(),
+                                                                   replica_spaces};
+    pipeline.enqueue(*filter, {});
+    pipeline.complete();
+  }
+  REQUIRE(filter->replica_count() == 2);
+  REQUIRE(filter->is_available_on_device(kProbeDevice));
+  auto const on_probe =
+    pipeline_mask(*filter, keys, kProbeDevice, replica_spaces.back().get_gpu_space());
+  CHECK(std::all_of(on_probe.begin(), on_probe.end(), [](std::uint8_t keep) { return keep != 0; }));
+
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kBuildDevice}};
+  filter.reset();
+}
+
+TEST_CASE("pipelined publication fails closed before any DMA when a target reservation is denied",
+          "[dynamic_filter][mgpu][bloom][publication_pipeline][reservation]")
+{
+  if (!require_two_gpus()) { return; }
+  if (!pipeline_peer_dma_available(2, kBuildDevice)) { return; }
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(2);
+  auto replica_spaces = get_replica_spaces(*memory_manager);
+  auto& target_space  = replica_spaces.back().get_gpu_space();
+  auto* target_mr =
+    target_space.get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(target_mr != nullptr);
+
+  auto const keys = pipeline_keys(5, 4096);
+  std::unique_ptr<sirius::op::sirius_dynamic_bloom_filter> root;
+  std::unique_ptr<sirius::op::sirius_dynamic_bloom_filter> partial;
+  {
+    // The partial lives on the target GPU (as a contribution would leave it), before the target
+    // is put under reservation pressure.
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kProbeDevice}};
+    auto const stream = target_space.acquire_stream();
+    partial           = std::make_unique<sirius::op::sirius_dynamic_bloom_filter>(
+      kInt64Type, keys.size(), stream, target_space.get_default_allocator());
+    auto column = make_values<std::int64_t>(keys, kInt64Type, stream);
+    partial->add(column->view(), stream);
+    stream.synchronize();
+  }
+  auto const allocated_with_partial = target_mr->get_total_allocated_bytes();
+  REQUIRE(allocated_with_partial < target_space.get_max_memory());
+  auto reservation_pressure =
+    target_space.make_reservation_or_null(target_space.get_max_memory() - allocated_with_partial);
+  REQUIRE(reservation_pressure != nullptr);
+  REQUIRE(target_space.make_reservation_or_null(rmm::CUDA_ALLOCATION_ALIGNMENT) == nullptr);
+  // The pressure arena itself is accounted; nothing may be added on top of it.
+  auto const allocated_under_pressure = target_mr->get_total_allocated_bytes();
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kBuildDevice}};
+    auto const& space = replica_spaces.front().get_gpu_space();
+    auto const stream = space.acquire_stream();
+    root              = std::make_unique<sirius::op::sirius_dynamic_bloom_filter>(
+      kInt64Type, keys.size(), stream, space.get_default_allocator());
+    stream.synchronize();
+
+    sirius::op::sirius_dynamic_bloom_publication_pipeline pipeline{replica_spaces.front(),
+                                                                   replica_spaces};
+    std::array<sirius::op::sirius_dynamic_bloom_publication_pipeline::source_partial, 1> const
+      sources{{{partial.get(), &replica_spaces.back()}}};
+    REQUIRE_THROWS_AS(pipeline.enqueue(*root, sources), std::runtime_error);
+    // Destroying an incomplete pipeline drains its streams; nothing was enqueued here.
+  }
+  CHECK(root->replica_count() == 1);
+  CHECK_FALSE(root->is_available_on_device(kProbeDevice));
+  CHECK(target_mr->get_total_allocated_bytes() == allocated_under_pressure);
+
+  {
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kProbeDevice}};
+    partial.reset();
+  }
+  rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{kBuildDevice}};
+  root.reset();
+}
+
+TEST_CASE("pipelined publication chunks are block-aligned and bounded by the filter",
+          "[dynamic_filter][bloom][publication_pipeline][chunk]")
+{
+  using pipeline            = sirius::op::sirius_dynamic_bloom_publication_pipeline;
+  constexpr std::size_t mib = 1 << 20;
+  // Automatic: clamp(bytes / 8, 2 MiB, 8 MiB).
+  CHECK(pipeline::resolve_chunk_bytes(146'000'000, pipeline::k_auto_chunk_bytes) == 8 * mib);
+  CHECK(pipeline::resolve_chunk_bytes(5'900'000, pipeline::k_auto_chunk_bytes) == 2 * mib);
+  auto const mid = pipeline::resolve_chunk_bytes(29'400'000, pipeline::k_auto_chunk_bytes);
+  CHECK(mid >= 29'400'000 / 8);
+  CHECK(mid < 29'400'000 / 8 + 32);
+  CHECK(mid % 32 == 0);
+  // Never larger than the filter; a tiny filter is one chunk.
+  CHECK(pipeline::resolve_chunk_bytes(1024, pipeline::k_auto_chunk_bytes) == 1024);
+  // Explicit requests round up to the 32-byte Bloom block.
+  CHECK(pipeline::resolve_chunk_bytes(4096, 100) == 128);
+  CHECK(pipeline::resolve_chunk_bytes(4096, 4096) == 4096);
+  CHECK(pipeline::resolve_chunk_bytes(4096, 1 << 30) == 4096);
+  CHECK(pipeline::resolve_chunk_bytes(32, 1) == 32);
+}

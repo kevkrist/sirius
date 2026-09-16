@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "creator/config.hpp"
 #include "exec/config.hpp"
+#include "op/dynamic_filter/dynamic_filter_publication_scheme.hpp"
 #include "scan_manager/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -164,6 +165,17 @@ struct operator_params {
   /// Zero disables accumulated Bloom construction only.
   uint64_t max_dynamic_filter_bloom_bytes_per_gpu =
     config::DEFAULT_MAX_DYNAMIC_FILTER_BLOOM_BYTES_PER_GPU;
+
+  /// Multi-partition Bloom root reduction + replication scheme. `root_pipelined` overlaps the pull
+  /// of remote partials, the OR and the replica copies chunk by chunk on the root's full-duplex
+  /// link (one host wait per target); `root_serial` is the drain-then-broadcast shape. Pipelining
+  /// requires direct peer DMA on every (target, root) pair and otherwise falls back to serial.
+  op::dynamic_filter_publication_scheme dynamic_filter_publication_scheme =
+    op::dynamic_filter_publication_scheme::root_pipelined;
+
+  /// Chunk bytes for `root_pipelined`; 0 selects clamp(filter_bytes / 8, 2 MiB, 8 MiB). Chunks are
+  /// rounded up to the 32-byte Bloom block and never exceed the filter footprint.
+  uint64_t dynamic_filter_publication_chunk_bytes = 0;
 
   /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
