@@ -1178,6 +1178,87 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   return assembled.release(stream, mr_ref);
 }
 
+//===----------------------------------------------------------------------===//
+// filter_and_project_with_dynamic_filters — masks on the view, one gather
+//===----------------------------------------------------------------------===//
+// The pinned-cache split arrives as a zero-copy view of the cached chunk, and
+// post_filter_and_project's release would deep-copy every row of it before the
+// DYNAMIC_FILTER operator discards most of them. Here the residual row filter
+// (when the decode did not apply it) and the published membership filters are
+// evaluated as masks on that view — on its stored (possibly narrowed) carriers,
+// the restoring cast follows in the scan operator and then only touches
+// survivors — and the projected columns are gathered once.
+std::unique_ptr<cudf::table> parquet_gpu_ingestible::filter_and_project_with_dynamic_filters(
+  filtered_table&& input,
+  ::cucascade::memory::memory_space const& mem_space,
+  rmm::cuda_stream_view stream,
+  scan_dynamic_filter_context const& dynamic_filters,
+  scan_dynamic_filter_result& applied)
+{
+  // Partition synthesis works on the released table; keep that path whole.
+  if (_plan->has_partitions()) {
+    return post_filter_and_project(std::move(input), mem_space, stream);
+  }
+  rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+  auto const view = input.table.view();
+
+  // Residual as a mask (no gather yet). Same per-batch residual assembly and
+  // "decode enforced every conjunct" reading as post_filter_and_project.
+  std::unique_ptr<cudf::column> residual_mask;
+  if (input.state != filter_state::ROW_FILTERED &&
+      input.state != filter_state::ROW_FILTERED_AND_PROJECTED && !_residual.empty()) {
+    auto sirius_filter_ast = _residual.against(input.predicate_columns, input.predicates_enforced);
+    if (sirius_filter_ast) {
+      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      residual_mask = exec.compute_mask(view);
+    } else {
+      input.state = filter_state::ROW_FILTERED;
+    }
+  }
+
+  // Output ordinal -> position in the D-order view (the same mapping
+  // assemble_scan_output applies; non-DATA entries cannot occur without
+  // partitions, but the guard keeps the resolver total).
+  auto const& plan    = *_plan;
+  auto probe_position = [&plan](std::size_t output_col) -> std::optional<cudf::size_type> {
+    if (output_col >= plan.output_layout.size()) { return std::nullopt; }
+    auto const& entry = plan.output_layout[output_col];
+    if (entry.source != scan_plan::output_entry::DATA) { return std::nullopt; }
+    return static_cast<cudf::size_type>(entry.idx);
+  };
+  auto const data_positions = output_data_positions(plan);
+
+  auto survivors = gather_view_survivors(view,
+                                         data_positions,
+                                         probe_position,
+                                         std::move(residual_mask),
+                                         &dynamic_filters.filters,
+                                         &dynamic_filters.gate,
+                                         mem_space.get_device_id(),
+                                         stream,
+                                         mr_ref,
+                                         &applied);
+  if (!survivors) {
+    // Nothing to mask: no residual left and no usable filter. Materialize as
+    // before (a move for an owned table, a copy for a cached view).
+    applied.applied.clear();
+    auto assembled =
+      assemble_scan_output(plan, std::move(input.table), /*partition_values=*/{}, stream);
+    return assembled.release(stream, mr_ref);
+  }
+  // Masks and gather only enqueued their reads of the view; order any reclaim
+  // of the backing cached chunk after them before the read lock drops with
+  // `input`.
+  input.table.record_reader_event(stream);
+  SIRIUS_LOG_DEBUG(
+    "[parquet_gpu_ingestible::filter_and_project_with_dynamic_filters] {} -> {} rows with {} "
+    "dynamic filters folded into the gather.",
+    view.num_rows(),
+    survivors->num_rows(),
+    applied.applied.size());
+  return survivors;
+}
+
 bool parquet_gpu_ingestible::output_assembly_is_leading_identity() const noexcept
 {
   // !needs_output_assembly means assemble_scan_output is a pass-through: no

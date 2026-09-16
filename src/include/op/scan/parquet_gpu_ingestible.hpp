@@ -300,6 +300,15 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) override;
 
+  /// Residual row filter and membership masks on the unmaterialized split, one survivor gather.
+  /// Hive-partitioned plans keep the base path (partition columns are synthesized on release).
+  std::unique_ptr<cudf::table> filter_and_project_with_dynamic_filters(
+    filtered_table&& input,
+    const cucascade::memory::memory_space& mem_space,
+    rmm::cuda_stream_view stream,
+    scan_dynamic_filter_context const& dynamic_filters,
+    scan_dynamic_filter_result& applied) override;
+
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;

@@ -155,6 +155,11 @@ class sirius_dynamic_zone_map_filter final : public sirius_dynamic_filter,
 
 /**
  * @brief Capability for computing a per-row keep mask
+ *
+ * Membership implementations accept the key type itself and any value-preserving narrower
+ * signed-integer carrier of it (compressed-materialization storage: an INT8/INT16/INT32 probe
+ * against an INT32 or INT64 key), widening each probe value on the fly. Other probe types are
+ * incompatible and yield null.
  */
 class sirius_mask_applicable {
  public:
@@ -168,6 +173,24 @@ class sirius_mask_applicable {
     int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const = 0;
+
+  /**
+   * @brief Stencilled variant of compute_mask()
+   *
+   * Rows whose @p stencil entry is `false` are not probed and yield `false`; a null @p stencil
+   * probes every row. @p stencil holds `probe.size()` device-resident values and must stay valid
+   * until work enqueued on @p stream completes. The default ignores the stencil, which is correct
+   * (the caller ANDs the result with the stencil) but does no work pruning.
+   */
+  [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    bool const* stencil,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const
+  {
+    return compute_mask(probe, device_id, stream, mr);
+  }
 };
 
 /**
@@ -201,6 +224,13 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    bool const* stencil,
     int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
@@ -258,6 +288,13 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
 
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    bool const* stencil,
     int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
@@ -326,6 +363,13 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
 
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
+    int device_id,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask_if(
+    cudf::column_view const& probe,
+    bool const* stencil,
     int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;

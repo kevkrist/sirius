@@ -32,6 +32,7 @@
 
 // cccl
 #include <cub/device/device_for.cuh>
+#include <cuda/dynamic_filter_probe_carrier.cuh>
 
 // cucascade
 #include <cucascade/error.hpp>
@@ -53,6 +54,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -61,16 +63,24 @@ namespace {
 /// @brief Per-row brute-force membership scan: out[idx] == true iff probe[idx] equals any of the m
 /// needles. For the small m this filter gates on (<= k_max_keys), a compare-all linear scan beats a
 /// hash probe and reserves no sentinel value.
-template <class KeyT>
+///
+/// A narrower carrier (`ProbeT` smaller than `KeyT`) is widened per value; rows whose stencil
+/// entry is false (when a stencil is supplied) are not compared and yield false.
+template <class KeyT, class ProbeT>
 struct small_in_list_scan {
-  KeyT const* __restrict__ probe;
+  ProbeT const* __restrict__ probe;
+  bool const* __restrict__ stencil;
   KeyT const* __restrict__ needles;
   int m;
   bool* __restrict__ out;
 
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
-    auto const x = probe[idx];
+    if (stencil != nullptr && !stencil[idx]) {
+      out[idx] = false;
+      return;
+    }
+    auto const x = static_cast<KeyT>(probe[idx]);
     bool hit     = false;
     for (int j = 0; j < m; ++j) {
       hit |= (x == needles[j]);
@@ -173,7 +183,17 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  if (probe.type() != _key_type) { return nullptr; }
+  return compute_mask_if(probe, /*stencil=*/nullptr, device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask_if(
+  cudf::column_view const& probe,
+  bool const* stencil,
+  int device_id,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
+  if (!detail::probe_carrier_compatible(probe.type(), _key_type)) { return nullptr; }
   auto const* replica =
     _store ? _store->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica) { return nullptr; }
@@ -184,23 +204,18 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
   auto* const outp = out->mutable_view().data<bool>();
   auto const m     = static_cast<int>(_num_keys);
 
+  auto const scan = [&](auto key_tag) {
+    using key_type      = decltype(key_tag);
+    auto const* needles = static_cast<key_type const*>(replica->needles.data());
+    detail::dispatch_probe_carrier<key_type>(probe, [&](auto const* d) {
+      using probe_type = std::remove_cv_t<std::remove_pointer_t<decltype(d)>>;
+      CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
+        n, small_in_list_scan<key_type, probe_type>{d, stencil, needles, m, outp}, stream.value()));
+    });
+  };
   switch (_key_type.id()) {
-    case cudf::type_id::INT32: {
-      auto const* needles = static_cast<std::int32_t const*>(replica->needles.data());
-      CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
-        n,
-        small_in_list_scan<std::int32_t>{probe.data<std::int32_t>(), needles, m, outp},
-        stream.value()));
-      break;
-    }
-    case cudf::type_id::INT64: {
-      auto const* needles = static_cast<std::int64_t const*>(replica->needles.data());
-      CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
-        n,
-        small_in_list_scan<std::int64_t>{probe.data<std::int64_t>(), needles, m, outp},
-        stream.value()));
-      break;
-    }
+    case cudf::type_id::INT32: scan(std::int32_t{}); break;
+    case cudf::type_id::INT64: scan(std::int64_t{}); break;
     default: return nullptr;
   }
 

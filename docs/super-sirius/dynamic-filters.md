@@ -81,11 +81,13 @@ DuckDB static filters remain on their existing, authoritative path. Dynamic filt
 
 | Consumer | Zone map | Membership filter |
 |---|---|---|
-| Parquet scan | Reader AST via `reader_options::set_filter`; may prune row groups and rows during decode | Post-decode mask |
+| Parquet scan | Reader AST via `reader_options::set_filter`; may prune row groups and rows during decode | Mask inside `GPU_SCAN`, folded into the split's survivor gather (`enable_dynamic_filter_in_scan`); otherwise the post-decode mask in `DYNAMIC_FILTER` |
 | DuckDB-native scan | Post-decode AST row mask | Post-decode mask |
 | Join-edge endpoint | Not used | Post-decode mask |
 
 Membership filtering reduces downstream work but does not avoid scan I/O or decoding. The post-decode `dynamic_filter_gate` measures combined usefulness and can disable ineffective filtering; it also stops individual membership filters whose marginal keep ratio is weak.
+
+With `enable_dynamic_filter_in_scan` (default on), a parquet-backed `GPU_SCAN` — a pinned chunk served as a zero-copy view, or a fresh read that still owes its row filter — evaluates its residual row filter and every visible membership filter as masks on the unmaterialized split, ANDs them (each later mask uses the running conjunction as a stencil, so rows already dropped are not probed), and materializes the projected columns with one gather of the survivors. Masks are computed on the stored carriers: a membership filter accepts any narrower signed-integer carrier of its key type and widens each probe value on the fly, so the compressed-materialization restore cast runs on survivors only. Per-filter marginal keep ratios and the scan-level ratio come from device-side survivor counts; the scan and its `DYNAMIC_FILTER` operator share one gate, and the operator passes through the filters the scan reports as applied (`scan_output_operator_data`), applying only filters published after the scan's snapshot. The one `cudf::apply_boolean_mask` keeps its own host synchronization; the survivor counts ride on it. Hive-partitioned plans and non-parquet formats keep the post-decode path.
 
 ## Filter selection
 
@@ -148,6 +150,7 @@ The settings live under `sirius.operator_params`:
 | `dynamic_filter_domain_coverage_threshold` | `0.9` | Skip a proven-unique key at or above this known-domain coverage; values above `1.0` disable the gate |
 | `dynamic_filter_inlist_max_l2_fraction` | `0.125` | Maximum fraction of the smallest probe-GPU L2 used by the hash IN-list estimate |
 | `dynamic_filter_keep_threshold` | `0.9` | Disable post-decode filtering when the measured keep ratio is higher |
+| `enable_dynamic_filter_in_scan` | `true` | Fold membership masks into the parquet scan's single survivor gather; the `DYNAMIC_FILTER` operator applies only later publications |
 
 ### Observability
 

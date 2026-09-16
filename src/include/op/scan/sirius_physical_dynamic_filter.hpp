@@ -29,16 +29,32 @@ namespace sirius::op::scan {
 /// @brief Applies visible dynamic filters at scan or direct-route endpoints.
 ///
 /// Mode controls whether AST masks supplement membership masks; finalization closes the channel.
+/// Filters a GPU_SCAN child already folded into its gather (reported on
+/// @ref scan_output_operator_data) are passed through, so only filters published after the scan's
+/// snapshot are applied here.
 class sirius_physical_dynamic_filter : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DYNAMIC_FILTER;
 
+  /// Owns a private selectivity gate built from @p gate_keep_threshold.
   sirius_physical_dynamic_filter(
     duckdb::vector<sirius::logical_type> types,
     std::size_t estimated_cardinality,
     std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
     double gate_keep_threshold     = dynamic_filter_gate::k_default_keep_threshold,
     dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::membership_masks_only);
+
+  /**
+   * @brief Shares the selectivity gate with the producing GPU_SCAN
+   *
+   * The scan's own measurements (when it applies filters itself) and this operator's feed the
+   * same ACTIVE-terminal state machine. @p gate must be non-null.
+   */
+  sirius_physical_dynamic_filter(duckdb::vector<sirius::logical_type> types,
+                                 std::size_t estimated_cardinality,
+                                 std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
+                                 std::shared_ptr<dynamic_filter_gate> gate,
+                                 dynamic_filter_apply_mode mode);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
@@ -53,7 +69,7 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
 
  private:
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _filters;
-  dynamic_filter_gate _gate;
+  std::shared_ptr<dynamic_filter_gate> _gate;
   dynamic_filter_apply_mode _mode;
 };
 

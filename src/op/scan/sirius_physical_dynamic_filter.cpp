@@ -17,6 +17,7 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
+#include <op/scan/scan_output_operator_data.hpp>
 #include <op/scan/sirius_physical_dynamic_filter.hpp>
 
 // nvtx
@@ -26,6 +27,11 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 
+// standard library
+#include <span>
+#include <stdexcept>
+#include <utility>
+
 namespace sirius::op::scan {
 
 sirius_physical_dynamic_filter::sirius_physical_dynamic_filter(
@@ -34,12 +40,29 @@ sirius_physical_dynamic_filter::sirius_physical_dynamic_filter(
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
   double gate_keep_threshold,
   dynamic_filter_apply_mode mode)
+  : sirius_physical_dynamic_filter(std::move(types),
+                                   estimated_cardinality,
+                                   std::move(filters),
+                                   std::make_shared<dynamic_filter_gate>(gate_keep_threshold),
+                                   mode)
+{
+}
+
+sirius_physical_dynamic_filter::sirius_physical_dynamic_filter(
+  duckdb::vector<sirius::logical_type> types,
+  std::size_t estimated_cardinality,
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> filters,
+  std::shared_ptr<dynamic_filter_gate> gate,
+  dynamic_filter_apply_mode mode)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::DYNAMIC_FILTER, std::move(types), estimated_cardinality),
     _filters(std::move(filters)),
-    _gate(gate_keep_threshold),
+    _gate(std::move(gate)),
     _mode(mode)
 {
+  if (!_gate) {
+    throw std::invalid_argument("[sirius_physical_dynamic_filter] the selectivity gate is null");
+  }
 }
 
 void sirius_physical_dynamic_filter::on_finalize_operator()
@@ -57,8 +80,14 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   // intervening join can race it. Keep the no-filter fast path for that transitive case and for an
   // intentionally empty publication. The gate remains filter-count-aware if later splits observe
   // additional filters.
-  if (!_filters || !_gate.applicable(*_filters)) {
+  if (!_filters || !_gate->applicable(*_filters)) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+  }
+
+  // Filters the producing scan already folded into its gather are not applied again.
+  std::span<sirius::op::sirius_dynamic_filter const* const> already_applied;
+  if (auto const* scan_output = dynamic_cast<const scan_output_operator_data*>(&input_data)) {
+    already_applied = scan_output->dynamic_filters_applied().applied;
   }
 
   auto const& idle_batches = input.get_data_batches();
@@ -69,14 +98,16 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
 
   for (std::size_t i = 0; i < ro_batches.size(); ++i) {
     auto const& ro = ro_batches[i];
-    // A null result means nothing was dropped — the gate declined, or no published filter matched.
-    // Forward the batch unchanged (zero-copy; its columns stay co-owned via the idle shared_ptr).
+    // A null result means nothing was dropped — the gate declined, no published filter matched,
+    // or the scan applied every visible filter already. Forward the batch unchanged (zero-copy;
+    // its columns stay co-owned via the idle shared_ptr).
     auto filtered = apply_dynamic_filters_gated_view(sirius::get_cudf_table_view(ro),
                                                      *_filters,
-                                                     _gate,
+                                                     *_gate,
                                                      stream,
                                                      _mode,
-                                                     ro.get_memory_space()->get_device_id());
+                                                     ro.get_memory_space()->get_device_id(),
+                                                     already_applied);
     if (filtered) {
       output_batches.push_back(sirius::make_data_batch(
         std::move(filtered), *ro.get_memory_space(), stream, batch_telemetry()));

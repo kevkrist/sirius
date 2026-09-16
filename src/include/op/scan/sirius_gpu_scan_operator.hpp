@@ -149,6 +149,19 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
   [[nodiscard]] gpu_ingestible& get_ingestible() const;
 
+  /**
+   * @brief Makes this scan apply its channel's membership dynamic filters itself
+   *
+   * @p gate is the selectivity gate shared with the downstream DYNAMIC_FILTER operator (one
+   * ACTIVE-terminal state machine per scan). Splits routed through the ingestible's
+   * `filter_and_project_with_dynamic_filters` gather only surviving rows and report the applied
+   * filters on their output (@ref scan_output_operator_data). No effect without a channel.
+   */
+  void apply_dynamic_filters_in_scan(std::shared_ptr<dynamic_filter_gate> gate)
+  {
+    _dynamic_filter_scan_gate = std::move(gate);
+  }
+
   scan_manager::split_connector& get_split_connector();
 
   /// Shared handle to the connector, for components (e.g. the memory
@@ -174,6 +187,9 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /// prepare_for_processing can snapshot membership filters at DECODE time
   /// (see scan_operator_input::dynamic_filters).
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _dynamic_filters_channel;
+  /// Set by the planner when the scan applies membership filters itself; shared with the
+  /// downstream DYNAMIC_FILTER operator. Null keeps every filter on that operator.
+  std::shared_ptr<dynamic_filter_gate> _dynamic_filter_scan_gate;
   /// Non-owning observer. The registered-state shared_ptr owns the context for
   /// at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer;

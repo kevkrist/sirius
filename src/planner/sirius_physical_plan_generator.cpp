@@ -260,22 +260,25 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   info->sirius_dynamic_filters = dynamic_filters;
 
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
-    duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      scan.types,
-      scan.estimated_cardinality,
-      std::move(ingestible),
-      compressed_materialization_observer);
+  auto scan_leaf  = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
+    scan.types,
+    scan.estimated_cardinality,
+    std::move(ingestible),
+    compressed_materialization_observer);
+  // One selectivity gate per scan, shared by the scan (when it applies the filters itself) and
+  // the DYNAMIC_FILTER operator that applies whatever the scan did not.
+  auto gate = std::make_shared<sirius::op::scan::dynamic_filter_gate>(
+    op_params.dynamic_filter_keep_threshold);
+  if (dynamic_filters && op_params.enable_dynamic_filter_in_scan) {
+    scan_leaf->apply_dynamic_filters_in_scan(gate);
+  }
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf = std::move(scan_leaf);
   // Preserve propagated carriers; dynamic-filter targets are already native.
   if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
 
   if (dynamic_filters) {
     auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
-      scan.types,
-      scan.estimated_cardinality,
-      std::move(dynamic_filters),
-      op_params.dynamic_filter_keep_threshold,
-      mode);
+      scan.types, scan.estimated_cardinality, std::move(dynamic_filters), std::move(gate), mode);
     if (scan.has_physical_overrides()) {
       dynamic_filter_op->set_physical_types(scan.get_physical_types());
     }

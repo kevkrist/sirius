@@ -50,6 +50,7 @@ class sirius_scan_manager;
 
 namespace sirius::op {
 class operator_data;
+class sirius_dynamic_filter_set;
 
 namespace scan {
 
@@ -57,6 +58,17 @@ class gpu_ingestible;
 // Forward-declared to break the gpu_ingestible.hpp <-> sirius_gpu_scan_operator_data.hpp
 // include cycle; only used by const-reference below. Full definition pulled in by .cpp.
 class scan_operator_input;
+class dynamic_filter_gate;
+struct scan_dynamic_filter_result;
+
+/**
+ * @brief The scan's dynamic-filter channel and gate, handed to
+ *        @ref gpu_ingestible::filter_and_project_with_dynamic_filters.
+ */
+struct scan_dynamic_filter_context {
+  sirius::op::sirius_dynamic_filter_set const& filters;
+  dynamic_filter_gate& gate;
+};
 
 //===----------------------------------------------------------------------===//
 // gpu_ingestible
@@ -140,6 +152,29 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     filtered_table&& input,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream) = 0;
+
+  /**
+   * @brief @ref post_filter_and_project that also folds the scan's published
+   *        membership dynamic filters into the split's survivor gather.
+   *
+   * Called instead of @ref post_filter_and_project when the scan applies
+   * dynamic filters itself (operator_params.enable_dynamic_filter_in_scan).
+   * A format whose materialization can be expressed as one gather over the
+   * still-unmaterialized split evaluates the row filter and the dynamic-filter
+   * masks on that view and gathers only the survivors, reporting the filters it
+   * applied through @p applied so the DYNAMIC_FILTER operator passes them
+   * through. Every other format keeps this default: filters untouched,
+   * @p applied left empty, and the downstream operator applies them.
+   */
+  virtual std::unique_ptr<cudf::table> filter_and_project_with_dynamic_filters(
+    filtered_table&& input,
+    const cucascade::memory::memory_space& mem_space,
+    rmm::cuda_stream_view stream,
+    scan_dynamic_filter_context const& /*dynamic_filters*/,
+    scan_dynamic_filter_result& /*applied*/)
+  {
+    return post_filter_and_project(std::move(input), mem_space, stream);
+  }
 
   /**
    * @brief Whether this ingestible holds a row-filter expression that
