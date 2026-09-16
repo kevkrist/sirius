@@ -109,7 +109,9 @@ physical hash join. It contains:
 
 - every probe channel and its probe-column mapping;
 - whether zone maps may be emitted;
-- the per-key build-key-domain estimates used by the publication gates; and
+- the per-key build-key domain bounds and uniqueness flags used by the publication gates
+  (exact catalog or pinned-registry evidence only, never cardinality estimates; see
+  `dynamic_filter_domain_evidence` in [dynamic-filters.md](dynamic-filters.md)); and
 - non-owning placement handles for the context's active GPU memory spaces.
 
 Each `dynamic_filter_replica_space` pairs a non-null CuCascade GPU
