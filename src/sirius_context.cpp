@@ -47,6 +47,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
@@ -73,6 +74,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 
@@ -259,6 +261,110 @@ void SiriusContext::log_pool_stats(std::string_view tag) const
                     ra_mr->get_peak_total_allocated_bytes(),
                     ra_mr->get_total_reserved_bytes());
   }
+}
+
+void SiriusContext::grant_pool_peer_access(std::vector<int> const& active_gpu_ids)
+{
+  using cucascade::memory::pool_peer_access_status;
+
+  // Owner device -> the cudaMallocAsync pool its cuCascade space allocates from.
+  // A space built on a custom allocator that is not pool-based has nothing to
+  // grant on: its cudaMalloc memory is already covered by the legacy enable.
+  std::unordered_map<int, cudaMemPool_t> pools_by_device;
+  for (auto const* gpu_space :
+       memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    auto const* adaptor =
+      gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+    cudaMemPool_t const pool = adaptor != nullptr ? adaptor->pool_handle() : nullptr;
+    if (pool == nullptr) {
+      SIRIUS_LOG_WARN(
+        "SiriusContext: GPU {} memory space is not backed by a cudaMallocAsync pool; "
+        "pool peer access not applicable",
+        gpu_space->get_device_id());
+      continue;
+    }
+    pools_by_device.emplace(gpu_space->get_device_id(), pool);
+  }
+
+  std::size_t pairs                  = 0;
+  std::size_t granted                = 0;
+  std::size_t skipped_no_peer_access = 0;
+  std::size_t skipped_probe_broken   = 0;
+  std::size_t failed                 = 0;
+  for (int owner : active_gpu_ids) {
+    auto const pool_it = pools_by_device.find(owner);
+    if (pool_it == pools_by_device.end()) { continue; }
+    // Also open the owner's device default pool: anything allocated with plain
+    // cudaMallocAsync (bypassing the cuCascade resource) lands there and a peer
+    // copy of that memory would otherwise stay driver-staged.
+    cudaMemPool_t default_pool = nullptr;
+    if (cudaDeviceGetMemPool(&default_pool, owner) != cudaSuccess) {
+      (void)cudaGetLastError();
+      default_pool = nullptr;
+    }
+    for (int accessor : active_gpu_ids) {
+      if (accessor == owner) { continue; }
+      ++pairs;
+      if (!is_peer_access_enabled(accessor, owner)) {
+        ++skipped_no_peer_access;
+        SIRIUS_LOG_INFO(
+          "SiriusContext: pool peer access {} -> GPU {} pool skipped: no legacy peer access",
+          accessor,
+          owner);
+        continue;
+      }
+      auto const result =
+        cucascade::memory::grant_pool_peer_access(pool_it->second, owner, accessor);
+      switch (result.status) {
+        case pool_peer_access_status::granted: {
+          ++granted;
+          pool_peer_access_granted_pairs_.emplace(accessor, owner);
+          bool const default_pool_granted =
+            default_pool != nullptr &&
+            cucascade::memory::grant_pool_peer_access(default_pool, owner, accessor).status ==
+              pool_peer_access_status::granted;
+          SIRIUS_LOG_INFO("SiriusContext: pool peer access granted {} -> GPU {} pool{}",
+                          accessor,
+                          owner,
+                          default_pool_granted ? " (+ device default pool)" : "");
+          break;
+        }
+        case pool_peer_access_status::peer_dma_broken:
+          ++skipped_probe_broken;
+          SIRIUS_LOG_INFO(
+            "SiriusContext: pool peer access {} -> GPU {} pool skipped: empirical probe found "
+            "direct peer DMA broken; cudaMemcpyPeer* keeps host staging",
+            accessor,
+            owner);
+          break;
+        case pool_peer_access_status::not_peer_capable:
+          ++skipped_no_peer_access;
+          SIRIUS_LOG_INFO(
+            "SiriusContext: pool peer access {} -> GPU {} pool skipped: cudaDeviceCanAccessPeer "
+            "reports no access",
+            accessor,
+            owner);
+          break;
+        case pool_peer_access_status::set_access_failed:
+          ++failed;
+          SIRIUS_LOG_ERROR(
+            "SiriusContext: cudaMemPoolSetAccess({} -> GPU {} pool) failed: {}; the pair keeps "
+            "the driver-staged route",
+            accessor,
+            owner,
+            cudaGetErrorString(result.error));
+          break;
+      }
+    }
+  }
+  SIRIUS_LOG_INFO(
+    "SiriusContext: pool peer access granted on {}/{} ordered GPU pairs "
+    "({} skipped without peer access, {} skipped probe-broken, {} failed)",
+    granted,
+    pairs,
+    skipped_no_peer_access,
+    skipped_probe_broken,
+    failed);
 }
 
 void SiriusContext::QueryBegin(ClientContext& context)
@@ -754,6 +860,22 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
         "configured GPU set has no pairs to enable",
         active_gpu_ids.size());
     }
+  }
+
+  // Pool-level peer access. cudaDeviceEnablePeerAccess above only covers legacy
+  // cudaMalloc memory, but every GPU space allocates from a cudaMallocAsync pool
+  // and a peer may only read/write pool memory after cudaMemPoolSetAccess.
+  // Without it the driver still completes cudaMemcpyPeerAsync between pools,
+  // but as a host-staged two-leg copy instead of direct DMA (no PtoP transfer,
+  // lower bandwidth, and the enqueue blocks the host), and any UVA dereference
+  // of a peer pool faults. Pairs whose empirical probe found direct DMA broken
+  // are left at ProtNone so they keep the host-staging route.
+  if (!config_.get_gpu_memory_params().enable_pool_peer_access) {
+    SIRIUS_LOG_INFO(
+      "SiriusContext: pool peer access disabled (sirius.memory.gpu.enable_pool_peer_access=false); "
+      "cross-GPU copies of pool memory stay driver-staged");
+  } else if (active_gpu_ids.size() >= 2) {
+    grant_pool_peer_access(active_gpu_ids);
   }
 
   // Configure cuDF to use our pinned slab allocator for small internal host buffers

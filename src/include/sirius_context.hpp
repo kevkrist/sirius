@@ -507,6 +507,24 @@ class SiriusContext : public ClientContextState {
     return peer_access_enabled_pairs_.count({src, dst}) > 0;
   }
 
+  /// @brief Check whether SiriusContext::initialize() granted @p accessor
+  ///        read/write access (`cudaMemPoolSetAccess`) to @p owner's
+  ///        cudaMallocAsync pool.
+  ///
+  /// This is the precondition for any kernel that dereferences peer pool
+  /// memory through UVA, and the condition under which `cudaMemcpyPeerAsync`
+  /// on pool memory is a direct DMA rather than the driver's host-staged copy.
+  /// False when `sirius.memory.gpu.enable_pool_peer_access` is off, when the
+  /// pair has no legacy peer access, when the empirical peer-DMA probe failed
+  /// for it, or when the grant itself failed.
+  ///
+  /// @param accessor GPU that reads/writes the peer pool
+  /// @param owner GPU whose pool is accessed
+  [[nodiscard]] bool is_pool_peer_access_granted(int accessor, int owner) const noexcept
+  {
+    return pool_peer_access_granted_pairs_.count({accessor, owner}) > 0;
+  }
+
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
@@ -598,6 +616,11 @@ class SiriusContext : public ClientContextState {
 
  private:
   void throw_if_not_initialized() const;
+  /// Grant every probe-verified (accessor, owner) pair of `active_gpu_ids`
+  /// read/write access to the owner's cudaMallocAsync pool (and to its device
+  /// default pool). Requires the legacy peer-access loop to have run. Non-fatal:
+  /// each failure is logged and the pair simply keeps the host-staged route.
+  void grant_pool_peer_access(std::vector<int> const& active_gpu_ids);
   /// Acquire the slot. Errors on same-thread reacquire — a nested acquire on
   /// one thread would otherwise be a silent permanent wait. After acquiring
   /// (and before returning) re-checks BOTH runtime health and the acquiring
@@ -674,6 +697,11 @@ class SiriusContext : public ClientContextState {
     }
   };
   std::unordered_set<std::pair<int, int>, peer_pair_hash> peer_access_enabled_pairs_;
+  // Pool-level P2P: set of (accessor, owner) GPU pairs where initialize()
+  // granted `accessor` ReadWrite access to `owner`'s cudaMallocAsync pool via
+  // cudaMemPoolSetAccess. Consumed by is_pool_peer_access_granted(). Plain int
+  // pairs, no CUDA resources.
+  std::unordered_set<std::pair<int, int>, peer_pair_hash> pool_peer_access_granted_pairs_;
   // NUMA-aware cuDF small-pinned MR. Owns one
   // small_pinned_host_memory_resource per host space (one per NUMA node)
   // and dispatches each cuDF allocate/deallocate to the slab pool whose

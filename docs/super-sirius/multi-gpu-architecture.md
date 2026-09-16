@@ -186,7 +186,7 @@ Host- and disk-resident inputs intentionally keep **move semantics**: `lock_or_p
 
 The underlying byte transfer is `cucascade::convert_gpu_to_gpu` (in `cucascade/src/cudf/representation_converter_builtins.cpp`), which waits on the source's writer event and synchronizes its copy stream before returning, so the clone is complete when `clone_to` returns. The transfer chooses one of two paths empirically:
 
-1. **Direct peer DMA** (`cudaMemcpyPeerAsync`) — fastest, used when `probe_peer_dma_works(src, dst)` returns true. Real peer access requires both GPUs to have driver-level P2P enabled AND the hardware to actually honor it.
+1. **Direct peer DMA** (`cudaMemcpyPeerAsync`) — fastest, used when `probe_peer_dma_works(src, dst)` returns true. Real peer access requires both GPUs to have driver-level P2P enabled AND the hardware to actually honor it. Because every GPU space allocates from a cudaMallocAsync pool, the peer must additionally hold `cudaMemPoolSetAccess` on that pool: `SiriusContext::initialize` grants it for every probe-verified pair (`sirius.memory.gpu.enable_pool_peer_access`, default true; `is_pool_peer_access_granted(accessor, owner)` reports the outcome). Without the grant the copy still succeeds but as a driver-staged two-leg transfer, and UVA kernel reads of a peer pool fault.
 2. **Host-staging** (`cudaMemcpyAsync(DtoH)` → host buffer → `cudaMemcpyAsync(HtoD)`) — fallback for hardware where peer DMA is empirically broken (e.g., the consumer-grade RTX 6000 Ada we use for development, which advertises P2P but silently fails DMA in both directions).
 
 The probe runs once at startup per (src, dst) pair: allocate small buffers on each device, attempt a `cudaMemcpyPeerAsync` and a roundtrip read-back. If the bytes don't match, mark the pair as host-stage-required.
@@ -258,7 +258,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 
 | Path | Role |
 |------|------|
-| `src/sirius_context.{hpp,cpp}` | `SiriusContext`, per-GPU memory/topology initialization, P2P peer-access enablement |
+| `src/sirius_context.{hpp,cpp}` | `SiriusContext`, per-GPU memory/topology initialization, P2P peer-access enablement (legacy `cudaDeviceEnablePeerAccess` + pool-level `cudaMemPoolSetAccess`) |
 | `src/memory/sirius_memory_reservation_manager.{hpp,cpp}` | Extends `cucascade::memory_reservation_manager`; sets cudf device resource refs per GPU; synchronizes on destruction |
 | `src/include/scan_manager/sirius_scan_manager.hpp` | `pinned_entry`, `chunk_memory_spaces` invariant |
 | `src/include/memory/topology_index.hpp` | `topology_index` — the single NUMA↔GPU map injected into task creator, scan manager, downgrade configs |
