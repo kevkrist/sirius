@@ -583,8 +583,11 @@ TEST_CASE("pool peer access grant makes the probe GPU's pool reachable from the 
   auto memory_manager =
     sirius::test::operator_utils::initialize_memory_manager(kReplicaDevices.size());
   auto replica_spaces = get_replica_spaces(*memory_manager);
-  if (!cucascade::memory::probe_peer_dma_works(kProbeDevice, kBuildDevice)) {
-    WARN("pool peer access test requires direct peer DMA from GPU 1 to GPU 0; skipping");
+  // The grant requires the probe to pass in both directions (the peer may pull from and push into
+  // the pool), so an asymmetric-broken pair must skip rather than fail.
+  if (!cucascade::memory::probe_peer_dma_works(kProbeDevice, kBuildDevice) ||
+      !cucascade::memory::probe_peer_dma_works(kBuildDevice, kProbeDevice)) {
+    WARN("pool peer access test requires direct peer DMA between GPU 0 and GPU 1; skipping");
     return;
   }
 

@@ -273,6 +273,7 @@ void SiriusContext::grant_pool_peer_access(std::vector<int> const& active_gpu_id
   std::unordered_map<int, cudaMemPool_t> pools_by_device;
   for (auto const* gpu_space :
        memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (gpu_space == nullptr) { continue; }
     auto const* adaptor =
       gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
     cudaMemPool_t const pool = adaptor != nullptr ? adaptor->pool_handle() : nullptr;
@@ -1012,6 +1013,7 @@ void SiriusContext::terminate()
   telemetry_context_.reset();
 
   peer_access_enabled_pairs_.clear();
+  pool_peer_access_granted_pairs_.clear();
 
   if (memory_manager_) {
     auto gpu_spaces = memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
