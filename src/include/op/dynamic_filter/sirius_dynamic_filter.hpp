@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/dynamic_filter/dynamic_filter_membership_probe.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
 #include <cudf/ast/ast_operator.hpp>
@@ -191,6 +192,24 @@ class sirius_mask_applicable {
   {
     return compute_mask(probe, device_id, stream, mr);
   }
+
+  /**
+   * @brief Describes this filter as one step of a fused membership pass over @p probe
+   *
+   * `ready`: @p out names this filter's replica on @p device_id and the probe's storage, and the
+   * fused mask kernel then answers per row exactly what compute_mask_if() would (a null probe row
+   * is `false`). `unservable`: the filter cannot serve this probe on this device — the same
+   * condition under which compute_mask_if() returns null. `unsupported` (the default): the kind
+   * has no fused form and must be applied through compute_mask_if().
+   *
+   * @p out stays valid only while this filter and the probe column's storage do.
+   */
+  [[nodiscard]] virtual device_probe_status device_probe(cudf::column_view const& /*probe*/,
+                                                         int /*device_id*/,
+                                                         membership_probe& /*out*/) const noexcept
+  {
+    return device_probe_status::unsupported;
+  }
 };
 
 /**
@@ -234,6 +253,10 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
     int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] device_probe_status device_probe(cudf::column_view const& probe,
+                                                 int device_id,
+                                                 membership_probe& out) const noexcept override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
@@ -298,6 +321,10 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] device_probe_status device_probe(cudf::column_view const& probe,
+                                                 int device_id,
+                                                 membership_probe& out) const noexcept override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
@@ -373,6 +400,10 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     int device_id,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const override;
+
+  [[nodiscard]] device_probe_status device_probe(cudf::column_view const& probe,
+                                                 int device_id,
+                                                 membership_probe& out) const noexcept override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
 

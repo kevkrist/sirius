@@ -31,6 +31,7 @@
 #include <cuco/operator.hpp>
 #include <cuco/static_set.cuh>
 #include <cuco/storage.cuh>
+#include <cuda/dynamic_filter_membership_probe.cuh>
 #include <cuda/dynamic_filter_probe_carrier.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/functional>
@@ -60,14 +61,9 @@ namespace {
 constexpr std::size_t kCapacityFactor = 2;
 constexpr double kLoadFactor          = 1.0 / kCapacityFactor;
 
-// Threads per key probe.
-constexpr std::size_t kCgSize = 1;
-static_assert(kCgSize == 1, "cuco::static_set requires kCgSize==1 for device_for bulk iteration");
-
-// Keys per bucket. Sized for a double-hashed probe, where each step is a random fetch and a
-// wider bucket retires several dependent fetches in one; the right value depends on the probing
-// scheme, not on the key type.
-constexpr std::int32_t kBucketSize = 4;
+// The probe geometry and the set type live in cuda/dynamic_filter_membership_probe.cuh so the
+// fused mask kernel can name the same device ref.
+constexpr std::int32_t kBucketSize = k_in_list_bucket_size;
 
 // Largest capacity multiplier whose table still fits `budget`, else the baseline. Growth only
 // makes an already-chosen set sparser: estimated_set_bytes (and so IN-list vs Bloom selection)
@@ -94,16 +90,10 @@ constexpr std::size_t kGrowthCandidates[] = {4, 3};
 constexpr std::size_t kMinCapacity = 8;
 
 template <class KeyT>
-using set_alloc = sirius::rmm_cuco_allocator<KeyT>;
+using set_alloc = in_list_set_alloc<KeyT>;
 
 template <class KeyT>
-using set_type = cuco::static_set<KeyT,
-                                  cuco::extent<std::size_t>,
-                                  cuda::thread_scope_device,
-                                  cuda::std::equal_to<KeyT>,
-                                  cuco::double_hashing<kCgSize, cuco::default_hash_function<KeyT>>,
-                                  set_alloc<KeyT>,
-                                  cuco::storage<kBucketSize>>;
+using set_type = in_list_set<KeyT>;
 
 template <class KeyT>
 using set_owner = std::unique_ptr<set_type<KeyT>>;
@@ -428,6 +418,23 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask_if(
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
   }
   return out;
+}
+
+device_probe_status sirius_dynamic_in_list_filter::device_probe(
+  cudf::column_view const& probe, int device_id, membership_probe& out) const noexcept
+{
+  if (!detail::probe_carrier_compatible(probe.type(), _key_type)) {
+    return device_probe_status::unservable;
+  }
+  auto const* replica =
+    _set ? _set->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
+  if (!replica || !replica->has_set()) { return device_probe_status::unservable; }
+
+  out.kind = membership_probe_kind::hash_set;
+  describe_probe_column(out, probe, _key_type.id());
+  std::visit([&](auto const& set) { store_probe_ref(out, set->ref(cuco::contains)); },
+             replica->set);
+  return device_probe_status::ready;
 }
 
 std::size_t sirius_dynamic_in_list_filter::size() const noexcept { return _num_keys; }

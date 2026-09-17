@@ -26,6 +26,7 @@
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
 #include <cuco/hash_functions.cuh>
+#include <cuda/dynamic_filter_membership_probe.cuh>
 #include <cuda/dynamic_filter_probe_carrier.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/bit>
@@ -75,64 +76,8 @@ std::size_t blocks_for(std::size_t num_keys)
   return num_keys == 0 ? 1 : 1 + (num_keys - 1) / keys_per_block;
 }
 
-using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
-
-/**
- * @brief cuco-compatible Bloom policy using Lemire fast-range
- *
- * Arrow's policy caps filter size, while cuco's default uses costly 64-bit modulo. Construction
- * and lookup share this mapping, preserving the no-false-negative contract.
- */
-template <class KeyT>
-class sirius_bloom_policy {
- public:
-  using hasher             = cuco::xxhash_64<KeyT>;
-  using word_type          = std::uint32_t;
-  using hash_argument_type = typename hasher::argument_type;
-  using hash_result_type   = decltype(std::declval<hasher>()(std::declval<hash_argument_type>()));
-
-  static constexpr std::uint32_t words_per_block = 8;
-
- private:
-  static constexpr std::uint32_t word_bits       = cuda::std::numeric_limits<word_type>::digits;
-  static constexpr std::uint32_t bit_index_width = cuda::std::bit_width(word_bits - 1);
-  static constexpr word_type bit_index_mask      = (word_type{1} << bit_index_width) - 1;
-
-  static_assert(words_per_block * bit_index_width <=
-                  cuda::std::numeric_limits<hash_result_type>::digits,
-                "hash is too narrow to supply one fingerprint bit per word");
-
- public:
-  __device__ constexpr hash_result_type hash(hash_argument_type const& key) const
-  {
-    return hash_(key);
-  }
-
-  template <class Extent>
-  [[nodiscard]] __device__ constexpr Extent block_index(hash_result_type hash,
-                                                        Extent num_blocks) const
-  {
-    auto const wide = static_cast<__uint128_t>(static_cast<std::uint64_t>(hash)) *
-                      static_cast<__uint128_t>(static_cast<std::uint64_t>(num_blocks));
-    return static_cast<Extent>(static_cast<std::uint64_t>(wide >> 64));
-  }
-
-  [[nodiscard]] __device__ constexpr word_type word_pattern(hash_result_type hash,
-                                                            std::uint32_t word_index) const
-  {
-    return word_type{1} << ((hash >> (word_index * bit_index_width)) & bit_index_mask);
-  }
-
- private:
-  hasher hash_{};
-};
-
-template <class KeyT>
-using sirius_bloom = cuco::bloom_filter<KeyT,
-                                        cuco::extent<std::size_t>,
-                                        cuda::thread_scope_device,
-                                        sirius_bloom_policy<KeyT>,
-                                        bloom_alloc>;
+// `sirius_bloom_policy`, `sirius_bloom` and `bloom_alloc` live in
+// cuda/dynamic_filter_membership_probe.cuh so the fused mask kernel can name the same device ref.
 
 template <class Filter>
 using bloom_owner = std::unique_ptr<Filter>;
@@ -757,6 +702,29 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask_if(
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
   }
   return out;
+}
+
+device_probe_status sirius_dynamic_bloom_filter::device_probe(cudf::column_view const& probe,
+                                                              int device_id,
+                                                              membership_probe& out) const noexcept
+{
+  auto const* replica =
+    _impl ? _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
+  if (!replica || !replica->has_bloom()) { return device_probe_status::unservable; }
+  return std::visit(
+    [&](auto const& bloom) {
+      using owner_type = std::decay_t<decltype(bloom)>;
+      using key_type   = typename owner_type::element_type::key_type;
+      if (!detail::probe_carrier_compatible(probe.type(),
+                                            cudf::data_type{key_type_id<key_type>()})) {
+        return device_probe_status::unservable;
+      }
+      out.kind = membership_probe_kind::bloom;
+      describe_probe_column(out, probe, key_type_id<key_type>());
+      store_probe_ref(out, bloom->ref());
+      return device_probe_status::ready;
+    },
+    replica->bloom);
 }
 
 // Owns every borrowed stream, event and scratch buffer of one pipelined publication. It never

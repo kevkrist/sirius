@@ -270,7 +270,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   auto gate = std::make_shared<sirius::op::scan::dynamic_filter_gate>(
     op_params.dynamic_filter_keep_threshold);
   if (dynamic_filters && op_params.enable_dynamic_filter_in_scan) {
-    scan_leaf->apply_dynamic_filters_in_scan(gate);
+    scan_leaf->apply_dynamic_filters_in_scan(gate, op_params.dynamic_filter_mask_kernel);
   }
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf = std::move(scan_leaf);
   // Preserve propagated carriers; dynamic-filter targets are already native.

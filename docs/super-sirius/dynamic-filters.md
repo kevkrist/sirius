@@ -89,6 +89,8 @@ Membership filtering reduces downstream work but does not avoid scan I/O or deco
 
 With `enable_dynamic_filter_in_scan` (default on), a parquet-backed `GPU_SCAN` — a pinned chunk served as a zero-copy view, or a fresh read that still owes its row filter — evaluates its residual row filter and every visible membership filter as masks on the unmaterialized split, ANDs them (each later mask uses the running conjunction as a stencil, so rows already dropped are not probed), and materializes the projected columns with one gather of the survivors. Masks are computed on the stored carriers: a membership filter accepts any narrower signed-integer carrier of its key type and widens each probe value on the fly, so the compressed-materialization restore cast runs on survivors only. Per-filter marginal keep ratios and the scan-level ratio come from device-side survivor counts; the scan and its `DYNAMIC_FILTER` operator share one gate, and the operator passes through the filters the scan reports as applied (`scan_output_operator_data`), applying only filters published after the scan's snapshot. The one `cudf::apply_boolean_mask` keeps its own host synchronization; the survivor counts ride on it. Hive-partitioned plans and non-parquet formats keep the post-decode path.
 
+`dynamic_filter_mask_kernel` (default `fused`) selects how that conjunction is formed. `fused`: every membership filter kind exposes a type-erased device probe (`sirius_mask_applicable::device_probe` → `membership_probe`: the replica's cuco `bloom_filter_ref` / `static_set_ref` or the small list's needles, plus the probe column's carrier and validity), and one kernel per split (`fused_membership_mask`, `dynamic_filter_mask_ops.cu`) walks each row through the residual and the probes in cascade order with early-out, writing the conjunction byte and the per-step survivor counts in a single pass — one launch and no intermediate mask columns instead of 2 + 2K launches and K masks. Two shapes are short-cut because a pass would only add work: a lone filter without a residual keeps its plain probe kernel and takes its count from the gather, and a residual alone is gathered directly (`apply_boolean_mask` drops its null rows). `cascade` is the pre-fusion shape (one stencilled probe kernel per filter, one AND + count pass after the residual and after every mask) and the fallback for a filter kind without a fused device probe; both produce identical survivors and gate ratios.
+
 ## Filter selection
 
 The publisher emits at most one membership representation per admitted key and may additionally emit a zone map:
@@ -152,6 +154,7 @@ The settings live under `sirius.operator_params`:
 | `dynamic_filter_inlist_max_l2_fraction` | `0.125` | Maximum fraction of the smallest probe-GPU L2 used by the hash IN-list estimate |
 | `dynamic_filter_keep_threshold` | `0.9` | Disable post-decode filtering when the measured keep ratio is higher |
 | `enable_dynamic_filter_in_scan` | `true` | Fold membership masks into the parquet scan's single survivor gather; the `DYNAMIC_FILTER` operator applies only later publications |
+| `dynamic_filter_mask_kernel` | `fused` | Scan-side mask pass: `fused` (one kernel per split: residual + every membership probe + per-step counts) or `cascade` (one probe kernel and one AND + count pass per filter) |
 
 ### Observability
 

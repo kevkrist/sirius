@@ -32,6 +32,7 @@
 
 // cccl
 #include <cub/device/device_for.cuh>
+#include <cuda/dynamic_filter_membership_probe.cuh>
 #include <cuda/dynamic_filter_probe_carrier.cuh>
 
 // cucascade
@@ -223,6 +224,35 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask_
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
   }
   return out;
+}
+
+device_probe_status sirius_dynamic_small_in_list_filter::device_probe(
+  cudf::column_view const& probe, int device_id, membership_probe& out) const noexcept
+{
+  if (!detail::probe_carrier_compatible(probe.type(), _key_type)) {
+    return device_probe_status::unservable;
+  }
+  auto const* replica =
+    _store ? _store->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
+  if (!replica) { return device_probe_status::unservable; }
+
+  out.kind = membership_probe_kind::small_in_list;
+  describe_probe_column(out, probe, _key_type.id());
+  auto const count = static_cast<int>(_num_keys);
+  switch (_key_type.id()) {
+    case cudf::type_id::INT32:
+      store_probe_ref(out,
+                      small_in_list_ref<std::int32_t>{
+                        static_cast<std::int32_t const*>(replica->needles.data()), count});
+      break;
+    case cudf::type_id::INT64:
+      store_probe_ref(out,
+                      small_in_list_ref<std::int64_t>{
+                        static_cast<std::int64_t const*>(replica->needles.data()), count});
+      break;
+    default: return device_probe_status::unservable;
+  }
+  return device_probe_status::ready;
 }
 
 void sirius_dynamic_small_in_list_filter::replicate_to_devices(

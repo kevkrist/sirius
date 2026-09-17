@@ -38,7 +38,9 @@
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
+#include <op/dynamic_filter/dynamic_filter_mask_kernel.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
+#include <op/dynamic_filter/dynamic_filter_membership_probe.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/scan_plan.hpp>
@@ -47,6 +49,8 @@
 #include <barrier>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -1516,7 +1520,9 @@ struct fused_apply_fixture {
     sirius_dynamic_filter_set const* filters,
     sirius::op::scan::dynamic_filter_gate* gate,
     sirius::op::scan::scan_dynamic_filter_result* applied,
-    rmm::cuda_stream_view stream) const
+    rmm::cuda_stream_view stream,
+    sirius::op::dynamic_filter_mask_kernel kernel =
+      sirius::op::dynamic_filter_mask_kernel::fused) const
   {
     auto out = sirius::op::scan::gather_view_survivors(split->view(),
                                                        output_positions,
@@ -1527,7 +1533,8 @@ struct fused_apply_fixture {
                                                        -1,
                                                        stream,
                                                        cudf::get_current_device_resource_ref(),
-                                                       applied);
+                                                       applied,
+                                                       kernel);
     stream.synchronize();
     return out;
   }
@@ -1547,10 +1554,14 @@ TEST_CASE("gather_view_survivors folds the residual and every membership mask in
   sirius_dynamic_filter_set filters;
   filters.push_filter(1, prefix7);
   filters.push_filter(1, prefix4);
+  // Both mask kernels must reproduce the hand-computed survivors and ratios below.
+  auto const kernel = GENERATE(sirius::op::dynamic_filter_mask_kernel::cascade,
+                               sirius::op::dynamic_filter_mask_kernel::fused);
+  INFO("kernel=" << sirius::op::to_string(kernel));
   sirius::op::scan::dynamic_filter_gate gate;
   sirius::op::scan::scan_dynamic_filter_result applied;
 
-  auto out = fx.gather(fx.even_rows_mask(stream), &filters, &gate, &applied, stream);
+  auto out = fx.gather(fx.even_rows_mask(stream), &filters, &gate, &applied, stream, kernel);
   REQUIRE(out != nullptr);
   // even {0,2,4,6,8} ∩ {0..6} ∩ {0..3} = {0, 2}; output layout {payload, key}, carriers kept.
   REQUIRE(out->num_columns() == 2);
@@ -1687,4 +1698,672 @@ TEST_CASE("apply_dynamic_filters_to_view skips filters the scan already applied"
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 6);  // only `other` ran
   REQUIRE(counted->mask_calls() == 0);
+}
+
+//===----------------------------------------------------------------------===//
+// fused vs cascade mask kernel — same survivors, same gate verdicts, on a large split
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+using sirius::op::dynamic_filter_mask_kernel;
+
+/// Device column from host values with an optional validity vector (bulk null mask, no per-row
+/// kernel launches).
+template <class T>
+std::unique_ptr<cudf::column> make_device_column(std::vector<T> const& values,
+                                                 cudf::type_id type,
+                                                 std::vector<bool> const* valid,
+                                                 rmm::cuda_stream_view stream)
+{
+  auto const n = static_cast<cudf::size_type>(values.size());
+  auto col =
+    cudf::make_numeric_column(cudf::data_type{type}, n, cudf::mask_state::UNALLOCATED, stream);
+  cudaMemcpyAsync(col->mutable_view().head<T>(),
+                  values.data(),
+                  values.size() * sizeof(T),
+                  cudaMemcpyHostToDevice,
+                  stream.value());
+  if (valid != nullptr) {
+    auto const words = cudf::bitmask_allocation_size_bytes(n) / sizeof(cudf::bitmask_type);
+    std::vector<cudf::bitmask_type> bits(words, 0);
+    cudf::size_type nulls = 0;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if ((*valid)[i]) {
+        bits[i / 32] |= cudf::bitmask_type{1} << (i % 32);
+      } else {
+        ++nulls;
+      }
+    }
+    rmm::device_buffer mask(bits.data(), bits.size() * sizeof(cudf::bitmask_type), stream);
+    col->set_null_mask(std::move(mask), nulls);
+  }
+  stream.synchronize();
+  return col;
+}
+
+/// A lineitem-like split large enough for the grid-stride loops to iterate: five columns of
+/// pseudo-random keys in different carriers, a row id, and a nullable key.
+struct large_split {
+  static constexpr cudf::size_type k_rows             = 1'500'000;
+  static constexpr cudf::size_type k_key64_col        = 0;  // INT64 in [0, 1e6) + sentinel rows
+  static constexpr cudf::size_type k_key32_col        = 1;  // INT32 in [0, 1e6)
+  static constexpr cudf::size_type k_key16_col        = 2;  // INT16 in [0, 20000)
+  static constexpr cudf::size_type k_row_id_col       = 3;  // INT64 row id
+  static constexpr cudf::size_type k_nullable_key_col = 4;  // INT64 = key64, null every 7th row
+
+  std::vector<int64_t> key64;
+  std::vector<int32_t> key32;
+  std::vector<int16_t> key16;
+  std::vector<bool> nullable_valid;
+  std::unique_ptr<cudf::table> table;
+
+  explicit large_split(rmm::cuda_stream_view stream)
+  {
+    key64.resize(k_rows);
+    key32.resize(k_rows);
+    key16.resize(k_rows);
+    nullable_valid.resize(k_rows);
+    std::vector<int64_t> row_id(k_rows);
+    std::uint64_t x = 0x9e3779b97f4a7c15ULL;
+    auto next       = [&x]() {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      return x;
+    };
+    for (cudf::size_type i = 0; i < k_rows; ++i) {
+      key64[i] = static_cast<int64_t>(next() % 1'000'000);
+      if (i % 100'003 == 0) { key64[i] = std::numeric_limits<int64_t>::min(); }
+      key32[i]          = static_cast<int32_t>(next() % 1'000'000);
+      key16[i]          = static_cast<int16_t>(next() % 20'000);
+      row_id[i]         = i;
+      nullable_valid[i] = (i % 7) != 0;
+    }
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(make_device_column(key64, cudf::type_id::INT64, nullptr, stream));
+    cols.push_back(make_device_column(key32, cudf::type_id::INT32, nullptr, stream));
+    cols.push_back(make_device_column(key16, cudf::type_id::INT16, nullptr, stream));
+    cols.push_back(make_device_column(row_id, cudf::type_id::INT64, nullptr, stream));
+    cols.push_back(make_device_column(key64, cudf::type_id::INT64, &nullable_valid, stream));
+    table = std::make_unique<cudf::table>(std::move(cols));
+  }
+
+  /// Residual "row is even", null every 11th row (a nullable BOOL8 like a cudf AST result).
+  [[nodiscard]] std::unique_ptr<cudf::column> residual(rmm::cuda_stream_view stream) const
+  {
+    std::vector<std::uint8_t> values(k_rows);
+    std::vector<bool> valid(k_rows);
+    for (cudf::size_type i = 0; i < k_rows; ++i) {
+      values[i] = (i % 2 == 0) ? 1 : 0;
+      valid[i]  = (i % 11) != 0;
+    }
+    return make_device_column(values, cudf::type_id::BOOL8, &valid, stream);
+  }
+
+  /// Host truth of the residual.
+  [[nodiscard]] static bool residual_keeps(cudf::size_type i) noexcept
+  {
+    return (i % 2 == 0) && (i % 11) != 0;
+  }
+};
+
+template <class T>
+std::vector<T> host_range(T first, T last, T step)
+{
+  std::vector<T> v;
+  for (T k = first; k < last; k += step) {
+    v.push_back(k);
+  }
+  return v;
+}
+
+/// Everything one gather_view_survivors() call decided, for comparing the two kernels.
+struct gather_outcome {
+  bool produced = false;
+  std::vector<int64_t> row_ids;
+  std::vector<sirius_dynamic_filter const*> applied;
+  std::vector<std::optional<double>> ratios;  // per identity, in the order given
+  bool gate_applicable = false;
+};
+
+gather_outcome run_gather(cudf::table_view const& split,
+                          std::unique_ptr<cudf::column> residual,
+                          sirius_dynamic_filter_set const& filters,
+                          std::vector<sirius_dynamic_filter const*> const& identities,
+                          dynamic_filter_mask_kernel kernel,
+                          rmm::cuda_stream_view stream)
+{
+  auto const num_cols = static_cast<std::size_t>(split.num_columns());
+  sirius::op::scan::probe_position_fn probe_position =
+    [num_cols](std::size_t col) -> std::optional<cudf::size_type> {
+    if (col >= num_cols) { return std::nullopt; }
+    return static_cast<cudf::size_type>(col);
+  };
+  sirius::op::scan::dynamic_filter_gate gate;
+  sirius::op::scan::scan_dynamic_filter_result applied;
+  auto out = sirius::op::scan::gather_view_survivors(split,
+                                                     /*output_positions=*/{},
+                                                     probe_position,
+                                                     std::move(residual),
+                                                     &filters,
+                                                     &gate,
+                                                     -1,
+                                                     stream,
+                                                     cudf::get_current_device_resource_ref(),
+                                                     &applied,
+                                                     kernel);
+  stream.synchronize();
+  gather_outcome o;
+  o.produced = out != nullptr;
+  if (out) { o.row_ids = to_host_int64(out->view().column(large_split::k_row_id_col), stream); }
+  o.applied = applied.applied;
+  for (auto const* f : identities) {
+    o.ratios.push_back(gate.filter_keep_ratio(f, filters.filter_count()));
+  }
+  o.gate_applicable = gate.applicable(filters);
+  return o;
+}
+
+void require_same_outcome(gather_outcome const& cascade, gather_outcome const& fused)
+{
+  REQUIRE(fused.produced == cascade.produced);
+  REQUIRE(fused.row_ids.size() == cascade.row_ids.size());
+  REQUIRE(fused.row_ids == cascade.row_ids);
+  REQUIRE(fused.applied == cascade.applied);
+  REQUIRE(fused.gate_applicable == cascade.gate_applicable);
+  REQUIRE(fused.ratios.size() == cascade.ratios.size());
+  for (std::size_t i = 0; i < fused.ratios.size(); ++i) {
+    INFO("filter " << i);
+    REQUIRE(fused.ratios[i].has_value() == cascade.ratios[i].has_value());
+    if (fused.ratios[i]) { REQUIRE(*fused.ratios[i] == Approx(*cascade.ratios[i])); }
+  }
+}
+
+/// Runs both kernels on the same inputs and requires identical outcomes; returns the fused one.
+gather_outcome require_kernels_agree(large_split const& split,
+                                     bool with_residual,
+                                     sirius_dynamic_filter_set const& filters,
+                                     std::vector<sirius_dynamic_filter const*> const& identities,
+                                     rmm::cuda_stream_view stream)
+{
+  auto residual = [&]() -> std::unique_ptr<cudf::column> {
+    return with_residual ? split.residual(stream) : nullptr;
+  };
+  auto const cascade = run_gather(split.table->view(),
+                                  residual(),
+                                  filters,
+                                  identities,
+                                  dynamic_filter_mask_kernel::cascade,
+                                  stream);
+  auto const fused   = run_gather(split.table->view(),
+                                residual(),
+                                filters,
+                                identities,
+                                dynamic_filter_mask_kernel::fused,
+                                stream);
+  require_same_outcome(cascade, fused);
+  return fused;
+}
+
+}  // namespace
+
+TEST_CASE("fused and cascade mask kernels agree on every filter kind, carrier and residual shape",
+          "[dynamic_filter][scan_merge][fused_apply][mask_kernel]")
+{
+  auto stream   = cudf::get_default_stream();
+  auto const mr = cudf::get_current_device_resource_ref();
+  large_split const split(stream);
+
+  // Membership filters over the split's key domains.
+  auto const bloom_keys =
+    make_device_column(host_range<int64_t>(0, 300'000, 3), cudf::type_id::INT64, nullptr, stream);
+  auto bloom =
+    std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(bloom_keys->view(), stream, mr);
+  auto const in_list64_keys =
+    make_device_column(host_range<int64_t>(0, 400'000, 2), cudf::type_id::INT64, nullptr, stream);
+  auto in_list64 =
+    std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(in_list64_keys->view(), stream, mr);
+  auto const in_list32_keys =
+    make_device_column(host_range<int32_t>(0, 20'000, 5), cudf::type_id::INT32, nullptr, stream);
+  auto in_list32 =
+    std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(in_list32_keys->view(), stream, mr);
+  std::vector<int64_t> const small_values{
+    1, 7, 42, 999, 123'456, 777'777, std::numeric_limits<int64_t>::min()};
+  auto const small_keys = make_device_column(small_values, cudf::type_id::INT64, nullptr, stream);
+  auto small            = std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
+    small_keys->view(), stream, mr);
+  stream.synchronize();
+
+  SECTION("residual + Bloom + hash set on an INT32 carrier + small list (K = 3, one pass)")
+  {
+    sirius_dynamic_filter_set filters;
+    filters.push_filter(large_split::k_key64_col, bloom);
+    filters.push_filter(large_split::k_key32_col, in_list64);
+    filters.push_filter(large_split::k_key64_col, small);
+    auto const fused = require_kernels_agree(
+      split, true, filters, {bloom.get(), in_list64.get(), small.get()}, stream);
+    REQUIRE(fused.produced);
+    REQUIRE(fused.applied.size() == 3);
+  }
+
+  SECTION("one hash set on an INT16 carrier of an INT32 key, no residual (plain probe + gather)")
+  {
+    sirius_dynamic_filter_set filters;
+    filters.push_filter(large_split::k_key16_col, in_list32);
+    auto const fused = require_kernels_agree(split, false, filters, {in_list32.get()}, stream);
+    REQUIRE(fused.produced);
+    // Exact filter: the host knows the answer.
+    std::vector<int64_t> expected;
+    for (cudf::size_type i = 0; i < large_split::k_rows; ++i) {
+      if (split.key16[i] % 5 == 0) { expected.push_back(i); }
+    }
+    REQUIRE(fused.row_ids == expected);
+    REQUIRE(fused.ratios[0].has_value());
+    REQUIRE(*fused.ratios[0] == Approx(static_cast<double>(expected.size()) / large_split::k_rows));
+  }
+
+  SECTION("Bloom + hash set on a nullable probe, no residual (K = 2)")
+  {
+    sirius_dynamic_filter_set filters;
+    filters.push_filter(large_split::k_key64_col, bloom);
+    filters.push_filter(large_split::k_nullable_key_col, in_list64);
+    auto const fused =
+      require_kernels_agree(split, false, filters, {bloom.get(), in_list64.get()}, stream);
+    REQUIRE(fused.produced);
+    // A null probe row never survives the hash-set step.
+    for (auto const row : fused.row_ids) {
+      REQUIRE(split.nullable_valid[static_cast<std::size_t>(row)]);
+    }
+  }
+
+  SECTION("residual alone (no membership filter)")
+  {
+    sirius_dynamic_filter_set empty;
+    auto const fused = require_kernels_agree(split, true, empty, {}, stream);
+    REQUIRE(fused.produced);
+    std::vector<int64_t> expected;
+    for (cudf::size_type i = 0; i < large_split::k_rows; ++i) {
+      if (large_split::residual_keeps(i)) { expected.push_back(i); }
+    }
+    REQUIRE(fused.row_ids == expected);
+    REQUIRE(fused.applied.empty());
+  }
+
+  SECTION("exact filters with a residual: both kernels match the host oracle and its ratios")
+  {
+    sirius_dynamic_filter_set filters;
+    filters.push_filter(large_split::k_key32_col, in_list64);
+    filters.push_filter(large_split::k_key16_col, in_list32);
+    filters.push_filter(large_split::k_key64_col, small);
+    std::vector<sirius_dynamic_filter const*> const identities{
+      in_list64.get(), in_list32.get(), small.get()};
+    auto const fused = require_kernels_agree(split, true, filters, identities, stream);
+    REQUIRE(fused.produced);
+    REQUIRE(fused.applied.size() == 3);
+
+    auto const keeps = [&](sirius_dynamic_filter const* f, cudf::size_type i) {
+      if (f == in_list64.get()) { return split.key32[i] % 2 == 0 && split.key32[i] < 400'000; }
+      if (f == in_list32.get()) { return split.key16[i] % 5 == 0; }
+      return std::find(small_values.begin(), small_values.end(), split.key64[i]) !=
+             small_values.end();
+    };
+    // Marginal ratios follow the cascade order the scan reports through `applied`.
+    std::vector<int64_t> expected;
+    std::vector<double> expected_ratio(3);
+    std::size_t rows_before = 0;
+    std::vector<std::size_t> after(3, 0);
+    for (cudf::size_type i = 0; i < large_split::k_rows; ++i) {
+      if (!large_split::residual_keeps(i)) { continue; }
+      ++rows_before;
+      bool keep = true;
+      for (std::size_t s = 0; s < 3 && keep; ++s) {
+        keep = keeps(fused.applied[s], i);
+        after[s] += keep ? 1 : 0;
+      }
+      if (keep) { expected.push_back(i); }
+    }
+    REQUIRE(fused.row_ids == expected);
+    std::size_t entering = rows_before;
+    for (std::size_t s = 0; s < 3; ++s) {
+      auto const idx = static_cast<std::size_t>(
+        std::find(identities.begin(), identities.end(), fused.applied[s]) - identities.begin());
+      REQUIRE(fused.ratios[idx].has_value());
+      REQUIRE(*fused.ratios[idx] ==
+              Approx(static_cast<double>(after[s]) / static_cast<double>(entering)));
+      entering = after[s];
+    }
+  }
+
+  SECTION("more filters than one fused round takes (K = 5 -> two rounds)")
+  {
+    static_assert(sirius::op::k_fused_membership_max_steps == 4);
+    std::vector<std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter>> prefixes;
+    std::vector<sirius_dynamic_filter const*> identities;
+    sirius_dynamic_filter_set filters;
+    for (int64_t count : {900'000, 800'000, 700'000, 600'000, 500'000}) {
+      prefixes.push_back(make_in_list_prefix(count, stream));
+      identities.push_back(prefixes.back().get());
+      filters.push_filter(large_split::k_key64_col, prefixes.back());
+    }
+    auto const fused = require_kernels_agree(split, true, filters, identities, stream);
+    REQUIRE(fused.produced);
+    REQUIRE(fused.applied.size() == 5);
+    // Every prefix keeps [0, count) plus the set's sentinel key (INT64_MIN rows exist by
+    // construction and can never be dropped by a hash set).
+    std::vector<int64_t> expected;
+    for (cudf::size_type i = 0; i < large_split::k_rows; ++i) {
+      auto const key = split.key64[i];
+      if (large_split::residual_keeps(i) &&
+          ((key >= 0 && key < 500'000) || key == std::numeric_limits<int64_t>::min())) {
+        expected.push_back(i);
+      }
+    }
+    REQUIRE(fused.row_ids == expected);
+  }
+
+  SECTION("the hash set's sentinel key is kept, never dropped")
+  {
+    std::vector<int64_t> const sentinel_keys{std::numeric_limits<int64_t>::min(), 5, 10};
+    auto const keys = make_device_column(sentinel_keys, cudf::type_id::INT64, nullptr, stream);
+    auto with_sentinel =
+      std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(keys->view(), stream, mr);
+    stream.synchronize();
+    sirius_dynamic_filter_set filters;
+    filters.push_filter(large_split::k_key64_col, with_sentinel);
+    for (bool const with_residual : {false, true}) {
+      auto const fused =
+        require_kernels_agree(split, with_residual, filters, {with_sentinel.get()}, stream);
+      REQUIRE(fused.produced);
+      std::vector<int64_t> expected;
+      for (cudf::size_type i = 0; i < large_split::k_rows; ++i) {
+        if (with_residual && !large_split::residual_keeps(i)) { continue; }
+        if (std::find(sentinel_keys.begin(), sentinel_keys.end(), split.key64[i]) !=
+            sentinel_keys.end()) {
+          expected.push_back(i);
+        }
+      }
+      REQUIRE(fused.row_ids == expected);
+      REQUIRE_FALSE(expected.empty());  // the sentinel rows exist by construction
+    }
+  }
+
+  SECTION("an unservable probe is recorded as keep-everything by both kernels")
+  {
+    // INT32 keys probed with an INT64 column: wider than the key, no mask possible.
+    sirius_dynamic_filter_set filters;
+    filters.push_filter(large_split::k_key64_col, in_list32);
+    filters.push_filter(large_split::k_key64_col, bloom);
+    auto const fused =
+      require_kernels_agree(split, true, filters, {in_list32.get(), bloom.get()}, stream);
+    REQUIRE(fused.produced);
+    REQUIRE(fused.applied == std::vector<sirius_dynamic_filter const*>{bloom.get()});
+    REQUIRE(fused.ratios[0].has_value());
+    REQUIRE(sirius::op::scan::dynamic_filter_gate::filter_skippable(*fused.ratios[0]));
+  }
+
+  SECTION("a filter kind without a fused probe sends the split down the cascade")
+  {
+    auto counted = std::make_shared<counting_in_list_filter>(in_list64);
+    sirius_dynamic_filter_set filters;
+    filters.push_filter(large_split::k_key32_col, counted);
+    filters.push_filter(large_split::k_key64_col, bloom);
+    auto const fused =
+      require_kernels_agree(split, true, filters, {counted.get(), bloom.get()}, stream);
+    REQUIRE(fused.produced);
+    REQUIRE(fused.applied.size() == 2);
+    REQUIRE(counted->mask_calls() == 2);  // once per kernel: the fused run fell back
+    sirius::op::membership_probe probe;
+    REQUIRE(counted->device_probe(split.table->view().column(large_split::k_key32_col),
+                                  -1,
+                                  probe) == sirius::op::device_probe_status::unsupported);
+  }
+}
+
+TEST_CASE("device_probe describes a servable probe and refuses the rest",
+          "[dynamic_filter][scan_merge][mask_kernel]")
+{
+  auto stream = cudf::get_default_stream();
+  membership_trio const filters(stream);  // INT64 keys 0..4
+  auto const probe64 = make_int64_keys(10, stream);
+  auto const probe32 =
+    make_column(iota_values<int32_t>(10), cudf::data_type{cudf::type_id::INT32}, stream, {3});
+  auto const probe_f64 =
+    make_values_table<double>({0.0, 1.0}, cudf::data_type{cudf::type_id::FLOAT64}, stream);
+
+  using sirius::op::device_probe_status;
+  using sirius::op::membership_probe_kind;
+  auto const expected_kind = [&](sirius::op::sirius_mask_applicable const* f) {
+    if (f == filters.bloom.get()) { return membership_probe_kind::bloom; }
+    if (f == filters.in_list.get()) { return membership_probe_kind::hash_set; }
+    return membership_probe_kind::small_in_list;
+  };
+  for (auto const* filter : filters.all()) {
+    sirius::op::membership_probe probe;
+    // The key type itself.
+    REQUIRE(filter->device_probe(probe64->view(), -1, probe) == device_probe_status::ready);
+    REQUIRE(probe.kind == expected_kind(filter));
+    REQUIRE(probe.key_type == cudf::type_id::INT64);
+    REQUIRE(probe.carrier == cudf::type_id::INT64);
+    REQUIRE(probe.data == probe64->view().data<int64_t>());
+    REQUIRE(probe.null_mask == nullptr);
+    // A narrower carrier with nulls: the validity travels with the descriptor.
+    REQUIRE(filter->device_probe(probe32->view(), -1, probe) == device_probe_status::ready);
+    REQUIRE(probe.carrier == cudf::type_id::INT32);
+    REQUIRE(probe.null_mask == probe32->view().null_mask());
+    // Not a carrier of the key type.
+    REQUIRE(filter->device_probe(probe_f64->view().column(0), -1, probe) ==
+            device_probe_status::unservable);
+    // No replica on that device.
+    REQUIRE(filter->device_probe(probe64->view(), 1023, probe) == device_probe_status::unservable);
+  }
+}
+
+TEST_CASE("fused_membership_mask rejects an empty or oversized round",
+          "[dynamic_filter][scan_merge][mask_kernel]")
+{
+  auto stream = cudf::get_default_stream();
+  std::vector<sirius::op::membership_probe> const none;
+  std::vector<sirius::op::membership_probe> const too_many(
+    sirius::op::k_fused_membership_max_steps + 1);
+  bool* out = nullptr;
+  REQUIRE_THROWS_AS(
+    sirius::op::fused_membership_mask(nullptr, nullptr, 0, none, out, 0, nullptr, nullptr, stream),
+    std::invalid_argument);
+  REQUIRE_THROWS_AS(sirius::op::fused_membership_mask(
+                      nullptr, nullptr, 0, too_many, out, 0, nullptr, nullptr, stream),
+                    std::invalid_argument);
+}
+
+//===----------------------------------------------------------------------===//
+// Hidden microbenchmark: fused vs cascade on engine-scale splits (run with "[mask_kernel_bench]")
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+struct bench_split {
+  std::unique_ptr<cudf::table>
+    table;  // col0 INT32 carrier of an INT64 key, col1 INT32 key, col2 INT64 payload
+  cudf::size_type rows;
+};
+
+bench_split make_bench_split(cudf::size_type rows,
+                             std::uint32_t key_domain,
+                             std::uint32_t key32_domain,
+                             rmm::cuda_stream_view stream)
+{
+  std::vector<int32_t> key(rows), key32(rows);
+  std::vector<int64_t> payload(rows);
+  std::uint64_t x = 0x1234567897654321ULL;
+  for (cudf::size_type i = 0; i < rows; ++i) {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    key[i]     = static_cast<int32_t>(1 + (x % key_domain));
+    key32[i]   = static_cast<int32_t>(1 + ((x >> 20) % key32_domain));
+    payload[i] = i;
+  }
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(make_device_column(key, cudf::type_id::INT32, nullptr, stream));
+  cols.push_back(make_device_column(key32, cudf::type_id::INT32, nullptr, stream));
+  cols.push_back(make_device_column(payload, cudf::type_id::INT64, nullptr, stream));
+  return {std::make_unique<cudf::table>(std::move(cols)), rows};
+}
+
+std::unique_ptr<cudf::column> make_bench_residual(cudf::size_type rows,
+                                                  int keep_percent,
+                                                  rmm::cuda_stream_view stream)
+{
+  std::vector<std::uint8_t> values(rows);
+  std::uint64_t x = 0xabcdef1234567ULL;
+  for (cudf::size_type i = 0; i < rows; ++i) {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    values[i] = (x % 100) < static_cast<std::uint64_t>(keep_percent) ? 1 : 0;
+  }
+  return make_device_column(values, cudf::type_id::BOOL8, nullptr, stream);
+}
+
+/// Median wall time (us) of gather_view_survivors over `reps` L2-cold repetitions.
+double time_gather(bench_split const& split,
+                   std::function<std::unique_ptr<cudf::column>()> const& residual,
+                   sirius_dynamic_filter_set const& filters,
+                   dynamic_filter_mask_kernel kernel,
+                   rmm::cuda_stream_view stream,
+                   int reps = 7)
+{
+  auto const num_cols = static_cast<std::size_t>(split.table->num_columns());
+  sirius::op::scan::probe_position_fn probe_position =
+    [num_cols](std::size_t col) -> std::optional<cudf::size_type> {
+    if (col >= num_cols) { return std::nullopt; }
+    return static_cast<cudf::size_type>(col);
+  };
+  rmm::device_buffer flush(std::size_t{320} << 20, stream);
+  cudaEvent_t a, b;
+  cudaEventCreate(&a);
+  cudaEventCreate(&b);
+  std::vector<float> ms;
+  for (int r = 0; r < reps + 1; ++r) {
+    sirius::op::scan::dynamic_filter_gate gate;  // fresh: every filter measured every rep
+    auto res = residual();
+    cudaMemsetAsync(flush.data(), 0, flush.size(), stream.value());
+    cudaEventRecord(a, stream.value());
+    auto out = sirius::op::scan::gather_view_survivors(split.table->view(),
+                                                       {},
+                                                       probe_position,
+                                                       std::move(res),
+                                                       &filters,
+                                                       &gate,
+                                                       -1,
+                                                       stream,
+                                                       cudf::get_current_device_resource_ref(),
+                                                       nullptr,
+                                                       kernel);
+    cudaEventRecord(b, stream.value());
+    cudaEventSynchronize(b);
+    float t = 0;
+    cudaEventElapsedTime(&t, a, b);
+    if (r > 0) { ms.push_back(t); }
+  }
+  cudaEventDestroy(a);
+  cudaEventDestroy(b);
+  std::sort(ms.begin(), ms.end());
+  return ms[ms.size() / 2] * 1000.0;
+}
+
+}  // namespace
+
+TEST_CASE("mask kernel microbenchmark: fused vs cascade on q3/q8-shaped splits",
+          "[.][mask_kernel_bench]")
+{
+  auto stream   = cudf::get_default_stream();
+  auto const mr = cudf::get_current_device_resource_ref();
+  std::printf("shape,kernel,median_us\n");
+
+  // q3 lineitem: 34 M rows, INT32 carrier of l_orderkey (domain 600 M), 54 % residual, Bloom over
+  // 14.7 M orders keys.
+  {
+    auto const split = make_bench_split(34'000'000, 600'000'000u, 20'000'000u, stream);
+    std::vector<int64_t> keys(14'700'000);
+    std::uint64_t x = 0x777ULL;
+    for (auto& k : keys) {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      k = static_cast<int64_t>(1 + (x % 600'000'000u));
+    }
+    auto const key_col = make_device_column(keys, cudf::type_id::INT64, nullptr, stream);
+    auto bloom =
+      std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(key_col->view(), stream, mr);
+    stream.synchronize();
+    sirius_dynamic_filter_set filters;
+    filters.push_filter(0, bloom);
+    for (auto const kernel :
+         {dynamic_filter_mask_kernel::cascade, dynamic_filter_mask_kernel::fused}) {
+      auto const with = time_gather(
+        split,
+        [&] { return make_bench_residual(split.rows, 54, stream); },
+        filters,
+        kernel,
+        stream);
+      std::printf("q3_34M_res54_bloom14.7M,%s,%.1f\n",
+                  std::string(sirius::op::to_string(kernel)).c_str(),
+                  with);
+      auto const without =
+        time_gather(split, [] { return std::unique_ptr<cudf::column>{}; }, filters, kernel, stream);
+      std::printf("q5_34M_nores_bloom14.7M,%s,%.1f\n",
+                  std::string(sirius::op::to_string(kernel)).c_str(),
+                  without);
+    }
+  }
+
+  // q8 lineitem: 29.8 M rows, hash set over 133 K part keys (INT32) then Bloom over 9.1 M orders
+  // keys, no residual (K = 2 cascade, the L2-thrash shape).
+  {
+    auto const split = make_bench_split(29'800'000, 600'000'000u, 20'000'000u, stream);
+    std::vector<int64_t> bloom_keys(9'100'000);
+    std::uint64_t x = 0x999ULL;
+    for (auto& k : bloom_keys) {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      k = static_cast<int64_t>(1 + (x % 600'000'000u));
+    }
+    auto const bloom_col = make_device_column(bloom_keys, cudf::type_id::INT64, nullptr, stream);
+    auto bloom =
+      std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(bloom_col->view(), stream, mr);
+    std::vector<int32_t> set_keys(133'000);
+    for (auto& k : set_keys) {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      k = static_cast<int32_t>(1 + (x % 20'000'000u));
+    }
+    auto const set_col = make_device_column(set_keys, cudf::type_id::INT32, nullptr, stream);
+    auto set =
+      std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(set_col->view(), stream, mr);
+    stream.synchronize();
+    sirius_dynamic_filter_set filters;
+    filters.push_filter(1, set);
+    filters.push_filter(0, bloom);
+    for (auto const kernel :
+         {dynamic_filter_mask_kernel::cascade, dynamic_filter_mask_kernel::fused}) {
+      auto const t =
+        time_gather(split, [] { return std::unique_ptr<cudf::column>{}; }, filters, kernel, stream);
+      std::printf("q8_29.8M_set133K_bloom9.1M,%s,%.1f\n",
+                  std::string(sirius::op::to_string(kernel)).c_str(),
+                  t);
+      auto const t_res = time_gather(
+        split,
+        [&] { return make_bench_residual(split.rows, 30, stream); },
+        filters,
+        kernel,
+        stream);
+      std::printf("q7_29.8M_res30_set133K_bloom9.1M,%s,%.1f\n",
+                  std::string(sirius::op::to_string(kernel)).c_str(),
+                  t_res);
+    }
+  }
+  std::fflush(stdout);
 }
