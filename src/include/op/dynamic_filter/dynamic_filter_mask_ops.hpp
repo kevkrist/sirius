@@ -22,9 +22,40 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <op/dynamic_filter/dynamic_filter_membership_probe.hpp>
+
 #include <optional>
+#include <span>
 
 namespace sirius::op {
+
+/// Most membership steps one fused_membership_mask() launch evaluates (kernel-argument bound); a
+/// split with more filters runs further rounds over its conjunction.
+constexpr std::size_t k_fused_membership_max_steps = 4;
+
+/**
+ * @brief One pass: residual AND up to k_fused_membership_max_steps membership probes, with counts
+ *
+ * For every row `i < n`, `out[i] = r(i) && step_0 keeps i && ... && step_{K-1} keeps i`, where
+ * `r(i)` is `residual[i]` folded with its validity (`true` without a residual) and a row dropped
+ * by an earlier step is not probed by a later one, so each step's count is its marginal
+ * survivors — exactly the cascade's stencilled semantics. `residual` may alias `out` (in-place
+ * fold). When non-null, `*residual_count` is incremented by the rows passing `r`;
+ * `step_counts[s]` by the rows surviving step `s`. Counters are device-resident and zeroed by the
+ * caller on @p stream.
+ *
+ * @throw std::invalid_argument if @p steps is empty or longer than k_fused_membership_max_steps
+ * @throw cucascade::cuda_error if the launch fails
+ */
+void fused_membership_mask(bool const* residual,
+                           cudf::bitmask_type const* residual_valid,
+                           cudf::size_type residual_offset,
+                           std::span<membership_probe const> steps,
+                           bool* out,
+                           cudf::size_type n,
+                           cudf::size_type* residual_count,
+                           cudf::size_type* step_counts,
+                           rmm::cuda_stream_view stream);
 
 /**
  * @brief Folds a keep mask into a running conjunction and counts the survivors, in one pass

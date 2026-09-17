@@ -22,6 +22,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <op/dynamic_filter/dynamic_filter_mask_kernel.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_gate.hpp>
 #include <op/scan/scan_plan.hpp>
@@ -109,9 +110,16 @@ using probe_position_fn = std::function<std::optional<cudf::size_type>(std::size
  * mask of every applicable membership filter, then gathers @p output_positions of @p input once
  * (all columns when empty): that gather is the split's only materialization. Filter masks are
  * computed on the view's storage carriers (narrow carriers are widened per value) in the gate's
- * cascade order, each using the running conjunction as a stencil so rows already dropped are not
- * probed. Per-filter marginal keep ratios and the scan-level ratio are recorded on @p gate from
- * device-side survivor counts; the applied identities are reported through @p applied.
+ * cascade order, each seeing only rows the residual and the earlier masks kept. Per-filter
+ * marginal keep ratios and the scan-level ratio are recorded on @p gate from device-side
+ * survivor counts; the applied identities are reported through @p applied.
+ *
+ * @p kernel selects how the conjunction is formed. `cascade`: one stencilled probe kernel per
+ * filter and a streaming AND + count pass after the residual and after every mask. `fused`: one
+ * kernel per split evaluates the residual and every membership probe per row with early-out and
+ * writes the conjunction and the per-step counts in a single pass (a lone filter without a
+ * residual keeps its plain probe kernel and takes its count from the gather; a filter kind
+ * without a fused form sends the split down the cascade). Both produce identical results.
  *
  * Returns null when nothing applies (no residual and no usable filter); the caller then
  * materializes as it otherwise would. Reads of @p input are only enqueued on @p stream.
@@ -130,6 +138,7 @@ using probe_position_fn = std::function<std::optional<cudf::size_type>(std::size
   int device_id,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
-  scan_dynamic_filter_result* applied);
+  scan_dynamic_filter_result* applied,
+  sirius::op::dynamic_filter_mask_kernel kernel = sirius::op::dynamic_filter_mask_kernel::fused);
 
 }  // namespace sirius::op::scan

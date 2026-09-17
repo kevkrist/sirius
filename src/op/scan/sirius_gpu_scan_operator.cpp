@@ -340,8 +340,8 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       if (_dynamic_filter_scan_gate && _dynamic_filters_channel) {
         // Fold the channel's membership filters into the split's survivor gather; the
         // DYNAMIC_FILTER operator downstream passes the reported filters through.
-        scan_dynamic_filter_context const context{*_dynamic_filters_channel,
-                                                  *_dynamic_filter_scan_gate};
+        scan_dynamic_filter_context const context{
+          *_dynamic_filters_channel, *_dynamic_filter_scan_gate, _dynamic_filter_mask_kernel};
         output_table = _ingestible->filter_and_project_with_dynamic_filters(
           std::move(materialized_table), *mem_space, stream, context, dynamic_filters_applied);
       } else {

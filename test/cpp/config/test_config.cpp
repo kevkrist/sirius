@@ -794,6 +794,42 @@ TEST_CASE("the dynamic-filter publication scheme and chunk are consumed from ope
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("the dynamic-filter mask kernel is consumed from operator_params",
+          "[config_opt][dynamic_filter]")
+{
+  using sirius::op::dynamic_filter_mask_kernel;
+  CHECK(operator_params{}.dynamic_filter_mask_kernel == dynamic_filter_mask_kernel::fused);
+
+  auto const path =
+    std::filesystem::temp_directory_path() / "sirius_dynamic_filter_mask_kernel.yaml";
+  auto write = [&](char const* kernel) {
+    std::ofstream out(path);
+    out << "sirius:\n"
+           "  operator_params:\n"
+           "    dynamic_filter_mask_kernel: "
+        << kernel << "\n";
+  };
+
+  write("cascade");
+  sirius_config cfg;
+  cfg.load_from_file(path);
+  CHECK(cfg.get_operator_params().dynamic_filter_mask_kernel ==
+        dynamic_filter_mask_kernel::cascade);
+
+  write("fused");
+  cfg.load_from_file(path);
+  CHECK(cfg.get_operator_params().dynamic_filter_mask_kernel == dynamic_filter_mask_kernel::fused);
+
+  write("vectorised");
+  CHECK_THROWS_WITH(cfg.load_from_file(path), Catch::Contains("dynamic_filter_mask_kernel"));
+
+  cfg.apply_defaults();
+  CHECK(cfg.get_operator_params().dynamic_filter_mask_kernel == dynamic_filter_mask_kernel::fused);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("the pool peer-access switch is consumed from the memory.gpu YAML section",
           "[config_opt][pool_peer_access]")
 {

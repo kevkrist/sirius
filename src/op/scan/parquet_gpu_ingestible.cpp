@@ -1240,7 +1240,8 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::filter_and_project_with_dyn
                                       mem_space.get_device_id(),
                                       stream,
                                       mr_ref,
-                                      &applied);
+                                      &applied,
+                                      dynamic_filters.mask_kernel);
   } catch (...) {
     // The residual, the membership masks and the gather's count pass enqueue
     // reads of the view before the allocation that may throw (an OOM on a mask

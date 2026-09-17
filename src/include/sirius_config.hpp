@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "log/level.hpp"
 #include "op/dynamic_filter/dynamic_filter_domain_evidence.hpp"
+#include "op/dynamic_filter/dynamic_filter_mask_kernel.hpp"
 #include "op/dynamic_filter/dynamic_filter_publication_scheme.hpp"
 #include "pipeline/scheduler_config.hpp"
 #include "scan_manager/config.hpp"
@@ -216,6 +217,14 @@ struct operator_params {
   /// disabled, the scan materializes every row and the operator filters afterwards. Effective
   /// only when enable_dynamic_filter is enabled.
   bool enable_dynamic_filter_in_scan = true;
+
+  /// How a scan that applies membership filters itself folds its residual row filter and the
+  /// masks into the split's survivor mask. `fused`: one kernel per split runs the residual and
+  /// every membership probe per row in the gate's order with early-out and writes the conjunction
+  /// plus the per-step survivor counts in a single pass (a lone filter without a residual keeps
+  /// the plain probe kernel). `cascade`: one stencilled probe kernel per filter plus a streaming
+  /// AND + count pass after the residual and after each mask. Same masks and gate ratios.
+  op::dynamic_filter_mask_kernel dynamic_filter_mask_kernel = op::dynamic_filter_mask_kernel::fused;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the

@@ -21,6 +21,7 @@
 #include <cudf/table/table_view.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <op/dynamic_filter/dynamic_filter_mask_kernel.hpp>
 #include <op/scan/batch_coalescer.hpp>
 #include <op/scan/gpu_ingestible_types.hpp>
 #include <op/scan/scan_filter_analysis.hpp>
@@ -68,6 +69,9 @@ struct scan_dynamic_filter_result;
 struct scan_dynamic_filter_context {
   sirius::op::sirius_dynamic_filter_set const& filters;
   dynamic_filter_gate& gate;
+  /// How the residual row filter and the membership masks are folded into the survivor mask.
+  sirius::op::dynamic_filter_mask_kernel mask_kernel =
+    sirius::op::dynamic_filter_mask_kernel::fused;
 };
 
 //===----------------------------------------------------------------------===//

@@ -156,10 +156,15 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    * ACTIVE-terminal state machine per scan). Splits routed through the ingestible's
    * `filter_and_project_with_dynamic_filters` gather only surviving rows and report the applied
    * filters on their output (@ref scan_output_operator_data). No effect without a channel.
+   * @p mask_kernel selects how the residual and the masks are folded into the survivor mask
+   * (`operator_params.dynamic_filter_mask_kernel`).
    */
-  void apply_dynamic_filters_in_scan(std::shared_ptr<dynamic_filter_gate> gate)
+  void apply_dynamic_filters_in_scan(std::shared_ptr<dynamic_filter_gate> gate,
+                                     sirius::op::dynamic_filter_mask_kernel mask_kernel =
+                                       sirius::op::dynamic_filter_mask_kernel::fused)
   {
-    _dynamic_filter_scan_gate = std::move(gate);
+    _dynamic_filter_scan_gate   = std::move(gate);
+    _dynamic_filter_mask_kernel = mask_kernel;
   }
 
   scan_manager::split_connector& get_split_connector();
@@ -190,6 +195,9 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   /// Set by the planner when the scan applies membership filters itself; shared with the
   /// downstream DYNAMIC_FILTER operator. Null keeps every filter on that operator.
   std::shared_ptr<dynamic_filter_gate> _dynamic_filter_scan_gate;
+  /// Mask kernel the scan-side apply uses; meaningful only with `_dynamic_filter_scan_gate`.
+  sirius::op::dynamic_filter_mask_kernel _dynamic_filter_mask_kernel =
+    sirius::op::dynamic_filter_mask_kernel::fused;
   /// Non-owning observer. The registered-state shared_ptr owns the context for
   /// at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer;

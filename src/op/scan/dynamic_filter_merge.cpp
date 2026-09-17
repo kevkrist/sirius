@@ -15,6 +15,7 @@
  */
 
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -31,7 +32,9 @@
 #include <cucascade/error.hpp>
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/dynamic_filter_mask_kernel.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
+#include <op/dynamic_filter/dynamic_filter_membership_probe.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 
 #include <algorithm>
@@ -153,6 +156,249 @@ class pinned_counts {
   cudf::size_type* _data;
 };
 
+/// Device-side survivor counts landed in pinned memory ahead of the gather so the gather's own
+/// host sync covers the copy; wait() only guards against a gather that no longer syncs.
+class counts_readback {
+ public:
+  counts_readback(rmm::device_uvector<cudf::size_type> const& counts, rmm::cuda_stream_view stream)
+    : _host(counts.size(), stream)
+  {
+    CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
+      _host.data(), counts.data(), _host.bytes(), cudaMemcpyDeviceToHost, stream.value()));
+    _ready.record(stream);
+  }
+
+  void wait() { _ready.synchronize(); }
+  [[nodiscard]] cudf::size_type operator[](std::size_t i) const noexcept { return _host[i]; }
+
+ private:
+  pinned_counts _host;
+  cucascade::cuda::cuda_event _ready;
+};
+
+/// Gathers @p output_positions of @p input (all columns when empty) where @p mask is non-null
+/// and true — the split's only materialization.
+std::unique_ptr<cudf::table> gather_with_mask(cudf::table_view const& input,
+                                              std::span<cudf::size_type const> output_positions,
+                                              cudf::column_view const& mask,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
+{
+  nvtx3::scoped_range nvtx_gather_range{"dynfilter::scan::gather"};
+  auto const to_gather = output_positions.empty()
+                           ? input
+                           : input.select(output_positions.begin(), output_positions.end());
+  return cudf::apply_boolean_mask(to_gather, mask, stream, mr);
+}
+
+/// What one mask pass over a split produced, for the gate bookkeeping both kernels share.
+struct survivor_pass {
+  std::unique_ptr<cudf::table> survivors;  // null when nothing applied
+  /// Rows entering the first membership mask (after the residual).
+  cudf::size_type rows_into_masks = 0;
+  /// Per entry: rows surviving its mask; unset for entries whose mask was not applied.
+  std::vector<std::optional<cudf::size_type>> rows_after;
+};
+
+/// The split and its admitted membership entries, as both kernels see them.
+struct survivor_pass_inputs {
+  cudf::table_view const& input;
+  std::span<cudf::size_type const> output_positions;
+  probe_position_fn const& probe_position;
+  std::vector<membership_entry> const& entries;
+  dynamic_filter_gate* gate;
+  std::size_t observed_filter_count;
+  int device_id;
+  rmm::cuda_stream_view stream;
+  rmm::device_async_resource_ref mr;
+
+  [[nodiscard]] cudf::column_view probe_column(membership_entry const& e) const
+  {
+    return input.column(*probe_position(e.col_idx));  // present by construction of the entry list
+  }
+
+  /// Same verdict the cascade records for a probe the filter cannot serve: nothing kept out, so
+  /// the filter is not worth attempting again on this scan.
+  void record_unservable(membership_entry const& e) const
+  {
+    if (gate && !e.recorded) {
+      gate->record_filter_keep_ratio(e.identity, 1.0, observed_filter_count);
+    }
+  }
+};
+
+/**
+ * `dynamic_filter_mask_kernel::cascade`: one stencilled probe kernel per filter, and one
+ * streaming AND + count pass after the residual and after every mask. @p residual_mask is
+ * consumed.
+ */
+survivor_pass gather_cascade(survivor_pass_inputs const& in,
+                             std::unique_ptr<cudf::column>& residual_mask)
+{
+  auto const& entries = in.entries;
+  survivor_pass pass;
+  pass.rows_after.assign(entries.size(), std::nullopt);
+
+  // counts[0] = rows entering the first membership mask (after the residual); counts[i + 1] =
+  // rows surviving entry i. Zeroed on the stream, read back after the gather's own sync.
+  rmm::device_uvector<cudf::size_type> counts(entries.size() + 1, in.stream, in.mr);
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(counts.data(), 0, counts.size() * sizeof(cudf::size_type), in.stream.value()));
+
+  // The running conjunction. Null-free once folded, so it can serve as a cuco stencil and as the
+  // gather's boolean mask directly.
+  std::unique_ptr<cudf::column> conjunction;
+  auto const fold = [&](std::unique_ptr<cudf::column> mask, cudf::size_type* survivor_count) {
+    if (!conjunction) {
+      conjunction = std::move(mask);
+      sirius::op::and_mask_count(*conjunction, std::nullopt, survivor_count, in.stream);
+      if (conjunction->nullable()) { conjunction->set_null_mask(rmm::device_buffer{}, 0); }
+    } else {
+      sirius::op::and_mask_count(*conjunction, mask->view(), survivor_count, in.stream);
+    }
+  };
+
+  bool const has_residual = residual_mask != nullptr;
+  if (has_residual) { fold(std::move(residual_mask), counts.data()); }
+
+  std::vector<bool> mask_applied(entries.size(), false);
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    auto const& e             = entries[i];
+    bool const* const stencil = conjunction ? conjunction->view().data<bool>() : nullptr;
+    auto mask =
+      e.filter->compute_mask_if(in.probe_column(e), stencil, in.device_id, in.stream, in.mr);
+    if (!mask) {
+      in.record_unservable(e);
+      continue;
+    }
+    fold(std::move(mask), counts.data() + i + 1);
+    mask_applied[i] = true;
+  }
+  if (!conjunction) { return pass; }
+
+  counts_readback host_counts(counts, in.stream);
+  pass.survivors =
+    gather_with_mask(in.input, in.output_positions, conjunction->view(), in.stream, in.mr);
+  host_counts.wait();
+  pass.rows_into_masks = has_residual ? host_counts[0] : in.input.num_rows();
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (mask_applied[i]) { pass.rows_after[i] = host_counts[i + 1]; }
+  }
+  return pass;
+}
+
+/**
+ * `dynamic_filter_mask_kernel::fused`: the residual and every servable membership probe in one
+ * pass per split (rounds of k_fused_membership_max_steps), with the two shapes where a pass
+ * would only add work short-cut. Returns null — before consuming @p residual_mask or touching the
+ * gate — when a filter kind has no fused form, so the caller can run the cascade instead.
+ */
+std::optional<survivor_pass> gather_fused(survivor_pass_inputs const& in,
+                                          std::unique_ptr<cudf::column>& residual_mask)
+{
+  auto const& entries = in.entries;
+  auto const num_rows = in.input.num_rows();
+
+  std::vector<sirius::op::membership_probe> steps(entries.size());
+  std::vector<sirius::op::device_probe_status> status(entries.size());
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    status[i] =
+      entries[i].filter->device_probe(in.probe_column(entries[i]), in.device_id, steps[i]);
+    if (status[i] == sirius::op::device_probe_status::unsupported) { return std::nullopt; }
+  }
+
+  survivor_pass pass;
+  pass.rows_after.assign(entries.size(), std::nullopt);
+  std::vector<std::size_t> ready;  // entry indices, in cascade order
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (status[i] == sirius::op::device_probe_status::ready) {
+      ready.push_back(i);
+    } else {
+      in.record_unservable(entries[i]);
+    }
+  }
+
+  bool const has_residual = residual_mask != nullptr;
+  if (ready.empty()) {
+    if (!has_residual) { return pass; }
+    // Residual alone: apply_boolean_mask drops its null rows, so the gather is the whole select.
+    pass.survivors =
+      gather_with_mask(in.input, in.output_positions, residual_mask->view(), in.stream, in.mr);
+    pass.rows_into_masks = pass.survivors->num_rows();
+    return pass;
+  }
+  if (!has_residual && ready.size() == 1) {
+    // One membership filter, no residual: the filter's plain probe kernel already yields the
+    // final mask and the gather's row count is its survivor count — no fold, no count pass, no
+    // readback (a fused pass would only add the count reduction to the same probe).
+    auto const& e = entries[ready.front()];
+    auto mask     = e.filter->compute_mask_if(
+      in.probe_column(e), /*stencil=*/nullptr, in.device_id, in.stream, in.mr);
+    if (!mask) {
+      in.record_unservable(e);
+      return pass;
+    }
+    pass.survivors =
+      gather_with_mask(in.input, in.output_positions, mask->view(), in.stream, in.mr);
+    pass.rows_into_masks           = num_rows;
+    pass.rows_after[ready.front()] = pass.survivors->num_rows();
+    return pass;
+  }
+
+  // The conjunction is written in place over the residual, or into a fresh mask column without
+  // one. counts[0] = rows passing the residual; counts[s + 1] = rows surviving ready step s.
+  std::unique_ptr<cudf::column> conjunction =
+    has_residual ? std::move(residual_mask)
+                 : cudf::make_numeric_column(cudf::data_type{cudf::type_id::BOOL8},
+                                             num_rows,
+                                             cudf::mask_state::UNALLOCATED,
+                                             in.stream,
+                                             in.mr);
+  rmm::device_uvector<cudf::size_type> counts(ready.size() + 1, in.stream, in.mr);
+  CUCASCADE_CUDA_TRY(
+    cudaMemsetAsync(counts.data(), 0, counts.size() * sizeof(cudf::size_type), in.stream.value()));
+  {
+    nvtx3::scoped_range nvtx_fused_range{"dynfilter::apply::fused_mask"};
+    auto const residual_view = conjunction->view();
+    bool* const out          = conjunction->mutable_view().data<bool>();
+    std::vector<sirius::op::membership_probe> round;
+    round.reserve(sirius::op::k_fused_membership_max_steps);
+    for (std::size_t first = 0; first < ready.size();
+         first += sirius::op::k_fused_membership_max_steps) {
+      auto const last = std::min(ready.size(), first + sirius::op::k_fused_membership_max_steps);
+      round.clear();
+      for (auto s = first; s < last; ++s) {
+        round.push_back(steps[ready[s]]);
+      }
+      // A later round folds into the (already null-free) conjunction the previous one wrote.
+      bool const first_round = first == 0;
+      sirius::op::fused_membership_mask(
+        first_round ? (has_residual ? residual_view.data<bool>() : nullptr) : out,
+        first_round && has_residual && residual_view.nullable() ? residual_view.null_mask()
+                                                                : nullptr,
+        first_round ? residual_view.offset() : 0,
+        round,
+        out,
+        num_rows,
+        first_round && has_residual ? counts.data() : nullptr,
+        counts.data() + 1 + static_cast<std::ptrdiff_t>(first),
+        in.stream);
+    }
+  }
+  // The pass folded the residual's validity into the values.
+  if (conjunction->nullable()) { conjunction->set_null_mask(rmm::device_buffer{}, 0); }
+
+  counts_readback host_counts(counts, in.stream);
+  pass.survivors =
+    gather_with_mask(in.input, in.output_positions, conjunction->view(), in.stream, in.mr);
+  host_counts.wait();
+  pass.rows_into_masks = has_residual ? host_counts[0] : num_rows;
+  for (std::size_t s = 0; s < ready.size(); ++s) {
+    pass.rows_after[ready[s]] = host_counts[s + 1];
+  }
+  return pass;
+}
+
 }  // namespace
 
 std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
@@ -251,7 +497,8 @@ std::unique_ptr<cudf::table> gather_view_survivors(
   int device_id,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr,
-  scan_dynamic_filter_result* applied)
+  scan_dynamic_filter_result* applied,
+  sirius::op::dynamic_filter_mask_kernel kernel)
 {
   nvtx3::scoped_range nvtx_range{"dynfilter::scan::fused_apply"};
   auto const num_rows = input.num_rows();
@@ -278,74 +525,42 @@ std::unique_ptr<cudf::table> gather_view_survivors(
   }
   if (!residual_mask && entries.empty()) { return nullptr; }
 
-  // counts[0] = rows entering the first membership mask (after the residual); counts[i + 1] =
-  // rows surviving entry i. Zeroed on the stream, read back after the gather's own sync.
-  rmm::device_uvector<cudf::size_type> counts(entries.size() + 1, stream, mr);
-  CUCASCADE_CUDA_TRY(
-    cudaMemsetAsync(counts.data(), 0, counts.size() * sizeof(cudf::size_type), stream.value()));
-
-  // The running conjunction. Null-free once folded, so it can serve as a cuco stencil and as the
-  // gather's boolean mask directly.
-  std::unique_ptr<cudf::column> conjunction;
-  auto const fold = [&](std::unique_ptr<cudf::column> mask, cudf::size_type* survivor_count) {
-    if (!conjunction) {
-      conjunction = std::move(mask);
-      sirius::op::and_mask_count(*conjunction, std::nullopt, survivor_count, stream);
-      if (conjunction->nullable()) { conjunction->set_null_mask(rmm::device_buffer{}, 0); }
-    } else {
-      sirius::op::and_mask_count(*conjunction, mask->view(), survivor_count, stream);
-    }
-  };
-
   bool const has_residual = residual_mask != nullptr;
-  if (has_residual) { fold(std::move(residual_mask), counts.data()); }
-
-  std::vector<bool> mask_applied(entries.size(), false);
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    auto const& e       = entries[i];
-    auto const position = *probe_position(e.col_idx);  // present by construction of the entry list
-    auto const& probe   = input.column(position);
-    bool const* const stencil = conjunction ? conjunction->view().data<bool>() : nullptr;
-    auto mask                 = e.filter->compute_mask_if(probe, stencil, device_id, stream, mr);
-    if (!mask) {
-      // Same verdict the cascade records for a probe the filter cannot serve: nothing kept out,
-      // so the filter is not worth attempting again on this scan.
-      if (gate && !e.recorded) {
-        gate->record_filter_keep_ratio(e.identity, 1.0, observed_filter_count);
-      }
-      continue;
+  survivor_pass_inputs const inputs{input,
+                                    output_positions,
+                                    probe_position,
+                                    entries,
+                                    gate,
+                                    observed_filter_count,
+                                    device_id,
+                                    stream,
+                                    mr};
+  std::optional<survivor_pass> pass;
+  if (kernel == sirius::op::dynamic_filter_mask_kernel::fused) {
+    pass = gather_fused(inputs, residual_mask);
+    if (!pass) {
+      SIRIUS_LOG_DEBUG(
+        "[gather_view_survivors] device={} a membership filter has no fused probe; applying the "
+        "cascade.",
+        device_id);
     }
-    fold(std::move(mask), counts.data() + i + 1);
-    mask_applied[i] = true;
   }
-  if (!conjunction) { return nullptr; }
+  if (!pass) { pass = gather_cascade(inputs, residual_mask); }
+  if (!pass->survivors) { return nullptr; }
+  auto& survivors = pass->survivors;
 
-  // Land the counts in pinned memory before the gather so the gather's internal host sync covers
-  // the copy; the event only guards against a future gather implementation that no longer syncs.
-  pinned_counts host_counts(counts.size(), stream);
-  CUCASCADE_CUDA_TRY(cudaMemcpyAsync(host_counts.data(),
-                                     counts.data(),
-                                     host_counts.bytes(),
-                                     cudaMemcpyDeviceToHost,
-                                     stream.value()));
-  cucascade::cuda::cuda_event counts_ready;
-  counts_ready.record(stream);
-
-  std::unique_ptr<cudf::table> survivors;
-  {
-    nvtx3::scoped_range nvtx_gather_range{"dynfilter::scan::gather"};
-    auto const to_gather = output_positions.empty()
-                             ? input
-                             : input.select(output_positions.begin(), output_positions.end());
-    survivors            = cudf::apply_boolean_mask(to_gather, conjunction->view(), stream, mr);
+  // Gate bookkeeping, identical for both kernels: marginal ratios chain through the applied
+  // masks in cascade order; the scan-level ratio covers every applied mask.
+  auto const rows_into_masks  = pass->rows_into_masks;
+  cudf::size_type rows_before = rows_into_masks;
+  std::size_t masks_applied   = 0;
+  if (applied) {
+    applied->applied.clear();
+    applied->observed_filter_count = observed_filter_count;
   }
-
-  counts_ready.synchronize();
-  cudf::size_type rows_before = has_residual ? host_counts[0] : num_rows;
-  auto const rows_into_masks  = rows_before;
   for (std::size_t i = 0; i < entries.size(); ++i) {
-    if (!mask_applied[i]) { continue; }
-    auto const rows_after = host_counts[i + 1];
+    if (!pass->rows_after[i]) { continue; }
+    auto const rows_after = *pass->rows_after[i];
     // An empty input has no marginal ratio; the cascade stops measuring there too.
     if (rows_before > 0 && gate && !entries[i].recorded) {
       gate->record_filter_keep_ratio(
@@ -354,14 +569,6 @@ std::unique_ptr<cudf::table> gather_view_survivors(
         observed_filter_count);
     }
     rows_before = rows_after;
-  }
-  std::size_t masks_applied = 0;
-  if (applied) {
-    applied->applied.clear();
-    applied->observed_filter_count = observed_filter_count;
-  }
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    if (!mask_applied[i]) { continue; }
     ++masks_applied;
     if (applied) { applied->applied.push_back(entries[i].identity); }
   }
@@ -371,14 +578,16 @@ std::unique_ptr<cudf::table> gather_view_survivors(
                             observed_filter_count);
   }
   SIRIUS_LOG_DEBUG(
-    "[gather_view_survivors] device={} residual={} membership_masks={} rows: {} -> {} -> {}.",
+    "[gather_view_survivors] device={} kernel={} residual={} membership_masks={} rows: {} -> {} "
+    "-> {}.",
     device_id,
+    sirius::op::to_string(kernel),
     has_residual,
     masks_applied,
     num_rows,
     rows_into_masks,
     survivors->num_rows());
-  return survivors;
+  return std::move(survivors);
 }
 
 std::optional<double> dynamic_filter_gate::filter_keep_ratio(
