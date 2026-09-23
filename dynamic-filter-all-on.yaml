@@ -1,0 +1,15 @@
+# Merge these settings into your own Sirius hardware/workload configuration.
+sirius:
+  memory:
+    gpu:
+      enable_pool_peer_access: true
+  operator_params:
+    enable_dynamic_filter: true
+    enable_dynamic_filter_multi_partition: true
+    enable_dynamic_filter_in_scan: true
+    dynamic_filter_publication_scheme: root_pipelined
+    dynamic_filter_domain_evidence: catalog_and_pinned
+    dynamic_filter_domain_coverage_threshold: 0.45
+    dynamic_filter_mask_kernel: fused
+  scheduler:
+    probe_activation: on_partitioned_and_published
