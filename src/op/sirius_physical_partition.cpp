@@ -754,18 +754,18 @@ std::optional<std::uint64_t> sirius_physical_partition::contribute_to_accumulate
   cucascade::read_only_data_batch const& batch,
   ::cuda::stream_ref stream)
 {
-  auto& session           = join.dynamic_filter_session();
-  auto const original_ids = input.original_batch_ids();
+  auto& session          = join.dynamic_filter_session();
+  auto const original_id = input.original_batch_id(0);
   // clang-format off
   if (!port_directive().empty() ||            // Cannot have late materialization directive
       input.get_data_batches().size() != 1 || // Must have exactly one readable batch
-      original_ids.size() != 1) {             // Must have exactly one original batch ID
+      !original_id) {                         // Must have an original batch ID
     // clang-format on
     session.decline_accumulation();
     return std::nullopt;
   }
-  session.contribute(original_ids.front(), batch, stream);
-  return original_ids.front();
+  session.contribute(*original_id, batch, stream);
+  return original_id;
 }
 
 void sirius_physical_partition::on_input_batch_pushed(std::string_view port_id,

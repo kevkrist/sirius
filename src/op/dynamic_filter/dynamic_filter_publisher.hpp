@@ -142,7 +142,7 @@ class dynamic_filter_publication_session final {
   /**
    * @brief Ends a collecting accumulation whose task input cannot identify one certified batch.
    *
-   * Transitions the session COLLECTING -> TERMINAL.
+   * The declined accumulation becomes terminal once its active operations finish.
    */
   void decline_accumulation() noexcept;
 
@@ -160,7 +160,7 @@ class dynamic_filter_publication_session final {
    *
    * After build tasks drain, `sirius_physical_partition::on_finalize_operator` calls this for an
    * accumulating join, and `sirius_physical_hash_join::on_finalize_operator` calls it for every
-   * join. Transitions the session to TERMINAL.
+   * join.
    */
   void finalize_input() noexcept;
 
@@ -202,7 +202,8 @@ class dynamic_filter_publication_session final {
   /**
    * @brief Close input, cancel future publication, and request cancellation of an active attempt.
    *
-   * An owed publication that never ran ends as cancelled. Transitions the session to TERMINAL.
+   * An owed publication that never ran ends as cancelled. The session becomes terminal once its
+   * active operations finish.
    */
   void cancel() noexcept;
 

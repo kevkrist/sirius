@@ -270,7 +270,14 @@ TEST_CASE("operator-data provenance retains original input order through prepara
   auto require_ids = [&expected](auto const& data) {
     auto const ids = data.original_batch_ids();
     REQUIRE(std::vector<std::uint64_t>(ids.begin(), ids.end()) == expected);
+    STATIC_REQUIRE(noexcept(data.original_batch_id(0)));
+    REQUIRE(data.original_batch_id(0) == expected[0]);
+    REQUIRE(data.original_batch_id(1) == expected[1]);
+    REQUIRE_FALSE(data.original_batch_id(2));
   };
+  sirius::op::pipelineable_operator_data with_null({nullptr, first});
+  REQUIRE_FALSE(with_null.original_batch_id(0));
+  REQUIRE(with_null.original_batch_id(1) == first->get_batch_id());
   require_ids(input);
   input.prepare_for_processing(f.gpu0, stream);
   require_ids(input);
@@ -295,6 +302,7 @@ TEST_CASE("operator-data provenance survives cross-GPU preparation and OOM resch
   auto require_identity = [original_id](auto const& data) {
     REQUIRE(data.original_batch_ids().size() == 1);
     REQUIRE(data.original_batch_ids()[0] == original_id);
+    REQUIRE(data.original_batch_id(0) == original_id);
     REQUIRE(data.get_data_batches().size() == 1);
   };
 

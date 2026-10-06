@@ -270,6 +270,14 @@ class pipelineable_operator_data : public operator_data {
    */
   [[nodiscard]] std::vector<std::uint64_t> original_batch_ids() const;
 
+  /**
+   * @brief Returns the original ID at @p position without allocating.
+   *
+   * @param position Input position before preparation
+   * @return The ID preserved across preparation and retries, or nullopt for a missing/null batch
+   */
+  [[nodiscard]] std::optional<std::uint64_t> original_batch_id(std::size_t position) const noexcept;
+
   [[nodiscard]] operator_data_type get_type() const override
   {
     return operator_data_type::PIPELINEABLE;

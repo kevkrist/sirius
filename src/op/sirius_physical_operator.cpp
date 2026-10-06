@@ -44,13 +44,19 @@ std::vector<std::uint64_t> pipelineable_operator_data::original_batch_ids() cons
   std::vector<std::uint64_t> ids;
   ids.reserve(_data_batches.size());
   for (std::size_t position = 0; position < _data_batches.size(); ++position) {
-    if (!_data_batches[position]) { continue; }
-    auto const replaced = std::ranges::find(
-      _replaced_batch_ids, position, &std::pair<std::size_t, std::uint64_t>::first);
-    ids.push_back(replaced != _replaced_batch_ids.end() ? replaced->second
-                                                        : _data_batches[position]->get_batch_id());
+    if (auto const id = original_batch_id(position)) { ids.push_back(*id); }
   }
   return ids;
+}
+
+std::optional<std::uint64_t> pipelineable_operator_data::original_batch_id(
+  std::size_t position) const noexcept
+{
+  if (position >= _data_batches.size() || !_data_batches[position]) { return std::nullopt; }
+  auto const replaced =
+    std::ranges::find(_replaced_batch_ids, position, &std::pair<std::size_t, std::uint64_t>::first);
+  return replaced != _replaced_batch_ids.end() ? replaced->second
+                                               : _data_batches[position]->get_batch_id();
 }
 
 const std::vector<std::shared_ptr<::cucascade::data_batch>>&
