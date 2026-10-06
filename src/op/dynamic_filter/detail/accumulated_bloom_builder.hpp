@@ -73,7 +73,9 @@ class accumulation_cuda_error : public std::exception {
    * (`is_retryable_launch_error`).
    */
   [[nodiscard]] bool transient_launch_failure() const noexcept
-  { return _kernel_launch && is_retryable_launch_error(_code); }
+  {
+    return _kernel_launch && is_retryable_launch_error(_code);
+  }
 
  private:
   cudaError_t _code;
@@ -105,7 +107,9 @@ class accumulation_invariant_error : public std::exception {
 class unjoined_gpu_work : public std::exception {
  public:
   [[nodiscard]] char const* what() const noexcept override
-  { return "GPU work may still run after a failed host join"; }
+  {
+    return "GPU work may still run after a failed host join";
+  }
 };
 
 /**
@@ -182,7 +186,9 @@ class accumulated_bloom_builder final {
    * @return True if @p type is INT32 or INT64
    */
   [[nodiscard]] static constexpr bool supports(cudf::data_type type) noexcept
-  { return type.id() == cudf::type_id::INT32 || type.id() == cudf::type_id::INT64; }
+  {
+    return type.id() == cudf::type_id::INT32 || type.id() == cudf::type_id::INT64;
+  }
 
   /**
    * @brief Allocates zeroed arrays on every GPU of @p targets without waiting on the host.

@@ -91,7 +91,9 @@ accumulation_failure classify_failure(std::exception_ptr error) noexcept
 }
 
 bool recoverable(accumulation_failure kind) noexcept
-{ return kind == accumulation_failure::ADMISSION || kind == accumulation_failure::TRANSIENT; }
+{
+  return kind == accumulation_failure::ADMISSION || kind == accumulation_failure::TRANSIENT;
+}
 
 void count_failure(dynamic_filter_stats_snapshot& outcome, accumulation_failure kind) noexcept
 {
@@ -563,7 +565,9 @@ dynamic_filter_publication_session::dynamic_filter_publication_session(
 dynamic_filter_publication_session::~dynamic_filter_publication_session() { cancel(); }
 
 dynamic_filter_publish_plan const& dynamic_filter_publication_session::plan() const noexcept
-{ return _state->plan; }
+{
+  return _state->plan;
+}
 
 void dynamic_filter_publication_session::restrict_replicas_to(
   std::vector<int> const& admitted_gpu_ids)
@@ -752,9 +756,9 @@ void dynamic_filter_publication_session::contribute(std::uint64_t original_id,
       std::scoped_lock lock(operation.mutex);
       if (!operation.inventory) { return; }
       auto const* entry = operation.inventory->find(original_id);
-      auto const index = entry != nullptr
-                           ? static_cast<std::size_t>(entry - operation.inventory->batches().data())
-                           : 0;
+      auto const index  = entry != nullptr
+                            ? static_cast<std::size_t>(entry - operation.inventory->batches().data())
+                            : 0;
       // Retry identity precedes representation validation: a completed batch can have been
       // spilled or cloned since its first contribution.
       if (entry != nullptr && operation.claimed[index]) {
