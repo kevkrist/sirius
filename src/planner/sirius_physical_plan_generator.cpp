@@ -82,6 +82,7 @@
 #include <atomic>
 #include <numeric>
 #include <utility>
+#include <vector>
 
 namespace sirius::planner {
 
@@ -402,7 +403,8 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
 /**
  * @brief Builds a GPU scan, wrapping it when registered dynamic-filter producers exist
  *
- * @p mode selects membership-only or AST-plus-membership post-decode filtering.
+ * @p mode selects membership-only or AST-plus-membership post-decode filtering. @p sirius_ctx,
+ * when not null, observes compressed materialization and receives the dynamic-filter counters.
  */
 template <typename InfoT>
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
@@ -410,32 +412,41 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_gpu_scan_leaf(
   const sirius::op::sirius_physical_table_scan& scan,
   const sirius::operator_params& op_params,
   sirius::op::scan::dynamic_filter_apply_mode mode,
-  duckdb::SiriusContext* compressed_materialization_observer)
+  duckdb::SiriusContext* sirius_ctx)
 {
   auto dynamic_filters = scan.sirius_dynamic_filters;
   if (dynamic_filters && !dynamic_filters->has_producers()) { dynamic_filters.reset(); }
-  info->sirius_dynamic_filters = dynamic_filters;
-  info->contract_id            = scan.contract_id;
+  // Parquet also prunes with its own snapshot of the channel.
+  if constexpr (requires { info->sirius_dynamic_filters; }) {
+    info->sirius_dynamic_filters = dynamic_filters;
+  }
+  info->contract_id = scan.contract_id;
 
   auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+  auto consumer =
+    dynamic_filters
+      ? sirius::op::scan::make_dynamic_filter_consumer(
+          dynamic_filters,
+          mode,
+          op_params.dynamic_filter_keep_threshold,
+          ingestible ? sirius::op::scan::scan_decode_bindings(*ingestible, scan.types.size())
+                     : std::vector<sirius::op::scan::binding>{},
+          sirius_ctx ? &sirius_ctx->get_dynamic_filter_stats() : nullptr)
+      : nullptr;
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf =
-    duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      scan.types,
-      scan.estimated_cardinality,
-      std::move(ingestible),
-      scan.contract_id,
-      compressed_materialization_observer,
-      scan.read_views);
+    duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(scan.types,
+                                                                  scan.estimated_cardinality,
+                                                                  std::move(ingestible),
+                                                                  scan.contract_id,
+                                                                  sirius_ctx,
+                                                                  scan.read_views,
+                                                                  consumer);
   // Preserve propagated carriers; dynamic-filter targets are already native.
   if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
 
   if (dynamic_filters) {
     auto dynamic_filter_op = duckdb::make_uniq<sirius::op::scan::sirius_physical_dynamic_filter>(
-      scan.types,
-      scan.estimated_cardinality,
-      std::move(dynamic_filters),
-      op_params.dynamic_filter_keep_threshold,
-      mode);
+      scan.types, scan.estimated_cardinality, std::move(consumer));
     if (scan.has_physical_overrides()) {
       dynamic_filter_op->set_physical_types(scan.get_physical_types());
     }

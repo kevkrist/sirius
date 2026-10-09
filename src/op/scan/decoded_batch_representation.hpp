@@ -35,7 +35,8 @@ namespace sirius {
  * when it does not, so nothing changes on the ordinary path and the feature
  * gate being off is byte-identical to before. @c sirius::pushdown_outcome is
  * declared with the decoder that fills it (compression/compressed_scan.hpp);
- * scan_operator_input::prepare_for_processing reads it right after convert_to.
+ * scan_operator_input::prepare_for_processing reads it after its own conversion
+ * or when adopting a prefetched result.
  *
  * Carrying it as a VALUE is the point: the outcome is a property of this decode,
  * so a copy sharing the decoded columns shares it too — where the dynamic-type
