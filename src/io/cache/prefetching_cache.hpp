@@ -65,6 +65,10 @@ namespace cucascade::memory {
 class memory_reservation_manager;
 }  // namespace cucascade::memory
 
+namespace sirius::io {
+class deferred_batch_registry;
+}  // namespace sirius::io
+
 namespace sirius::io::cache {
 
 /// True when every chunk of @p chunks owns a staging buffer, i.e. its
@@ -322,6 +326,35 @@ class prefetching_cache {
   /// outside the cache.
   [[nodiscard]] std::size_t chunk_size() const noexcept { return _chunk_size; }
 
+  /// Whether @c sirius_datasource::device_read_async should batch reads through this cache per
+  /// stream and issue them on the first wait (@c config::deferred_device_reads) rather than as each
+  /// is called.
+  [[nodiscard]] bool defers_device_reads() const noexcept { return _cfg.deferred_device_reads; }
+
+  /// Record that @c sirius_datasource is issuing one deferred batch through this cache and return
+  /// the running count, which numbers its "vectored flush #n" debug line. The datasource calls this
+  /// before handing the batch to @c device_read_ranges_async, so a backend request produced by the
+  /// batch is never observable before the counter reflects the flush. The cache cannot count these
+  /// itself because the bulk route shares @c device_read_ranges_async.
+  std::uint64_t note_deferred_flush() noexcept
+  {
+    return _counters.deferred_flushes.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
+  /// The open deferred batches of every datasource reading through this cache. A waiter on a
+  /// deferred device read issues the open batches of other datasources on its stream before its
+  /// own.
+  [[nodiscard]] std::shared_ptr<deferred_batch_registry> const& deferred_batches() const noexcept
+  {
+    return _deferred_batches;
+  }
+
+  /// Deferred batches issued through this cache so far (see @c note_deferred_flush).
+  [[nodiscard]] std::uint64_t deferred_flushes() const noexcept
+  {
+    return _counters.deferred_flushes.load(std::memory_order_relaxed);
+  }
+
   [[nodiscard]] std::size_t host_read(
     const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle = nullptr);
 
@@ -506,6 +539,7 @@ class prefetching_cache {
   void reclaim_idle_chunks(cache_generation& generation) noexcept;
 
   const config _cfg;
+  std::shared_ptr<deferred_batch_registry> _deferred_batches;
   std::shared_ptr<buffer_pool> _pool;
   size_t _chunk_size = 1;
 
@@ -530,6 +564,7 @@ class prefetching_cache {
     std::atomic<uint64_t> h2d{0};        // chunks (re)loaded via host->device IO (mark_loading)
     std::atomic<uint64_t> misses{0};     // chunks read fresh (missing / not yet usable)
     std::atomic<uint64_t> evictions{0};  // chunks evicted back to the pool
+    std::atomic<uint64_t> deferred_flushes{0};  // deferred device read batches issued
   };
   struct counters_snapshot {
     uint64_t n_reads{0};
@@ -537,6 +572,7 @@ class prefetching_cache {
     uint64_t h2d{0};
     uint64_t misses{0};
     uint64_t evictions{0};
+    uint64_t deferred_flushes{0};
   };
 
   counters _counters;

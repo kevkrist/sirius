@@ -1,0 +1,23 @@
+--- production.cpp
++++ datasource_diagnostic.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "io/sirius_datasource.hpp"
++#include "diagnostics.hpp"
+ 
+ #include "exec/semi_future.hpp"
+ #include "exec/try.hpp"
+@@ -85,10 +86,12 @@
+                                      std::shared_ptr<io_object> io_obj)
+   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_obj))
+ {
++  order_diagnostic::track(this, &_cache_handle);
+ }
+ 
+ sirius_datasource::~sirius_datasource()
+ {
++  order_diagnostic::untrack(this);
+   std::vector<std::weak_ptr<deferred_device_batch>> batches;
+   {
+     std::scoped_lock lock(_pending_mutex);

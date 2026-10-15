@@ -277,6 +277,7 @@ static void from_yaml(const YAML::Node& node, sirius::io::cache::config& opt)
              yaml::fraction<double>{});
   r.optional(
     "eviction_threshold_fraction", opt.eviction_threshold_fraction, yaml::fraction<double>{});
+  r.optional("deferred_device_reads", opt.deferred_device_reads);
   r.reject_unknown();
   opt.apply_mode();
 }

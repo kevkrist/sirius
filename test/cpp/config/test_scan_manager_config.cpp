@@ -166,6 +166,23 @@ TEST_CASE("scan_manager_config defaults to the none cache mode",
   CHECK_FALSE(cfg.cache.dispose_on_idle);
 }
 
+TEST_CASE("cache.deferred_device_reads defaults on and is YAML-loadable",
+          "[scan_manager][config][cache]")
+{
+  CHECK(scan_manager_config{}.cache.deferred_device_reads);
+
+  auto const on = load_scan_manager("deferred_device_reads_on.yaml",
+                                    cache_yaml("        mode: sirius\n"
+                                               "        deferred_device_reads: true\n"));
+  CHECK(on.cache.deferred_device_reads);
+
+  auto const off = load_scan_manager("deferred_device_reads_off.yaml",
+                                     cache_yaml("        mode: sirius\n"
+                                                "        deferred_device_reads: false\n"));
+  CHECK_FALSE(off.cache.deferred_device_reads);
+  CHECK(off.cache.use_prefetching_cache());
+}
+
 TEST_CASE("apply_cache_mode derives the knobs for every mode", "[scan_manager][config][cache_mode]")
 {
   scan_manager_config cfg{};

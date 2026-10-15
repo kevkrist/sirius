@@ -28,11 +28,10 @@
 
 #include "catch.hpp"
 #include "io/cache/config.hpp"
+#include "io/cache/controlled_backend.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_request.hpp"
 #include "io/sirius_datasource.hpp"
-#include "io/templated_ioctx.hpp"
-#include "memory/topology_index.hpp"
 #include "scan/test_utils.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -44,146 +43,20 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
-#include <optional>
-#include <span>
-#include <string>
-#include <string_view>
-#include <utility>
 #include <vector>
 
 using namespace std::chrono_literals;
 
 namespace {
 
-constexpr std::size_t chunk_size = 1U << 20;
-constexpr std::size_t read_size  = 4096;
+using namespace sirius::test::controlled;
 
-struct controlled_config {
-  [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return 1; }
-  [[nodiscard]] std::size_t merge_gap_size() const noexcept { return 0; }
-
-  std::size_t n_max_concurrent_scans{1};
-};
-
-class controlled_object final : public sirius::io::io_object {
- public:
-  explicit controlled_object(std::string path) : _path(std::move(path)) {}
-
-  [[nodiscard]] std::string const& raw_file_cache_id() const noexcept override { return _path; }
-  [[nodiscard]] std::string const& object_path() const noexcept override { return _path; }
-  [[nodiscard]] std::size_t size() const noexcept override { return 4 * chunk_size; }
-
- private:
-  std::string _path;
-};
-
-class controlled_reactor {
- public:
-  using io_object_type                  = controlled_object;
-  using reactor_config_type             = controlled_config;
-  static constexpr bool prefers_bulk_io = false;
-
-  /// @p staging_block_size mirrors what a real reactor takes from its host
-  /// resource; 0 means "no staging", which opts the reactor out of the
-  /// chunk-size check in ioctx::initialize_cache.
-  explicit controlled_reactor(std::size_t staging_block_size = 0)
-    : _staging_block_size(staging_block_size)
-  {
-  }
-
-  [[nodiscard]] controlled_config const& get_config() const noexcept { return _config; }
-
-  [[nodiscard]] std::size_t staging_block_size() const noexcept { return _staging_block_size; }
-
-  void enqueue(std::unique_ptr<sirius::io::grouped_io_request> request) noexcept
-  {
-    {
-      std::lock_guard lock(_mutex);
-      _requests.push_back(std::move(request));
-    }
-    _ready.notify_one();
-  }
-
-  [[nodiscard]] std::unique_ptr<sirius::io::grouped_io_request> take_next(
-    std::chrono::milliseconds timeout = 2s)
-  {
-    std::unique_lock lock(_mutex);
-    if (!_ready.wait_for(lock, timeout, [this] { return !_requests.empty(); })) { return nullptr; }
-    auto request = std::move(_requests.front());
-    _requests.pop_front();
-    return request;
-  }
-
-  [[nodiscard]] std::size_t pending() const
-  {
-    std::lock_guard lock(_mutex);
-    return _requests.size();
-  }
-
-  [[nodiscard]] std::size_t queued_bytes() const noexcept { return 0; }
-
-  std::size_t host_read(controlled_object const&,
-                        std::size_t,
-                        std::size_t size,
-                        std::uint8_t*) const
-  {
-    return size;
-  }
-
-  void start() {}
-  void shutdown() {}
-  void interrupt() {}
-
-  [[nodiscard]] static std::unique_ptr<controlled_object> create_io_object(std::string path)
-  {
-    return std::make_unique<controlled_object>(std::move(path));
-  }
-
-  [[nodiscard]] static bool supports(std::string_view) { return true; }
-
-  [[nodiscard]] static std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
-    std::span<cudf::io::text::byte_range_info const> ranges, std::optional<std::size_t>)
-  {
-    return {ranges.begin(), ranges.end()};
-  }
-
- private:
-  controlled_config _config;
-  std::size_t _staging_block_size{0};
-  mutable std::mutex _mutex;
-  std::condition_variable _ready;
-  std::deque<std::unique_ptr<sirius::io::grouped_io_request>> _requests;
-};
-
-class controlled_context final : public sirius::io::templated_ioctx<controlled_reactor> {
- public:
-  using templated_ioctx::templated_ioctx;
-
-  [[nodiscard]] sirius::io::io_context_type type() const noexcept override
-  {
-    return sirius::io::io_context_type::uring;
-  }
-
-  [[nodiscard]] controlled_reactor& reactor() noexcept { return *_reactors.front(); }
-};
-
-std::shared_ptr<const sirius::memory::topology_index> single_gpu_topology()
-{
-  cucascade::memory::system_topology_info topology;
-  topology.num_gpus = 1;
-  cucascade::memory::gpu_topology_info gpu;
-  gpu.id        = 0;
-  gpu.numa_node = 0;
-  topology.gpus.push_back(std::move(gpu));
-  return std::make_shared<sirius::memory::topology_index>(topology, std::vector<int>{0});
-}
+constexpr std::size_t read_size = 4096;
 
 struct cache_fixture {
   cache_fixture()
@@ -193,6 +66,10 @@ struct cache_fixture {
   {
     sirius::io::cache::config config;
     config.mode = sirius::io::cache::cache_mode::sirius;
+    // Arbitration is the cache's decision and is observed as the request reaching the reactor, so
+    // reads are issued as called here; the datasource's deferred issue is covered by
+    // test_deferred_device_reads.cpp.
+    config.deferred_device_reads = false;
     config.apply_mode();
     context->initialize_cache(*memory, config, single_gpu_topology());
     datasource = context->open_datasource("controlled://cache-read-arbitration");
@@ -216,24 +93,6 @@ struct cache_fixture {
   std::shared_ptr<controlled_context> context;
   std::unique_ptr<sirius::io::sirius_datasource> datasource;
 };
-
-void complete_success(sirius::io::grouped_io_request& request, std::uint8_t value = 0x5a)
-{
-  while (!request.empty()) {
-    auto slice = request.take_front();
-    if (slice.h_buffer.is_contiguous()) {
-      auto* destination = std::get<std::uint8_t*>(slice.h_buffer.buffer);
-      std::fill_n(destination, slice.size(), value);
-    } else if (slice.h_buffer.is_fragmented()) {
-      for (auto* chunk : slice.h_buffer.fragments()) {
-        auto const within_chunk = slice.offset() - chunk->offset;
-        std::fill_n(chunk->data + within_chunk, slice.size(), value);
-      }
-    }
-    if (slice.on_complete != nullptr) { (*slice.on_complete)(slice.h_buffer.fragments(), true); }
-    request.coordinator->on_complete();
-  }
-}
 
 }  // namespace
 

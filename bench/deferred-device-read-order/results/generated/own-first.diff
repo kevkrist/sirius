@@ -1,0 +1,30 @@
+--- /data/sirius_optblind/wt/landing-f1-deferred-vectored-reads/src/io/deferred_device_batch.cpp
++++ own_first.cpp
+@@ -64,13 +64,6 @@
+ {
+   // Sibling I/O can overlap a prefetch wait inside our own issue call. A blocked sibling can also
+   // delay us.
+-  if (auto registry = _registry.lock()) {
+-    for (auto const& weak : registry->take_batches(_stream)) {
+-      if (auto sibling = weak.lock(); sibling && sibling.get() != this) {
+-        sibling->issue_if_open();
+-      }
+-    }
+-  }
+   std::shared_future<std::size_t> completion;
+   {
+     std::scoped_lock lock(_mutex);
+@@ -81,6 +74,13 @@
+         "sirius_datasource destroyed before its deferred device reads were waited on");
+     }
+     completion = _completion;
++  }
++  if (auto registry = _registry.lock()) {
++    for (auto const& weak : registry->take_batches(_stream)) {
++      if (auto sibling = weak.lock(); sibling && sibling.get() != this) {
++        sibling->issue_if_open();
++      }
++    }
+   }
+   std::ignore = completion.get();
+   return bytes;

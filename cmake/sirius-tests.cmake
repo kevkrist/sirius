@@ -457,3 +457,61 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# Opt-in measured comparison of deferred read ordering. The alternative source
+# is generated in the build tree; the production policy has no tuning switch.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(_deferred_order_dir "${CMAKE_CURRENT_BINARY_DIR}/deferred-order")
+  set(_deferred_order_generated
+      "${_deferred_order_dir}/deferred_device_batch_own_first.cpp"
+      "${_deferred_order_dir}/deferred_device_batch_siblings_first.cpp"
+      "${_deferred_order_dir}/deferred_device_batch_baseline.cpp"
+      "${_deferred_order_dir}/copy_symbols.hpp"
+      "${_deferred_order_dir}/wrap.rsp"
+      "${_deferred_order_dir}/manifest.json"
+      "${_deferred_order_dir}/own-first.diff"
+      "${_deferred_order_dir}/siblings-first.diff")
+  add_custom_command(
+    OUTPUT ${_deferred_order_generated}
+    COMMAND
+      "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/bench/deferred-device-read-order/prepare.py"
+      --root "${CMAKE_CURRENT_SOURCE_DIR}" --output "${_deferred_order_dir}"
+      --cudf "$<TARGET_FILE:cudf::cudf>"
+    DEPENDS src/io/deferred_device_batch.cpp
+            bench/deferred-device-read-order/prepare.py
+    VERBATIM)
+  add_custom_target(deferred_order_sources DEPENDS ${_deferred_order_generated})
+  foreach(_order IN ITEMS siblings_first own_first)
+    set(_target "deferred_order_${_order}")
+    add_executable(${_target} EXCLUDE_FROM_ALL
+                   test/io/deferred_device_order_benchmark.cpp)
+    add_dependencies(${_target} deferred_order_sources)
+    target_sources(
+      ${_target}
+      PRIVATE "${_deferred_order_dir}/deferred_device_batch_${_order}.cpp")
+    target_include_directories(
+      ${_target}
+      PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp"
+              "${CMAKE_CURRENT_SOURCE_DIR}/src" "${_deferred_order_dir}")
+    target_compile_definitions(${_target}
+                               PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+    target_link_libraries(
+      ${_target} PRIVATE sirius_core duckdb_static
+                         duckdb_generated_extension_loader ZLIB::ZLIB)
+    target_link_options(
+      ${_target} PRIVATE "LINKER:@${_deferred_order_dir}/wrap.rsp"
+      "LINKER:--allow-multiple-definition")
+    set_target_properties(
+      ${_target}
+      PROPERTIES CXX_STANDARD 20
+                 CXX_STANDARD_REQUIRED ON
+                 CXX_SCAN_FOR_MODULES OFF
+                 RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+    if(VCPKG_BUILD)
+      set_target_properties(${_target} PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+      target_include_directories(${_target} BEFORE PRIVATE ${_VCPKG_INC})
+    endif()
+  endforeach()
+endif()

@@ -451,6 +451,7 @@ sirius:
 | `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the Sirius cache. Only meaningful under `mode: sirius`. Values are lowercase. |
 | `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when the cache pool fills to this fraction. |
 | `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
+| `deferred_device_reads` | bool | `true` | Under `mode: sirius`, `sirius_datasource::device_read_async` collects explicit-stream ranges into batches and the first wait issues the stream's batches as vectored cache reads (see [Scan](scan.md#read-path)). Shared default-stream handles always issue eagerly; `false` makes every read eager. |
 
 `mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
 through the kernel page cache instead. `mode: sirius` reads `O_DIRECT` into Sirius's own

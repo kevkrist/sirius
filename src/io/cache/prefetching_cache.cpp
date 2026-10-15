@@ -20,6 +20,7 @@
 #include "exec/semi_future.hpp"
 #include "exec/try.hpp"
 #include "io/cache/types.hpp"
+#include "io/deferred_device_batch.hpp"
 #include "io/io_context.hpp"
 #include "io/io_request.hpp"
 #include "io/types.hpp"
@@ -332,6 +333,7 @@ prefetching_cache::prefetching_cache(
   const config& cfg,
   std::shared_ptr<const sirius::memory::topology_index> topology_index)
   : _cfg(cfg),
+    _deferred_batches(std::make_shared<deferred_batch_registry>()),
     _pool(std::make_shared<buffer_pool>(
       reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
     _io_ctx(io_ctx),
@@ -1214,26 +1216,29 @@ std::string prefetching_cache::summary() const
 {
   // Global totals plus the deltas since the last refresh (the most recent
   // query cycle), reported separately.
-  uint64_t const reads = _counters.n_reads.load(std::memory_order_relaxed);
-  uint64_t const hits  = _counters.hits.load(std::memory_order_relaxed);
-  uint64_t const h2d   = _counters.h2d.load(std::memory_order_relaxed);
-  uint64_t const miss  = _counters.misses.load(std::memory_order_relaxed);
-  uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
+  uint64_t const reads   = _counters.n_reads.load(std::memory_order_relaxed);
+  uint64_t const hits    = _counters.hits.load(std::memory_order_relaxed);
+  uint64_t const h2d     = _counters.h2d.load(std::memory_order_relaxed);
+  uint64_t const miss    = _counters.misses.load(std::memory_order_relaxed);
+  uint64_t const evict   = _counters.evictions.load(std::memory_order_relaxed);
+  uint64_t const flushes = _counters.deferred_flushes.load(std::memory_order_relaxed);
 
   return std::format(
     "prefetching_cache: "
-    "global[reads={} hits={} h2d={} miss={} evictions={}] "
-    "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
+    "global[reads={} hits={} h2d={} miss={} evictions={} deferred_flushes={}] "
+    "last_cycle[reads={} hits={} h2d={} miss={} evictions={} deferred_flushes={}]",
     reads,
     hits,
     h2d,
     miss,
     evict,
+    flushes,
     reads - _last_reported.n_reads,
     hits - _last_reported.hits,
     h2d - _last_reported.h2d,
     miss - _last_reported.misses,
-    evict - _last_reported.evictions);
+    evict - _last_reported.evictions,
+    flushes - _last_reported.deferred_flushes);
 }
 
 void prefetching_cache::prepare_for_query() noexcept
@@ -1249,6 +1254,7 @@ void prefetching_cache::prepare_for_query() noexcept
     _counters.h2d.load(std::memory_order_relaxed),
     _counters.misses.load(std::memory_order_relaxed),
     _counters.evictions.load(std::memory_order_relaxed),
+    _counters.deferred_flushes.load(std::memory_order_relaxed),
   };
 }
 

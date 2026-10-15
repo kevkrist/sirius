@@ -1,0 +1,41 @@
+{
+  "utc": "2026-10-15T20:35:31Z",
+  "platform": "Linux-5.15.0-126-generic-x86_64-with-glibc2.35",
+  "cpu": "x86_64",
+  "cuda_visible_devices": "unset",
+  "arguments": {
+    "build": "build/release",
+    "output": "/tmp/deferred-order-results",
+    "rounds": 2,
+    "iterations": 10,
+    "warmups": 2,
+    "gate_us": 20000,
+    "service_us": [
+      0,
+      2000
+    ]
+  },
+  "binaries": {
+    "siblings_first": {
+      "path": "/data/sirius_optblind/wt/landing-f1-deferred-vectored-reads/build/release/test/io/deferred_order_siblings_first",
+      "sha256": "d15e2576663f5eec356d226081586388df0852496f32f4f74da6518910800b60"
+    },
+    "own_first": {
+      "path": "/data/sirius_optblind/wt/landing-f1-deferred-vectored-reads/build/release/test/io/deferred_order_own_first",
+      "sha256": "576b0e534cef4f503aae033c450c87d0c213863190e6f5217bfb5711d4f5ca66"
+    }
+  },
+  "source_sha256": {
+    "src/io/deferred_device_batch.cpp": "633104d513bd8f7258bceaddba5aa11f3665461401ed1aa967a1c2d794e27266",
+    "test/io/deferred_device_order_benchmark.cpp": "0446fb676debd99833681101d9b169bea7eef97fde0e687abb5469ac04572b21",
+    "src/io/sirius_datasource.cpp": "0a492bb0912de2cc6446723a3a2a964fd64553ea4007bdde61cb93c2e696dfb7",
+    "src/io/cache/prefetching_cache.cpp": "e2e5b414585e9124911024c0536f1dae01bd2f7847bf7d05ae24646526934ca6"
+  },
+  "backend": "bounded pread workers; pinned staging; actual CUDA H2D",
+  "file_cache": "page-cache warm: deterministic files freshly written before samples",
+  "cache": "new Sirius cache each iteration; only selected source has active prefetch",
+  "queue_capacity": 8,
+  "slices_per_source": 4,
+  "completion_observation": "stream host callback after each cudf memcpy batch",
+  "gpu": "NVIDIA L40S, 615.71.09, GPU-ffe8bd1a-3fca-282b-42a5-6257b06dbe34\nNVIDIA L40S, 615.71.09, GPU-3ec63cef-a0fe-c01b-88c4-398c3a6824c5\nNVIDIA L40S, 615.71.09, GPU-58431c38-0305-e5ee-3855-775365cb4cca\nNVIDIA L40S, 615.71.09, GPU-fc2cd946-02e9-7f5b-6222-924d01930381\n"
+}

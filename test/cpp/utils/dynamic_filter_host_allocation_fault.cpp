@@ -61,7 +61,7 @@ function_range load_range(char const* variable)
 
 bool matches_scope() noexcept
 {
-  if (fault.scope == 2) { return true; }
+  if (fault.scope == 2 || fault.scope == 3) { return true; }
   static auto const range = load_range("SIRIUS_HOST_FAULT_SHELL_RANGE");
   void* frames[32];
   auto const count = backtrace(frames, 32);
@@ -75,8 +75,8 @@ bool matches_scope() noexcept
 }  // namespace
 
 /**
- * @brief Arms one publisher thread: scope 1 selects filter shells and 2 selects every allocation. A
- * zero ordinal only counts matching allocations.
+ * @brief Arms one publisher thread: scope 1 selects filter shells, 2 selects every allocation, and
+ * 3 sustains failures. A zero ordinal only counts matching allocations.
  *
  * This helper is loaded only for the hidden host-allocation tests. Ordinary test runs do not link
  * or load it.
@@ -103,8 +103,8 @@ void* operator new(std::size_t bytes)
     fault.inspecting   = true;
     auto const matches = matches_scope();
     fault.inspecting   = false;
-    if (matches && ++fault.observed == fault.fail_at) {
-      fault.scope = 0;
+    if (matches && ++fault.observed >= fault.fail_at && fault.fail_at != 0) {
+      if (fault.scope != 3) { fault.scope = 0; }
       fault.fired = true;
       throw std::bad_alloc{};
     }

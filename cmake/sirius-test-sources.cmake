@@ -137,6 +137,7 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/cache/test_cache_read_arbitration.cpp
     test/cpp/io/cache/test_chunk_state.cpp
+    test/cpp/io/cache/test_deferred_device_reads.cpp
     test/cpp/io/cache/test_dispose_eviction.cpp
     test/cpp/io/cache/test_explicit_eviction.cpp
     test/cpp/io/cache/test_stage_machines.cpp

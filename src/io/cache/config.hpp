@@ -99,7 +99,8 @@ inline bool enum_to_string(eviction_policy policy, std::string& out)
  * from caching (O_DIRECT vs buffered reads, whether the prefetching cache is
  * armed, whether idle chunks are dropped) follows from them, so those derived
  * settings are not separately configurable. The remaining fields size the
- * prefetching cache and only matter under @ref cache_mode::sirius.
+ * prefetching cache or tune how reads are issued through it, and only matter
+ * under @ref cache_mode::sirius.
  */
 struct config {
   /// Which cache the read path goes through.
@@ -113,6 +114,12 @@ struct config {
 
   /// Start evicting once the pool fills to this fraction of its capacity.
   double eviction_threshold_fraction{0.8};
+
+  /// Whether `sirius_datasource::device_read_async` collects explicit-stream ranges and issues the
+  /// stream's batches as vectored reads on the first wait. Submission captures the CUDA device;
+  /// cache lookup, copies and backend I/O are deferred. Shared default-stream handles always issue
+  /// eagerly. See `deferred_batch_registry` for cross-source issuance and its ordering tradeoff.
+  bool deferred_device_reads{true};
 
   /// Derived from @ref eviction by @ref apply_mode; not settable on its own.
   bool dispose_on_idle{false};
