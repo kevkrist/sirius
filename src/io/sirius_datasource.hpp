@@ -18,7 +18,6 @@
 
 #include "exec/invocable.hpp"
 #include "io/cache/prefetching_cache.hpp"
-#include "io/deferred_device_batch.hpp"
 #include "io/io_context.hpp"
 #include "io/types.hpp"
 
@@ -35,8 +34,8 @@
 
 #include <cstdint>
 #include <exception>
+#include <future>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <vector>
 
@@ -116,15 +115,14 @@ enum class prepare_result : std::uint8_t {
  * Scans may share the underlying `io_object`, but each owns its own `sirius_datasource` and
  * `cache_handle`. Initialize `fadvise` before publishing the scan. Handle replacement, movement and
  * destruction require external exclusion from reads, prefetch operations and future waits accessing
- * the handle. A stable installed handle uses the cache's atomic producer/consumer protocol;
- * deferred batch mutexes do not protect handle replacement. Datasource destruction cancels deferred
- * issuance under its batch mutexes but must still exclude other datasource operations.
+ * the handle. A stable installed handle uses the cache's atomic producer/consumer protocol.
+ * Datasource destruction must exclude other datasource operations.
  */
 class sirius_datasource : public cudf::io::datasource {
  public:
   explicit sirius_datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_obj);
 
-  ~sirius_datasource() override;
+  ~sirius_datasource() override = default;
 
   sirius_datasource(sirius_datasource const&)            = delete;
   sirius_datasource& operator=(sirius_datasource const&) = delete;
@@ -178,21 +176,10 @@ class sirius_datasource : public cudf::io::datasource {
   /**
    * @brief Read one range asynchronously into a borrowed device destination.
    *
-   * With the prefetching cache and `deferred_device_reads` enabled, explicit-stream reads capture
-   * their CUDA device and join a batch. The first `get()` or `wait()` issues the batch through
-   * `device_read_ranges_async`; `deferred_batch_registry` also issues collected batches from other
-   * datasources on that stream. Cache lookup, copies and backend I/O occur at issuance. Each member
-   * returns its own clamped byte count. Shared default-stream handles and reads without this
-   * optimization issue eagerly.
-   *
-   * A destination is accepted only if this call returns its future. Dropping one member preserves
-   * its slice while other members remain. Last-member destruction and issuance arbitrate under the
-   * batch mutex: if destruction wins, the unissued batch is cancelled; if issuance wins,
-   * destinations remain borrowed until completion and destruction does not drain the I/O. A caller
-   * reclaiming destinations after abandonment must externally exclude racing issuance. `wait_for()`
-   * and `wait_until()` report `std::future_status::deferred` without issuing. Destroying the
-   * datasource cancels unissued batches without allocating; a later member `get()` reports
-   * `std::logic_error` (or allocation failure while constructing that error).
+   * Submission uses the caller's current CUDA device and stream. The returned promise-backed future
+   * reports completion and the clamped byte count; timed waits never defer issuance. A destination
+   * is accepted only if this call returns its future and remains borrowed until completion.
+   * Destroying the future does not cancel or drain the read.
    */
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
@@ -272,11 +259,6 @@ class sirius_datasource : public cudf::io::datasource {
   [[nodiscard]] bool prefers_bulk_io() const noexcept;
 
  private:
-  /**
-   * @brief Construct a member future before publishing its borrowed destination to an open batch.
-   */
-  [[nodiscard]] std::future<size_t> enqueue_deferred(cudaStream_t stream, slice const& request);
-
   std::shared_ptr<ioctx> _io_ctx;
   std::shared_ptr<io_object> _io_object;
   /**
@@ -284,18 +266,6 @@ class sirius_datasource : public cudf::io::datasource {
    * Disposing it lets the cache reclaim the request.
    */
   cache::cache_handle _cache_handle;
-
-  /**
-   * Guards @c _pending_batches. Lock order: this mutex before a batch or registry mutex; registry
-   * operations never take either of the other mutexes.
-   */
-  std::mutex _pending_mutex;
-  /**
-   * Batches opened by `device_read_async`, at most one open batch per stream and device. Weak
-   * references do not keep batches alive; last-member destruction closes an unissued batch even if
-   * an issuer retains a strong reference.
-   */
-  std::vector<std::weak_ptr<deferred_device_batch>> _pending_batches;
 };
 
 }  // namespace sirius::io

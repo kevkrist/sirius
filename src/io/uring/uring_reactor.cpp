@@ -785,6 +785,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           slot.op->request.finish_success();
           reset_slot(slot);
         } else {
+          slot.op->request.device_copy->drain_after_error();
           settle_slot_error(slot, status, true);
         }
       }
@@ -1067,6 +1068,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
             slot.op->request.finish_success();
             reset_slot(slot);
           } else {
+            slot.op->request.device_copy->drain_after_error();
             settle_slot_error(slot, status, true);
           }
           poll_copy_completions();
@@ -1173,6 +1175,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
         slot.op->request.finish_success();
         reset_slot(slot);
       } else {
+        slot.op->request.device_copy->drain_after_error();
         settle_slot_error(slot, status, true);
       }
     }

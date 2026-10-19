@@ -292,6 +292,13 @@ struct device_cpy_request {
   device_buffer d_buffer;
   int device_id{-1};
 
+  /// Retain the request and its staging storage until this error-path drain returns.
+  void drain_after_error() const noexcept
+  {
+    sirius::cuda::drain_copy_stream_or_terminate(d_buffer.stream,
+                                                 device_id >= 0 ? device_id : d_buffer.device_id);
+  }
+
   /**
    * @brief Copy the logical request window out of physical I/O buffers.
    *
@@ -299,9 +306,11 @@ struct device_cpy_request {
    * over-read is skipped, fragmented sources are batched, and the optional
    * event is recorded after the final copy on the destination stream.
    */
-  [[nodiscard]] cudaError_t copy_async(range io_rng,
-                                       std::span<iovec const> host_buf,
-                                       cudaEvent_t event = nullptr) const noexcept
+  [[nodiscard]] cudaError_t copy_async(
+    range io_rng,
+    std::span<iovec const> host_buf,
+    cudaEvent_t event                             = nullptr,
+    sirius::cuda::detail::copy_completion_api api = {}) const noexcept
   {
     try {
       if (d_buffer.data == nullptr) return cudaErrorInvalidValue;
@@ -341,9 +350,21 @@ struct device_cpy_request {
       }
 
       if (remaining != 0) return cudaErrorInvalidValue;
-      auto const copy_status = batch.enqueue(d_buffer.stream);
-      if (copy_status != cudaSuccess) return copy_status;
-      return event == nullptr ? cudaSuccess : cudaEventRecord(event, d_buffer.stream.get());
+      cudaError_t status = cudaErrorUnknown;
+      try {
+        status = batch.enqueue(d_buffer.stream);
+        if (status == cudaSuccess && event != nullptr) {
+          status = api.record(event, d_buffer.stream.get());
+        }
+      } catch (...) {
+        status = cudaErrorUnknown;
+      }
+      // Enqueue or event publication can fail after accepting copies. Keep the
+      // original error, but never let the reactor release their storage early.
+      if (status != cudaSuccess) {
+        sirius::cuda::drain_copy_stream_or_terminate(d_buffer.stream, target_device, api);
+      }
+      return status;
     } catch (...) {
       return cudaErrorUnknown;
     }

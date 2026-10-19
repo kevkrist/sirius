@@ -20,7 +20,6 @@
 #include "exec/try.hpp"
 #include "io/cache/prefetching_cache.hpp"
 
-#include <rmm/cuda_device.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <fcntl.h>
@@ -33,29 +32,13 @@
 #include <exception>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
-#include <tuple>
 #include <utility>
 #include <vector>
 
 namespace sirius::io {
 
 namespace {
-
-std::future<size_t> ready_future(size_t value)
-{
-  std::promise<size_t> p;
-  p.set_value(value);
-  return p.get_future();
-}
-
-std::future<size_t> failed_future(std::exception_ptr error)
-{
-  std::promise<size_t> p;
-  p.set_exception(std::move(error));
-  return p.get_future();
-}
 
 // Bridge a semi_future into a real (promise-backed) std::future. Promise,
 // std::future, and the exact type-erased terminal are all built before
@@ -85,18 +68,6 @@ sirius_datasource::sirius_datasource(std::shared_ptr<ioctx> io_ctx,
                                      std::shared_ptr<io_object> io_obj)
   : _io_ctx(std::move(io_ctx)), _io_object(std::move(io_obj))
 {
-}
-
-sirius_datasource::~sirius_datasource()
-{
-  std::vector<std::weak_ptr<deferred_device_batch>> batches;
-  {
-    std::scoped_lock lock(_pending_mutex);
-    batches.swap(_pending_batches);
-  }
-  for (auto const& weak : batches) {
-    if (auto batch = weak.lock()) { batch->cancel(); }
-  }
 }
 
 std::shared_ptr<io_object_metadata> sirius_datasource::metadata() const
@@ -204,53 +175,10 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
     return bridge_semi_to_std(
       [&] { return _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream); });
   }
-  auto* cache = _io_ctx->cache();
-  if (!cache->defers_device_reads() || !deferred_batch_registry::accepts(stream.get())) {
-    return bridge_semi_to_std([&] {
-      return cache->device_read_async(*_io_object, offset, size, dst, stream, &_cache_handle);
-    });
-  }
-
-  // Same degenerate-input answers as prefetching_cache::device_read_async, settled here so they
-  // never join a batch.
-  if (size == 0) { return ready_future(0); }
-  if (dst == nullptr) {
-    return failed_future(
-      std::make_exception_ptr(std::invalid_argument("device read destination is null")));
-  }
-  auto const file_size = _io_object->size();
-  if (offset >= file_size) { return ready_future(0); }
-  size = std::min(size, file_size - offset);
-
-  return enqueue_deferred(stream.get(), slice{offset, size, dst});
-}
-
-std::future<size_t> sirius_datasource::enqueue_deferred(cudaStream_t stream, slice const& request)
-{
-  auto const device   = rmm::get_current_cuda_device().value();
-  auto const registry = _io_ctx->cache()->deferred_batches();
-  std::scoped_lock lock(_pending_mutex);
-  std::erase_if(_pending_batches, [](std::weak_ptr<deferred_device_batch> const& weak) {
-    auto open = weak.lock();
-    return open == nullptr || !open->is_open();
+  return bridge_semi_to_std([&] {
+    return _io_ctx->cache()->device_read_async(
+      *_io_object, offset, size, dst, stream, &_cache_handle);
   });
-  for (auto const& weak : _pending_batches) {
-    auto open = weak.lock();
-    if (open && open->stream() == stream && open->device() == device) {
-      if (auto member = deferred_device_batch::try_add_member(open, request)) {
-        return std::move(*member);
-      }
-    }
-  }
-
-  _pending_batches.reserve(_pending_batches.size() + 1);
-  auto batch  = std::make_shared<deferred_device_batch>(*this, stream, device, registry);
-  auto member = deferred_device_batch::try_add_member(batch, request);
-  // Registration commits publication. Reserved owner tracking and the future return cannot
-  // allocate.
-  registry->add(batch);
-  _pending_batches.emplace_back(batch);
-  return std::move(*member);
 }
 
 std::future<size_t> sirius_datasource::device_read_ranges_async(std::span<const slice> ranges,

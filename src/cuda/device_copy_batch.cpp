@@ -18,7 +18,24 @@
 
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 
+#include <rmm/cuda_device.hpp>
+
+#include <exception>
+
 namespace sirius::cuda {
+
+void drain_copy_stream_or_terminate(::cuda::stream_ref stream,
+                                    int device,
+                                    detail::copy_completion_api api) noexcept
+{
+  try {
+    if (device < 0 && cudaGetDevice(&device) != cudaSuccess) { std::terminate(); }
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+    if (api.synchronize(stream.get()) != cudaSuccess) { std::terminate(); }
+  } catch (...) {
+    std::terminate();
+  }
+}
 
 void device_copy_batch::reserve(std::size_t n)
 {

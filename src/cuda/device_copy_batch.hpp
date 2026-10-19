@@ -24,6 +24,21 @@
 
 namespace sirius::cuda {
 
+namespace detail {
+// Substitute only the completion boundary in deterministic copy-lifetime tests.
+struct copy_completion_api {
+  decltype(&cudaEventRecord) record            = &cudaEventRecord;
+  decltype(&cudaStreamSynchronize) synchronize = &cudaStreamSynchronize;
+};
+}  // namespace detail
+
+/// Establish completion before releasing borrowed copy buffers on an error path.
+/// A negative device uses the caller's current device. Terminates if completion
+/// cannot be established; a CUDA error alone never permits releasing the buffers.
+void drain_copy_stream_or_terminate(::cuda::stream_ref stream,
+                                    int device                      = -1,
+                                    detail::copy_completion_api api = {}) noexcept;
+
 // ---------------------------------------------------------------------------
 // device_copy_batch — accumulate many copies, issue them as one
 // ---------------------------------------------------------------------------

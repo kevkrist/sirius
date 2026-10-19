@@ -147,9 +147,8 @@ bool is_unsafe_for_stats_filter(duckdb::Expression const& expr)
 
 /// True when the parquet reader's bloom filter probe hashes literals as the
 /// column's parquet physical type: cuDF 26.12 and later (rapidsai/cudf#24320).
-constexpr bool cudf_bloom_filter_probe_is_fixed = CUDF_VERSION_MAJOR > 26 ||
-                                                  (CUDF_VERSION_MAJOR == 26 &&
-                                                   CUDF_VERSION_MINOR >= 12);
+constexpr bool cudf_bloom_filter_probe_is_fixed =
+  CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 12);
 
 /// True when the bloom filter probe of the cuDF we build against is unreliable
 /// for a column of @p type. Always false from cuDF 26.12.
@@ -1704,13 +1703,9 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       table = cudf::concatenate(views, stream, mr_ref);
     }
   } else {
-    // materialize_parquet picks the route: a bulk hybrid scan (hybrid_scan_reader
-    // for one file, hybrid_scan_multifile for several) when every slice's backend
-    // prefers it, otherwise read_parquet.  Both routes apply `opts`' row filter
-    // identically, so `reader_applied_full_filter` below stays route-independent.
-    // The all-pruned split is left to read_parquet: it has no row groups to
-    // enumerate, and set_num_rows(0) already builds the schema-correct empty
-    // table without touching a data page.
+    // Bulk uses this final filter for statistics pruning and range derivation, including late
+    // dynamic filters. Both routes apply its row predicate, preserving the filter-state bookkeeping
+    // below. Initially all-pruned splits retain the metadata-only general read.
     std::vector<parquet_source> sources;
     sources.reserve(split.rg_slices.size());
     for (auto const& slice : split.rg_slices) {

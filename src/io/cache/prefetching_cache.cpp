@@ -20,7 +20,6 @@
 #include "exec/semi_future.hpp"
 #include "exec/try.hpp"
 #include "io/cache/types.hpp"
-#include "io/deferred_device_batch.hpp"
 #include "io/io_context.hpp"
 #include "io/io_request.hpp"
 #include "io/types.hpp"
@@ -121,6 +120,9 @@ struct prefetching_cache::cached_copy_retirement {
   std::shared_ptr<cache_generation> generation;
   std::shared_ptr<exec::completion_controller::slot> lifetime;
   std::shared_ptr<grouped_coordinator> coordinator;
+  exec::retire_lane* lane{nullptr};
+  int device_id{-1};
+  cudaError_t enqueue_status{cudaErrorUnknown};
   std::latch published{1};
   std::atomic<bool> finished{false};
   bool pins_released{false};
@@ -153,7 +155,21 @@ struct prefetching_cache::cached_copy_retirement {
           std::this_thread::yield();
           break;
         case exec::cuda_event_completion_poll::progress::undelivered:
-          std::ignore = poll.fail_all(cudaErrorUnknown);
+          // Another lane's health failure says nothing about our writes. Only
+          // recover this lane, fencing its producers before synchronizing it.
+          if (lane != nullptr && lane->faulted()) {
+            try {
+              rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device_id}};
+              auto const status = lane->recover_after_error();
+              if (status != cudaSuccess && !finished.load(std::memory_order_acquire)) {
+                std::terminate();
+              }
+            } catch (...) {
+              std::terminate();
+            }
+          } else {
+            std::this_thread::yield();
+          }
           break;
       }
     }
@@ -331,15 +347,16 @@ prefetching_cache::prefetching_cache(
   cucascade::memory::memory_reservation_manager& reservation_manager,
   ioctx* io_ctx,
   const config& cfg,
-  std::shared_ptr<const sirius::memory::topology_index> topology_index)
+  std::shared_ptr<const sirius::memory::topology_index> topology_index,
+  exec::detail::completion_cuda_api completion_api)
   : _cfg(cfg),
-    _deferred_batches(std::make_shared<deferred_batch_registry>()),
     _pool(std::make_shared<buffer_pool>(
       reservation_manager, cfg.min_prefetching_budget_fraction, cfg.eviction_threshold_fraction)),
     _io_ctx(io_ctx),
     _topology_index(std::move(topology_index)),
     _armed(_io_ctx->can_use_prefetching_cache()),
-    _retire_mtx(std::make_shared<std::shared_mutex>())
+    _retire_mtx(std::make_shared<std::shared_mutex>()),
+    _completion_poll(completion_api)
 {
   _chunk_size          = _pool->chunk_size();
   auto const max_bytes = chunk_state::max_chunk_bytes();
@@ -1118,6 +1135,7 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_ranges_async(
         retirement->generation  = generation;
         retirement->lifetime    = lifetime;
         retirement->coordinator = coordinator;
+        retirement->device_id   = device_id.value();
 
         exec::invocable<void()> completion_task{
           [this, retirement]() noexcept { retirement->wait_and_finish(_completion_poll); }};
@@ -1171,10 +1189,10 @@ void prefetching_cache::retire_pins_after_stream(
     cudaError_t status = cudaErrorUnknown;
     try {
       status = copies.enqueue(stream);
-      if (status == cudaSuccess) { status = cudaStreamSynchronize(stream.get()); }
     } catch (...) {
       status = cudaErrorUnknown;
     }
+    sirius::cuda::drain_copy_stream_or_terminate(stream, retirement->device_id);
     retirement->finish(status);
     retirement->signal_published();
     return;
@@ -1182,32 +1200,31 @@ void prefetching_cache::retire_pins_after_stream(
 
   try {
     // The submission lock keeps ticket order identical to stream enqueue order.
-    auto submission            = lane->begin();
-    cudaError_t enqueue_status = cudaErrorUnknown;
-    try {
-      enqueue_status = copies.enqueue(stream);
-    } catch (...) {
-      enqueue_status = cudaErrorUnknown;
-    }
-    submission.on_retire([retirement, enqueue_status](cudaError_t stream_status) noexcept {
-      retirement->finish(enqueue_status == cudaSuccess ? stream_status : enqueue_status);
+    auto submission  = lane->begin();
+    retirement->lane = lane;
+    submission.on_retire([retirement](cudaError_t stream_status) noexcept {
+      auto const status =
+        retirement->enqueue_status != cudaSuccess
+          ? retirement->enqueue_status
+          : (stream_status != cudaSuccess ? stream_status : retirement->lane->fault_error());
+      retirement->finish(status);
     });
+    try {
+      retirement->enqueue_status = copies.enqueue(stream);
+    } catch (...) {
+      retirement->enqueue_status = cudaErrorUnknown;
+    }
     auto const commit_status = submission.commit();
     retirement->signal_published();
     if (commit_status != cudaSuccess) {
-      SIRIUS_LOG_ERROR("prefetching_cache: failed to publish cached-copy completion: {}",
-                       cudaGetErrorString(commit_status));
+      sirius::log::log_noexcept([&] {
+        SIRIUS_LOG_ERROR("prefetching_cache: failed to publish cached-copy completion: {}",
+                         cudaGetErrorString(commit_status));
+      });
     }
   } catch (...) {
-    // A failure while staging the retirement may follow partially-enqueued
-    // copies. Synchronize before releasing their source pins.
-    cudaError_t status = cudaErrorUnknown;
-    try {
-      status = cudaStreamSynchronize(stream.get());
-    } catch (...) {
-      status = cudaErrorUnknown;
-    }
-    retirement->finish(status);
+    // All throwing preparation precedes enqueue; no copy borrows these pins.
+    retirement->finish(cudaErrorUnknown);
     retirement->signal_published();
   }
 }
@@ -1216,29 +1233,26 @@ std::string prefetching_cache::summary() const
 {
   // Global totals plus the deltas since the last refresh (the most recent
   // query cycle), reported separately.
-  uint64_t const reads   = _counters.n_reads.load(std::memory_order_relaxed);
-  uint64_t const hits    = _counters.hits.load(std::memory_order_relaxed);
-  uint64_t const h2d     = _counters.h2d.load(std::memory_order_relaxed);
-  uint64_t const miss    = _counters.misses.load(std::memory_order_relaxed);
-  uint64_t const evict   = _counters.evictions.load(std::memory_order_relaxed);
-  uint64_t const flushes = _counters.deferred_flushes.load(std::memory_order_relaxed);
+  uint64_t const reads = _counters.n_reads.load(std::memory_order_relaxed);
+  uint64_t const hits  = _counters.hits.load(std::memory_order_relaxed);
+  uint64_t const h2d   = _counters.h2d.load(std::memory_order_relaxed);
+  uint64_t const miss  = _counters.misses.load(std::memory_order_relaxed);
+  uint64_t const evict = _counters.evictions.load(std::memory_order_relaxed);
 
   return std::format(
     "prefetching_cache: "
-    "global[reads={} hits={} h2d={} miss={} evictions={} deferred_flushes={}] "
-    "last_cycle[reads={} hits={} h2d={} miss={} evictions={} deferred_flushes={}]",
+    "global[reads={} hits={} h2d={} miss={} evictions={}] "
+    "last_cycle[reads={} hits={} h2d={} miss={} evictions={}]",
     reads,
     hits,
     h2d,
     miss,
     evict,
-    flushes,
     reads - _last_reported.n_reads,
     hits - _last_reported.hits,
     h2d - _last_reported.h2d,
     miss - _last_reported.misses,
-    evict - _last_reported.evictions,
-    flushes - _last_reported.deferred_flushes);
+    evict - _last_reported.evictions);
 }
 
 void prefetching_cache::prepare_for_query() noexcept
@@ -1254,7 +1268,6 @@ void prefetching_cache::prepare_for_query() noexcept
     _counters.h2d.load(std::memory_order_relaxed),
     _counters.misses.load(std::memory_order_relaxed),
     _counters.evictions.load(std::memory_order_relaxed),
-    _counters.deferred_flushes.load(std::memory_order_relaxed),
   };
 }
 

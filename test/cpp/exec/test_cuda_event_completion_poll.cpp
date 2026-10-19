@@ -309,6 +309,61 @@ TEST_CASE("failed callback installation retains ownership until safe",
   CHECK(seen[1] == cudaErrorNotSupported);
 }
 
+TEST_CASE("lane recovery fences producers without retiring another stream",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream failed, held;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& failed_lane = poll.lane_for(failed.stream());
+  auto& held_lane   = poll.lane_for(held.stream());
+  int failed_calls = 0, held_calls = 0;
+  submit(failed_lane, [&](cudaError_t) noexcept { ++failed_calls; });
+  submit(held_lane, [&](cudaError_t) noexcept { ++held_calls; });
+  failed.query_error = cudaErrorUnknown;
+  CHECK(poll.wait_for_progress() == cuda_event_completion_poll::progress::undelivered);
+  CHECK(failed_calls == 0);
+  CHECK(held_calls == 0);
+
+  CHECK(failed_lane.recover_after_error() == cudaSuccess);
+  CHECK(failed_calls == 1);
+  CHECK(held_calls == 0);
+  CHECK(held.synchronizations == 0);
+  CHECK_THROWS_AS(failed_lane.begin(), std::logic_error);
+  CHECK_FALSE(held_lane.idle());
+  held.complete();
+  CHECK(poll.drain_all() == 1);
+  CHECK(held_calls == 1);
+}
+
+TEST_CASE("failed lane recovery retains captures until successful drainage",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane              = poll.lane_for(stream.stream());
+  auto owner              = std::make_shared<int>(7);
+  std::weak_ptr<int> weak = owner;
+  cudaError_t seen        = cudaSuccess;
+  stream.install_error    = cudaErrorNotSupported;
+  stream.sync_error       = cudaErrorUnknown;
+  {
+    auto submission = lane.begin();
+    submission.on_retire(
+      [owner = std::move(owner), &seen](cudaError_t status) noexcept { seen = status; });
+    CHECK(submission.commit() == cudaErrorUnknown);
+  }
+  CHECK(lane.recover_after_error() == cudaErrorUnknown);
+  CHECK_FALSE(weak.expired());
+  CHECK_FALSE(lane.idle());
+  CHECK_THROWS_AS(lane.begin(), std::logic_error);
+
+  stream.sync_error = cudaSuccess;
+  CHECK(lane.recover_after_error() == cudaSuccess);
+  CHECK(weak.expired());
+  CHECK(seen == cudaErrorNotSupported);
+  CHECK(lane.idle());
+}
+
 TEST_CASE("terminal retirement delivers the exact requested failure once",
           "[exec][cuda_event_completion_poll]")
 {

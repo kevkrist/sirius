@@ -1,7 +1,6 @@
 target_sources(
   sirius_objects
   PRIVATE datasource_factory.cpp
-          deferred_device_batch.cpp
           io_context.cpp
           parquet_helpers.cpp
           sirius_datasource.cpp

@@ -73,9 +73,6 @@ sirius::io::cache::config identity_cache_config()
   cfg.eviction                        = sirius::io::cache::eviction_policy::lru;
   cfg.min_prefetching_budget_fraction = 0.5;
   cfg.eviction_threshold_fraction     = 1.0;
-  // These tests watch when a device read reaches the backend; the datasource's deferred issue is
-  // covered by test_deferred_device_reads.cpp.
-  cfg.deferred_device_reads = false;
   cfg.apply_mode();
   return cfg;
 }

@@ -313,6 +313,30 @@ class retire_lane {
     return idle() ? cudaSuccess : cudaErrorNotReady;
   }
 
+  // Error recovery with live producers: fence submissions, synchronize only
+  // this lane, then retire confirmed boundaries. Failure retains unconfirmed
+  // captures. Unlike quiesce(), permanently closes admission under the producer
+  // lock; callers must keep the stream alive and select its CUDA device.
+  [[nodiscard]] cudaError_t recover_after_error() noexcept
+  {
+    cudaError_t result = cudaSuccess;
+    {
+      std::lock_guard lock(submit_m_);
+      closed_ = true;
+      if (detached_) { return cudaErrorInvalidResourceHandle; }
+      result = api_.synchronize(stream_);
+      if (result != cudaSuccess) {
+        remember_host_error(result);
+      } else {
+        recovered_.store(submitted_, std::memory_order_release);
+      }
+    }
+    claim_drainer();
+    drain_owned(completed(), false, cudaSuccess);
+    release_drainer();
+    return result;
+  }
+
  private:
   friend class submission;
   std::uint64_t completed() const noexcept

@@ -66,10 +66,6 @@ struct cache_fixture {
   {
     sirius::io::cache::config config;
     config.mode = sirius::io::cache::cache_mode::sirius;
-    // Arbitration is the cache's decision and is observed as the request reaching the reactor, so
-    // reads are issued as called here; the datasource's deferred issue is covered by
-    // test_deferred_device_reads.cpp.
-    config.deferred_device_reads = false;
     config.apply_mode();
     context->initialize_cache(*memory, config, single_gpu_topology());
     datasource = context->open_datasource("controlled://cache-read-arbitration");
