@@ -1,3 +1,0 @@
-#pragma once
-#define SIRIUS_BENCH_REAL_COPY "__real__ZN4cudf6detail18memcpy_batch_asyncEPKPvPKPKvPKmmN3rmm9_RMM_26_816cuda_stream_viewE"
-#define SIRIUS_BENCH_WRAPPED_COPY "__wrap__ZN4cudf6detail18memcpy_batch_asyncEPKPvPKPKvPKmmN3rmm9_RMM_26_816cuda_stream_viewE"

@@ -341,9 +341,8 @@ class prefetching_cache {
     return _counters.deferred_flushes.fetch_add(1, std::memory_order_relaxed) + 1;
   }
 
-  /// The open deferred batches of every datasource reading through this cache. A waiter on a
-  /// deferred device read issues the open batches of other datasources on its stream before its
-  /// own.
+  /// The open deferred batches of every datasource reading through this cache. A waiter issues its
+  /// own batch, then other datasources' batches on its stream, before waiting for its completion.
   [[nodiscard]] std::shared_ptr<deferred_batch_registry> const& deferred_batches() const noexcept
   {
     return _deferred_batches;

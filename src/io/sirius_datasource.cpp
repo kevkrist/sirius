@@ -229,11 +229,6 @@ std::future<size_t> sirius_datasource::enqueue_deferred(cudaStream_t stream, sli
 {
   auto const device   = rmm::get_current_cuda_device().value();
   auto const registry = _io_ctx->cache()->deferred_batches();
-  auto make_member    = [&](std::shared_ptr<deferred_device_batch> const& batch) {
-    return std::async(std::launch::deferred,
-                      [batch, bytes = request.size()] { return batch->await(bytes); });
-  };
-
   std::scoped_lock lock(_pending_mutex);
   std::erase_if(_pending_batches, [](std::weak_ptr<deferred_device_batch> const& weak) {
     auto open = weak.lock();
@@ -242,22 +237,20 @@ std::future<size_t> sirius_datasource::enqueue_deferred(cudaStream_t stream, sli
   for (auto const& weak : _pending_batches) {
     auto open = weak.lock();
     if (open && open->stream() == stream && open->device() == device) {
-      auto member = make_member(open);
-      // Publish only after the returned future exists. A concurrent waiter may close the batch
-      // meanwhile.
-      if (open->try_add(request)) { return member; }
+      if (auto member = deferred_device_batch::try_add_member(open, request)) {
+        return std::move(*member);
+      }
     }
   }
 
   _pending_batches.reserve(_pending_batches.size() + 1);
   auto batch  = std::make_shared<deferred_device_batch>(*this, stream, device, registry);
-  auto member = make_member(batch);
-  std::ignore = batch->try_add(request);
+  auto member = deferred_device_batch::try_add_member(batch, request);
   // Registration commits publication. Reserved owner tracking and the future return cannot
   // allocate.
   registry->add(batch);
   _pending_batches.emplace_back(batch);
-  return member;
+  return std::move(*member);
 }
 
 std::future<size_t> sirius_datasource::device_read_ranges_async(std::span<const slice> ranges,
@@ -305,7 +298,7 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   if (_cache_handle && _cache_handle.is_active()) {
     SIRIUS_LOG_WARN(
       "sirius_datasource::fadvise: a cache_handle was already stored on "
-      "this datasource (path={}); cancelling the stale request.  Each scan "
+      "this datasource (path={}); keeping the active request.  Each scan "
       "should own a unique datasource.",
       _io_object->object_path());
     return;

@@ -46,12 +46,45 @@ deferred_device_batch::deferred_device_batch(
 {
 }
 
-bool deferred_device_batch::try_add(slice const& request)
+struct deferred_device_batch::member_registration {
+  explicit member_registration(std::shared_ptr<deferred_device_batch> owner) noexcept
+    : batch{std::move(owner)}
+  {
+  }
+
+  ~member_registration() noexcept
+  {
+    if (active) { batch->release_member(); }
+  }
+
+  member_registration(member_registration const&)            = delete;
+  member_registration& operator=(member_registration const&) = delete;
+
+  std::shared_ptr<deferred_device_batch> batch;
+  bool active{false};
+};
+
+std::optional<std::future<std::size_t>> deferred_device_batch::try_add_member(
+  std::shared_ptr<deferred_device_batch> const& batch, slice const& request)
+{
+  auto registration = std::make_unique<member_registration>(batch);
+  auto* member      = registration.get();
+  auto future       = std::async(std::launch::deferred,
+                           [registration = std::move(registration), bytes = request.size()] {
+                             return registration->batch->await(bytes);
+                           });
+  std::scoped_lock lock(batch->_mutex);
+  if (batch->_state != state::OPEN) { return std::nullopt; }
+  batch->_slices.push_back(request);
+  ++batch->_members;
+  member->active = true;
+  return std::move(future);
+}
+
+void deferred_device_batch::release_member() noexcept
 {
   std::scoped_lock lock(_mutex);
-  if (_state != state::OPEN) { return false; }
-  _slices.push_back(request);
-  return true;
+  if (--_members == 0 && _state == state::OPEN) { _state = state::CANCELLED; }
 }
 
 bool deferred_device_batch::is_open() const
@@ -87,7 +120,7 @@ std::size_t deferred_device_batch::await(std::size_t bytes)
 void deferred_device_batch::issue_if_open()
 {
   std::scoped_lock lock(_mutex);
-  if (_state == state::OPEN) { issue(); }
+  if (_state == state::OPEN && _members != 0) { issue(); }
 }
 
 void deferred_device_batch::cancel() noexcept
@@ -102,16 +135,18 @@ void deferred_device_batch::issue() noexcept
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_device}};
     if (_owner->uses_prefetching_cache()) {
       auto const flush_id = _owner->io_ctx()->cache()->note_deferred_flush();
-      SIRIUS_LOG_DEBUG(
-        "sirius_datasource: vectored flush #{} ranges={} bytes={} stream={:#x} path={}",
-        flush_id,
-        _slices.size(),
-        std::accumulate(_slices.begin(),
-                        _slices.end(),
-                        std::size_t{0},
-                        [](std::size_t acc, slice const& s) { return acc + s.size(); }),
-        reinterpret_cast<std::uintptr_t>(_stream),
-        _owner->get_io_object().object_path());
+      sirius::log::log_noexcept([&] {
+        SIRIUS_LOG_DEBUG(
+          "sirius_datasource: vectored flush #{} ranges={} bytes={} stream={:#x} path={}",
+          flush_id,
+          _slices.size(),
+          std::accumulate(_slices.begin(),
+                          _slices.end(),
+                          std::size_t{0},
+                          [](std::size_t acc, slice const& s) { return acc + s.size(); }),
+          reinterpret_cast<std::uintptr_t>(_stream),
+          _owner->get_io_object().object_path());
+      });
     }
     _completion = _owner->device_read_ranges_async(_slices, ::cuda::stream_ref{_stream}).share();
     _state      = state::ISSUED;

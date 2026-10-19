@@ -29,6 +29,7 @@
 #include "io/deferred_device_batch.hpp"
 #include "io/io_request.hpp"
 #include "io/sirius_datasource.hpp"
+#include "log/logging.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/host_allocation_fault.hpp"
 
@@ -112,6 +113,16 @@ struct deferred_fixture {
   }
 
   [[nodiscard]] std::uint64_t flushes() const { return context->cache()->deferred_flushes(); }
+
+  [[nodiscard]] std::shared_ptr<sirius::io::deferred_device_batch> promote_batch(
+    rmm::cuda_stream_view stream)
+  {
+    auto batches = context->cache()->deferred_batches()->take_batches(stream.value());
+    REQUIRE(batches.size() == 1);
+    auto batch = batches.front().lock();
+    REQUIRE(batch != nullptr);
+    return batch;
+  }
 
   /// Poll until at least @p count deferred batches have been issued through the cache; false when
   /// @p timeout passes first.
@@ -251,6 +262,53 @@ std::vector<std::uint8_t> download(rmm::device_buffer const& buffer, rmm::cuda_s
   stream.synchronize();
   return host;
 }
+
+class flush_throwing_sink final : public sirius::log::sink {
+ public:
+  void set_level(sirius::log::level) override {}
+  [[nodiscard]] bool should_log(sirius::log::level) const override { return true; }
+
+  void log(sirius::log::level, std::source_location const&, std::string_view message) override
+  {
+    if (message.starts_with("sirius_datasource: vectored flush #")) {
+      attempts.fetch_add(1, std::memory_order_relaxed);
+      std::rethrow_exception(_error);
+    }
+  }
+
+  bool flush() noexcept override { return true; }
+
+  std::atomic<std::size_t> attempts{0};
+
+ private:
+  std::exception_ptr _error{std::make_exception_ptr(std::runtime_error("flush log failure"))};
+};
+
+class scoped_flush_log_failure {
+ public:
+  scoped_flush_log_failure() : _previous{sirius::log::get_sink()}
+  {
+    try {
+      sirius::log::set_sink(_sink);
+    } catch (...) {
+      sirius::log::set_sink(_previous);
+      throw;
+    }
+  }
+
+  ~scoped_flush_log_failure() noexcept { sirius::log::set_sink(_previous); }
+  scoped_flush_log_failure(scoped_flush_log_failure const&)            = delete;
+  scoped_flush_log_failure& operator=(scoped_flush_log_failure const&) = delete;
+
+  [[nodiscard]] std::size_t attempts() const
+  {
+    return _sink->attempts.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::shared_ptr<sirius::log::sink> _previous;
+  std::shared_ptr<flush_throwing_sink> _sink{std::make_shared<flush_throwing_sink>()};
+};
 
 }  // namespace
 
@@ -553,12 +611,11 @@ TEST_CASE("a dropped member is still issued when a sibling of its batch is waite
   rmm::device_buffer kept_destination{read_size, stream};
   rmm::device_buffer dropped_destination{read_size, stream};
   deferred_scope scope{fixture};
-  auto kept = fixture.read(0, kept_destination, stream);
-  {
-    auto dropped = fixture.read(chunk_size, dropped_destination, stream);
-    CHECK(dropped.wait_for(0ms) == std::future_status::deferred);
-  }
-
+  auto kept    = fixture.read(0, kept_destination, stream);
+  auto dropped = fixture.read(chunk_size, dropped_destination, stream);
+  auto batch   = fixture.promote_batch(stream);
+  dropped      = {};
+  batch->issue_if_open();
   auto& waiting = scope.get_async(std::move(kept));
   auto* request = scope.take_next();
   REQUIRE(request != nullptr);
@@ -568,7 +625,7 @@ TEST_CASE("a dropped member is still issued when a sibling of its batch is waite
   CHECK(fixture.flushes() == 1);
 }
 
-TEST_CASE("a batch whose members were all dropped expires instead of being joined",
+TEST_CASE("last member abandonment closes a promoted batch and the next submission opens a new one",
           "[cache][deferred_device_reads][gpu_execution]")
 {
   deferred_fixture fixture;
@@ -577,19 +634,67 @@ TEST_CASE("a batch whose members were all dropped expires instead of being joine
   rmm::device_buffer abandoned_destination{read_size, stream};
   rmm::device_buffer destination{read_size, stream};
   deferred_scope scope{fixture};
-  {
-    auto abandoned = fixture.read(0, abandoned_destination, stream);
-    CHECK(abandoned.wait_for(0ms) == std::future_status::deferred);
-  }
+  auto abandoned = fixture.read(0, abandoned_destination, stream);
+  auto batch     = fixture.promote_batch(stream);
+  abandoned      = {};
+  CHECK_FALSE(batch->is_open());
+  batch->issue_if_open();
+  CHECK(fixture.flushes() == 0);
+  CHECK(fixture.context->reactor().pending() == 0);
 
   auto& waiting = scope.get_async(fixture.read(chunk_size, destination, stream));
   auto* request = scope.take_next();
   REQUIRE(request != nullptr);
+  CHECK(request->front().offset() == chunk_size);
   CHECK(complete_success(*request) == 1);
   REQUIRE(waiting.wait_for(2s) == std::future_status::ready);
   CHECK(waiting.get() == read_size);
   CHECK(fixture.flushes() == 1);
 }
+
+TEST_CASE("dropping the last member after issuance does not cancel its accepted request",
+          "[cache][deferred_device_reads][gpu_execution]")
+{
+  deferred_fixture fixture;
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination{read_size, stream};
+  deferred_scope scope{fixture};
+  auto member = fixture.read(0, destination, stream);
+  auto batch  = fixture.promote_batch(stream);
+  batch->issue_if_open();
+  auto* request = scope.take_next();
+  REQUIRE(request != nullptr);
+  member = {};
+  batch->issue_if_open();
+  CHECK(fixture.flushes() == 1);
+  CHECK(fixture.context->reactor().pending() == 0);
+  CHECK(complete_success(*request) == 1);
+  CHECK(batch->await(read_size) == read_size);
+}
+
+#if SIRIUS_ACTIVE_LOG_LEVEL <= SIRIUS_LOG_LEVEL_DEBUG
+TEST_CASE("a throwing deferred flush diagnostic cannot fail the device read",
+          "[cache][deferred_device_reads][gpu_execution]")
+{
+  deferred_fixture fixture;
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination{read_size, stream};
+  auto previous = sirius::log::get_sink();
+  {
+    scoped_flush_log_failure logging;
+    deferred_scope scope{fixture};
+    auto& waiting = scope.get_async(fixture.read(0, destination, stream));
+    auto* request = scope.take_next();
+    REQUIRE(request != nullptr);
+    CHECK(logging.attempts() == 1);
+    CHECK(complete_success(*request) == 1);
+    REQUIRE(waiting.wait_for(2s) == std::future_status::ready);
+    CHECK(waiting.get() == read_size);
+    CHECK(fixture.flushes() == 1);
+  }
+  CHECK(sirius::log::get_sink() == previous);
+}
+#endif
 
 TEST_CASE("a mixed hit and miss deferred batch issues one request for the non-resident pieces",
           "[cache][deferred_device_reads][gpu_execution]")
@@ -1194,8 +1299,9 @@ TEST_CASE(
   auto const registry = fixture.context->cache()->deferred_batches();
   auto first          = std::make_shared<sirius::io::deferred_device_batch>(
     *fixture.datasource, stream.value(), rmm::get_current_cuda_device().value(), registry);
-  REQUIRE(first->try_add(
-    sirius::io::slice{0, read_size, static_cast<std::uint8_t*>(first_destination.data())}));
+  auto first_member = sirius::io::deferred_device_batch::try_add_member(
+    first, sirius::io::slice{0, read_size, static_cast<std::uint8_t*>(first_destination.data())});
+  REQUIRE(first_member.has_value());
   registry->add(first);
   std::size_t allocations = 0;
   {
@@ -1209,7 +1315,7 @@ TEST_CASE(
   auto const first_flushes = fixture.flushes();
   auto second_read = deferred_fixture::read_on(*second, chunk_size, second_destination, stream);
 
-  auto& waiting = scope.run_async([first] { return first->await(read_size); });
+  auto& waiting = scope.get_async(std::move(*first_member));
   auto* request = scope.take_next();
   REQUIRE(request != nullptr);
   CHECK(request->front().offset() == chunk_size);
@@ -1218,5 +1324,28 @@ TEST_CASE(
   CHECK(complete_success(*request) == 1);
   CHECK(second_read.get() == read_size);
   CHECK(fixture.flushes() == first_flushes + 1);
+  CHECK(fixture.context->reactor().pending() == 0);
+}
+
+TEST_CASE("last member abandonment requires no allocation even with a promoted batch",
+          "[.][cache][deferred_host_allocation_fault][host_allocation_fault][gpu_execution]")
+{
+  using fault_guard = sirius::test::scoped_host_allocation_fault;
+  REQUIRE(fault_guard::available());
+  deferred_fixture fixture;
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination{read_size, stream};
+  auto member             = fixture.read(0, destination, stream);
+  auto batch              = fixture.promote_batch(stream);
+  std::size_t allocations = 0;
+  {
+    fault_guard fault{fault_guard::sustained_allocation_scope, 1};
+    member      = {};
+    allocations = fault.stop();
+  }
+  CHECK(allocations == 0);
+  CHECK_FALSE(batch->is_open());
+  batch->issue_if_open();
+  CHECK(fixture.flushes() == 0);
   CHECK(fixture.context->reactor().pending() == 0);
 }

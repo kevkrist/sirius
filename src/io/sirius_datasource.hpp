@@ -55,19 +55,6 @@ using cudf_datasource_stream_t = rmm::cuda_stream_view;
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Concrete @c io_datasource backed by io_uring.
- *
- * Every read method forwards to @c ioctx, or to its prefetching cache when one is armed, passing
- * the owned @c io_object by reference; @c device_read_async may first batch reads per stream, as
- * its documentation describes.
- *
- * Ownership model: one scan owns one @c sirius_datasource.  The underlying
- * @c io_object can be shared across multiple datasources (e.g. when
- * the same file is scanned in different pipelines), but the datasource
- * itself stores per-scan state (notably the @c cache_handle returned
- * by an @c fadvise call) and is therefore not safe to share.
- */
-/**
  * Why a datasource did or did not start a prefetch, so the readahead can attribute a refusal
  * instead of only counting one.  A refusal is normal -- the readahead offers work the read path is
  * free to turn down -- but the reason decides whether it means "we are out of memory" or "we are
@@ -123,6 +110,16 @@ enum class prepare_result : std::uint8_t {
   nothing_to_prepare,
 };
 
+/**
+ * @brief One scan's datasource, forwarding reads to `ioctx` or its prefetching cache.
+ *
+ * Scans may share the underlying `io_object`, but each owns its own `sirius_datasource` and
+ * `cache_handle`. Initialize `fadvise` before publishing the scan. Handle replacement, movement and
+ * destruction require external exclusion from reads, prefetch operations and future waits accessing
+ * the handle. A stable installed handle uses the cache's atomic producer/consumer protocol;
+ * deferred batch mutexes do not protect handle replacement. Datasource destruction cancels deferred
+ * issuance under its batch mutexes but must still exclude other datasource operations.
+ */
 class sirius_datasource : public cudf::io::datasource {
  public:
   explicit sirius_datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_obj);
@@ -188,12 +185,14 @@ class sirius_datasource : public cudf::io::datasource {
    * returns its own clamped byte count. Shared default-stream handles and reads without this
    * optimization issue eagerly.
    *
-   * A destination is accepted only if this call returns its future. Once accepted it must remain
-   * valid until batch completion, even if its own future is dropped. `wait_for()` and
-   * `wait_until()` report `std::future_status::deferred` without issuing. Dropping every member
-   * before issuance abandons the batch. Destroying the datasource cancels unissued batches without
-   * allocating; a later member `get()` reports `std::logic_error` (or allocation failure while
-   * constructing that error).
+   * A destination is accepted only if this call returns its future. Dropping one member preserves
+   * its slice while other members remain. Last-member destruction and issuance arbitrate under the
+   * batch mutex: if destruction wins, the unissued batch is cancelled; if issuance wins,
+   * destinations remain borrowed until completion and destruction does not drain the I/O. A caller
+   * reclaiming destinations after abandonment must externally exclude racing issuance. `wait_for()`
+   * and `wait_until()` report `std::future_status::deferred` without issuing. Destroying the
+   * datasource cancels unissued batches without allocating; a later member `get()` reports
+   * `std::logic_error` (or allocation failure while constructing that error).
    */
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
@@ -292,9 +291,9 @@ class sirius_datasource : public cudf::io::datasource {
    */
   std::mutex _pending_mutex;
   /**
-   * Batches opened by @c device_read_async, at most one open batch per stream. Held weakly because
-   * the member futures own their batch: a batch whose futures were all dropped expires here instead
-   * of being joined by a later read and issued along with it.
+   * Batches opened by `device_read_async`, at most one open batch per stream and device. Weak
+   * references do not keep batches alive; last-member destruction closes an unissued batch even if
+   * an issuer retains a strong reference.
    */
   std::vector<std::weak_ptr<deferred_device_batch>> _pending_batches;
 };

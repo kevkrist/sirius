@@ -25,6 +25,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -36,11 +37,13 @@ class deferred_batch_registry;
 /**
  * @brief Reads collected by one `sirius_datasource` for one explicit CUDA stream and device.
  *
- * Member futures own the batch; destinations remain borrowed until its completion. The mutex
- * protects collection, issuance and cancellation. `sirius_datasource` cancels its batches before
- * destruction under that same mutex, waiting out any issuance that dereferences the owner. Issuance
- * never takes another batch's mutex or the registry mutex. Every member observes the same
- * completion or terminal error, even when its future is moved to another thread.
+ * Member futures own registrations separately from batch references held by issuers. Releasing the
+ * last registration closes an unissued batch even if an issuer still holds it. Accepted
+ * destinations remain borrowed until completion if issuance wins, or while any member remains. The
+ * mutex protects collection, membership, issuance and cancellation. `sirius_datasource` cancels its
+ * batches before destruction under that same mutex, waiting out any issuance that dereferences the
+ * owner. Issuance never takes another batch's mutex or the registry mutex. Every member observes
+ * the same completion or terminal error, even when its future is moved to another thread.
  */
 class deferred_device_batch {
  public:
@@ -53,9 +56,14 @@ class deferred_device_batch {
   [[nodiscard]] int device() const noexcept { return _device; }
 
   /**
-   * @brief Append a request if still open; allocation failure leaves the batch unchanged.
+   * @brief Construct a member future before accepting its request; return empty if the batch
+   * closed.
+   *
+   * Allocation failure leaves the batch unchanged. Committing the slice and activating the future's
+   * registration happen together under the batch mutex.
    */
-  [[nodiscard]] bool try_add(slice const& request);
+  [[nodiscard]] static std::optional<std::future<std::size_t>> try_add_member(
+    std::shared_ptr<deferred_device_batch> const& batch, slice const& request);
 
   [[nodiscard]] bool is_open() const;
 
@@ -81,7 +89,10 @@ class deferred_device_batch {
   void cancel() noexcept;
 
  private:
+  struct member_registration;
   enum class state { OPEN, ISSUED, FAILED, CANCELLED };
+
+  void release_member() noexcept;
 
   /**
    * @brief Issue once under `_mutex`, retaining errors without allocating a replacement future.
@@ -95,6 +106,7 @@ class deferred_device_batch {
   std::weak_ptr<deferred_batch_registry> const _registry;
   mutable std::mutex _mutex;
   std::vector<slice> _slices;
+  std::size_t _members{0};
   state _state{state::OPEN};
   std::shared_future<std::size_t> _completion;
   std::exception_ptr _error;

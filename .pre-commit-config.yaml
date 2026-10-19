@@ -38,16 +38,13 @@ repos:
       - id: destroyed-symlinks
       - id: detect-private-key
       - id: end-of-file-fixer
-        # Benchmark evidence is retained byte-for-byte; formatting would invalidate hashes.
         exclude: |
           (?x)^(
             ^python/cudf/cudf/tests/data/vocab.txt|
             .*version-hint\.text$|
-            ^test/cpp/integration/data/iceberg_conformance/.*\.json$|
-            bench/deferred-device-read-order/(tpch/)?results/
+            ^test/cpp/integration/data/iceberg_conformance/.*\.json$
           )
       - id: mixed-line-ending
-        exclude: '^bench/deferred-device-read-order/(tpch/)?results/'
       - id: pretty-format-json
         args: [--autofix]
         # The iceberg conformance corpus is verbatim pyiceberg output, and that is the whole
@@ -55,31 +52,26 @@ repos:
         # keys, so formatting it would leave the in-tree copy differing from what gen_corpus.py
         # writes — every regeneration would fail lint, and every lint fix would move the corpus
         # further from the reference implementation. check-json still validates these files.
-        exclude: '^test/cpp/integration/data/iceberg_conformance/.*\.json$|^bench/deferred-device-read-order/(tpch/)?results/'
+        exclude: '^test/cpp/integration/data/iceberg_conformance/.*\.json$'
       - id: trailing-whitespace
-        exclude: '^bench/deferred-device-read-order/(tpch/)?results/'
   - repo: https://github.com/psf/black
     rev: 25.1.0
     hooks:
       - id: black
-        exclude: '^bench/deferred-device-read-order/(tpch/)?results/'
   - repo: https://github.com/sirosen/texthooks
     rev: 0.7.1
     hooks:
       - id: fix-smartquotes
-        exclude: '^bench/deferred-device-read-order/(tpch/)?results/'
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v20.1.4
     hooks:
       - id: clang-format
-        exclude: '^bench/deferred-device-read-order/(tpch/)?results/'
         types_or: [c++, c, cuda]
         args: ["-fallback-style=none", "-style=file", "-i"]
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:
       - id: codespell
-        exclude: '^bench/deferred-device-read-order/(tpch/)?results/'
         args:
           [
             "--write-changes",
@@ -96,7 +88,6 @@ repos:
   - repo: local
     hooks:
       - id: rumdl
-        exclude: '^bench/deferred-device-read-order/(tpch/)?results/'
         name: rumdl check --fix
         entry: pixi run --locked rumdl check --fix
         language: system
