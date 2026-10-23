@@ -104,6 +104,8 @@ Two things then decide whether the ride is taken:
 
 One bundle installs per scan (one rowid rides), and arbitration is widest-wins.
 
+A consumer carries one ride as well. When two scans' bundles land at the same consumer, the scan that installs first owns it and the other can only join as a rider (below). The scan manager therefore visits scans in order of what their own bundle would save, net bytes per row times port crossings, largest first, instead of the order the plan lists them. A scan that finds its consumer already taken is offered to the rider pass rather than refused. DuckDB v2 lists q10's `nation` scan before `customer`, because it joins nation to customer first; without the ordering, nation's one-column ride claimed the consumer and customer's five wide columns were materialized early.
+
 ## Riding through a group-by, and riders
 
 If the deferred columns are the GROUP BY keys, the sound stop is the aggregate's input — which
@@ -237,9 +239,7 @@ it off `device_pin_chunk::memory_space` or `pinned_entry::chunk_memory_spaces`),
 4. The owner's temporaries are freed on the owner's stream only after an event records that the
    consumer's copies have been enqueued.
 
-Both transfers are `cudaMemcpyPeerAsync`: a pair with working peer DMA takes it, and a pair
-without is staged through host by the driver (cucascade disables peer access on pairs whose
-DMA probe fails). What crosses is the size of the SELECTION, not the chunk, which is why the
+Both transfers use `cudaMemcpyPeerAsync`. Manager initialization grants access to the actual managed pools where supported; cuCascade does not disable ordinary peer access. The physical driver route is not measured by this setup, and a failed grant does not promise host staging. What crosses is the size of the SELECTION, not the chunk, which is why the
 cost model is unchanged: the ride still ends at the reduced row set, and the remote gather adds
 two small transfers to it. A remote batch forces the canonical path (per-batch selections),
 because the one-pass raw gather dereferences every batch from the consumer's GPU.

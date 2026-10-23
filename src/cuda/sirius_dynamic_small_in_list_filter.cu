@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "memory/runtime_stream_pool.hpp"
+
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
@@ -234,16 +236,20 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
 
   // Retain every destination and pooled stream while direct peer copies are submitted. Waiting
   // only after this loop lets different destination GPUs transfer concurrently.
-  std::vector<std::pair<std::unique_ptr<needle_store::needle_replica>, ::cuda::stream_ref>> pending;
+  std::vector<std::pair<std::unique_ptr<needle_store::needle_replica>,
+                        sirius::memory::runtime_stream_pool::lease>>
+    pending;
   pending.reserve(spaces.size());
   _store->replicas.reserve(_store->replicas.size() + spaces.size());
+  detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
     if (device_id == _store->source_device || _store->find(device_id)) { continue; }
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      auto const stream = target_space.acquire_stream();
+      auto stream_lease = sirius::memory::runtime_stream_pool::acquire(target_space);
+      auto const stream = stream_lease.get();
 
       auto reservation = detail::scoped_replica_reservation::try_acquire(
         target, detail::tracked_replica_allocation_bytes(bytes), stream);
@@ -266,15 +272,14 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
                                    bytes,
                                    stream,
                                    target.get_host_staging_space());
-      pending.emplace_back(std::move(replica), stream);
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_WARN(
-        "[sirius_dynamic_small_in_list_filter] replica GPU {} -> GPU {} unavailable: {}. That GPU "
-        "will skip this optional filter.",
-        _store->source_device,
-        device_id,
-        e.what());
-      continue;
+      pending.emplace_back(std::move(replica), std::move(stream_lease));
+    } catch (...) {
+      if (failures.skip_if_recoverable(
+            "[sirius_dynamic_small_in_list_filter]", _store->source_device, device_id)) {
+        continue;
+      }
+      // Earlier destinations still own asynchronous copies; drain them before propagating.
+      break;
     }
     SIRIUS_LOG_DEBUG(
       "[sirius_dynamic_small_in_list_filter] queued {}-byte replica GPU {} -> GPU {}.",
@@ -283,7 +288,8 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
       device_id);
   }
 
-  for (auto& [replica, stream] : pending) {
+  for (auto& [replica, stream_lease] : pending) {
+    auto const stream    = stream_lease.get();
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
@@ -298,6 +304,7 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
         e.what());
     }
   }
+  failures.rethrow_if_fatal();
 }
 
 bool sirius_dynamic_small_in_list_filter::is_available_on_device(int device_id) const noexcept
