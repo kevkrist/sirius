@@ -15,7 +15,6 @@
  */
 
 #include "op/dynamic_filter/bloom_sizing.hpp"
-#include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
 #include "s4_experiment_common.hpp"
 
 #include <rmm/aligned.hpp>
@@ -34,7 +33,18 @@
 #include <stdexcept>
 #include <system_error>
 
+#ifndef SIRIUS_S4_BASELINE_SQL
+#define SIRIUS_S4_BASELINE_SQL 0
+#endif
+#ifndef SIRIUS_S4_REVISION_ROLE
+#define SIRIUS_S4_REVISION_ROLE "final"
+#endif
+
 namespace sirius::test::s4 {
+namespace {
+constexpr std::string_view revision_role{SIRIUS_S4_REVISION_ROLE};
+static_assert(revision_role == (SIRIUS_S4_BASELINE_SQL ? "baseline" : "final"));
+}  // namespace
 
 record::record()
   : doc_(duckdb_yyjson::yyjson_mut_doc_new(nullptr), duckdb_yyjson::yyjson_mut_doc_free)
@@ -62,6 +72,19 @@ void record::set(std::string_view key, std::string_view value)
 void record::set(std::string_view key, bool value)
 {
   put(key, duckdb_yyjson::yyjson_mut_bool(doc_.get(), value));
+}
+
+void record::array(std::string_view key, std::span<std::string_view const> values)
+{
+  auto* result = duckdb_yyjson::yyjson_mut_arr(doc_.get());
+  if (!result) { throw std::bad_alloc{}; }
+  for (auto value : values) {
+    auto* element = duckdb_yyjson::yyjson_mut_strncpy(doc_.get(), value.data(), value.size());
+    if (!element || !duckdb_yyjson::yyjson_mut_arr_append(result, element)) {
+      throw std::bad_alloc{};
+    }
+  }
+  put(key, result);
 }
 void record::set(std::string_view key, double value)
 {
@@ -106,9 +129,10 @@ std::string read_text(std::string const& path)
 record sample_record(options const& r, std::uint64_t index)
 {
   record result;
+  if (r.mode == "sql") { record_sql_oracle_policy(result); }
   auto const warmup     = index < r.warmups;
   auto const repetition = warmup ? index : index - r.warmups;
-  result.set("schema_version", 1);
+  result.set("schema_version", 2);
   result.set("run_id", r.run_id);
   result.set("sample_id",
              r.sample_id + (warmup ? ":warmup:" : ":sample:") + std::to_string(repetition));
@@ -122,7 +146,8 @@ record sample_record(options const& r, std::uint64_t index)
   result.set("repetition", repetition);
   result.array("devices", std::span<int const>{r.devices});
   result.set("root", r.root);
-  result.set("compiled_schedule", op::detail::compiled_publication_schedule());
+  result.set("revision_role", revision_role);
+  result.set("identity_source", "fixture_build_metadata");
   result.set("linkage", "static_sirius_core");
   result.set("profile", r.profile);
   result.set("cap_bytes", r.cap_bytes);
@@ -296,10 +321,19 @@ options parse(int argc, char** argv)
 void identify(options const& request, std::ostream& output)
 {
   record result;
-  result.set("schema_version", 1);
+  result.set("schema_version", 2);
   result.set("mode", "identify");
   result.set("status", "ok");
-  result.set("compiled_schedule", op::detail::compiled_publication_schedule());
+  result.set("revision_role", revision_role);
+  result.set("identity_source", "fixture_build_metadata");
+#if SIRIUS_S4_BASELINE_SQL
+  constexpr std::string_view modes[]{"identify", "sql"};
+#else
+  constexpr std::string_view modes[]{"identify", "transport", "builder", "sql"};
+#endif
+  result.array("supported_modes", std::span<std::string_view const>{modes});
+  result.set("publication_metrics_supported", sql_publication_metrics_supported());
+  record_sql_oracle_policy(result);
   result.set("linkage", "static_sirius_core");
   result.set("executable_path", std::filesystem::read_symlink("/proc/self/exe").string());
   result.set("bloom_block_bytes", op::bloom_bytes_per_block);
@@ -329,7 +363,8 @@ int main(int argc, char** argv)
          "         --transport automatic|force_host|require_direct\n"
          "SQL: --database PATH --prepare-file PATH --query-file PATH --config PATH\n"
          "     --query-id ID --dataset NAME\n"
-         "Output is schema v1 JSONL. identify/--help make no CUDA calls. See "
+         "Baseline overlays support identify/sql only.\n"
+         "Output is schema v2 JSONL. identify/--help make no CUDA calls. See "
          "S4_FIXTURE_NOTES.md.\n";
     return argc < 2 ? 2 : 0;
   }
@@ -340,10 +375,20 @@ int main(int argc, char** argv)
     try {
       if (request.mode == "identify") {
         identify(request, output);
+#if SIRIUS_S4_BASELINE_SQL
+      } else if (request.mode != "sql") {
+        for (std::uint64_t i = 0; i < request.warmups + request.repetitions; ++i) {
+          auto sample = sample_record(request, i);
+          sample.set("status", "unavailable");
+          sample.set("skip_reason", "mode_not_supported_by_baseline_overlay");
+          sample.write(output);
+        }
+#else
       } else if (request.mode == "transport") {
         run_transport(request, output);
       } else if (request.mode == "builder") {
         run_builder(request, output);
+#endif
       } else {
         run_sql(request, output);
       }

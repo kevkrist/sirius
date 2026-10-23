@@ -280,7 +280,6 @@ std::unique_ptr<cudf::table> input_table(options const& r,
 
 void measure(record& sample, op::detail::publication_measurement const& m)
 {
-  sample.set("compiled_schedule", m.schedule);
   sample.set("actual_transport", m.actual_transport);
   if (m.submitted_logical_edge_bytes != 0) {
     bool const host = std::string_view{m.actual_transport} == "host";

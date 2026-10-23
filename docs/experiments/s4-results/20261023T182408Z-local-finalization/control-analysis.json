@@ -1,0 +1,2062 @@
+{
+  "campaigns": [
+    {
+      "all22_regression_guard_pass": false,
+      "baseline_kind": "s4_control",
+      "build_sources": {
+        "baseline": {
+          "baseline_kind": "s4_control",
+          "baseline_production_unchanged": true,
+          "diff": "diff --git a/CMakeLists.txt b/CMakeLists.txt\nindex 70093f9c..ca8b04aa 100644\n--- a/CMakeLists.txt\n+++ b/CMakeLists.txt\n@@ -69,6 +69,6 @@ endif()\n if(SIRIUS_BUILD_TESTS)\n   include(cmake/sirius-test-sources.cmake)\n   include(cmake/sirius-tests.cmake)\n-  include(cmake/sirius-s4-experiments.cmake)\n+  include(cmake/sirius-s4-baseline-fixture.cmake)\n   include(cmake/sirius-tpch-havoc.cmake)\n endif()\ndiff --git a/test/cpp/operator/s4_experiment.cpp b/test/cpp/operator/s4_experiment.cpp\nindex b4e44629..831d4a43 100644\n--- a/test/cpp/operator/s4_experiment.cpp\n+++ b/test/cpp/operator/s4_experiment.cpp\n@@ -15,7 +15,6 @@\n  */\n \n #include \"op/dynamic_filter/bloom_sizing.hpp\"\n-#include \"op/dynamic_filter/detail/accumulated_bloom_builder.hpp\"\n #include \"s4_experiment_common.hpp\"\n \n #include <rmm/aligned.hpp>\n@@ -34,7 +33,18 @@\n #include <stdexcept>\n #include <system_error>\n \n+#ifndef SIRIUS_S4_BASELINE_SQL\n+#define SIRIUS_S4_BASELINE_SQL 0\n+#endif\n+#ifndef SIRIUS_S4_REVISION_ROLE\n+#define SIRIUS_S4_REVISION_ROLE \"final\"\n+#endif\n+\n namespace sirius::test::s4 {\n+namespace {\n+constexpr std::string_view revision_role{SIRIUS_S4_REVISION_ROLE};\n+static_assert(revision_role == (SIRIUS_S4_BASELINE_SQL ? \"baseline\" : \"final\"));\n+}  // namespace\n \n record::record()\n   : doc_(duckdb_yyjson::yyjson_mut_doc_new(nullptr), duckdb_yyjson::yyjson_mut_doc_free)\n@@ -63,6 +73,19 @@ void record::set(std::string_view key, bool value)\n {\n   put(key, duckdb_yyjson::yyjson_mut_bool(doc_.get(), value));\n }\n+\n+void record::array(std::string_view key, std::span<std::string_view const> values)\n+{\n+  auto* result = duckdb_yyjson::yyjson_mut_arr(doc_.get());\n+  if (!result) { throw std::bad_alloc{}; }\n+  for (auto value : values) {\n+    auto* element = duckdb_yyjson::yyjson_mut_strncpy(doc_.get(), value.data(), value.size());\n+    if (!element || !duckdb_yyjson::yyjson_mut_arr_append(result, element)) {\n+      throw std::bad_alloc{};\n+    }\n+  }\n+  put(key, result);\n+}\n void record::set(std::string_view key, double value)\n {\n   put(key, duckdb_yyjson::yyjson_mut_real(doc_.get(), value));\n@@ -108,7 +131,7 @@ record sample_record(options const& r, std::uint64_t index)\n   record result;\n   auto const warmup     = index < r.warmups;\n   auto const repetition = warmup ? index : index - r.warmups;\n-  result.set(\"schema_version\", 1);\n+  result.set(\"schema_version\", 2);\n   result.set(\"run_id\", r.run_id);\n   result.set(\"sample_id\",\n              r.sample_id + (warmup ? \":warmup:\" : \":sample:\") + std::to_string(repetition));\n@@ -122,7 +145,8 @@ record sample_record(options const& r, std::uint64_t index)\n   result.set(\"repetition\", repetition);\n   result.array(\"devices\", std::span<int const>{r.devices});\n   result.set(\"root\", r.root);\n-  result.set(\"compiled_schedule\", op::detail::compiled_publication_schedule());\n+  result.set(\"revision_role\", revision_role);\n+  result.set(\"identity_source\", \"fixture_build_metadata\");\n   result.set(\"linkage\", \"static_sirius_core\");\n   result.set(\"profile\", r.profile);\n   result.set(\"cap_bytes\", r.cap_bytes);\n@@ -296,10 +320,18 @@ options parse(int argc, char** argv)\n void identify(options const& request, std::ostream& output)\n {\n   record result;\n-  result.set(\"schema_version\", 1);\n+  result.set(\"schema_version\", 2);\n   result.set(\"mode\", \"identify\");\n   result.set(\"status\", \"ok\");\n-  result.set(\"compiled_schedule\", op::detail::compiled_publication_schedule());\n+  result.set(\"revision_role\", revision_role);\n+  result.set(\"identity_source\", \"fixture_build_metadata\");\n+#if SIRIUS_S4_BASELINE_SQL\n+  constexpr std::string_view modes[]{\"identify\", \"sql\"};\n+#else\n+  constexpr std::string_view modes[]{\"identify\", \"transport\", \"builder\", \"sql\"};\n+#endif\n+  result.array(\"supported_modes\", std::span<std::string_view const>{modes});\n+  result.set(\"publication_metrics_supported\", sql_publication_metrics_supported());\n   result.set(\"linkage\", \"static_sirius_core\");\n   result.set(\"executable_path\", std::filesystem::read_symlink(\"/proc/self/exe\").string());\n   result.set(\"bloom_block_bytes\", op::bloom_bytes_per_block);\n@@ -329,7 +361,8 @@ int main(int argc, char** argv)\n          \"         --transport automatic|force_host|require_direct\\n\"\n          \"SQL: --database PATH --prepare-file PATH --query-file PATH --config PATH\\n\"\n          \"     --query-id ID --dataset NAME\\n\"\n-         \"Output is schema v1 JSONL. identify/--help make no CUDA calls. See \"\n+         \"Baseline overlays support identify/sql only.\\n\"\n+         \"Output is schema v2 JSONL. identify/--help make no CUDA calls. See \"\n          \"S4_FIXTURE_NOTES.md.\\n\";\n     return argc < 2 ? 2 : 0;\n   }\n@@ -340,10 +373,20 @@ int main(int argc, char** argv)\n     try {\n       if (request.mode == \"identify\") {\n         identify(request, output);\n+#if SIRIUS_S4_BASELINE_SQL\n+      } else if (request.mode != \"sql\") {\n+        for (std::uint64_t i = 0; i < request.warmups + request.repetitions; ++i) {\n+          auto sample = sample_record(request, i);\n+          sample.set(\"status\", \"unavailable\");\n+          sample.set(\"skip_reason\", \"mode_not_supported_by_baseline_overlay\");\n+          sample.write(output);\n+        }\n+#else\n       } else if (request.mode == \"transport\") {\n         run_transport(request, output);\n       } else if (request.mode == \"builder\") {\n         run_builder(request, output);\n+#endif\n       } else {\n         run_sql(request, output);\n       }\ndiff --git a/test/cpp/operator/s4_experiment_common.hpp b/test/cpp/operator/s4_experiment_common.hpp\nindex 62e2330f..3120bc0e 100644\n--- a/test/cpp/operator/s4_experiment_common.hpp\n+++ b/test/cpp/operator/s4_experiment_common.hpp\n@@ -85,6 +85,7 @@ class record {\n   void set(std::string_view key, bool value);\n   void set(std::string_view key, double value);\n   void null(std::string_view key);\n+  void array(std::string_view key, std::span<std::string_view const> values);\n \n   template <std::integral T>\n   void set(std::string_view key, T value)\n@@ -133,5 +134,6 @@ void skipped(record& sample, std::string_view reason);\n void run_transport(options const& request, std::ostream& output);\n void run_builder(options const& request, std::ostream& output);\n void run_sql(options const& request, std::ostream& output);\n+[[nodiscard]] bool sql_publication_metrics_supported() noexcept;\n \n }  // namespace sirius::test::s4\ndiff --git a/test/cpp/operator/s4_experiment_sql.cpp b/test/cpp/operator/s4_experiment_sql.cpp\nindex 03ec2e1e..55992f0a 100644\n--- a/test/cpp/operator/s4_experiment_sql.cpp\n+++ b/test/cpp/operator/s4_experiment_sql.cpp\n@@ -86,11 +86,24 @@ std::uint64_t delta(std::uint64_t before, std::uint64_t after)\n   return after - before;\n }\n \n-void filter_counters(record& sample,\n-                     op::dynamic_filter_stats_snapshot const& before,\n-                     op::dynamic_filter_stats_snapshot const& after)\n+template <typename Counters>\n+constexpr bool has_publication_metrics = requires(Counters value) {\n+  value.accumulations_skipped_cap;\n+  value.accumulations_skipped_resource;\n+  value.accumulation_input_bitmap_bytes;\n+  value.accumulation_ready_replica_bytes;\n+  value.accumulation_published_bitmap_bytes;\n+  value.accumulation_admitted_keys;\n+  value.accumulation_contributing_gpus;\n+  value.accumulation_prepare_to_completion_ns;\n+  value.accumulation_direct_publications;\n+  value.accumulation_host_publications;\n+};\n+\n+template <typename Counters>\n+void filter_counters(record& sample, Counters const& before, Counters const& after)\n {\n-  using counters = op::dynamic_filter_stats_snapshot;\n+  using counters = Counters;\n   struct field {\n     char const* name;\n     std::uint64_t counters::* value;\n@@ -101,8 +114,6 @@ void filter_counters(record& sample,\n     {\"accumulation_completed_contributions\", &counters::accumulation_completed_contributions},\n     {\"accumulations_skipped_inventory\", &counters::accumulations_skipped_inventory},\n     {\"accumulations_skipped_admission\", &counters::accumulations_skipped_admission},\n-    {\"accumulations_skipped_cap\", &counters::accumulations_skipped_cap},\n-    {\"accumulations_skipped_resource\", &counters::accumulations_skipped_resource},\n     {\"accumulations_skipped_error\", &counters::accumulations_skipped_error},\n     {\"accumulations_skipped_transient\", &counters::accumulations_skipped_transient},\n     {\"accumulations_incomplete\", &counters::accumulations_incomplete},\n@@ -110,14 +121,6 @@ void filter_counters(record& sample,\n     {\"accumulation_storage_leaks\", &counters::accumulation_storage_leaks},\n     {\"accumulation_publications_finished\", &counters::accumulation_publications_finished},\n     {\"accumulation_publication_latency_ns\", &counters::accumulation_publication_latency_ns},\n-    {\"accumulation_input_bitmap_bytes\", &counters::accumulation_input_bitmap_bytes},\n-    {\"accumulation_ready_replica_bytes\", &counters::accumulation_ready_replica_bytes},\n-    {\"accumulation_published_bitmap_bytes\", &counters::accumulation_published_bitmap_bytes},\n-    {\"accumulation_admitted_keys\", &counters::accumulation_admitted_keys},\n-    {\"accumulation_contributing_gpus\", &counters::accumulation_contributing_gpus},\n-    {\"accumulation_prepare_to_completion_ns\", &counters::accumulation_prepare_to_completion_ns},\n-    {\"accumulation_direct_publications\", &counters::accumulation_direct_publications},\n-    {\"accumulation_host_publications\", &counters::accumulation_host_publications},\n     {\"keys_skipped_bloom_size_gate\", &counters::keys_skipped_bloom_size_gate},\n     {\"keys_skipped_domain_gate\", &counters::keys_skipped_domain_gate},\n     {\"keys_skipped_type_mismatch\", &counters::keys_skipped_type_mismatch},\n@@ -127,45 +130,89 @@ void filter_counters(record& sample,\n   for (auto const& field : fields) {\n     sample.set(field.name, delta(before.*field.value, after.*field.value));\n   }\n-  sample.set(\"input_bitmap_bytes\",\n-             delta(before.accumulation_input_bitmap_bytes, after.accumulation_input_bitmap_bytes));\n-  sample.set(\n-    \"ready_replica_bytes\",\n-    delta(before.accumulation_ready_replica_bytes, after.accumulation_ready_replica_bytes));\n-  sample.set(\n-    \"published_bitmap_bytes\",\n-    delta(before.accumulation_published_bitmap_bytes, after.accumulation_published_bitmap_bytes));\n-  auto const direct =\n-    delta(before.accumulation_direct_publications, after.accumulation_direct_publications);\n-  auto const host =\n-    delta(before.accumulation_host_publications, after.accumulation_host_publications);\n-  sample.set(\"actual_transport\", direct ? (host ? \"mixed\" : \"direct\") : (host ? \"host\" : \"none\"));\n   auto const publications =\n     delta(before.accumulation_publications_finished, after.accumulation_publications_finished);\n   sample.set(\"publication_count\", publications);\n-  sample.set(\"publication_measured\", publications != 0);\n+  sample.set(\"publication_metrics_supported\", has_publication_metrics<counters>);\n+  sample.set(\"publication_measured\", has_publication_metrics<counters> && publications != 0);\n+  auto const* reason =\n+    after.keys_skipped_domain_gate > before.keys_skipped_domain_gate ? \"domain_policy\"\n+    : after.accumulations_skipped_inventory > before.accumulations_skipped_inventory\n+      ? \"inventory_refused\"\n+    : after.accumulations_skipped_admission > before.accumulations_skipped_admission\n+      ? \"admission_refused\"\n+      : \"no_accumulated_publication\";\n+  if constexpr (has_publication_metrics<counters>) {\n+    constexpr field publication_fields[]{\n+      {\"accumulations_skipped_cap\", &counters::accumulations_skipped_cap},\n+      {\"accumulations_skipped_resource\", &counters::accumulations_skipped_resource},\n+      {\"accumulation_input_bitmap_bytes\", &counters::accumulation_input_bitmap_bytes},\n+      {\"accumulation_ready_replica_bytes\", &counters::accumulation_ready_replica_bytes},\n+      {\"accumulation_published_bitmap_bytes\", &counters::accumulation_published_bitmap_bytes},\n+      {\"accumulation_admitted_keys\", &counters::accumulation_admitted_keys},\n+      {\"accumulation_contributing_gpus\", &counters::accumulation_contributing_gpus},\n+      {\"accumulation_prepare_to_completion_ns\", &counters::accumulation_prepare_to_completion_ns},\n+      {\"accumulation_direct_publications\", &counters::accumulation_direct_publications},\n+      {\"accumulation_host_publications\", &counters::accumulation_host_publications}};\n+    for (auto const& field : publication_fields) {\n+      sample.set(field.name, delta(before.*field.value, after.*field.value));\n+    }\n+    sample.set(\n+      \"input_bitmap_bytes\",\n+      delta(before.accumulation_input_bitmap_bytes, after.accumulation_input_bitmap_bytes));\n+    sample.set(\n+      \"ready_replica_bytes\",\n+      delta(before.accumulation_ready_replica_bytes, after.accumulation_ready_replica_bytes));\n+    sample.set(\n+      \"published_bitmap_bytes\",\n+      delta(before.accumulation_published_bitmap_bytes, after.accumulation_published_bitmap_bytes));\n+    auto const direct =\n+      delta(before.accumulation_direct_publications, after.accumulation_direct_publications);\n+    auto const host =\n+      delta(before.accumulation_host_publications, after.accumulation_host_publications);\n+    sample.set(\"actual_transport\", direct ? (host ? \"mixed\" : \"direct\") : (host ? \"host\" : \"none\"));\n+    sample.set(\"publication_timing_scope\", \"sum_all_finish_attempts\");\n+    sample.null(\"publication_metrics_unavailable_reason\");\n+    if (publications) {\n+      sample.set(\"host_elapsed_ns\",\n+                 delta(before.accumulation_prepare_to_completion_ns,\n+                       after.accumulation_prepare_to_completion_ns));\n+    }\n+    if (after.accumulations_skipped_cap > before.accumulations_skipped_cap) {\n+      reason = \"cap_refused\";\n+    } else if (after.accumulations_skipped_resource > before.accumulations_skipped_resource) {\n+      reason = \"resource_refused\";\n+    }\n+  } else {\n+    for (auto const* name : {\"accumulations_skipped_cap\",\n+                             \"accumulations_skipped_resource\",\n+                             \"accumulation_input_bitmap_bytes\",\n+                             \"accumulation_ready_replica_bytes\",\n+                             \"accumulation_published_bitmap_bytes\",\n+                             \"accumulation_admitted_keys\",\n+                             \"accumulation_contributing_gpus\",\n+                             \"accumulation_prepare_to_completion_ns\",\n+                             \"accumulation_direct_publications\",\n+                             \"accumulation_host_publications\",\n+                             \"publication_timing_scope\"}) {\n+      sample.null(name);\n+    }\n+    sample.set(\"publication_metrics_unavailable_reason\", \"not_in_production_revision\");\n+  }\n   if (publications) {\n-    sample.set(\"host_elapsed_ns\",\n-               delta(before.accumulation_prepare_to_completion_ns,\n-                     after.accumulation_prepare_to_completion_ns));\n     sample.null(\"publication_skip_reason\");\n   } else {\n-    auto const* reason =\n-      after.accumulations_skipped_cap > before.accumulations_skipped_cap ? \"cap_refused\"\n-      : after.accumulations_skipped_resource > before.accumulations_skipped_resource\n-        ? \"resource_refused\"\n-      : after.keys_skipped_domain_gate > before.keys_skipped_domain_gate ? \"domain_policy\"\n-      : after.accumulations_skipped_inventory > before.accumulations_skipped_inventory\n-        ? \"inventory_refused\"\n-      : after.accumulations_skipped_admission > before.accumulations_skipped_admission\n-        ? \"admission_refused\"\n-        : \"no_accumulated_publication\";\n     sample.set(\"publication_skip_reason\", reason);\n   }\n }\n \n }  // namespace\n \n+bool sql_publication_metrics_supported() noexcept\n+{\n+  return has_publication_metrics<op::dynamic_filter_stats_snapshot>;\n+}\n+\n void run_sql(options const& r, std::ostream& output)\n {\n   if (r.query_file.empty()) { throw std::invalid_argument(\"sql requires --query-file\"); }\n@@ -277,7 +324,6 @@ void run_sql(options const& r, std::ostream& output)\n       execution_after.lease_held_at_replay == execution_before.lease_held_at_replay;\n     sample.set(\"query_elapsed_ns\", query_ns);\n     sample.set(\"timing_scope\", \"normal_sql_query\");\n-    sample.set(\"publication_timing_scope\", \"sum_all_finish_attempts\");\n     sample.set(\"result_rows\", values.size());\n     sample.set(\"result_digest\", digest(values));\n     sample.set(\"gpu_intercepted\", intercepted);",
+          "fixture_overlay_sha256": {
+            "cmake/sirius-s4-baseline-fixture.cmake": "bdae0ae992d10f3a5c94cd08598040ea6675734b089f3b7d2746069eff929315",
+            "test/cpp/operator/s4_experiment.cpp": "0d83ab0f78af3fc6a09b5004ef1648fb42871c4e4a0252be4a2aab393b019b5a",
+            "test/cpp/operator/s4_experiment_common.hpp": "e4a67ffa27d82ab74ed0ecf79a0edd71aad04f01bb215b08674027e61151029e",
+            "test/cpp/operator/s4_experiment_sql.cpp": "8acc13634eaf6db9a2a7ecdf38cea708ac6f6d377a555ccbb244c9880187413b"
+          },
+          "fixture_sources_sha256": {
+            "test/cpp/operator/s4_experiment.cpp": "0d83ab0f78af3fc6a09b5004ef1648fb42871c4e4a0252be4a2aab393b019b5a",
+            "test/cpp/operator/s4_experiment_common.hpp": "e4a67ffa27d82ab74ed0ecf79a0edd71aad04f01bb215b08674027e61151029e",
+            "test/cpp/operator/s4_experiment_sql.cpp": "8acc13634eaf6db9a2a7ecdf38cea708ac6f6d377a555ccbb244c9880187413b"
+          },
+          "head": "9b2e8201787f381b62715c01405f659b925c49a7",
+          "submodules": [
+            {
+              "initialized": true,
+              "path": ".claude/claude-tools",
+              "revision": "bcfccda6e35b50f356df99c2baae16204901ede3"
+            },
+            {
+              "initialized": true,
+              "path": "cucascade",
+              "revision": "1a9281093a0fe49634594d541d7ce327129f53d6"
+            },
+            {
+              "initialized": true,
+              "path": "duckdb",
+              "revision": "88ecd0a49d7d3d838e002b2fbc0ce91ccf74110e"
+            },
+            {
+              "initialized": false,
+              "path": "experimental/doris/doris",
+              "revision": "ad35a140c7fd0b842f18c23300bac581f7d04326"
+            },
+            {
+              "initialized": false,
+              "path": "experimental/starrocks/brpc",
+              "revision": "7daed0be6bf1f4d64b25554c72de7d9319a35dd7"
+            },
+            {
+              "initialized": false,
+              "path": "experimental/starrocks/starrocks",
+              "revision": "8a8e18642450fba09149c8a3f149abefa043c2b7"
+            },
+            {
+              "initialized": true,
+              "path": "sirius-duckdb/duckdb",
+              "revision": "88ecd0a49d7d3d838e002b2fbc0ce91ccf74110e"
+            },
+            {
+              "initialized": true,
+              "path": "sirius-duckdb/extension-ci-tools",
+              "revision": "55e9f697b4fb70f357cc1bd4d1893cbf217ee359"
+            },
+            {
+              "initialized": true,
+              "path": "sirius-duckdb/vcpkg",
+              "revision": "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3"
+            },
+            {
+              "initialized": true,
+              "path": "substrait",
+              "revision": "922489d3c8c77140b189ad3847554de141378b04"
+            },
+            {
+              "initialized": true,
+              "path": "substrait/duckdb",
+              "revision": "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa"
+            },
+            {
+              "initialized": true,
+              "path": "substrait/extension-ci-tools",
+              "revision": "72e76e99cd7fee45a99739cd118ec2db64e034ec"
+            },
+            {
+              "initialized": true,
+              "path": "substrait/substrait",
+              "revision": "29844f1b58a666f36493c27def553854e81328a7"
+            }
+          ],
+          "tree": "df9ad08eac3c88a170996fe097745a9bfb4d5fde",
+          "untracked_sha256": {
+            "cmake/sirius-s4-baseline-fixture.cmake": "bdae0ae992d10f3a5c94cd08598040ea6675734b089f3b7d2746069eff929315"
+          }
+        },
+        "final": {
+          "baseline_kind": null,
+          "baseline_production_unchanged": false,
+          "diff": "diff --git a/cmake/sirius-s4-experiments.cmake b/cmake/sirius-s4-experiments.cmake\nindex 7251c329..f163921c 100644\n--- a/cmake/sirius-s4-experiments.cmake\n+++ b/cmake/sirius-s4-experiments.cmake\n@@ -8,7 +8,8 @@ target_include_directories(\n   PRIVATE $<TARGET_PROPERTY:sirius_unittest,INCLUDE_DIRECTORIES>)\n target_compile_definitions(\n   sirius_s4_experiment\n-  PRIVATE $<TARGET_PROPERTY:sirius_unittest,COMPILE_DEFINITIONS>)\n+  PRIVATE $<TARGET_PROPERTY:sirius_unittest,COMPILE_DEFINITIONS>\n+          SIRIUS_S4_REVISION_ROLE=\"final\")\n target_link_libraries(\n   sirius_s4_experiment PRIVATE sirius_core duckdb_static ZLIB::ZLIB\n                                ${SIRIUS_CURL_TARGET} ${CMAKE_DL_LIBS})\ndiff --git a/src/cuda/CMakeLists.txt b/src/cuda/CMakeLists.txt\nindex 0775a3ce..d938bc01 100644\n--- a/src/cuda/CMakeLists.txt\n+++ b/src/cuda/CMakeLists.txt\n@@ -1,20 +1,3 @@\n-set(SIRIUS_S4_PUBLICATION_SCHEDULE\n-    \"current_direct\"\n-    CACHE STRING \"Private S4 experiment: current_direct or concurrent_ingress\")\n-set_property(CACHE SIRIUS_S4_PUBLICATION_SCHEDULE\n-             PROPERTY STRINGS current_direct concurrent_ingress)\n-if(SIRIUS_S4_PUBLICATION_SCHEDULE STREQUAL \"concurrent_ingress\")\n-  set_property(\n-    SOURCE \"${CMAKE_CURRENT_SOURCE_DIR}/sirius_dynamic_bloom_filter.cu\"\n-           TARGET_DIRECTORY sirius_objects\n-    APPEND\n-    PROPERTY COMPILE_DEFINITIONS SIRIUS_S4_CONCURRENT_INGRESS=1)\n-elseif(NOT SIRIUS_S4_PUBLICATION_SCHEDULE STREQUAL \"current_direct\")\n-  message(\n-    FATAL_ERROR\n-      \"Unknown S4 publication schedule: ${SIRIUS_S4_PUBLICATION_SCHEDULE}\")\n-endif()\n-\n target_sources(\n   sirius_objects\n   PRIVATE date_cast.cu\ndiff --git a/src/cuda/sirius_dynamic_bloom_filter.cu b/src/cuda/sirius_dynamic_bloom_filter.cu\nindex 6be839d3..032042ff 100644\n--- a/src/cuda/sirius_dynamic_bloom_filter.cu\n+++ b/src/cuda/sirius_dynamic_bloom_filter.cu\n@@ -567,17 +567,6 @@ bool sirius_dynamic_bloom_filter::prepare_fused_probe(cudf::column_view const& p\n \n namespace detail {\n \n-#if defined(SIRIUS_S4_CONCURRENT_INGRESS) && SIRIUS_S4_CONCURRENT_INGRESS\n-inline constexpr bool concurrent_ingress = true;\n-#else\n-inline constexpr bool concurrent_ingress = false;\n-#endif\n-\n-char const* compiled_publication_schedule() noexcept\n-{\n-  return concurrent_ingress ? \"concurrent_ingress\" : \"current_direct\";\n-}\n-\n //===----------------------------------------------------------------------===//\n // accumulated_bloom_builder::impl\n //===----------------------------------------------------------------------===//\n@@ -657,14 +646,14 @@ struct accumulated_bloom_builder::impl {\n  *\n  * Sources are the non-root partials with at least one contribution; targets are every non-root\n  * partial. Each chunk is copied from every source into one of two scratch buffers on the\n- * publication stream or exclusive root-device ingress streams, ORed into the root's array on the\n- * root partial's stream (merge), and copied from the root into every target on the target's stream\n- * (egress). Without sources the root's array is already the union and only egress runs.\n+ * publication stream, ORed into the root's array on the root partial's stream (merge), and copied\n+ * from the root into every target on the target's stream (egress). Without sources the root's array\n+ * is already the union and only egress runs.\n  */\n class accumulated_bloom_builder::impl::chunk_pipeline final {\n  public:\n   /**\n-   * @brief Creates the pipeline's events and exclusive root ingress streams; enqueues nothing.\n+   * @brief Creates the pipeline's events; enqueues nothing.\n    *\n    * @param owner The builder state whose arrays are published\n    * @param root The reducing partial; its GPU is the current device\n@@ -694,53 +683,28 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {\n   {\n     _source_ready.reserve(sources.size());\n     _target_done.reserve(targets.size());\n-    _ingress.reserve(concurrent_ingress ? sources.size() : 0);\n-    _copied.reserve(concurrent_ingress ? sources.size() : 0);\n     for (auto* source : sources) {\n       _source_ready.push_back(make_event_on(source->device_id));\n-      if constexpr (concurrent_ingress) {\n-        _ingress.push_back(\n-          std::make_unique<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking));\n-        _copied.push_back({make_event_on(root.device_id), make_event_on(root.device_id)});\n-      }\n     }\n     for (auto* target : targets) {\n       _target_done.push_back(make_event_on(target->device_id));\n     }\n   }\n \n-  /**\n-   * @brief Registers successfully constructed stream owners before their first submission.\n-   *\n-   * @pre `joined` has room for every ingress stream without reallocating\n-   */\n-  void register_ingress_streams(std::vector<::cuda::stream_ref>& joined) const\n-  {\n-    for (auto const& ingress : _ingress) {\n-      joined.emplace_back(ingress->value());\n-    }\n-  }\n-\n   /**\n    * @brief Orders the first reads of every partial after all of its inserts.\n    *\n-   * Every contribution is folded into its partial's stream. Each ingress stream waits for its\n+   * Every contribution is folded into its partial's stream. The publication stream waits for each\n    * source's stream before ingress; without sources, every target waits for the root's stream\n    * before egress. With sources, the merge on the root's stream already follows the root's inserts.\n    */\n   void order_after_inserts()\n   {\n-    check_cuda(cudaEventRecord(_allocation_ready.get(), _stream.get()),\n-               \"cudaEventRecord(scratch allocation ready)\");\n     for (std::size_t index = 0; index < _sources.size(); ++index) {\n       auto const& ready = _source_ready[index];\n       record(ready, *_sources[index]);\n-      auto const ingress = concurrent_ingress ? _ingress[index]->value() : _stream.get();\n-      check_cuda(cudaStreamWaitEvent(ingress, ready.get(), 0), \"cudaStreamWaitEvent(source ready)\");\n-      if constexpr (concurrent_ingress) {\n-        check_cuda(cudaStreamWaitEvent(ingress, _allocation_ready.get(), 0),\n-                   \"cudaStreamWaitEvent(scratch allocation ready)\");\n-      }\n+      check_cuda(cudaStreamWaitEvent(_stream.get(), ready.get(), 0),\n+                 \"cudaStreamWaitEvent(source ready)\");\n     }\n     if (!_sources.empty()) { return; }\n     record(_root_done, _root);\n@@ -810,7 +774,7 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {\n                        std::size_t bytes,\n                        std::size_t buffer)\n   {\n-    if (!concurrent_ingress && _sequence >= 2) {\n+    if (_sequence >= 2) {\n       // The merge of chunk (sequence - 2) read this buffer.\n       check_cuda(cudaStreamWaitEvent(_stream.get(), _merged[buffer].get(), 0),\n                  \"cudaStreamWaitEvent(scratch reuse)\");\n@@ -818,45 +782,27 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {\n     auto* const slots = _scratch + buffer * _slot_bytes;\n     for (std::size_t index = 0; index < _sources.size(); ++index) {\n       auto const* source = _sources[index];\n-      auto const ingress = concurrent_ingress ? _ingress[index]->value() : _stream.get();\n-      if (concurrent_ingress && _sequence >= 2) {\n-        check_cuda(cudaStreamWaitEvent(ingress, _merged[buffer].get(), 0),\n-                   \"cudaStreamWaitEvent(ingress scratch reuse)\");\n-      }\n-      auto const status = cudaMemcpyPeerAsync(\n+      auto const status  = cudaMemcpyPeerAsync(\n         slots + index * _geometry.chunk_bytes,\n         _root.device_id,\n         static_cast<std::byte const*>(source->arrays[key_index]->data()) + offset,\n         source->device_id,\n         bytes,\n-        ingress);\n+        _stream.get());\n       _measurement.submitted_bytes_complete &= status == cudaSuccess;\n       check_cuda(status, \"cudaMemcpyPeerAsync(ingress)\");\n       _measurement.submitted_logical_edge_bytes += bytes;\n-      if constexpr (concurrent_ingress) {\n-        check_cuda(cudaEventRecord(_copied[index][buffer].get(), ingress),\n-                   \"cudaEventRecord(source copied)\");\n-      }\n-    }\n-    if constexpr (!concurrent_ingress) {\n-      check_cuda(cudaEventRecord(_ingress_done[buffer].get(), _stream.get()),\n-                 \"cudaEventRecord(ingress)\");\n     }\n+    check_cuda(cudaEventRecord(_ingress_done[buffer].get(), _stream.get()),\n+               \"cudaEventRecord(ingress)\");\n   }\n \n   void enqueue_merge(std::byte* root_chunk, std::size_t bytes, std::size_t buffer)\n   {\n     constexpr unsigned threads = 256;\n     auto const root_stream     = _root.stream->value();\n-    if constexpr (concurrent_ingress) {\n-      for (auto const& copied : _copied) {\n-        check_cuda(cudaStreamWaitEvent(root_stream, copied[buffer].get(), 0),\n-                   \"cudaStreamWaitEvent(source copied)\");\n-      }\n-    } else {\n-      check_cuda(cudaStreamWaitEvent(root_stream, _ingress_done[buffer].get(), 0),\n-                 \"cudaStreamWaitEvent(ingress)\");\n-    }\n+    check_cuda(cudaStreamWaitEvent(root_stream, _ingress_done[buffer].get(), 0),\n+               \"cudaStreamWaitEvent(ingress)\");\n     auto const words = bytes / sizeof(uint4);\n     auto const blocks =\n       static_cast<unsigned>(std::min<std::size_t>(::cuda::ceil_div(words, threads), 4096));\n@@ -906,12 +852,9 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {\n   std::size_t _slot_bytes;\n   std::array<cuda_event, 2> _ingress_done;  // Per scratch buffer: its ingress landed\n   std::array<cuda_event, 2> _merged;        // Per scratch buffer: its merge finished\n-  cuda_event _allocation_ready;\n   cuda_event _root_done;\n   std::vector<cuda_event> _source_ready;\n   std::vector<cuda_event> _target_done;\n-  std::vector<std::unique_ptr<rmm::cuda_stream>> _ingress;\n-  std::vector<std::array<cuda_event, 2>> _copied;\n   std::size_t _sequence = 0;  // Global chunk index over (key, offset)\n };\n \n@@ -1072,7 +1015,6 @@ accumulated_bloom_builder::finish_for_experiment(rmm::cuda_device_id root_device\n   publication_measurement local;\n   auto& measured                     = measurement ? *measurement : local;\n   measured                           = {};\n-  measured.schedule                  = compiled_publication_schedule();\n   measured.status                    = \"failed\";\n   measured.root_device               = root_device.value();\n   measured.device_count              = _impl->partials.size();\n@@ -1114,7 +1056,7 @@ accumulated_bloom_builder::finish_for_experiment(rmm::cuda_device_id root_device\n   sources.reserve(_impl->partials.size());\n   targets.reserve(_impl->partials.size());\n   spaces.reserve(_impl->partials.size());\n-  joined.reserve(1 + 2 * _impl->partials.size());\n+  joined.reserve(1 + _impl->partials.size());\n   joined.push_back(stream);\n   for (auto const& entry : _impl->partials) {\n     spaces.push_back(entry->space);\n@@ -1205,7 +1147,6 @@ accumulated_bloom_builder::finish_for_experiment(rmm::cuda_device_id root_device\n           stream,\n           scratch ? static_cast<std::byte*>(scratch->data()) : nullptr,\n           measured);\n-        pipeline->register_ingress_streams(joined);\n       }\n       measured.refusal_reason = \"\";\n       prepared                = true;\n@@ -1294,7 +1235,6 @@ accumulated_bloom_builder::finish_for_experiment(rmm::cuda_device_id root_device\n     execute();\n   } catch (...) {\n     try {\n-      // Construct the span after preparation registered every additional ingress stream.\n       join_on_failure(joined, [] { throw; });\n     } catch (unjoined_gpu_work const&) {\n       measured.status = \"unjoined\";\ndiff --git a/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp b/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp\nindex 0cfb4939..013dc51f 100644\n--- a/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp\n+++ b/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp\n@@ -48,11 +48,6 @@ class sirius_dynamic_bloom_filter;\n \n namespace sirius::op::detail {\n \n-/**\n- * @brief The immutable publication schedule compiled into the library.\n- */\n-[[nodiscard]] char const* compiled_publication_schedule() noexcept;\n-\n /**\n  * @brief Diagnostic transport selection; production uses automatic selection.\n  */\n@@ -67,7 +62,6 @@ enum class publication_transport { automatic, force_host, require_direct };\n  * record through return or unwind. Local GPU stage durations are not measured here.\n  */\n struct publication_measurement {\n-  char const* schedule                         = \"\";\n   char const* actual_transport                 = \"none\";\n   char const* status                           = \"not_started\";\n   char const* refusal_reason                   = \"\";\n@@ -293,7 +287,7 @@ class accumulated_bloom_builder final {\n   /**\n    * @brief Runs `finish` with diagnostic transport selection and an optional measurement record.\n    *\n-   * Uses the compiled schedule and the same ownership and ordering contract as `finish`.\n+   * Uses the same ownership and ordering contract as `finish`.\n    * `require_direct` returns no filters with status `unavailable` when pool access cannot be\n    * established; `automatic` instead uses bounded HOST staging. CUDA errors propagate after\n    * accepted work is joined.\ndiff --git a/test/cpp/operator/s4_experiment.cpp b/test/cpp/operator/s4_experiment.cpp\nindex b4e44629..831d4a43 100644\n--- a/test/cpp/operator/s4_experiment.cpp\n+++ b/test/cpp/operator/s4_experiment.cpp\n@@ -15,7 +15,6 @@\n  */\n \n #include \"op/dynamic_filter/bloom_sizing.hpp\"\n-#include \"op/dynamic_filter/detail/accumulated_bloom_builder.hpp\"\n #include \"s4_experiment_common.hpp\"\n \n #include <rmm/aligned.hpp>\n@@ -34,7 +33,18 @@\n #include <stdexcept>\n #include <system_error>\n \n+#ifndef SIRIUS_S4_BASELINE_SQL\n+#define SIRIUS_S4_BASELINE_SQL 0\n+#endif\n+#ifndef SIRIUS_S4_REVISION_ROLE\n+#define SIRIUS_S4_REVISION_ROLE \"final\"\n+#endif\n+\n namespace sirius::test::s4 {\n+namespace {\n+constexpr std::string_view revision_role{SIRIUS_S4_REVISION_ROLE};\n+static_assert(revision_role == (SIRIUS_S4_BASELINE_SQL ? \"baseline\" : \"final\"));\n+}  // namespace\n \n record::record()\n   : doc_(duckdb_yyjson::yyjson_mut_doc_new(nullptr), duckdb_yyjson::yyjson_mut_doc_free)\n@@ -63,6 +73,19 @@ void record::set(std::string_view key, bool value)\n {\n   put(key, duckdb_yyjson::yyjson_mut_bool(doc_.get(), value));\n }\n+\n+void record::array(std::string_view key, std::span<std::string_view const> values)\n+{\n+  auto* result = duckdb_yyjson::yyjson_mut_arr(doc_.get());\n+  if (!result) { throw std::bad_alloc{}; }\n+  for (auto value : values) {\n+    auto* element = duckdb_yyjson::yyjson_mut_strncpy(doc_.get(), value.data(), value.size());\n+    if (!element || !duckdb_yyjson::yyjson_mut_arr_append(result, element)) {\n+      throw std::bad_alloc{};\n+    }\n+  }\n+  put(key, result);\n+}\n void record::set(std::string_view key, double value)\n {\n   put(key, duckdb_yyjson::yyjson_mut_real(doc_.get(), value));\n@@ -108,7 +131,7 @@ record sample_record(options const& r, std::uint64_t index)\n   record result;\n   auto const warmup     = index < r.warmups;\n   auto const repetition = warmup ? index : index - r.warmups;\n-  result.set(\"schema_version\", 1);\n+  result.set(\"schema_version\", 2);\n   result.set(\"run_id\", r.run_id);\n   result.set(\"sample_id\",\n              r.sample_id + (warmup ? \":warmup:\" : \":sample:\") + std::to_string(repetition));\n@@ -122,7 +145,8 @@ record sample_record(options const& r, std::uint64_t index)\n   result.set(\"repetition\", repetition);\n   result.array(\"devices\", std::span<int const>{r.devices});\n   result.set(\"root\", r.root);\n-  result.set(\"compiled_schedule\", op::detail::compiled_publication_schedule());\n+  result.set(\"revision_role\", revision_role);\n+  result.set(\"identity_source\", \"fixture_build_metadata\");\n   result.set(\"linkage\", \"static_sirius_core\");\n   result.set(\"profile\", r.profile);\n   result.set(\"cap_bytes\", r.cap_bytes);\n@@ -296,10 +320,18 @@ options parse(int argc, char** argv)\n void identify(options const& request, std::ostream& output)\n {\n   record result;\n-  result.set(\"schema_version\", 1);\n+  result.set(\"schema_version\", 2);\n   result.set(\"mode\", \"identify\");\n   result.set(\"status\", \"ok\");\n-  result.set(\"compiled_schedule\", op::detail::compiled_publication_schedule());\n+  result.set(\"revision_role\", revision_role);\n+  result.set(\"identity_source\", \"fixture_build_metadata\");\n+#if SIRIUS_S4_BASELINE_SQL\n+  constexpr std::string_view modes[]{\"identify\", \"sql\"};\n+#else\n+  constexpr std::string_view modes[]{\"identify\", \"transport\", \"builder\", \"sql\"};\n+#endif\n+  result.array(\"supported_modes\", std::span<std::string_view const>{modes});\n+  result.set(\"publication_metrics_supported\", sql_publication_metrics_supported());\n   result.set(\"linkage\", \"static_sirius_core\");\n   result.set(\"executable_path\", std::filesystem::read_symlink(\"/proc/self/exe\").string());\n   result.set(\"bloom_block_bytes\", op::bloom_bytes_per_block);\n@@ -329,7 +361,8 @@ int main(int argc, char** argv)\n          \"         --transport automatic|force_host|require_direct\\n\"\n          \"SQL: --database PATH --prepare-file PATH --query-file PATH --config PATH\\n\"\n          \"     --query-id ID --dataset NAME\\n\"\n-         \"Output is schema v1 JSONL. identify/--help make no CUDA calls. See \"\n+         \"Baseline overlays support identify/sql only.\\n\"\n+         \"Output is schema v2 JSONL. identify/--help make no CUDA calls. See \"\n          \"S4_FIXTURE_NOTES.md.\\n\";\n     return argc < 2 ? 2 : 0;\n   }\n@@ -340,10 +373,20 @@ int main(int argc, char** argv)\n     try {\n       if (request.mode == \"identify\") {\n         identify(request, output);\n+#if SIRIUS_S4_BASELINE_SQL\n+      } else if (request.mode != \"sql\") {\n+        for (std::uint64_t i = 0; i < request.warmups + request.repetitions; ++i) {\n+          auto sample = sample_record(request, i);\n+          sample.set(\"status\", \"unavailable\");\n+          sample.set(\"skip_reason\", \"mode_not_supported_by_baseline_overlay\");\n+          sample.write(output);\n+        }\n+#else\n       } else if (request.mode == \"transport\") {\n         run_transport(request, output);\n       } else if (request.mode == \"builder\") {\n         run_builder(request, output);\n+#endif\n       } else {\n         run_sql(request, output);\n       }\ndiff --git a/test/cpp/operator/s4_experiment_common.hpp b/test/cpp/operator/s4_experiment_common.hpp\nindex 62e2330f..3120bc0e 100644\n--- a/test/cpp/operator/s4_experiment_common.hpp\n+++ b/test/cpp/operator/s4_experiment_common.hpp\n@@ -85,6 +85,7 @@ class record {\n   void set(std::string_view key, bool value);\n   void set(std::string_view key, double value);\n   void null(std::string_view key);\n+  void array(std::string_view key, std::span<std::string_view const> values);\n \n   template <std::integral T>\n   void set(std::string_view key, T value)\n@@ -133,5 +134,6 @@ void skipped(record& sample, std::string_view reason);\n void run_transport(options const& request, std::ostream& output);\n void run_builder(options const& request, std::ostream& output);\n void run_sql(options const& request, std::ostream& output);\n+[[nodiscard]] bool sql_publication_metrics_supported() noexcept;\n \n }  // namespace sirius::test::s4\ndiff --git a/test/cpp/operator/s4_experiment_gpu.cpp b/test/cpp/operator/s4_experiment_gpu.cpp\nindex da180d46..a4342cc5 100644\n--- a/test/cpp/operator/s4_experiment_gpu.cpp\n+++ b/test/cpp/operator/s4_experiment_gpu.cpp\n@@ -280,7 +280,6 @@ std::unique_ptr<cudf::table> input_table(options const& r,\n \n void measure(record& sample, op::detail::publication_measurement const& m)\n {\n-  sample.set(\"compiled_schedule\", m.schedule);\n   sample.set(\"actual_transport\", m.actual_transport);\n   if (m.submitted_logical_edge_bytes != 0) {\n     bool const host = std::string_view{m.actual_transport} == \"host\";\ndiff --git a/test/cpp/operator/s4_experiment_sql.cpp b/test/cpp/operator/s4_experiment_sql.cpp\nindex 03ec2e1e..55992f0a 100644\n--- a/test/cpp/operator/s4_experiment_sql.cpp\n+++ b/test/cpp/operator/s4_experiment_sql.cpp\n@@ -86,11 +86,24 @@ std::uint64_t delta(std::uint64_t before, std::uint64_t after)\n   return after - before;\n }\n \n-void filter_counters(record& sample,\n-                     op::dynamic_filter_stats_snapshot const& before,\n-                     op::dynamic_filter_stats_snapshot const& after)\n+template <typename Counters>\n+constexpr bool has_publication_metrics = requires(Counters value) {\n+  value.accumulations_skipped_cap;\n+  value.accumulations_skipped_resource;\n+  value.accumulation_input_bitmap_bytes;\n+  value.accumulation_ready_replica_bytes;\n+  value.accumulation_published_bitmap_bytes;\n+  value.accumulation_admitted_keys;\n+  value.accumulation_contributing_gpus;\n+  value.accumulation_prepare_to_completion_ns;\n+  value.accumulation_direct_publications;\n+  value.accumulation_host_publications;\n+};\n+\n+template <typename Counters>\n+void filter_counters(record& sample, Counters const& before, Counters const& after)\n {\n-  using counters = op::dynamic_filter_stats_snapshot;\n+  using counters = Counters;\n   struct field {\n     char const* name;\n     std::uint64_t counters::* value;\n@@ -101,8 +114,6 @@ void filter_counters(record& sample,\n     {\"accumulation_completed_contributions\", &counters::accumulation_completed_contributions},\n     {\"accumulations_skipped_inventory\", &counters::accumulations_skipped_inventory},\n     {\"accumulations_skipped_admission\", &counters::accumulations_skipped_admission},\n-    {\"accumulations_skipped_cap\", &counters::accumulations_skipped_cap},\n-    {\"accumulations_skipped_resource\", &counters::accumulations_skipped_resource},\n     {\"accumulations_skipped_error\", &counters::accumulations_skipped_error},\n     {\"accumulations_skipped_transient\", &counters::accumulations_skipped_transient},\n     {\"accumulations_incomplete\", &counters::accumulations_incomplete},\n@@ -110,14 +121,6 @@ void filter_counters(record& sample,\n     {\"accumulation_storage_leaks\", &counters::accumulation_storage_leaks},\n     {\"accumulation_publications_finished\", &counters::accumulation_publications_finished},\n     {\"accumulation_publication_latency_ns\", &counters::accumulation_publication_latency_ns},\n-    {\"accumulation_input_bitmap_bytes\", &counters::accumulation_input_bitmap_bytes},\n-    {\"accumulation_ready_replica_bytes\", &counters::accumulation_ready_replica_bytes},\n-    {\"accumulation_published_bitmap_bytes\", &counters::accumulation_published_bitmap_bytes},\n-    {\"accumulation_admitted_keys\", &counters::accumulation_admitted_keys},\n-    {\"accumulation_contributing_gpus\", &counters::accumulation_contributing_gpus},\n-    {\"accumulation_prepare_to_completion_ns\", &counters::accumulation_prepare_to_completion_ns},\n-    {\"accumulation_direct_publications\", &counters::accumulation_direct_publications},\n-    {\"accumulation_host_publications\", &counters::accumulation_host_publications},\n     {\"keys_skipped_bloom_size_gate\", &counters::keys_skipped_bloom_size_gate},\n     {\"keys_skipped_domain_gate\", &counters::keys_skipped_domain_gate},\n     {\"keys_skipped_type_mismatch\", &counters::keys_skipped_type_mismatch},\n@@ -127,45 +130,89 @@ void filter_counters(record& sample,\n   for (auto const& field : fields) {\n     sample.set(field.name, delta(before.*field.value, after.*field.value));\n   }\n-  sample.set(\"input_bitmap_bytes\",\n-             delta(before.accumulation_input_bitmap_bytes, after.accumulation_input_bitmap_bytes));\n-  sample.set(\n-    \"ready_replica_bytes\",\n-    delta(before.accumulation_ready_replica_bytes, after.accumulation_ready_replica_bytes));\n-  sample.set(\n-    \"published_bitmap_bytes\",\n-    delta(before.accumulation_published_bitmap_bytes, after.accumulation_published_bitmap_bytes));\n-  auto const direct =\n-    delta(before.accumulation_direct_publications, after.accumulation_direct_publications);\n-  auto const host =\n-    delta(before.accumulation_host_publications, after.accumulation_host_publications);\n-  sample.set(\"actual_transport\", direct ? (host ? \"mixed\" : \"direct\") : (host ? \"host\" : \"none\"));\n   auto const publications =\n     delta(before.accumulation_publications_finished, after.accumulation_publications_finished);\n   sample.set(\"publication_count\", publications);\n-  sample.set(\"publication_measured\", publications != 0);\n+  sample.set(\"publication_metrics_supported\", has_publication_metrics<counters>);\n+  sample.set(\"publication_measured\", has_publication_metrics<counters> && publications != 0);\n+  auto const* reason =\n+    after.keys_skipped_domain_gate > before.keys_skipped_domain_gate ? \"domain_policy\"\n+    : after.accumulations_skipped_inventory > before.accumulations_skipped_inventory\n+      ? \"inventory_refused\"\n+    : after.accumulations_skipped_admission > before.accumulations_skipped_admission\n+      ? \"admission_refused\"\n+      : \"no_accumulated_publication\";\n+  if constexpr (has_publication_metrics<counters>) {\n+    constexpr field publication_fields[]{\n+      {\"accumulations_skipped_cap\", &counters::accumulations_skipped_cap},\n+      {\"accumulations_skipped_resource\", &counters::accumulations_skipped_resource},\n+      {\"accumulation_input_bitmap_bytes\", &counters::accumulation_input_bitmap_bytes},\n+      {\"accumulation_ready_replica_bytes\", &counters::accumulation_ready_replica_bytes},\n+      {\"accumulation_published_bitmap_bytes\", &counters::accumulation_published_bitmap_bytes},\n+      {\"accumulation_admitted_keys\", &counters::accumulation_admitted_keys},\n+      {\"accumulation_contributing_gpus\", &counters::accumulation_contributing_gpus},\n+      {\"accumulation_prepare_to_completion_ns\", &counters::accumulation_prepare_to_completion_ns},\n+      {\"accumulation_direct_publications\", &counters::accumulation_direct_publications},\n+      {\"accumulation_host_publications\", &counters::accumulation_host_publications}};\n+    for (auto const& field : publication_fields) {\n+      sample.set(field.name, delta(before.*field.value, after.*field.value));\n+    }\n+    sample.set(\n+      \"input_bitmap_bytes\",\n+      delta(before.accumulation_input_bitmap_bytes, after.accumulation_input_bitmap_bytes));\n+    sample.set(\n+      \"ready_replica_bytes\",\n+      delta(before.accumulation_ready_replica_bytes, after.accumulation_ready_replica_bytes));\n+    sample.set(\n+      \"published_bitmap_bytes\",\n+      delta(before.accumulation_published_bitmap_bytes, after.accumulation_published_bitmap_bytes));\n+    auto const direct =\n+      delta(before.accumulation_direct_publications, after.accumulation_direct_publications);\n+    auto const host =\n+      delta(before.accumulation_host_publications, after.accumulation_host_publications);\n+    sample.set(\"actual_transport\", direct ? (host ? \"mixed\" : \"direct\") : (host ? \"host\" : \"none\"));\n+    sample.set(\"publication_timing_scope\", \"sum_all_finish_attempts\");\n+    sample.null(\"publication_metrics_unavailable_reason\");\n+    if (publications) {\n+      sample.set(\"host_elapsed_ns\",\n+                 delta(before.accumulation_prepare_to_completion_ns,\n+                       after.accumulation_prepare_to_completion_ns));\n+    }\n+    if (after.accumulations_skipped_cap > before.accumulations_skipped_cap) {\n+      reason = \"cap_refused\";\n+    } else if (after.accumulations_skipped_resource > before.accumulations_skipped_resource) {\n+      reason = \"resource_refused\";\n+    }\n+  } else {\n+    for (auto const* name : {\"accumulations_skipped_cap\",\n+                             \"accumulations_skipped_resource\",\n+                             \"accumulation_input_bitmap_bytes\",\n+                             \"accumulation_ready_replica_bytes\",\n+                             \"accumulation_published_bitmap_bytes\",\n+                             \"accumulation_admitted_keys\",\n+                             \"accumulation_contributing_gpus\",\n+                             \"accumulation_prepare_to_completion_ns\",\n+                             \"accumulation_direct_publications\",\n+                             \"accumulation_host_publications\",\n+                             \"publication_timing_scope\"}) {\n+      sample.null(name);\n+    }\n+    sample.set(\"publication_metrics_unavailable_reason\", \"not_in_production_revision\");\n+  }\n   if (publications) {\n-    sample.set(\"host_elapsed_ns\",\n-               delta(before.accumulation_prepare_to_completion_ns,\n-                     after.accumulation_prepare_to_completion_ns));\n     sample.null(\"publication_skip_reason\");\n   } else {\n-    auto const* reason =\n-      after.accumulations_skipped_cap > before.accumulations_skipped_cap ? \"cap_refused\"\n-      : after.accumulations_skipped_resource > before.accumulations_skipped_resource\n-        ? \"resource_refused\"\n-      : after.keys_skipped_domain_gate > before.keys_skipped_domain_gate ? \"domain_policy\"\n-      : after.accumulations_skipped_inventory > before.accumulations_skipped_inventory\n-        ? \"inventory_refused\"\n-      : after.accumulations_skipped_admission > before.accumulations_skipped_admission\n-        ? \"admission_refused\"\n-        : \"no_accumulated_publication\";\n     sample.set(\"publication_skip_reason\", reason);\n   }\n }\n \n }  // namespace\n \n+bool sql_publication_metrics_supported() noexcept\n+{\n+  return has_publication_metrics<op::dynamic_filter_stats_snapshot>;\n+}\n+\n void run_sql(options const& r, std::ostream& output)\n {\n   if (r.query_file.empty()) { throw std::invalid_argument(\"sql requires --query-file\"); }\n@@ -277,7 +324,6 @@ void run_sql(options const& r, std::ostream& output)\n       execution_after.lease_held_at_replay == execution_before.lease_held_at_replay;\n     sample.set(\"query_elapsed_ns\", query_ns);\n     sample.set(\"timing_scope\", \"normal_sql_query\");\n-    sample.set(\"publication_timing_scope\", \"sum_all_finish_attempts\");\n     sample.set(\"result_rows\", values.size());\n     sample.set(\"result_digest\", digest(values));\n     sample.set(\"gpu_intercepted\", intercepted);\ndiff --git a/test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp b/test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp\nindex 46422075..c870b790 100644\n--- a/test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp\n+++ b/test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp\n@@ -109,11 +109,11 @@ TEST_CASE(\"S4 publication faults drain all registered streams and retain the CUD\n   }\n }\n \n-TEST_CASE(\"S4 late preparation event failure never joins a destroyed ingress stream\",\n+TEST_CASE(\"S4 preparation event failure preserves partials and retires scratch\",\n           \"[dynamic_filter][s4_publication_fault][multi_gpu]\")\n {\n   if (!has_two_gpus()) { return; }\n-  auto const skip = GENERATE(std::size_t{0}, std::size_t{7});\n+  auto const skip = GENERATE(std::size_t{0}, std::size_t{6});\n   acc::fixture fixture({.devices = 2});\n   if (!acc::has_pool_access(fixture.spaces)) { return; }\n   auto builder = acc::make_builder(fixture, acc::bloom_geometry(8000));\n@@ -123,7 +123,7 @@ TEST_CASE(\"S4 late preparation event failure never joins a destroyed ingress str\n   auto const expected = acc::partial_union(builder, 2, 2);\n   sirius::op::detail::publication_measurement measured;\n   {\n-    // Seven prior events place the candidate failure after construction of its first ingress owner.\n+    // Six prior events place the late failure at the last target-completion event.\n     fault injection{fault::create_event, skip, cudaErrorInvalidValue};\n     REQUIRE_THROWS_AS(\n       builder.finish_for_experiment(rmm::cuda_device_id{0},\n@@ -150,7 +150,7 @@ TEST_CASE(\"S4 delayed ingress merge and egress preserve every bitmap byte across\n                               failure_point{fault::peer_copy, 1, false},\n                               failure_point{fault::peer_copy, 4, false},\n                               failure_point{fault::peer_copy, 6, false},\n-                              failure_point{fault::record_event, 3, false},\n+                              failure_point{fault::record_event, 2, false},\n                               failure_point{fault::batch_copy, 1, true},\n                               failure_point{fault::batch_copy, 3, true});\n   CAPTURE(point.operation, point.skip, point.staged);",
+          "fixture_overlay_sha256": {},
+          "fixture_sources_sha256": {
+            "test/cpp/operator/s4_experiment.cpp": "0d83ab0f78af3fc6a09b5004ef1648fb42871c4e4a0252be4a2aab393b019b5a",
+            "test/cpp/operator/s4_experiment_common.hpp": "e4a67ffa27d82ab74ed0ecf79a0edd71aad04f01bb215b08674027e61151029e",
+            "test/cpp/operator/s4_experiment_sql.cpp": "8acc13634eaf6db9a2a7ecdf38cea708ac6f6d377a555ccbb244c9880187413b"
+          },
+          "head": "d925db5dcb909411598b57c566fd9888471d151c",
+          "submodules": [
+            {
+              "initialized": true,
+              "path": ".claude/claude-tools",
+              "revision": "bcfccda6e35b50f356df99c2baae16204901ede3"
+            },
+            {
+              "initialized": true,
+              "path": "cucascade",
+              "revision": "1a9281093a0fe49634594d541d7ce327129f53d6"
+            },
+            {
+              "initialized": true,
+              "path": "duckdb",
+              "revision": "88ecd0a49d7d3d838e002b2fbc0ce91ccf74110e"
+            },
+            {
+              "initialized": false,
+              "path": "experimental/doris/doris",
+              "revision": "ad35a140c7fd0b842f18c23300bac581f7d04326"
+            },
+            {
+              "initialized": false,
+              "path": "experimental/starrocks/brpc",
+              "revision": "7daed0be6bf1f4d64b25554c72de7d9319a35dd7"
+            },
+            {
+              "initialized": false,
+              "path": "experimental/starrocks/starrocks",
+              "revision": "8a8e18642450fba09149c8a3f149abefa043c2b7"
+            },
+            {
+              "initialized": true,
+              "path": "sirius-duckdb/duckdb",
+              "revision": "88ecd0a49d7d3d838e002b2fbc0ce91ccf74110e"
+            },
+            {
+              "initialized": true,
+              "path": "sirius-duckdb/extension-ci-tools",
+              "revision": "55e9f697b4fb70f357cc1bd4d1893cbf217ee359"
+            },
+            {
+              "initialized": true,
+              "path": "sirius-duckdb/vcpkg",
+              "revision": "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3"
+            },
+            {
+              "initialized": true,
+              "path": "substrait",
+              "revision": "922489d3c8c77140b189ad3847554de141378b04"
+            },
+            {
+              "initialized": true,
+              "path": "substrait/duckdb",
+              "revision": "d8cdaa33fda8df955cc76ef58a280f68f4cd43fa"
+            },
+            {
+              "initialized": true,
+              "path": "substrait/extension-ci-tools",
+              "revision": "72e76e99cd7fee45a99739cd118ec2db64e034ec"
+            },
+            {
+              "initialized": true,
+              "path": "substrait/substrait",
+              "revision": "29844f1b58a666f36493c27def553854e81328a7"
+            }
+          ],
+          "tree": "323d5b46fc49623f5846c9e98d48c92083342203",
+          "untracked_sha256": {
+            "cmake/sirius-s4-baseline-fixture.cmake": "bdae0ae992d10f3a5c94cd08598040ea6675734b089f3b7d2746069eff929315"
+          }
+        }
+      },
+      "builder": [],
+      "dataset": {
+        "availability": "available",
+        "files": [
+          {
+            "mtime_ns": 1792076232188111053,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/orders/part.0.parquet",
+            "sha256": "e52c690b48ea39e500c3bf2443398c97e03cc6d18a931cb7c3ae79de89a47c1d",
+            "size": 2525756275
+          },
+          {
+            "mtime_ns": 1792076232782115217,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/orders/part.1.parquet",
+            "sha256": "60c17ef1f5aacb7bdd3b3ce517aa5499dcc9df73c4bc4b8845c8af09c37115e2",
+            "size": 2525626871
+          },
+          {
+            "mtime_ns": 1792076232807115392,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/lineitem/part.0.parquet",
+            "sha256": "cd0db11bf44dce98df88e0be030c7ec9823367e54742b21825c87d13b876b3cc",
+            "size": 2864588086
+          },
+          {
+            "mtime_ns": 1792076233378119395,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/lineitem/part.1.parquet",
+            "sha256": "e2e524a8788ff58511258a51efc30d8d83bc619166e37f6775239671c89ccecc",
+            "size": 2864161741
+          },
+          {
+            "mtime_ns": 1792076233213118238,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/lineitem/part.2.parquet",
+            "sha256": "b4ecb8b7b55d46b1936fab147dcdd9f02cb9e4d87928a2f675311cc875ffae2c",
+            "size": 2865268729
+          },
+          {
+            "mtime_ns": 1792076231278104674,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/lineitem/part.3.parquet",
+            "sha256": "1d259add4cfd9afdb608042e33268eefd6762a06fc08f72ec39d5e982eb8655e",
+            "size": 2864315036
+          },
+          {
+            "mtime_ns": 1792076228337084057,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/lineitem/part.4.parquet",
+            "sha256": "7f6b1ab4d50218373d54d361406125be0d0a42f667d9f18f46ab3529c711698f",
+            "size": 2865084199
+          },
+          {
+            "mtime_ns": 1792076233458119956,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/lineitem/part.5.parquet",
+            "sha256": "16a9b6e130451a30eb1712f65388a0473caab2fc9599720f9fd63baf72442ddb",
+            "size": 2864185047
+          },
+          {
+            "mtime_ns": 1792076213953983231,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/supplier/part.0.parquet",
+            "sha256": "b17e69b8272193c233c31cca9cb6c7864082a38e25300e16dc996fd52ec13d6b",
+            "size": 68669903
+          },
+          {
+            "mtime_ns": 1792076214222985117,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/customer/part.0.parquet",
+            "sha256": "a86ecd3ca7951ce25e1bf71c0d24de7f7e76a5191992ab349a8f183fa9dbe8d1",
+            "size": 1076302309
+          },
+          {
+            "mtime_ns": 1792076204593930600,
+            "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100/nation/part.0.parquet",
+            "sha256": "f88e192facfb1f118f1e99b3907ebc2cbb30f5300b85dd79617915d66da09ea5",
+            "size": 2250
+          }
+        ],
+        "identity_method": "sha256",
+        "identity_sha256": "d4dcc5c1e89808ee8b8153017899441f4a9096eeff02b5980d8858e91a66b285",
+        "path": "/home/ubuntu/sirius-s3c-data/tpch_parquet_sf100",
+        "query_availability": {
+          "q21": {
+            "available": true,
+            "reason": null
+          },
+          "q4": {
+            "available": true,
+            "reason": null
+          },
+          "q7": {
+            "available": true,
+            "reason": null
+          }
+        },
+        "reason": null,
+        "row_counts": null,
+        "row_counts_availability": "not_measured_by_orchestrator",
+        "scale": "100",
+        "scale_provenance": "user_declared; not inferred from path"
+      },
+      "decision": "revision validation observations; local two-GPU runs do not establish four-GPU acceptance",
+      "directory": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100",
+      "outcomes": [
+        {
+          "assessment": "exploratory_screen_no_selection",
+          "baseline": {
+            "median_ns": 73743458,
+            "p90_ns": 74247773.2
+          },
+          "candidate": {
+            "median_ns": 73959521,
+            "p90_ns": 75407753.0
+          },
+          "changed_work": [],
+          "comparison": "baseline_final",
+          "complete_comparison": true,
+          "excluded_pairs": {},
+          "metric": "query_elapsed_ns",
+          "statistics": {
+            "cluster_mean_log_ratios": {
+              "0": 0.012638731804734253
+            },
+            "estimator": "equal-weight process-pair mean log ratios; Student-t interval across clusters",
+            "geometric_mean_ratio": 1.0127189381214048,
+            "independent_process_pairs": 1,
+            "measured_pairs": 3,
+            "median_ratio": 1.0029299276960948,
+            "p90_ratio": 1.03454332274213,
+            "paired_ratios": [
+              1.0424466715036387,
+              0.9934416332234614,
+              1.0029299276960948
+            ],
+            "ratio_ci95": null
+          },
+          "work_and_raw_timings": [
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1041062,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 72684592,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00001:sample:0",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1041955,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 75769811,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00000:sample:0",
+              "cluster": 0,
+              "repetition": 0,
+              "seed": 1872481269
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1047643,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 74373852,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00001:sample:1",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1012691,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 73886081,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00000:sample:1",
+              "cluster": 0,
+              "repetition": 1,
+              "seed": 1872481269
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1033269,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 73743458,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00001:sample:2",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1023286,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 73959521,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00000:sample:2",
+              "cluster": 0,
+              "repetition": 2,
+              "seed": 1872481269
+            }
+          ],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q7",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q7-prepare.sql",
+            "prepare_sha256": "23234af4a9b92bd754d5518755853e3790649e0bb4befa0b98d3f0fdaecdef4c",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q7.sql",
+            "query_id": "q7",
+            "query_sha256": "37dc1c940b19d8a61f1602e5772c44cc657255912ced70c057e9204ca18eadcd",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "exploratory_screen_no_selection",
+          "baseline": {
+            "median_ns": 1041062,
+            "p90_ns": 1046326.8
+          },
+          "candidate": {
+            "median_ns": 1023286,
+            "p90_ns": 1038221.2
+          },
+          "changed_work": [],
+          "comparison": "baseline_final",
+          "complete_comparison": true,
+          "excluded_pairs": {},
+          "metric": "host_elapsed_ns",
+          "statistics": {
+            "cluster_mean_log_ratios": {
+              "0": -0.014260956538590074
+            },
+            "estimator": "equal-weight process-pair mean log ratios; Student-t interval across clusters",
+            "geometric_mean_ratio": 0.985840249233869,
+            "independent_process_pairs": 1,
+            "measured_pairs": 3,
+            "median_ratio": 0.9903384307474626,
+            "p90_ratio": 0.9987539084878354,
+            "paired_ratios": [
+              1.0008577779229286,
+              0.9666374900610227,
+              0.9903384307474626
+            ],
+            "ratio_ci95": null
+          },
+          "work_and_raw_timings": [
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1041062,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 72684592,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00001:sample:0",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1041955,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 75769811,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00000:sample:0",
+              "cluster": 0,
+              "repetition": 0,
+              "seed": 1872481269
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1047643,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 74373852,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00001:sample:1",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1012691,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 73886081,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00000:sample:1",
+              "cluster": 0,
+              "repetition": 1,
+              "seed": 1872481269
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1033269,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 73743458,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00001:sample:2",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1023286,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 73959521,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00000:sample:2",
+              "cluster": 0,
+              "repetition": 2,
+              "seed": 1872481269
+            }
+          ],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q7",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q7-prepare.sql",
+            "prepare_sha256": "23234af4a9b92bd754d5518755853e3790649e0bb4befa0b98d3f0fdaecdef4c",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q7.sql",
+            "query_id": "q7",
+            "query_sha256": "37dc1c940b19d8a61f1602e5772c44cc657255912ced70c057e9204ca18eadcd",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "noise_control",
+          "baseline": {
+            "median_ns": 74391778,
+            "p90_ns": 75482742.8
+          },
+          "candidate": {
+            "median_ns": 74236397,
+            "p90_ns": 74973959.39999999
+          },
+          "changed_work": [],
+          "comparison": "baseline_baseline",
+          "complete_comparison": true,
+          "excluded_pairs": {},
+          "metric": "query_elapsed_ns",
+          "statistics": {
+            "cluster_mean_log_ratios": {
+              "1": -0.006703523386899758
+            },
+            "estimator": "equal-weight process-pair mean log ratios; Student-t interval across clusters",
+            "geometric_mean_ratio": 0.9933188951037359,
+            "independent_process_pairs": 1,
+            "measured_pairs": 3,
+            "median_ratio": 0.9921176135578514,
+            "p90_ratio": 0.9967525746129781,
+            "paired_ratios": [
+              0.9899448108518965,
+              0.9921176135578514,
+              0.9979113148767597
+            ],
+            "ratio_ci95": null
+          },
+          "work_and_raw_timings": [
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1019629,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 73374751,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00003:sample:0",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1055010,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 72636954,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00002:sample:0",
+              "cluster": 1,
+              "repetition": 0,
+              "seed": 2130661711
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1027442,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 75755484,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00003:sample:1",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1037904,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 75158350,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00002:sample:1",
+              "cluster": 1,
+              "repetition": 1,
+              "seed": 2130661711
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1049600,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 74391778,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00003:sample:2",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1072891,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 74236397,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00002:sample:2",
+              "cluster": 1,
+              "repetition": 2,
+              "seed": 2130661711
+            }
+          ],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q7",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q7-prepare.sql",
+            "prepare_sha256": "23234af4a9b92bd754d5518755853e3790649e0bb4befa0b98d3f0fdaecdef4c",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q7.sql",
+            "query_id": "q7",
+            "query_sha256": "37dc1c940b19d8a61f1602e5772c44cc657255912ced70c057e9204ca18eadcd",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "noise_control",
+          "baseline": {
+            "median_ns": 1027442,
+            "p90_ns": 1045168.3999999999
+          },
+          "candidate": {
+            "median_ns": 1055010,
+            "p90_ns": 1069314.8
+          },
+          "changed_work": [],
+          "comparison": "baseline_baseline",
+          "complete_comparison": true,
+          "excluded_pairs": {},
+          "metric": "host_elapsed_ns",
+          "statistics": {
+            "cluster_mean_log_ratios": {
+              "1": 0.022063407221065232
+            },
+            "estimator": "equal-weight process-pair mean log ratios; Student-t interval across clusters",
+            "geometric_mean_ratio": 1.0223086041630594,
+            "independent_process_pairs": 1,
+            "measured_pairs": 3,
+            "median_ratio": 1.0221903582317073,
+            "p90_ratio": 1.0321979725514745,
+            "paired_ratios": [
+              1.0346998761314163,
+              1.0101825699163554,
+              1.0221903582317073
+            ],
+            "ratio_ci95": null
+          },
+          "work_and_raw_timings": [
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1019629,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 73374751,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00003:sample:0",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1055010,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 72636954,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00002:sample:0",
+              "cluster": 1,
+              "repetition": 0,
+              "seed": 2130661711
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1027442,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 75755484,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00003:sample:1",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1037904,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 75158350,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00002:sample:1",
+              "cluster": 1,
+              "repetition": 1,
+              "seed": 2130661711
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1049600,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 74391778,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00003:sample:2",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 1072891,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 47965440,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 23982720,
+                "query_elapsed_ns": 74236397,
+                "ready_replica_bytes": 47965440,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00002:sample:2",
+              "cluster": 1,
+              "repetition": 2,
+              "seed": 2130661711
+            }
+          ],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q7",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q7-prepare.sql",
+            "prepare_sha256": "23234af4a9b92bd754d5518755853e3790649e0bb4befa0b98d3f0fdaecdef4c",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q7.sql",
+            "query_id": "q7",
+            "query_sha256": "37dc1c940b19d8a61f1602e5772c44cc657255912ced70c057e9204ca18eadcd",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "exploratory_screen_no_selection",
+          "baseline": {
+            "median_ns": 201131845,
+            "p90_ns": 202750832.20000002
+          },
+          "candidate": {
+            "median_ns": 201613544,
+            "p90_ns": 203814010.4
+          },
+          "changed_work": [],
+          "comparison": "baseline_final",
+          "complete_comparison": true,
+          "excluded_pairs": {},
+          "metric": "query_elapsed_ns",
+          "statistics": {
+            "cluster_mean_log_ratios": {
+              "2": 0.004483538571278264
+            },
+            "estimator": "equal-weight process-pair mean log ratios; Student-t interval across clusters",
+            "geometric_mean_ratio": 1.0044936046686277,
+            "independent_process_pairs": 1,
+            "measured_pairs": 3,
+            "median_ratio": 1.005948879208481,
+            "p90_ratio": 1.007768701371213,
+            "paired_ratios": [
+              1.005948879208481,
+              0.9993295591754752,
+              1.0082236569118963
+            ],
+            "ratio_ci95": null
+          },
+          "work_and_raw_timings": [
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6819321,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 203155579,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00005:sample:0",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6797003,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 204364127,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00004:sample:0",
+              "cluster": 2,
+              "repetition": 0,
+              "seed": 1862730374
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6930977,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 201131845,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00005:sample:1",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6954832,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 200996998,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00004:sample:1",
+              "cluster": 2,
+              "repetition": 1,
+              "seed": 1862730374
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6926062,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 199969067,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00005:sample:2",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6835986,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 201613544,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00004:sample:2",
+              "cluster": 2,
+              "repetition": 2,
+              "seed": 1862730374
+            }
+          ],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q21",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q21-prepare.sql",
+            "prepare_sha256": "fbbf8bef51b48c6dbd0c7d98664d9d60f1ee16efcc54421c4eb9fc763e4bd8a8",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q21.sql",
+            "query_id": "q21",
+            "query_sha256": "44eb1f0e6af8c9167e728908c0bc4c5a0006ac0456e07f743fd322faafd8455d",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "exploratory_screen_no_selection",
+          "baseline": {
+            "median_ns": 6926062,
+            "p90_ns": 6929994.0
+          },
+          "candidate": {
+            "median_ns": 6835986,
+            "p90_ns": 6931062.800000001
+          },
+          "changed_work": [],
+          "comparison": "baseline_final",
+          "complete_comparison": true,
+          "excluded_pairs": {},
+          "metric": "host_elapsed_ns",
+          "statistics": {
+            "cluster_mean_log_ratios": {
+              "2": -0.0043109740661068
+            },
+            "estimator": "equal-weight process-pair mean log ratios; Student-t interval across clusters",
+            "geometric_mean_ratio": 0.99569830484409,
+            "independent_process_pairs": 1,
+            "measured_pairs": 3,
+            "median_ratio": 0.9967272401460497,
+            "p90_ratio": 1.0020988838002418,
+            "paired_ratios": [
+              0.9967272401460497,
+              1.00344179471379,
+              0.9869946298488231
+            ],
+            "ratio_ci95": null
+          },
+          "work_and_raw_timings": [
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6819321,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 203155579,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00005:sample:0",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6797003,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 204364127,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00004:sample:0",
+              "cluster": 2,
+              "repetition": 0,
+              "seed": 1862730374
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6930977,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 201131845,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00005:sample:1",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6954832,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 200996998,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00004:sample:1",
+              "cluster": 2,
+              "repetition": 1,
+              "seed": 1862730374
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6926062,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 199969067,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00005:sample:2",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6835986,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 201613544,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00004:sample:2",
+              "cluster": 2,
+              "repetition": 2,
+              "seed": 1862730374
+            }
+          ],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q21",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q21-prepare.sql",
+            "prepare_sha256": "fbbf8bef51b48c6dbd0c7d98664d9d60f1ee16efcc54421c4eb9fc763e4bd8a8",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q21.sql",
+            "query_id": "q21",
+            "query_sha256": "44eb1f0e6af8c9167e728908c0bc4c5a0006ac0456e07f743fd322faafd8455d",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "noise_control",
+          "baseline": {
+            "median_ns": 200810563,
+            "p90_ns": 202512297.4
+          },
+          "candidate": {
+            "median_ns": 201231755,
+            "p90_ns": 201548487.0
+          },
+          "changed_work": [],
+          "comparison": "baseline_baseline",
+          "complete_comparison": true,
+          "excluded_pairs": {},
+          "metric": "query_elapsed_ns",
+          "statistics": {
+            "cluster_mean_log_ratios": {
+              "3": -0.0030325472297405443
+            },
+            "estimator": "equal-weight process-pair mean log ratios; Student-t interval across clusters",
+            "geometric_mean_ratio": 0.9969720462970743,
+            "independent_process_pairs": 1,
+            "measured_pairs": 3,
+            "median_ratio": 0.9935445173573957,
+            "p90_ratio": 1.0045315711919705,
+            "paired_ratios": [
+              0.9935445173573957,
+              1.0072783346506142,
+              0.9901753723981144
+            ],
+            "ratio_ci95": null
+          },
+          "work_and_raw_timings": [
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6838389,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 202937731,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00007:sample:0",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6948665,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 201627670,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00006:sample:0",
+              "cluster": 3,
+              "repetition": 0,
+              "seed": 1730992912
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6914587,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 199777706,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00007:sample:1",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6714245,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 201231755,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00006:sample:1",
+              "cluster": 3,
+              "repetition": 1,
+              "seed": 1730992912
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6881012,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 200810563,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00007:sample:2",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6759587,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 198837674,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00006:sample:2",
+              "cluster": 3,
+              "repetition": 2,
+              "seed": 1730992912
+            }
+          ],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q21",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q21-prepare.sql",
+            "prepare_sha256": "fbbf8bef51b48c6dbd0c7d98664d9d60f1ee16efcc54421c4eb9fc763e4bd8a8",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q21.sql",
+            "query_id": "q21",
+            "query_sha256": "44eb1f0e6af8c9167e728908c0bc4c5a0006ac0456e07f743fd322faafd8455d",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "noise_control",
+          "baseline": {
+            "median_ns": 6881012,
+            "p90_ns": 6907872.0
+          },
+          "candidate": {
+            "median_ns": 6759587,
+            "p90_ns": 6910849.399999999
+          },
+          "changed_work": [],
+          "comparison": "baseline_baseline",
+          "complete_comparison": true,
+          "excluded_pairs": {},
+          "metric": "host_elapsed_ns",
+          "statistics": {
+            "cluster_mean_log_ratios": {
+              "3": -0.010402804237375402
+            },
+            "estimator": "equal-weight process-pair mean log ratios; Student-t interval across clusters",
+            "geometric_mean_ratio": 0.9896511177885513,
+            "independent_process_pairs": 1,
+            "measured_pairs": 3,
+            "median_ratio": 0.9823536131022588,
+            "p90_ratio": 1.0093715388799538,
+            "paired_ratios": [
+              1.0161260203243776,
+              0.971026179871625,
+              0.9823536131022588
+            ],
+            "ratio_ci95": null
+          },
+          "work_and_raw_timings": [
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6838389,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 202937731,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00007:sample:0",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6948665,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 201627670,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00006:sample:0",
+              "cluster": 3,
+              "repetition": 0,
+              "seed": 1730992912
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6914587,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 199777706,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00007:sample:1",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6714245,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 201231755,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00006:sample:1",
+              "cluster": 3,
+              "repetition": 1,
+              "seed": 1730992912
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6881012,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 200810563,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00007:sample:2",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": 6759587,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 349949248,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 174974624,
+                "query_elapsed_ns": 198837674,
+                "ready_replica_bytes": 349949248,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00006:sample:2",
+              "cluster": 3,
+              "repetition": 2,
+              "seed": 1730992912
+            }
+          ],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q21",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q21-prepare.sql",
+            "prepare_sha256": "fbbf8bef51b48c6dbd0c7d98664d9d60f1ee16efcc54421c4eb9fc763e4bd8a8",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q21.sql",
+            "query_id": "q21",
+            "query_sha256": "44eb1f0e6af8c9167e728908c0bc4c5a0006ac0456e07f743fd322faafd8455d",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "noise_control",
+          "baseline": {
+            "median_ns": 49732781,
+            "p90_ns": 50511498.6
+          },
+          "candidate": {
+            "median_ns": 49393261,
+            "p90_ns": 49435393.8
+          },
+          "changed_work": [],
+          "comparison": "baseline_baseline",
+          "complete_comparison": true,
+          "excluded_pairs": {},
+          "metric": "query_elapsed_ns",
+          "statistics": {
+            "cluster_mean_log_ratios": {
+              "4": -0.014544261428021635
+            },
+            "estimator": "equal-weight process-pair mean log ratios; Student-t interval across clusters",
+            "geometric_mean_ratio": 0.9855609954299145,
+            "independent_process_pairs": 1,
+            "measured_pairs": 3,
+            "median_ratio": 0.9884527665572668,
+            "p90_ratio": 0.9930762286067882,
+            "paired_ratios": [
+              0.97410735630676,
+              0.9884527665572668,
+              0.9942320941191686
+            ],
+            "ratio_ci95": null
+          },
+          "work_and_raw_timings": [
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 50706178,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00009:sample:0",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 49393261,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00008:sample:0",
+              "cluster": 4,
+              "repetition": 0,
+              "seed": 562586567
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 49353813,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00009:sample:1",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 48783913,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00008:sample:1",
+              "cluster": 4,
+              "repetition": 1,
+              "seed": 562586567
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 49732781,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00009:sample:2",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 49445927,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00008:sample:2",
+              "cluster": 4,
+              "repetition": 2,
+              "seed": 562586567
+            }
+          ],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q4",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q4-prepare.sql",
+            "prepare_sha256": "8e5985872afc17e304003bd5e731f90e3385529e8bc0cb9213f4a92ddf5ea206",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q4.sql",
+            "query_id": "q4",
+            "query_sha256": "d5d5e45aa11871f0e5b729b6487c716afe08d81d8accb52cd1e960c871672852",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "noise_control",
+          "baseline": null,
+          "candidate": null,
+          "changed_work": [],
+          "comparison": "baseline_baseline",
+          "complete_comparison": false,
+          "excluded_pairs": {
+            "publication_work_not_equivalent_or_not_published": 3
+          },
+          "metric": "host_elapsed_ns",
+          "statistics": null,
+          "work_and_raw_timings": [],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q4",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q4-prepare.sql",
+            "prepare_sha256": "8e5985872afc17e304003bd5e731f90e3385529e8bc0cb9213f4a92ddf5ea206",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q4.sql",
+            "query_id": "q4",
+            "query_sha256": "d5d5e45aa11871f0e5b729b6487c716afe08d81d8accb52cd1e960c871672852",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "exploratory_screen_no_selection",
+          "baseline": {
+            "median_ns": 49217201,
+            "p90_ns": 50029475.4
+          },
+          "candidate": {
+            "median_ns": 49476097,
+            "p90_ns": 49831536.2
+          },
+          "changed_work": [],
+          "comparison": "baseline_final",
+          "complete_comparison": true,
+          "excluded_pairs": {},
+          "metric": "query_elapsed_ns",
+          "statistics": {
+            "cluster_mean_log_ratios": {
+              "5": -0.0007520556235356767
+            },
+            "estimator": "equal-weight process-pair mean log ratios; Student-t interval across clusters",
+            "geometric_mean_ratio": 0.9992482270994159,
+            "independent_process_pairs": 1,
+            "measured_pairs": 3,
+            "median_ratio": 0.9972079680028939,
+            "p90_ratio": 1.004878559207901,
+            "paired_ratios": [
+              0.9937859408434501,
+              0.9972079680028939,
+              1.0067962070091527
+            ],
+            "ratio_ci95": null
+          },
+          "work_and_raw_timings": [
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 50232544,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00010:sample:0",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 49920396,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00011:sample:0",
+              "cluster": 5,
+              "repetition": 0,
+              "seed": 1994771953
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 49217201,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00010:sample:1",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 49079785,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00011:sample:1",
+              "cluster": 5,
+              "repetition": 1,
+              "seed": 1994771953
+            },
+            {
+              "baseline": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 49142117,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "baseline_sample": "control-sf100-1792777616787438455:p00010:sample:2",
+              "candidate": {
+                "B": null,
+                "C": null,
+                "K": null,
+                "N": 2,
+                "d2h_bytes": null,
+                "h2d_bytes": null,
+                "host_elapsed_ns": null,
+                "host_staging_physical_bytes": null,
+                "input_bitmap_bytes": 0,
+                "logical_edge_bytes": null,
+                "published_bitmap_bytes": 0,
+                "query_elapsed_ns": 49476097,
+                "ready_replica_bytes": 0,
+                "scratch_aligned_bytes": null,
+                "scratch_requested_bytes": null
+              },
+              "candidate_sample": "control-sf100-1792777616787438455:p00011:sample:2",
+              "cluster": 5,
+              "repetition": 2,
+              "seed": 1994771953
+            }
+          ],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q4",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q4-prepare.sql",
+            "prepare_sha256": "8e5985872afc17e304003bd5e731f90e3385529e8bc0cb9213f4a92ddf5ea206",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q4.sql",
+            "query_id": "q4",
+            "query_sha256": "d5d5e45aa11871f0e5b729b6487c716afe08d81d8accb52cd1e960c871672852",
+            "skip_reason": null
+          }
+        },
+        {
+          "assessment": "exploratory_screen_no_selection",
+          "baseline": null,
+          "candidate": null,
+          "changed_work": [],
+          "comparison": "baseline_final",
+          "complete_comparison": false,
+          "excluded_pairs": {
+            "publication_work_not_equivalent_or_not_published": 3
+          },
+          "metric": "host_elapsed_ns",
+          "statistics": null,
+          "work_and_raw_timings": [],
+          "workload": {
+            "available": true,
+            "database": ":memory:",
+            "held_out": false,
+            "id": "sql-q4",
+            "mode": "sql",
+            "prepare_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q4-prepare.sql",
+            "prepare_sha256": "8e5985872afc17e304003bd5e731f90e3385529e8bc0cb9213f4a92ddf5ea206",
+            "query_file": "/home/ubuntu/sirius/build/s4-final/build/s4-local-validation/control-sf100/sql/q4.sql",
+            "query_id": "q4",
+            "query_sha256": "d5d5e45aa11871f0e5b729b6487c716afe08d81d8accb52cd1e960c871672852",
+            "skip_reason": null
+          }
+        }
+      ],
+      "phase": "screen",
+      "profile": "default256",
+      "publication_skip_reasons": {
+        "None": 24,
+        "no_accumulated_publication": 12
+      },
+      "run_id": "control-sf100-1792777616787438455",
+      "scale": "100",
+      "stage_a": {
+        "complete": false,
+        "directory": null,
+        "successful_samples": 0,
+        "unavailable_samples": 0
+      },
+      "status_counts": {
+        "ok": 36
+      },
+      "transport": []
+    }
+  ],
+  "schema_version": 2
+}

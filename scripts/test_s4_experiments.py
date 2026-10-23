@@ -17,6 +17,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import build_s4_experiments as build_helper
 import analyze_s4_experiments as analyze
 import run_s4_experiments as run
 
@@ -40,8 +41,9 @@ def arguments(phase="confirm", *extra):
 
 def native_sample(workload, job, manifest, build, repetition=0, warmup=False):
     record = {field: 0 for field in run.METRICS}
+    record.update({field: 0 for field in run.COMMON_SQL_OUTCOMES})
     record.update(
-        schema_version=1,
+        schema_version=2,
         run_id=manifest["run_id"],
         build_id=build["build_id"],
         sample_id=f"{job['sample_prefix']}:{'warmup' if warmup else 'sample'}:{repetition}",
@@ -49,7 +51,7 @@ def native_sample(workload, job, manifest, build, repetition=0, warmup=False):
         pair=job["pair"],
         order=job["order"],
         seed=job["seed"],
-        compiled_schedule=job["schedule"],
+        revision_role=job["revision_role"],
         devices=manifest["devices"],
         root=workload.get("root"),
         mode=workload["mode"],
@@ -63,6 +65,8 @@ def native_sample(workload, job, manifest, build, repetition=0, warmup=False):
         oracle_outcome="passed",
         oracle_passed=True,
         gpu_intercepted=True,
+        profile_verified=True,
+        publication_metrics_supported=True,
         host_elapsed_ns=100,
         query_elapsed_ns=1000,
         N=len(manifest["devices"]),
@@ -113,8 +117,8 @@ class WorkloadTests(unittest.TestCase):
         self.assertEqual(len(workloads), 42)
 
     def test_confirmation_pairing_and_baseline_controls(self):
-        args = arguments()
-        workloads = run.workload_set("confirm", "default256", [0, 1, 2, 3])
+        args = arguments("confirm", "--stages", "sql")
+        workloads = [{"id": "sql-q4", "mode": "sql", "held_out": False}]
         jobs = run.execution_plan(workloads, args)
         self.assertEqual(jobs, run.execution_plan(workloads, args))
         groups = defaultdict(list)
@@ -128,13 +132,68 @@ class WorkloadTests(unittest.TestCase):
             self.assertEqual(arms[0]["workload"], arms[1]["workload"])
             self.assertEqual(arms[0]["repetitions"], 6)
             if arms[0]["comparison"] == "baseline_baseline":
-                self.assertEqual({a["schedule"] for a in arms}, {"current_direct"})
+                self.assertEqual({a["revision_role"] for a in arms}, {"baseline"})
         self.assertEqual(
             {j["arm"] for j in jobs if j["order"] == 0}, {"baseline", "candidate"}
         )
 
 
 class StatisticsTests(unittest.TestCase):
+    def sql_pair(self):
+        left = {name: 0 for name in run.COMMON_SQL_OUTCOMES}
+        left.update({name: None for name in run.METRICS})
+        left.update(
+            mode="sql",
+            status="ok",
+            gpu_intercepted=True,
+            process_cluster=0,
+            seed=1,
+            repetition=0,
+            sample_id="baseline",
+            query_elapsed_ns=1000,
+            publication_count=2,
+            publication_metrics_supported=False,
+            harness={"arm": "baseline"},
+        )
+        right = dict(
+            left,
+            sample_id="final",
+            query_elapsed_ns=1010,
+            publication_metrics_supported=True,
+            host_elapsed_ns=100,
+            published_bitmap_bytes=1024,
+            harness={"arm": "candidate"},
+        )
+        return left, right
+
+    def test_absent_baseline_publication_metrics_keep_query_comparison(self):
+        samples = self.sql_pair()
+        query = analyze.summarize_pair_group(samples, "query_elapsed_ns")
+        publication = analyze.summarize_pair_group(samples, "host_elapsed_ns")
+        self.assertEqual(query["statistics"]["measured_pairs"], 1)
+        self.assertIsNone(publication["statistics"])
+        self.assertEqual(
+            publication["excluded_pairs"],
+            {"publication_work_not_equivalent_or_not_published": 1},
+        )
+
+    def test_changed_publication_or_contributions_exclude_overhead_claim(self):
+        for name in (
+            "publication_count",
+            "accumulation_completed_contributions",
+            "filters_pushed",
+        ):
+            left, right = self.sql_pair()
+            right[name] += 1
+            with self.subTest(name=name):
+                result = analyze.summarize_pair_group([left, right], "query_elapsed_ns")
+                self.assertIsNone(result["statistics"])
+                self.assertFalse(result["complete_comparison"])
+                self.assertEqual(
+                    result["changed_work"][0]["outcomes"][name],
+                    [left[name], right[name]],
+                )
+
     def test_thirty_pairs_are_five_clusters(self):
         values = {str(i): [math.log(0.80 + i * 0.05)] * 6 for i in range(5)}
         result = analyze.cluster_interval(values)
@@ -176,7 +235,172 @@ class StatisticsTests(unittest.TestCase):
         self.assertFalse(analyze.equivalent_publication(left, left))
 
 
+class ProvenanceTests(unittest.TestCase):
+    def test_baseline_overlay_preserves_production(self):
+        original = (
+            "if(SIRIUS_BUILD_TESTS)\n  include(cmake/sirius-tests.cmake)\nendif()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CMakeLists.txt").write_text(run.baseline_cmake(original))
+            for name in run.BASELINE_OVERLAY:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("test-only overlay\n")
+            changed = ["CMakeLists.txt"]
+
+            def git(command, **kwargs):
+                if command[1:3] == ["rev-parse", "HEAD"]:
+                    return run.BASELINE_REVISIONS["prerequisite"]
+                if command[1:3] == ["rev-parse", "HEAD^{tree}"]:
+                    return run.BASELINE_TREE
+                if command[1] == "show":
+                    return original.rstrip()
+                if command[1:3] == ["diff", "--name-only"]:
+                    return "\n".join(changed)
+                if command[1] == "ls-files":
+                    return "\n".join(run.BASELINE_OVERLAY)
+                return ""
+
+            with patch.object(run, "checked", side_effect=git):
+                identity = run.source_identity(root, "baseline")
+                self.assertTrue(identity["baseline_production_unchanged"])
+                self.assertEqual(len(identity["fixture_overlay_sha256"]), 5)
+                self.assertIn(
+                    "test/cpp/operator/s4_experiment_sql_oracle.hpp",
+                    identity["fixture_sources_sha256"],
+                )
+                changed.append("src/cuda/sirius_dynamic_bloom_filter.cu")
+                with self.assertRaisesRegex(ValueError, "non-overlay"):
+                    run.source_identity(root, "baseline")
+                changed.pop()
+                (root / "CMakeLists.txt").write_text(
+                    run.baseline_cmake(original) + "add_compile_definitions(ALTERED)\n"
+                )
+                with self.assertRaisesRegex(ValueError, "test-only include"):
+                    run.source_identity(root, "baseline")
+
+    def test_control_overlay_replaces_existing_fixture_include(self):
+        original = "  include(cmake/sirius-tests.cmake)\n  include(cmake/sirius-s4-experiments.cmake)\n"
+        result = run.baseline_cmake(original)
+        self.assertEqual(result.count("sirius-s4-baseline-fixture.cmake"), 1)
+        self.assertNotIn("sirius-s4-experiments.cmake", result)
+
+    def test_only_known_configuration_paths_are_normalized(self):
+        outputs = []
+        for root in (Path("/frozen/baseline"), Path("/frozen/final")):
+            settings = {
+                "SOURCE": str(root / "duckdb"),
+                "BUILD": str(root / "build/release/lib"),
+                "INSTALL": str(root / "install/lib"),
+                "CMAKE_CUDA_ARCHITECTURES": "120a-real",
+                "SIRIUS_TPCH_HAVOC": "OFF",
+                "FETCHCONTENT_SOURCE_DIR_CUCO": "/reuse/cuco",
+            }
+            outputs.append(
+                run.comparable_configuration(
+                    settings, root, root / "build/release", root / "install", None
+                )
+            )
+        self.assertEqual(*outputs)
+        self.assertEqual(outputs[0]["FETCHCONTENT_SOURCE_DIR_CUCO"], "/reuse/cuco")
+        self.assertEqual(outputs[0]["CMAKE_CUDA_ARCHITECTURES"], "120a-real")
+        with self.assertRaises(ValueError):
+            run.comparable_configuration(
+                {"SIRIUS_S4_PUBLICATION_SCHEDULE": "concurrent_ingress"},
+                root,
+                root / "build",
+                root / "install",
+                "s4_control",
+            )
+
+    def test_revision_pair_accepts_different_source_but_rejects_dependencies(self):
+        builds = {}
+        for role in run.REVISION_ROLES:
+            builds[role] = {
+                "revision_role": role,
+                "baseline_kind": "prerequisite" if role == "baseline" else None,
+                "source_sha256": role,
+                "configuration_sha256": "matched",
+                "source": {
+                    "head": (
+                        run.BASELINE_REVISIONS["prerequisite"]
+                        if role == "baseline"
+                        else "final-head"
+                    ),
+                    "baseline_production_unchanged": role == "baseline",
+                    "submodules": [],
+                    "fixture_sources_sha256": {"sql": "matched"},
+                },
+                "identify": {
+                    "duckdb_version": "matched",
+                    "bloom_block_bytes": 32,
+                    "cuda_allocation_alignment": 256,
+                },
+                "artifacts": {
+                    name: {"sha256": role} for name in ("fixture", "library")
+                },
+            }
+        run.validate_build_pair(builds)
+        builds["final"]["identify"].update(run.SQL_ORACLE_POLICY)
+        with self.assertRaisesRegex(ValueError, "oracle policies differ"):
+            run.validate_build_pair(builds)
+        builds["baseline"]["identify"].update(run.SQL_ORACLE_POLICY)
+        run.validate_build_pair(builds)
+        builds["final"]["source"]["fixture_sources_sha256"] = {"sql": "different"}
+        with self.assertRaisesRegex(ValueError, "fixture overlay differs"):
+            run.validate_build_pair(builds)
+        builds["final"]["source"]["fixture_sources_sha256"] = {"sql": "matched"}
+        builds["final"]["source"]["submodules"] = [{"revision": "different"}]
+        with self.assertRaisesRegex(ValueError, "Dependency"):
+            run.validate_build_pair(builds)
+
+    def test_gpu_diagnostics_never_request_baseline_modes(self):
+        work = run.workload_set(
+            "confirm", "default256", [0, 1]
+        ) + run.transport_workloads([0, 1])
+        jobs = run.execution_plan(
+            work, arguments("confirm", "--stages", "transport,builder")
+        )
+        self.assertTrue(jobs)
+        self.assertEqual({j["revision_role"] for j in jobs}, {"final"})
+        self.assertEqual({j["comparison"] for j in jobs}, {"diagnostic"})
+
+    def test_legacy_manifest_has_explicit_frozen_analyzer_guidance(self):
+        with self.assertRaisesRegex(ValueError, "9b2e8201"):
+            run.verify_build({"schema_version": 1})
+
+
 class ProtocolTests(unittest.TestCase):
+    def test_fixed_oracle_metadata_accepts_legacy_and_binds_new_samples(self):
+        self.workload = {"id": "sql-q1", "mode": "sql", "query_id": "q1"}
+        record = native_sample(self.workload, self.job, self.manifest, self.build)
+        self.validate(record)
+        self.build["identify"].update(run.SQL_ORACLE_POLICY)
+        with self.assertRaisesRegex(ValueError, "oracle policy differs"):
+            self.validate(record)
+        record.update(run.SQL_ORACLE_POLICY)
+        record.update(oracle_digest="123", result_digest="456")
+        self.validate(record)
+
+    def test_oracle_metadata_rejects_changed_missing_and_unbound_policy(self):
+        self.workload = {"id": "sql-q1", "mode": "sql", "query_id": "q1"}
+        record = native_sample(self.workload, self.job, self.manifest, self.build)
+        record.update(run.SQL_ORACLE_POLICY)
+        with self.assertRaisesRegex(ValueError, "oracle policy differs"):
+            self.validate(record)
+        self.build["identify"].update(run.SQL_ORACLE_POLICY)
+        for field, value in (
+            ("oracle_policy", "any_float"),
+            ("oracle_rel_tol", 1e-6),
+            ("oracle_abs_tol", None),
+        ):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(dict(record, **{field: value}))
+        del record["oracle_abs_tol"]
+        with self.assertRaises(ValueError):
+            self.validate(record)
+
     def test_duplicate_json_keys_are_rejected(self):
         with self.assertRaises(ValueError):
             run.decode_json('{"schema_version":1,"schema_version":2}')
@@ -203,7 +427,10 @@ class ProtocolTests(unittest.TestCase):
             "cap_bytes": 256 * run.MIB,
             "coverage": 0.9,
         }
-        self.build = {"build_id": "immutable"}
+        self.build = {
+            "build_id": "immutable",
+            "identify": {"publication_metrics_supported": True},
+        }
         self.sample = native_sample(self.workload, self.job, self.manifest, self.build)
 
     def validate(self, record):
@@ -214,9 +441,9 @@ class ProtocolTests(unittest.TestCase):
     def test_valid_record(self):
         self.validate(self.sample)
 
-    def test_wrong_schedule_missing_bytes_false_oracle_and_nonfinite_rejected(self):
+    def test_wrong_role_missing_bytes_false_oracle_and_nonfinite_rejected(self):
         for key, bad in (
-            ("compiled_schedule", "not_the_build"),
+            ("revision_role", "not_the_build"),
             ("ready_replica_bytes", 0),
             ("oracle_passed", False),
             ("host_elapsed_ns", float("nan")),
@@ -293,17 +520,19 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(all("sha256" in f for f in dataset["files"]))
 
     def test_bundle_roundtrip_and_missing_process_rejection(self):
-        args = arguments("screen", "--warmups", "0", "--pairs", "1")
+        args = arguments("screen", "--warmups", "0", "--pairs", "1", "--stages", "sql")
+        self.workload = {"id": "sql-q4", "mode": "sql", "held_out": False}
         jobs = run.execution_plan([self.workload], args)
         manifest = {
             **self.manifest,
-            "schema_version": 1,
+            "schema_version": 2,
+            "baseline_kind": "prerequisite",
             "phase": "screen",
             "scale": "unknown",
             "four_gpu_handoff": False,
             "stage_a_results": None,
             "dataset": {"availability": "not_requested"},
-            "builds": {name: self.build for name in run.SCHEDULES},
+            "builds": {name: self.build for name in run.REVISION_ROLES},
             "workloads": [self.workload],
             "jobs": jobs,
         }
@@ -337,7 +566,7 @@ class ProtocolTests(unittest.TestCase):
                 result["outcomes"][0]["assessment"],
                 (
                     "exploratory_screen_no_selection"
-                    if result["outcomes"][0]["comparison"] == "baseline_candidate"
+                    if result["outcomes"][0]["comparison"] == "baseline_final"
                     else "noise_control"
                 ),
             )
@@ -347,7 +576,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_manifest_tampering_rejected_before_subprocess(self):
         with self.assertRaises(ValueError):
-            run.verify_build({"schema_version": 1, "build_id": "forged"})
+            run.verify_build({"schema_version": 2, "build_id": "forged"})
 
     def test_cli_load_smoke_is_bail_and_configured(self):
         build = {
@@ -377,21 +606,40 @@ class ProtocolTests(unittest.TestCase):
             fake_binary = base / "fake-binary"
             fake_binary.write_text("CPU test artifact; never executed")
             builds = {
-                schedule: {
-                    "build_id": schedule,
+                role: {
+                    "build_id": role,
+                    "baseline_kind": "prerequisite" if role == "baseline" else None,
                     "library_search_paths": [],
                     "identify": {
                         "cuda_allocation_alignment": 256,
                         "bloom_block_bytes": 32,
+                        "publication_metrics_supported": True,
                     },
                     "artifacts": {
                         name: run.artifact(fake_binary)
                         for name in ("fixture", "library", "extension", "cli")
                     },
                 }
-                for schedule in run.SCHEDULES
+                for role in run.REVISION_ROLES
             }
-            workload = run.workload_set("confirm", "default256", [0, 1, 2, 3])[0]
+            query = base / "q4.sql"
+            query.write_text("SELECT 1")
+            workload = {
+                "id": "sql-q4",
+                "mode": "sql",
+                "held_out": False,
+                "query_id": "4",
+                "query_file": str(query),
+                "prepare_file": str(query),
+                "query_sha256": run.file_hash(query),
+                "prepare_sha256": run.file_hash(query),
+                "database": ":memory:",
+            }
+            dataset = {
+                "availability": "available",
+                "identity_sha256": "cpu-test",
+                "files": [],
+            }
 
             def fake_process(command, env, directory, timeout):
                 self.assertEqual(env["SIRIUS_ENABLE_TEST_OPTIONS"], "1")
@@ -399,7 +647,7 @@ class ProtocolTests(unittest.TestCase):
                 job = next(
                     j for j in manifest["jobs"] if j["process_id"] == directory.name
                 )
-                build = builds[job["schedule"]]
+                build = builds[job["revision_role"]]
                 records = [
                     native_sample(workload, job, manifest, build, i, warmup)
                     for warmup, count in (
@@ -417,13 +665,15 @@ class ProtocolTests(unittest.TestCase):
             ), patch.object(run, "cli_smoke"), patch.object(
                 run, "machine_info", return_value={"hostname": "cpu-test"}
             ), patch.object(
-                run, "workload_set", return_value=[workload]
+                run, "prepare_sql", return_value=([workload], dataset)
             ), patch.object(
                 run, "run_process", side_effect=fake_process
             ), contextlib.redirect_stdout(
                 io.StringIO()
             ):
-                args = arguments("confirm", "--output", str(base / "original"))
+                args = arguments(
+                    "confirm", "--stages", "sql", "--output", str(base / "original")
+                )
                 run.campaign(args)
                 sources = run.load_json(base / "original" / "experiment.json")[
                     "harness_sources"
@@ -443,6 +693,8 @@ class ProtocolTests(unittest.TestCase):
                 )
                 args = arguments(
                     "confirm",
+                    "--stages",
+                    "sql",
                     "--output",
                     str(base / "extended"),
                     "--extend-from",

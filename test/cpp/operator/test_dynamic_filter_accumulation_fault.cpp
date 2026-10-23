@@ -109,11 +109,11 @@ TEST_CASE("S4 publication faults drain all registered streams and retain the CUD
   }
 }
 
-TEST_CASE("S4 late preparation event failure never joins a destroyed ingress stream",
+TEST_CASE("S4 preparation event failure preserves partials and retires scratch",
           "[dynamic_filter][s4_publication_fault][multi_gpu]")
 {
   if (!has_two_gpus()) { return; }
-  auto const skip = GENERATE(std::size_t{0}, std::size_t{7});
+  auto const skip = GENERATE(std::size_t{0}, std::size_t{6});
   acc::fixture fixture({.devices = 2});
   if (!acc::has_pool_access(fixture.spaces)) { return; }
   auto builder = acc::make_builder(fixture, acc::bloom_geometry(8000));
@@ -123,7 +123,7 @@ TEST_CASE("S4 late preparation event failure never joins a destroyed ingress str
   auto const expected = acc::partial_union(builder, 2, 2);
   sirius::op::detail::publication_measurement measured;
   {
-    // Seven prior events place the candidate failure after construction of its first ingress owner.
+    // Six prior events place the late failure at the last target-completion event.
     fault injection{fault::create_event, skip, cudaErrorInvalidValue};
     REQUIRE_THROWS_AS(
       builder.finish_for_experiment(rmm::cuda_device_id{0},
@@ -150,7 +150,7 @@ TEST_CASE("S4 delayed ingress merge and egress preserve every bitmap byte across
                               failure_point{fault::peer_copy, 1, false},
                               failure_point{fault::peer_copy, 4, false},
                               failure_point{fault::peer_copy, 6, false},
-                              failure_point{fault::record_event, 3, false},
+                              failure_point{fault::record_event, 2, false},
                               failure_point{fault::batch_copy, 1, true},
                               failure_point{fault::batch_copy, 3, true});
   CAPTURE(point.operation, point.skip, point.staged);

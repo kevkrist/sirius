@@ -17,6 +17,8 @@ import sys
 
 from run_s4_experiments import (
     METRICS,
+    COMMON_SQL_OUTCOMES,
+    LEGACY_SCHEMA_MESSAGE,
     file_hash,
     jsonl,
     load_json,
@@ -75,7 +77,7 @@ def cluster_interval(cluster_logs: dict[str, list[float]]) -> dict:
 def validated_bundle(directory: Path) -> tuple[dict, list[dict]]:
     run = load_json(directory / "experiment.json")
     completion = load_json(directory / "completion.json")
-    require(run.get("schema_version") == 1, "Unsupported experiment schema")
+    require(run.get("schema_version") == 2, LEGACY_SCHEMA_MESSAGE)
     require(completion.get("status") == "complete", f"Incomplete campaign: {directory}")
     require(
         completion["samples_sha256"] == file_hash(directory / "samples.jsonl"),
@@ -113,7 +115,11 @@ def validated_bundle(directory: Path) -> tuple[dict, list[dict]]:
     for process_id, group in groups.items():
         job = jobs[process_id]
         validate_native(
-            group, run["builds"][job["schedule"]], workloads[job["workload"]], job, run
+            group,
+            run["builds"][job["revision_role"]],
+            workloads[job["workload"]],
+            job,
+            run,
         )
     return run, records
 
@@ -131,6 +137,10 @@ def equivalent_publication(left: dict, right: dict) -> bool:
         "actual_transport",
     )
     if left["mode"] == "sql":
+        if not left.get("publication_metrics_supported") or not right.get(
+            "publication_metrics_supported"
+        ):
+            return False
         if not left["published_bitmap_bytes"] or not right["published_bitmap_bytes"]:
             return False
         sql_fields = (
@@ -159,6 +169,7 @@ def summarize_pair_group(records: list[dict], metric: str) -> dict:
         matched[key][arm] = record
     logs = defaultdict(list)
     excluded = Counter()
+    changed_work = []
     baseline_values, candidate_values = [], []
     work = []
     for (cluster, seed, repetition), arms in matched.items():
@@ -175,6 +186,24 @@ def summarize_pair_group(records: list[dict], metric: str) -> dict:
         ):
             excluded["gpu_interception_not_proven"] += 1
             continue
+        if left["mode"] == "sql":
+            differences = {
+                name: [left.get(name), right.get(name)]
+                for name in COMMON_SQL_OUTCOMES
+                if left.get(name) is None
+                or right.get(name) is None
+                or left[name] != right[name]
+            }
+            if differences:
+                excluded["common_sql_outcomes_changed_or_missing"] += 1
+                changed_work.append(
+                    {
+                        "baseline_sample": left["sample_id"],
+                        "candidate_sample": right["sample_id"],
+                        "outcomes": differences,
+                    }
+                )
+                continue
         if metric == "host_elapsed_ns" and not equivalent_publication(left, right):
             excluded["publication_work_not_equivalent_or_not_published"] += 1
             continue
@@ -199,6 +228,7 @@ def summarize_pair_group(records: list[dict], metric: str) -> dict:
     result = {
         "metric": metric,
         "excluded_pairs": dict(excluded),
+        "changed_work": changed_work,
         "work_and_raw_timings": work,
         "complete_comparison": not excluded,
         "statistics": cluster_interval(logs) if logs else None,
@@ -276,11 +306,7 @@ def assess(
             if high <= 1.03
             else "regression" if low > 1.03 else "regression_guard_inconclusive"
         )
-    if stats["median_ratio"] <= 0.90 and high < 1:
-        if abs(noise["median_ratio"] - 1) >= 1 - stats["median_ratio"]:
-            return "inconclusive_baseline_noise"
-        return "publication_gate_observed"
-    return "publication_gate_not_established"
+    return "publication_timing_observation"
 
 
 def analyze(directory: Path) -> dict:
@@ -309,10 +335,13 @@ def analyze(directory: Path) -> dict:
     stage_a = stage_a_evidence(directory, run, records)
     groups = defaultdict(list)
     transport = defaultdict(list)
+    builder = defaultdict(list)
     for record in records:
         harness = record["harness"]
         if record["mode"] == "transport":
             transport[harness["workload"]].append(record)
+        elif record["mode"] == "builder":
+            builder[harness["workload"]].append(record)
         else:
             groups[(harness["workload"], harness["comparison"])].append(record)
     summaries = {}
@@ -329,8 +358,9 @@ def analyze(directory: Path) -> dict:
     workloads = {w["id"]: w for w in run["workloads"]}
     eligible = (
         run["four_gpu_handoff"]
-        and stage_a["complete"]
         and run["profile"] == "default256"
+        and run["scale"] == "100"
+        and run["dataset"]["availability"] == "available"
         and all(
             record["harness"]["warmups"] >= 3 and record["harness"]["repetitions"] >= 6
             for record in all_records
@@ -341,7 +371,7 @@ def analyze(directory: Path) -> dict:
             control = summaries.get((workload, "baseline_baseline"), {}).get(metric)
             decision = (
                 assess(summary, control, run["phase"], metric, eligible)
-                if comparison == "baseline_candidate"
+                if comparison == "baseline_final"
                 else "noise_control"
             )
             outcomes.append(
@@ -373,11 +403,27 @@ def analyze(directory: Path) -> dict:
     query_guards = [
         o
         for o in outcomes
-        if o["comparison"] == "baseline_candidate" and o["metric"] == "query_elapsed_ns"
+        if o["comparison"] == "baseline_final" and o["metric"] == "query_elapsed_ns"
     ]
-    all22 = len(query_guards) == 22 and all(
-        o["assessment"] == "regression_guard_pass" for o in query_guards
+    all22 = (
+        len(query_guards) == 22
+        and all(o["assessment"] == "regression_guard_pass" for o in query_guards)
+        and run["baseline_kind"] == "prerequisite"
     )
+    builder_diagnostics = []
+    for workload, samples in builder.items():
+        values = [r["host_elapsed_ns"] for r in samples if r["status"] == "ok"]
+        builder_diagnostics.append(
+            {
+                "workload": workloads[workload],
+                "revision_role": "final",
+                "assessment": "final_only_correctness_and_timing; no baseline comparison",
+                "statuses": dict(Counter(r["status"] for r in samples)),
+                "median_ns": statistics.median(values) if values else None,
+                "p90_ns": percentile(values, 0.9) if values else None,
+                "samples": samples,
+            }
+        )
     return {
         "directory": str(directory),
         "phase": run["phase"],
@@ -385,6 +431,10 @@ def analyze(directory: Path) -> dict:
         "profile": run["profile"],
         "scale": run["scale"],
         "dataset": run["dataset"],
+        "baseline_kind": run["baseline_kind"],
+        "build_sources": {
+            role: build.get("source") for role, build in run["builds"].items()
+        },
         "stage_a": stage_a,
         "status_counts": dict(Counter(r["status"] for r in records)),
         "publication_skip_reasons": dict(
@@ -396,8 +446,9 @@ def analyze(directory: Path) -> dict:
         ),
         "outcomes": outcomes,
         "transport": diagnostics,
+        "builder": builder_diagnostics,
         "all22_regression_guard_pass": all22,
-        "decision": "observations_only; topology selection and final production validation remain separate",
+        "decision": "revision validation observations; local two-GPU runs do not establish four-GPU acceptance",
     }
 
 
@@ -423,7 +474,7 @@ def main(argv=None) -> int:
         )
         require(bool(directories), "No experiment.json found")
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "campaigns": [analyze(d.resolve()) for d in directories],
         }
         text = json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"

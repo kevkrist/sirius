@@ -85,6 +85,7 @@ class record {
   void set(std::string_view key, bool value);
   void set(std::string_view key, double value);
   void null(std::string_view key);
+  void array(std::string_view key, std::span<std::string_view const> values);
 
   template <std::integral T>
   void set(std::string_view key, T value)
@@ -133,5 +134,7 @@ void skipped(record& sample, std::string_view reason);
 void run_transport(options const& request, std::ostream& output);
 void run_builder(options const& request, std::ostream& output);
 void run_sql(options const& request, std::ostream& output);
+[[nodiscard]] bool sql_publication_metrics_supported() noexcept;
+void record_sql_oracle_policy(record& sample);
 
 }  // namespace sirius::test::s4

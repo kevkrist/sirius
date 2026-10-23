@@ -16,6 +16,7 @@
 
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "s4_experiment_common.hpp"
+#include "s4_experiment_sql_oracle.hpp"
 #include "sirius_context.hpp"
 #include "util/env_guard.hpp"
 #include "utils/gpu_execution_fixture.hpp"
@@ -33,7 +34,7 @@
 namespace sirius::test::s4 {
 namespace {
 
-using rows = std::vector<std::vector<std::string>>;
+using rows = sql_rows;
 
 auto query(duckdb::Connection& connection, std::string const& sql)
 {
@@ -56,6 +57,15 @@ rows canonical_rows(duckdb::QueryResult& result)
   }
   std::ranges::sort(output);
   return output;
+}
+
+sql_result snapshot(duckdb::QueryResult& result)
+{
+  std::vector<std::string> names;
+  for (auto const& name : result.GetNames()) {
+    names.push_back(name.GetIdentifierName());
+  }
+  return {result.GetTypes(), std::move(names), canonical_rows(result)};
 }
 
 std::string digest(rows const& values)
@@ -86,11 +96,24 @@ std::uint64_t delta(std::uint64_t before, std::uint64_t after)
   return after - before;
 }
 
-void filter_counters(record& sample,
-                     op::dynamic_filter_stats_snapshot const& before,
-                     op::dynamic_filter_stats_snapshot const& after)
+template <typename Counters>
+constexpr bool has_publication_metrics = requires(Counters value) {
+  value.accumulations_skipped_cap;
+  value.accumulations_skipped_resource;
+  value.accumulation_input_bitmap_bytes;
+  value.accumulation_ready_replica_bytes;
+  value.accumulation_published_bitmap_bytes;
+  value.accumulation_admitted_keys;
+  value.accumulation_contributing_gpus;
+  value.accumulation_prepare_to_completion_ns;
+  value.accumulation_direct_publications;
+  value.accumulation_host_publications;
+};
+
+template <typename Counters>
+void filter_counters(record& sample, Counters const& before, Counters const& after)
 {
-  using counters = op::dynamic_filter_stats_snapshot;
+  using counters = Counters;
   struct field {
     char const* name;
     std::uint64_t counters::* value;
@@ -101,8 +124,6 @@ void filter_counters(record& sample,
     {"accumulation_completed_contributions", &counters::accumulation_completed_contributions},
     {"accumulations_skipped_inventory", &counters::accumulations_skipped_inventory},
     {"accumulations_skipped_admission", &counters::accumulations_skipped_admission},
-    {"accumulations_skipped_cap", &counters::accumulations_skipped_cap},
-    {"accumulations_skipped_resource", &counters::accumulations_skipped_resource},
     {"accumulations_skipped_error", &counters::accumulations_skipped_error},
     {"accumulations_skipped_transient", &counters::accumulations_skipped_transient},
     {"accumulations_incomplete", &counters::accumulations_incomplete},
@@ -110,14 +131,6 @@ void filter_counters(record& sample,
     {"accumulation_storage_leaks", &counters::accumulation_storage_leaks},
     {"accumulation_publications_finished", &counters::accumulation_publications_finished},
     {"accumulation_publication_latency_ns", &counters::accumulation_publication_latency_ns},
-    {"accumulation_input_bitmap_bytes", &counters::accumulation_input_bitmap_bytes},
-    {"accumulation_ready_replica_bytes", &counters::accumulation_ready_replica_bytes},
-    {"accumulation_published_bitmap_bytes", &counters::accumulation_published_bitmap_bytes},
-    {"accumulation_admitted_keys", &counters::accumulation_admitted_keys},
-    {"accumulation_contributing_gpus", &counters::accumulation_contributing_gpus},
-    {"accumulation_prepare_to_completion_ns", &counters::accumulation_prepare_to_completion_ns},
-    {"accumulation_direct_publications", &counters::accumulation_direct_publications},
-    {"accumulation_host_publications", &counters::accumulation_host_publications},
     {"keys_skipped_bloom_size_gate", &counters::keys_skipped_bloom_size_gate},
     {"keys_skipped_domain_gate", &counters::keys_skipped_domain_gate},
     {"keys_skipped_type_mismatch", &counters::keys_skipped_type_mismatch},
@@ -127,44 +140,95 @@ void filter_counters(record& sample,
   for (auto const& field : fields) {
     sample.set(field.name, delta(before.*field.value, after.*field.value));
   }
-  sample.set("input_bitmap_bytes",
-             delta(before.accumulation_input_bitmap_bytes, after.accumulation_input_bitmap_bytes));
-  sample.set(
-    "ready_replica_bytes",
-    delta(before.accumulation_ready_replica_bytes, after.accumulation_ready_replica_bytes));
-  sample.set(
-    "published_bitmap_bytes",
-    delta(before.accumulation_published_bitmap_bytes, after.accumulation_published_bitmap_bytes));
-  auto const direct =
-    delta(before.accumulation_direct_publications, after.accumulation_direct_publications);
-  auto const host =
-    delta(before.accumulation_host_publications, after.accumulation_host_publications);
-  sample.set("actual_transport", direct ? (host ? "mixed" : "direct") : (host ? "host" : "none"));
   auto const publications =
     delta(before.accumulation_publications_finished, after.accumulation_publications_finished);
   sample.set("publication_count", publications);
-  sample.set("publication_measured", publications != 0);
+  sample.set("publication_metrics_supported", has_publication_metrics<counters>);
+  sample.set("publication_measured", has_publication_metrics<counters> && publications != 0);
+  auto const* reason =
+    after.keys_skipped_domain_gate > before.keys_skipped_domain_gate ? "domain_policy"
+    : after.accumulations_skipped_inventory > before.accumulations_skipped_inventory
+      ? "inventory_refused"
+    : after.accumulations_skipped_admission > before.accumulations_skipped_admission
+      ? "admission_refused"
+      : "no_accumulated_publication";
+  if constexpr (has_publication_metrics<counters>) {
+    constexpr field publication_fields[]{
+      {"accumulations_skipped_cap", &counters::accumulations_skipped_cap},
+      {"accumulations_skipped_resource", &counters::accumulations_skipped_resource},
+      {"accumulation_input_bitmap_bytes", &counters::accumulation_input_bitmap_bytes},
+      {"accumulation_ready_replica_bytes", &counters::accumulation_ready_replica_bytes},
+      {"accumulation_published_bitmap_bytes", &counters::accumulation_published_bitmap_bytes},
+      {"accumulation_admitted_keys", &counters::accumulation_admitted_keys},
+      {"accumulation_contributing_gpus", &counters::accumulation_contributing_gpus},
+      {"accumulation_prepare_to_completion_ns", &counters::accumulation_prepare_to_completion_ns},
+      {"accumulation_direct_publications", &counters::accumulation_direct_publications},
+      {"accumulation_host_publications", &counters::accumulation_host_publications}};
+    for (auto const& field : publication_fields) {
+      sample.set(field.name, delta(before.*field.value, after.*field.value));
+    }
+    sample.set(
+      "input_bitmap_bytes",
+      delta(before.accumulation_input_bitmap_bytes, after.accumulation_input_bitmap_bytes));
+    sample.set(
+      "ready_replica_bytes",
+      delta(before.accumulation_ready_replica_bytes, after.accumulation_ready_replica_bytes));
+    sample.set(
+      "published_bitmap_bytes",
+      delta(before.accumulation_published_bitmap_bytes, after.accumulation_published_bitmap_bytes));
+    auto const direct =
+      delta(before.accumulation_direct_publications, after.accumulation_direct_publications);
+    auto const host =
+      delta(before.accumulation_host_publications, after.accumulation_host_publications);
+    sample.set("actual_transport", direct ? (host ? "mixed" : "direct") : (host ? "host" : "none"));
+    sample.set("publication_timing_scope", "sum_all_finish_attempts");
+    sample.null("publication_metrics_unavailable_reason");
+    if (publications) {
+      sample.set("host_elapsed_ns",
+                 delta(before.accumulation_prepare_to_completion_ns,
+                       after.accumulation_prepare_to_completion_ns));
+    }
+    if (after.accumulations_skipped_cap > before.accumulations_skipped_cap) {
+      reason = "cap_refused";
+    } else if (after.accumulations_skipped_resource > before.accumulations_skipped_resource) {
+      reason = "resource_refused";
+    }
+  } else {
+    for (auto const* name : {"accumulations_skipped_cap",
+                             "accumulations_skipped_resource",
+                             "accumulation_input_bitmap_bytes",
+                             "accumulation_ready_replica_bytes",
+                             "accumulation_published_bitmap_bytes",
+                             "accumulation_admitted_keys",
+                             "accumulation_contributing_gpus",
+                             "accumulation_prepare_to_completion_ns",
+                             "accumulation_direct_publications",
+                             "accumulation_host_publications",
+                             "publication_timing_scope"}) {
+      sample.null(name);
+    }
+    sample.set("publication_metrics_unavailable_reason", "not_in_production_revision");
+  }
   if (publications) {
-    sample.set("host_elapsed_ns",
-               delta(before.accumulation_prepare_to_completion_ns,
-                     after.accumulation_prepare_to_completion_ns));
     sample.null("publication_skip_reason");
   } else {
-    auto const* reason =
-      after.accumulations_skipped_cap > before.accumulations_skipped_cap ? "cap_refused"
-      : after.accumulations_skipped_resource > before.accumulations_skipped_resource
-        ? "resource_refused"
-      : after.keys_skipped_domain_gate > before.keys_skipped_domain_gate ? "domain_policy"
-      : after.accumulations_skipped_inventory > before.accumulations_skipped_inventory
-        ? "inventory_refused"
-      : after.accumulations_skipped_admission > before.accumulations_skipped_admission
-        ? "admission_refused"
-        : "no_accumulated_publication";
     sample.set("publication_skip_reason", reason);
   }
 }
 
 }  // namespace
+
+bool sql_publication_metrics_supported() noexcept
+{
+  return has_publication_metrics<op::dynamic_filter_stats_snapshot>;
+}
+
+void record_sql_oracle_policy(record& sample)
+{
+  sample.set("oracle_policy", sql_oracle_policy);
+  sample.set("oracle_rel_tol", sql_oracle_tolerance);
+  sample.set("oracle_abs_tol", sql_oracle_tolerance);
+}
 
 void run_sql(options const& r, std::ostream& output)
 {
@@ -231,9 +295,8 @@ void run_sql(options const& r, std::ostream& output)
   }
   query(connection, "SET gpu_execution = false;");
   auto cpu                   = query(connection, sql);
-  auto const expected        = canonical_rows(*cpu);
-  auto const expected_digest = digest(expected);
-  auto const expected_types  = cpu->GetTypes();
+  auto const expected        = snapshot(*cpu);
+  auto const expected_digest = digest(expected.rows);
   cpu.reset();
   query(connection, "SET gpu_execution = true;");
   for (std::uint64_t i = 0; i < r.warmups + r.repetitions; ++i) {
@@ -256,8 +319,8 @@ void run_sql(options const& r, std::ostream& output)
     auto const query_ns         = elapsed_ns(start);
     auto const after            = context->get_dynamic_filter_stats_snapshot();
     auto const execution_after  = context->get_transparent_execution_stats();
-    auto const values           = canonical_rows(*actual);
-    bool const equal            = actual->GetTypes() == expected_types && values == expected;
+    auto const values           = snapshot(*actual);
+    bool const equal            = sql_results_equal(r.query_id, expected, values);
     auto const rebinds =
       delta(execution_before.successful_rebinds, execution_after.successful_rebinds);
     auto const executions = delta(execution_before.executions, execution_after.executions);
@@ -277,9 +340,8 @@ void run_sql(options const& r, std::ostream& output)
       execution_after.lease_held_at_replay == execution_before.lease_held_at_replay;
     sample.set("query_elapsed_ns", query_ns);
     sample.set("timing_scope", "normal_sql_query");
-    sample.set("publication_timing_scope", "sum_all_finish_attempts");
-    sample.set("result_rows", values.size());
-    sample.set("result_digest", digest(values));
+    sample.set("result_rows", values.rows.size());
+    sample.set("result_digest", digest(values.rows));
     sample.set("gpu_intercepted", intercepted);
     sample.set("successful_rebinds", rebinds);
     sample.set("executions", executions);

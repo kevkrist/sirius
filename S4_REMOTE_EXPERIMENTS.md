@@ -1,152 +1,90 @@
-# S4: instructions for the four-GPU experiment agent
+# S4 final four-GPU validation instructions
 
-Run the initial four-GPU screen, analyze it, and push the evidence back to
-`kevkrist/sirius`, branch `experiment/s4-four-gpu-20261023`. The coordinating agent
-will fetch your results and decide the next implementation or confirmation step.
-This is an experiment branch, not a production release or a request to open a PR.
+Validate the pruned final S4 implementation against the exact pre-S4 prerequisite, then make the separate smaller frozen-control comparison. The retained implementation is the existing direct pipeline plus bounded HOST fallback. The earlier concurrent-ingress pilot was rejected after screening; do not rerun that pilot or implement another topology in this task.
 
-## 1. Read and establish the starting point
+## Establish source and scope
 
-Read this file, the repository's `AGENTS.md`, and [S4_EXPERIMENTS.md](S4_EXPERIMENTS.md)
-before running commands. That guide owns the CLI details and experiment protocol.
-Read the experiment phases and acceptance criteria in
-[S4_ARCHITECTURE.md](S4_ARCHITECTURE.md) before interpreting results. Consult
-[S4_IMPLEMENTATION_KICKOFF.md](S4_IMPLEMENTATION_KICKOFF.md) for the bounded pilot's
-scope and [S4_FIXTURE_NOTES.md](S4_FIXTURE_NOTES.md) when investigating a native record.
+Start from the final checkout supplied by the coordinator. Read repository `AGENTS.md`, [S4_FINALIZATION.md](S4_FINALIZATION.md), and [S4_EXPERIMENTS.md](S4_EXPERIMENTS.md). The experiment guide contains the executable worktree, overlay, build, correctness, campaign and analysis commands. [S4_FIXTURE_NOTES.md](S4_FIXTURE_NOTES.md) defines native records. [S4_EXPERIMENT_RESULTS.md](S4_EXPERIMENT_RESULTS.md) and its archived evidence remain historical screening results, not final acceptance.
 
-The comparison is `current_direct` versus `concurrent_ingress`. Both include the
-required bounded HOST fallback. The candidate changes root ingress scheduling;
-Stage A's source-issued writes are transport diagnostics, not another compiled
-production candidate. Tree/ring/distributed-OR implementations are not present.
+Use `experiment/s4-final-validation-20261023` on `https://github.com/kevkrist/sirius.git`. The coordinator verifies that remote snapshot before handing it off, while preserving the local review worktree's HEAD/index/unstaged cleanup. Use the guide's fetch/checkout commands, record the clean measured HEAD, and build fresh remote artifacts from that snapshot.
 
-Use a clean checkout of the branch. Record `git rev-parse HEAD` as the measured
-source commit before building. Keep that commit checked out until measurements
-finish; commit the report afterward. The prerequisite tree
-`9f59d68e4cdc7ca47999c3579407f6f5168ea652` is preserved in the branch's merge ancestry.
-It combines S3c with the actual migration PR #2302.
+Record the final commit, clean source status, dependency revisions and start time. Keep those sources fixed until measurements finish. Use isolated persistent reference worktrees. The prerequisite must be exactly `78a3e34c66143152ff075729f4c018806c11e67d`, tree `9f59d68e4cdc7ca47999c3579407f6f5168ea652`; the frozen S4-control reference must be `9b2e8201787f381b62715c01405f659b925c49a7`. Initialize pinned build submodules in every worktree.
 
-Initialize the build submodules from their pinned revisions:
+Install only the guide's allowlisted SQL fixture overlay in reference worktrees. Baseline production source and core-target definitions must remain unchanged. The helper verifies this before building. If compilation needs a production compatibility edit, preserve the error and return it to the coordinator. Do not silently weaken the baseline.
 
-```bash
-git submodule update --init --recursive -- \
-  duckdb cucascade substrait .claude/claude-tools \
-  sirius-duckdb/vcpkg sirius-duckdb/duckdb sirius-duckdb/extension-ci-tools
-git cat-file -t 9f59d68e4cdc7ca47999c3579407f6f5168ea652
-```
+New manifests and samples use schema v2, `revision_role=baseline|final` and explicit `baseline_kind=prerequisite|s4_control` provenance. Frozen S4 control is already S4: its comparison checks pruning and cannot replace prerequisite-versus-final validation. Schema-v1 records retain their original meaning and use the committed original analyzer as documented in the guide.
 
-The last command must print `tree`. Record the recursive submodule status.
-The historical two-GPU checks are described in [S4_VALIDATION.md](S4_VALIDATION.md)
-and [REVIEW.md](REVIEW.md). Their old `/tmp` paths are historical: that environment's
-temporary files were lost. The production/fixture source was recovered and its
-source hash matched both validated builds exactly; see [S4_PUBLICATION.md](S4_PUBLICATION.md).
-Build fresh artifacts on this host and report your own test results.
+## Establish hardware, data and immutable artifacts
 
-Completion: clean source, exact source commit recorded, required submodules ready.
+Use the user's assigned four GPUs, with explicit CUDA-visible ordinals. Record any visibility mapping, UUIDs/models/memory, PCI topology, peer capability, driver/toolkit, CPU/NUMA affinity, clocks/power and concurrent activity. The runner captures boundary snapshots. Keep processes sequential in an idle window. Driver peer capability is not physical-route evidence or proof of access to actual allocator pools.
 
-## 2. Confirm host and dataset, then build and check correctness
+Use the actual TPC-H SF100 Parquet directory or DuckDB database. Record generator metadata and independently counted table rows where available; do not infer scale from the directory name. The parent verified its own two-GPU dataset, which does not establish the identity of this host's data. Missing SF100 blocks SQL performance acceptance; tiny fixture data remains explicitly `unknown/tiny`.
 
-Use the four GPUs assigned by the user. Record their visible ordinals, any
-`CUDA_VISIBLE_DEVICES` mapping, UUIDs, models, memory, driver/toolkit, topology,
-power/clocks, and concurrent GPU activity. The runner captures machine evidence;
-record any unavailable measurements explicitly. Coordinate an idle test window;
-keep experiment processes sequential. The historical four-L40S host is not an
-assumption about this machine.
+Execute the guide's **Build immutable revision artifacts** commands. Use this host's architecture (`native` or its correct explicit architecture), matched dependencies and identical extra CMake flags in every arm. Reusable fetch-source overrides are supported; retain the exact raw options and activated package environment. Build the prerequisite/final pair, then only the control baseline and pair it with the already-frozen final artifacts. Do not rebuild final unnecessarily.
 
-Locate the user's actual TPC-H SF100 Parquet directory or DuckDB database. Report
-how its scale is known. The runner does not generate/download SF100. If SF100 is
-unavailable, run transport/builder with SQL absence recorded and report the missing
-dataset; tiny fixture data cannot establish SQL performance. Use default256
-(256 MiB cap, 0.9 coverage) and GPU pinning. Keep any raised-cap/SF1000 diagnostic
-separate and label it; it cannot establish default-profile value.
+Before timing, run the final focused publication tests and isolated fault executable from the guide, plus applicable original reference correctness checks and the CPU harness tests. Save exact commands, exit statuses, counts and skip reasons. Record any coordinator-requested bounded sanitizer coverage separately. A failed build, identity check, oracle, effective-profile check or GPU-interception check blocks performance interpretation. Preserve failures and report the concrete blocker.
 
-Follow **Build the paired artifacts** in `S4_EXPERIMENTS.md`. Build on this host
-with `--cuda-architectures native`, or its correct explicit architecture, and a
-reasonable job count. Save build stdout/stderr and exit status. The helper must
-successfully create `build/s4/build-manifest.json` and verify both schedule identities
-and library resolutions. Keep production sources, fixtures, configuration, and
-dependencies unchanged between the two builds and throughout measurements.
+## Run final diagnostics and revision comparisons
 
-Run the guide's focused unit and isolated fault tests for both frozen schedules,
-sequentially. Also run the Python harness tests from the guide. Save each command,
-exit status, test/assertion count, and any skip reason. A failed build, identity
-check, oracle, GPU interception check, or correctness test blocks performance
-interpretation. Preserve the failure logs and report the blocker. If a source fix
-is needed, return the diagnosis rather than silently changing the measured code.
+Follow **Four-GPU final acceptance** in the guide. Required work is:
 
-Completion: two verified builds and passing applicable correctness checks, or a
-specific blocker with reproducible evidence.
+1. Final-only builder screen, including positive forced HOST, followed by held-out one/two-key sizes, tails and representative/adverse roots. Preserve full bitmap equality, membership and workspace evidence. The prerequisite has no compatible builder diagnostic; do not invent a comparative baseline. Stage A transport is optional final-host diagnostic evidence, not a new topology campaign.
+2. Final versus prerequisite, normal SQL all22 at verified SF100/default256. This subsumes Q4/Q7/Q21. Use three warmups, five fresh independent process pairs and six measured repetitions per process, with randomized arm order and separate baseline/baseline controls.
+3. Separate final versus frozen S4 control, Q4/Q7/Q21, using the same process-cluster design when making a non-regression conclusion.
 
-## 3. Run the first screen and analyze it
+Run the analyzer and retain its JSON report. The per-query slowdown upper-bound guard is 3%; do not average away a regressing query. Five process-pair summaries provide independent observations, not thirty IID repetitions. Baseline-control drift makes a result inconclusive. Use only the documented single five-cluster extension with a fresh seed and linked original evidence when justified; preserve both original and extension results. Do not repeatedly rerun and select favorable outcomes.
 
-Run **Run the four-GPU screen** from `S4_EXPERIMENTS.md`: stages
-`transport,builder,sql`, four explicit GPU IDs, default256, Q4/Q21/Q7, three warmups,
-three pairs, seed 1823. Use a new output directory. Set the real dataset path and
-scale; use the same machine configuration for both builds. The guide describes
-`--sirius-config` when this machine needs an explicit configuration.
+The prerequisite lacks S4 publication preparation timing and byte/transport counters. Unsupported fields are null, even when its common publication count is positive. Compare query end-to-end time only with matched common execution/publication/contribution outcomes. Changed work is explicitly excluded from overhead attribution. Never substitute the old final-contribution-to-first-push latency for S4 preparation time. Q4 can be a nonpublication control; final Q7/Q21 must demonstrate positive publication on this acceptance host.
 
-Preserve complete raw records, manifests, frozen SQL/config inputs, loader-smoke
-logs, machine snapshots, and `completion.json`. Successful SQL output alone does
-not prove GPU execution. Check interception/profile flags and published-byte counts.
-A query with no accumulated publication has no publication-speedup observation.
+Verify successful normal-SQL GPU interception and CPU parity under `exact_except_q1_avg_disc_v1`. Only Q1's `avg_disc` DOUBLE column permits finite relative or absolute differences up to `1e-12`, with native schema/type/shape and exact unique key checks; all other cells remain exact. The shared `s4_experiment_sql_oracle.hpp` must match across all three fixtures. Identify and SQL samples must bind the fixed `oracle_policy`, `oracle_rel_tol`, and `oracle_abs_tol` values to their manifests. Accepted Q1 raw digests may differ. Do not broaden this policy after another mismatch. A CPU result after failed LOAD, a fallback query, or a profile mismatch is not performance evidence. The loader smoke uses `-bail -no-agent` and must resolve the matching frozen shared library. Native static fixture identity is a separate artifact path, not dynamic shared-library proof.
 
-Run the guide's analyzer against the completed screen and save its JSON output.
-Summarize all scheduled workloads and unavailable/skipped cases. Inspect both the
-baseline/candidate and baseline/baseline controls. Report logical bytes and host
-elapsed times as such; a CUDA API or peer-capability matrix does not identify the
-physical data route. Do not add overlapping per-device event durations together.
+## Return evidence
 
-This screen has no selection confidence interval. End this run with a justified
-next-step recommendation. Held-out confirmation, all22 regression, any conditional
-topology implementation, and final pruning follow after the coordinating agent
-reviews the evidence. The guide includes those later commands for reference.
+Create a new `S4_FINAL_RESULTS.md` and a unique directory under `docs/experiments/s4-results/`. Preserve the historical `S4_EXPERIMENT_RESULTS.md` and its evidence unchanged. Report:
 
-Completion: a complete, analyzable screen with honest limitations, or a preserved
-failed campaign and explanation. Keep unsuccessful runs; use a new directory for
-any justified retry and explain the change instead of choosing the best run.
-
-## 4. Write the result and preserve the evidence
-
-Create project-level `S4_EXPERIMENT_RESULTS.md` with these sections:
-
-| Section | Required content |
+| Section | Required evidence |
 | --- | --- |
-| Conclusion | Ready for confirmation, retain control, inconclusive, or blocked; evidence and next action. Separate observations from hypotheses. |
-| Reproduction | Measured source commit, prerequisite tree, dependency revisions, exact commands, seed, environment/configuration, dataset identity/scale, artifact hashes, start/end time. |
-| Machine | GPU IDs/UUIDs/models, interconnect/topology, peer access, CPU/NUMA, driver/toolkit, power/clocks, competing load, and unavailable measurements. |
-| Correctness | Per-build tests and counts/skips, exit statuses, exact bitmap/SQL oracles, GPU interception, profile verification, and extension/library identity checks. |
-| Stage A | Every ordered pair and concurrent/root pattern, both issuing directions, bytes, timing/throughput, roots, failures/unavailable access. Distinguish actual-pool evidence from driver capability. |
-| Builder | Each workload's root, contributor/key counts, bitmap/chunk sizes, transport, input/ready bytes, scratch/HOST charges, raw timing summaries, candidate/control ratios, and baseline-control variation. |
-| SQL | Per query: query timing, publication timing when published, publication count/bytes, admission/skip reason, work equivalence, parity/interception, candidate/control and baseline-control results. |
-| Interpretation | What root/direction/bottleneck evidence supports, what it cannot show, and whether a bounded next experiment is justified. Do not claim a four-GPU winner from screening alone. |
-| Evidence and limitations | Relative paths and checksums for all returned artifacts; missing datasets/counters, failed runs, deviations, and reproduction steps for blockers. |
+| Conclusion | Passed guards, inconclusive, changed work, or blocked; exact remaining limits. Separate prerequisite and cleanup comparisons. |
+| Reproduction | Final/reference revisions and trees, fixture overlay hashes, package/dependency identity, complete commands/options, seed, config, data identity/scale, artifact hashes and timestamps. |
+| Correctness | Per-revision checks/counts/skips, exit statuses, complete oracles, interception/profile evidence and both linkage paths. |
+| Final diagnostics | Every builder workload, roots/keys/tails, actual direct/HOST behavior, bytes/workspace, statuses and raw timings. Include optional transport observations without physical-route claims. |
+| SQL | Every query in each comparison, cluster counts, median/p90/interval, baseline drift, common-counter equivalence, exclusions and individual 3% guard. |
+| Limits | Missing datasets/metrics, fallback/refusal/changed work, failed attempts, unmeasured clocks/routes/stages/allocator peaks and deviations. |
 
-Choose a unique run ID and set `S4_EVIDENCE_DIR` to its directory under
-`docs/experiments/s4-results/`. Put evidence there: analyzer JSON,
-test/build logs, and a compressed archive of each complete campaign directory.
-The archive must include the untouched native JSONL records as well as aggregate
-samples, requests, machine/config/SQL metadata, loader logs, and completion/failure
-records. Include both build manifests and build commands/CMake caches. Add
-`SHA256SUMS`. Preserve paths inside manifests; the report should map the originating
-host paths to the returned archive locations. Exclude datasets, built binaries,
-environment directories, and credentials from the commit.
+Include the analyzer JSON and compressed complete campaign directories: untouched native JSONL, aggregate samples, requests, frozen SQL/config, loader logs, machine snapshots and completion/failure records. Include all three build manifests, pair manifests, raw commands and per-revision CMake caches. Preserve source artifact hashes from `experiment.json.harness_sources` and include the matching measured harness files. Keep older strict schema-v2 campaigns under their original manifests and measured harness. Provide checksums and a map from original absolute paths to returned archive locations; do not rewrite originating manifests. Verify archive completeness and rerun the matching analyzer on the extracted evidence.
 
-Completion: another agent can audit every reported result using the committed
-summary and raw evidence, without access to this host. A table of selected timings
-alone is not sufficient.
+Exclude datasets, built binaries, environment directories and credentials from the returned source/evidence package. Keep unsuccessful runs and explain any retry. Do not overwrite the archived pilot report or claim final acceptance from the local two-GPU checks.
 
-## 5. Push the results back
+## Commit and push the results back
 
-Commit only `S4_EXPERIMENT_RESULTS.md` and the specific evidence directory. Push
-that result commit to the same fork branch:
+The user explicitly authorizes the agent on the experiment machine to commit and push **only `S4_FINAL_RESULTS.md` and its new unique evidence directory** to the provided personal-fork final-validation branch on `kevkrist/sirius`. This result return does not require another approval. The coordinator will fetch that result commit; final implementation acceptance and PR decisions remain with the coordinator. The coordinator's local review worktree keeps its HEAD, index and unstaged source changes unchanged.
+
+Return results to `experiment/s4-final-validation-20261023` on `kevkrist/sirius`. Set `S4_RESULT_REMOTE` to its personal-fork remote and `S4_EVIDENCE_DIR` to the new relative directory used for this run. Record the measured source commit before creating the result commit. Check that the push remote is exactly `kevkrist/sirius`, that no unrelated changes are staged, and that the evidence directory is new:
 
 ```bash
-git add -- S4_EXPERIMENT_RESULTS.md "$S4_EVIDENCE_DIR"
-git commit -m "Report S4 four-GPU screening results"
-git push https://github.com/kevkrist/sirius.git \
-  HEAD:refs/heads/experiment/s4-four-gpu-20261023
+(
+set -e
+S4_RESULT_BRANCH=experiment/s4-final-validation-20261023
+: "${S4_RESULT_REMOTE:?Name the personal-fork remote}"
+: "${S4_EVIDENCE_DIR:?Use this run's new directory under docs/experiments/s4-results}"
+git remote -v
+case "$(git remote get-url --push --all "$S4_RESULT_REMOTE")" in
+  https://github.com/kevkrist/sirius.git|https://github.com/kevkrist/sirius|git@github.com:kevkrist/sirius.git) ;;
+  *) echo 'Push remote must be kevkrist/sirius'; exit 1 ;;
+esac
+case "$S4_EVIDENCE_DIR" in
+  docs/experiments/s4-results/*) ;;
+  *) echo 'Evidence must be under docs/experiments/s4-results'; exit 1 ;;
+esac
+test -z "$(git diff --cached --name-only)" || exit 1
+test -z "$(git ls-files -- "$S4_EVIDENCE_DIR")" || exit 1
+git check-ref-format --branch "$S4_RESULT_BRANCH"
+git add -- S4_FINAL_RESULTS.md "$S4_EVIDENCE_DIR"
+git diff --cached --stat
+git commit -m "Report final S4 four-GPU validation"
+git push "$S4_RESULT_REMOTE" "HEAD:refs/heads/$S4_RESULT_BRANCH"
+git rev-parse HEAD
+)
 ```
 
-Use a normal fast-forward push. If the remote moved, fetch and inspect the new
-commits before integrating; preserve the recorded measured-source identity.
-Return the result commit SHA, branch URL, result-file URL, and a short conclusion.
-Do not open a PR or push to upstream/main as part of this experiment handoff.
+Use a normal fast-forward push, never force-push or push upstream. If the remote advanced, fetch and inspect it before integrating; preserve the recorded measured-source identity and all returned evidence. Send the coordinator the result commit SHA, fork branch URL, result-file URL and brief conclusion so it can fetch and review the results. This authorization covers the remote result commit only, not source edits, an upstream push or a PR.

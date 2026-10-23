@@ -1,24 +1,28 @@
 # S4: bounded accumulated Bloom publication and measured topology selection
 
-Status: implementation in progress, 2026-10-22. The first delivery is bounded by [S4_IMPLEMENTATION_KICKOFF.md](S4_IMPLEMENTATION_KICKOFF.md); it stops at the four-GPU experimental handoff. [S4_BASELINE.md](S4_BASELINE.md) records the integrated prerequisites. The user runs the four-GPU experiments on a host whose model and topology are inputs, not assumptions.
+Status: final architecture approval for the four-GPU validation handoff, 2026-10-23, with no remaining architecture findings. The first screen is complete; see [S4_EXPERIMENT_RESULTS.md](S4_EXPERIMENT_RESULTS.md). Current direct publication plus bounded HOST fallback is retained and the losing concurrent-ingress pilot is removed. Local comparisons and Q1 checks across all three revisions passed; Rawls's final review is green with no findings. [S4_FINALIZATION.md](S4_FINALIZATION.md) records the verified evidence and exact prerequisite/control comparison contracts. Final four-GPU acceptance remains pending the user's runs, with no 10% topology-gain obligation for retaining the original direct algorithm. Parent publication uses a separate Git index/ref and preserves local HEAD/index/review changes. [S4_IMPLEMENTATION_KICKOFF.md](S4_IMPLEMENTATION_KICKOFF.md) records the earlier handoff contract.
+
+The final SQL preflight exposed a reproducible `1e-17` Q1 `avg_disc` DOUBLE difference. The reviewed test-only policy `exact_except_q1_avg_disc_v1` permits the existing relative-or-absolute `1e-12` convention only for column 8 of the recognized Q1 schema with exact unique group keys. All other comparisons stay exact; original strict Q8/Q14/Q17 preflights passed. There is no global floating-point tolerance or producer/library runtime change. Original strict comparison manifests and measured harness bytes are preserved. The parent reports green comparator checks (6 cases/43 assertions), 30 CPU harness tests, source hooks, refreshed artifact validation and Q1 across all three revisions passing. All three production libraries remain byte-identical to their prior artifacts, and raw digests are not rewritten to conceal the accepted Q1 difference. See [the oracle correction record](S4_FINALIZATION.md#quantified-q1-oracle-correction).
 
 ## Decision and authoritative baseline
 
-S4 delivers bounded accumulated-filter publication when direct peer access is unavailable, preserves a working direct path, and evaluates topology changes before selecting the smallest justified improvement. An inconclusive experiment keeps the current double-buffered direct pipeline **plus the required bounded host fallback**. Serial host staging alone does not satisfy the direct-path deliverable.
+S4 delivers bounded accumulated-filter publication when direct peer access is unavailable and preserves the current double-buffered direct pipeline **plus the required bounded host fallback**. The returned screen rejects concurrent ingress: larger builder publication slowed roughly 48–55% and equivalent Q7/Q21 publication slowed roughly 47%. This supports pruning the added complexity, not a claim of universal topology optimality. No advanced topology implementation is justified. Serial host staging alone does not satisfy the direct-path deliverable.
 
-The coordinator remains the final contributor. It owns completion, failure, cancellation, and publication even if an experimentally justified algorithm distributes OR work. No general collective engine, new pool registry, capability cache, NCCL dependency, or production topology-tuning interface is planned.
+The coordinator remains the final contributor and reducer. It owns completion, failure, cancellation, and publication. No distributed OR, general collective engine, new pool registry, capability cache, NCCL dependency, or production topology-tuning interface is planned.
 
 | Input | Revision/state used here | Authority |
 | --- | --- | --- |
-| Root S3c worktree | `9c329e31f65be938bf9de4fc823bd29abf0359cc` | Existing S3c behavior, including fused probe work |
-| Local `origin/main` | `12d312ee02263f0187bf4c91ffd689e8e5d48229` | Current target branch; contains newer partition/concat changes |
+| Original S3c input | `9c329e31f65be938bf9de4fc823bd29abf0359cc` | Existing S3c behavior, including fused probe work |
+| Main ancestry at prerequisite integration | `12d312ee02263f0187bf4c91ffd689e8e5d48229` | Includes the prerequisite partition/concat changes; not a claim about today's remote tip |
 | Separate Sirius migration / verified PR #2302 | Local head `cb6e7f9d0a055679b700e30f2da51b1ba331a027`, parent `12d312ee...`; live PR head verified at implementation kickoff | Required integration prerequisite; not assumed upstream merged |
 | cuCascade | `1a9281093a0fe49634594d541d7ce327129f53d6` | Final dependency contracts and source |
 | Integrated implementation reference | `origin/reference/df-optimized-20260917`, `ef17c8c55003dbc889e93c24eedf55f127f22c7a` | Implementation ideas only; neither final dependency authority nor S4 results |
+| Exact prerequisite baseline | Merge `78a3e34c66143152ff075729f4c018806c11e67d`, tree `9f59d68e4cdc7ca47999c3579407f6f5168ea652` | Untouched production baseline for final S4 end-to-end comparison |
+| Finalization starting point | `d925db5dcb909411598b57c566fd9888471d151c`, branch `stacked/df/04-final` | Returned evidence and implementation; new cleanup remains unstaged/uncommitted |
 
 C1 is resolved upstream: GitHub API verification of [cuCascade PR #203](https://github.com/NVIDIA/cuCascade/pull/203) reports `merged=true`, `merged_at=2026-10-21T18:59:18Z`, and exactly the dependency SHA above. This does not establish that the separate Sirius migration is merged. The original #2303 reference returned 404. At implementation kickoff, the migration was identified as [Sirius PR #2302](https://github.com/sirius-db/sirius/pull/2302), open at `cb6e7f9d0a055679b700e30f2da51b1ba331a027`. Its fetched head matches the local migration branch.
 
-S3c HEAD is not an ancestor of current main; main lacks `src/cuda/dynamic_filter_fused_probe.cuh`. Consequently, branching from main alone today loses a required parent. Implementation begins with a combined prerequisite baseline; it need not wait for both PRs to merge:
+At initial integration, S3c was not an ancestor of the main input, which lacked `src/cuda/dynamic_filter_fused_probe.cuh`. The completed prerequisite assembly preserved both parents. The following records that initial procedure, not new checkout or staging instructions for finalization:
 
 1. Resolve and record the current S3c and PR #2302 heads, including the latter's main baseline and cuCascade pin.
 2. Create an isolated S4 worktree/branch from S3c and integrate PR #2302, including its main ancestry. Resolve overlaps in dynamic filters, converters, tests, and build registration while preserving both prerequisites' behavior. Existing worktrees remain intact.
@@ -26,7 +30,7 @@ S3c HEAD is not an ancestor of current main; main lacks `src/cuda/dynamic_filter
 4. Build the cumulative engine and run the relevant available correctness checks before changing publication. Supply the four-GPU baseline validation to the user as part of the experiment handoff. Neither parent's separate test results substitute for testing the combined code.
 5. Begin S4's bounded fallback and experiment harness only after the cumulative baseline is sound. When both parents land, restack S4 onto refreshed main and remove their changes from the final PR diff. Use current CONTRIBUTING rules for any earlier dependent draft; same-repo stacking is maintainer-only. S4 remains one PR, and any later commits/publication follow the user's authorization.
 
-The prerequisites were integrated without conflicts in the isolated S4 worktree. Their combined tree is `9f59d68e4cdc7ca47999c3579407f6f5168ea652`; the prerequisite index remains frozen, with no commit. Build and validation evidence is recorded separately as work proceeds.
+The prerequisites were integrated without conflicts, initially as a frozen index and later preserved in merge `78a3e34c...` with exact tree `9f59d68e4cdc7ca47999c3579407f6f5168ea652`. Finalization uses a separate detached prerequisite worktree; its production source remains unchanged. Compare final against both this pre-S4 baseline and the frozen S4 `current_direct` control in separate campaigns: the screened control already includes S4 fallback preparation and instrumentation.
 
 The earlier migration review/design artifacts were removed from the migration worktree during its commit/rebase. The older root design and rollout documents contain superseded `dev`, dependency ownership, and fixed-root assumptions. This document reconciles them using current tracked migration documentation and source; it does not rewrite those documents or link missing artifacts. Historical migration validation is background evidence, not validation of S4 or a claim that the rebased implementation is byte-identical.
 
@@ -38,9 +42,9 @@ The October 5 amendment to [issue #1823](https://github.com/sirius-db/sirius/iss
 
 Current code creates one full-sized partial array per admitted key on every configured replica GPU. Only GPUs that contribute are reduction sources. The final contributor's task calls `finish(root_device, stream, scratch_mr)`. Nonroot contributing partials are copied into root scratch, ORed into the root partial, and complete chunks overwrite the other GPUs' existing arrays. Final replicas reuse partial allocations; publication does not require a second full set of arrays.
 
-The current `chunk_pipeline` already has **source-disjoint slots in each of two scratch halves**. Ingress is serialized on the publication stream, OR runs on the root partial's stream, and egress uses target streams. Parallel ingress can reuse this allocation. It still needs per-source completion events, allocation readiness, and reuse barriers on every new copy stream. The integrated reference demonstrates useful half/cross-key ordering, but its older route assumptions and replica allocation scheme must not be transplanted.
+The retained `chunk_pipeline` has **source-disjoint slots in each of two scratch halves**. Ingress is serialized on the publication stream, OR runs on the root partial's stream, and egress uses target streams. The evaluated parallel-ingress streams and their additional events are removed during finalization. The integrated reference demonstrates useful half/cross-key ordering, but its older route assumptions and replica allocation scheme must not be transplanted.
 
-Proposed internal operations are preparation and execution within the existing builder, not a new public transport abstraction:
+Retained internal operations are preparation and execution within the existing builder, not a new public transport abstraction:
 
 | Interface | Required behavior |
 | --- | --- |
@@ -48,7 +52,7 @@ Proposed internal operations are preparation and execution within the existing b
 | `enqueue_add(table, device, stream)` | Preserve deduplication, type checks, and insertion readiness. A partial represents all accepted contributions on that GPU. |
 | `finish(root_device, stream, scratch_mr)` | Keep the current caller contract. Internally prepare a direct or staged workspace before mutation, execute it, join, then return only complete owned filters. |
 | Private publication preparation | Validate device/stream identity, required pool grants, geometry, arithmetic, and all scratch/staging resources. Return a ready owned workspace or the existing optional admission refusal. Typed CUDA/programming errors propagate. |
-| Private schedule test seam | Fixtures may supply algorithm/direction choices to the same implementation linked into the library. Real SQL selects a candidate through a separate experimental library build with a private build-time choice, as specified below. Final production `finish` selects fixed reviewed defaults. No mutable global, runtime environment selector, or public SQL setting is required. Remove losing algorithms and the build selector before merge. |
+| Private transport diagnostic seam | Retain existing `finish_for_experiment` with automatic/forced-HOST/required-direct transport and fixed measurements; it uses the same production mechanism. Remove the compiled algorithm selector/getter and schedule measurement field. Cross-revision comparisons use normal SQL with a test-only common-counter fixture overlay, not new production settings or baseline diagnostic backports. |
 
 Use existing `std::span` for borrowed replica/source lists and the existing constrained `join_on_failure` callable interface. Avoid introducing a concept hierarchy or virtual scheduler merely to enumerate experiments. Two real transport implementations justify internal variation; topology hypotheses do not justify a public framework.
 
@@ -66,7 +70,7 @@ Use existing `std::span` for borrowed replica/source lists and the existing cons
 | `src/cuda/device_copy_batch.{hpp,cpp}` | Reuse checked directional copies over fixed HOST blocks; ordinarily no changes. |
 | `test/cpp/operator/test_dynamic_filter_accumulation.cpp` and its existing utility header | Canonical bitmap, fallback, workspace, ordering, cancellation, and fault cases through the builder/session interface. |
 | Existing dynamic-filter multi-GPU, native-shape, and integration tests | Cumulative S3c/main/migration regression coverage and SQL parity; extend only for S4-specific gaps. |
-| Proposed experiment fixture, handoff runners, and result analysis | Names/contracts below. These do not exist yet and are not delivered by this design task. |
+| Retained experiment fixture, handoff runner, and result analysis | Schema-v2 revision-role comparisons, prerequisite SQL-only overlay, and final-only canonical diagnostics under `S4_FINALIZATION.md`. Preserve archived schema-v1 results and their reproducible analysis. |
 | `docs/super-sirius/dynamic-filters.md` and rollout docs | Implementation author updates final behavior, selected schedule, limitations, and evidence after experiments. |
 
 ## Terms, bytes, and storage
@@ -143,6 +147,8 @@ The current migration's `replica_fanout_failures` helper retains fatal errors wh
 
 ## Mandatory experiment sequence and pruning
 
+The sequence below records the original experiment design. Stages A/B have returned screening evidence; the concurrent pilot is rejected and Stage C is not activated. Current work is the bounded finalization in [S4_FINALIZATION.md](S4_FINALIZATION.md). Original candidate-specific build instructions and ingress-stream invariants apply to the historical pilot, not the retained production implementation. The final validation compares revisions and does not confirm a bad pilot.
+
 Experiments precede a final production topology choice within this one PR. They are development stages, not separate production features. Historical four-L40S/PHB measurements in #1823 motivate investigating a root bottleneck but do not describe the user's next host. Historical q4 was approximately 114 MB/GPU and 26 ms; raised-cap q21 approximately 1.46 GB/GPU and 352–365 ms. Neither these figures nor the issue's projected reduction establishes a speedup here.
 
 The [earlier issue comment](https://github.com/sirius-db/sirius/issues/1823#issuecomment-5898684675) reports a pair probe passing while pool copies staged through the host, and a different publication placement overlapping CONCAT. Re-measure actual allocated-pool transfers and current in-task contention. Do not import that overlap or "no end-to-end loss" conclusion into this schedule.
@@ -154,7 +160,7 @@ Implementation proceeds through four bounded phases within the **single S4 PR**:
 3. Choose at most one conditional finalist from that evidence, prepare any needed experimental build, then have the user run held-out confirmation and SQL comparisons.
 4. Prune losing algorithms and all experimental selectors, rebuild the selected production implementation, and have the user rerun focused correctness/performance checks against the baseline. Complete cumulative regression review and documentation in the same PR.
 
-The first handoff implementation now supplies bounded HOST fallback, the unchanged default direct schedule, and a compiled concurrent-ingress pilot. Local two-GPU checks and paired artifacts are recorded in [S4_VALIDATION.md](S4_VALIDATION.md). Four-GPU measurements and the final topology decision remain pending; follow [S4_EXPERIMENTS.md](S4_EXPERIMENTS.md) for executable build and experiment commands.
+The first handoff supplied bounded HOST fallback, the unchanged default direct schedule, and a compiled concurrent-ingress pilot. Its local checks are recorded in [S4_VALIDATION.md](S4_VALIDATION.md), and its four-GPU screen in [S4_EXPERIMENT_RESULTS.md](S4_EXPERIMENT_RESULTS.md). Cleanup retains the control and fallback. The harness owner updates [S4_EXPERIMENTS.md](S4_EXPERIMENTS.md) for executable revision-comparison commands under the finalization contract; final four-GPU acceptance is still pending.
 
 ### Stage A: correctness and bandwidth screen
 
@@ -201,6 +207,8 @@ Match observations by process-pair cluster, workload, seed, and repetition index
 Every SQL sample records actual accumulated and published bytes, admitted keys/contributors, publication count, and any cap/policy skip reason. A skipped filter is not a faster publication sample. Compare publication timings only for equivalent admitted work; keep skipped-query end-to-end results separately for parity and regression assessment. q21 at SF1000 may exceed the default 256 MiB cap: report that expected default-profile skip and run the explicitly raised-cap profile for publication measurement. An advanced topology that wins only above the production cap is unreachable under current policy: preserve its experiment for S5 and remove its dormant implementation from S4. Retaining it requires an explicit justified scope change, not silently raising the cap or changing coverage.
 
 ## User-run handoff and evidence contract
+
+For the final handoff, use schema-v2 `baseline`/`final` artifact roles and separate prerequisite-versus-final and frozen-S4-control-versus-final manifests. The prerequisite uses a SQL-only test overlay and its actual production engine; unavailable S4 statistics remain null. Final-only canonical builder/HOST diagnostics retain useful accounting. The historical paired-algorithm protocol below remains evidence context; [S4_FINALIZATION.md](S4_FINALIZATION.md) specifies the current minimal seam, local two-GPU smoke and remote four-GPU acceptance requirements.
 
 The following runner/options are **proposed and not yet implemented**. Use one runner with transport/builder/SQL stages and one small analysis script; do not duplicate orchestration across three runners or introduce a benchmark framework. The implementer supplies help text and bounded defaults. Host GPU IDs, data paths, and binary locations are explicit inputs; no machine model or dataset location is assumed here.
 
@@ -261,4 +269,4 @@ Primary implementation consultations are deliberately narrow; CPU engine designs
 - [Velox `HashJoinBridge.cpp`](https://github.com/facebookincubator/velox/blob/main/velox/exec/HashJoinBridge.cpp): complete build-result handoff is coordinated under a lock, with waiter notification outside it; pending asynchronous work must be retired on failure. Preserve session ownership without holding its lock across GPU waits.
 - [DataFusion hash-join execution](https://github.com/apache/datafusion/blob/main/datafusion/physical-plan/src/joins/hash_join/exec.rs) and [shared bounds](https://github.com/apache/datafusion/blob/main/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs): shared build accumulation waits for partition completion, and cancellation/unknown contributions cannot justify a restrictive filter. Preserve certified completeness and optional omission rather than expose a partial union.
 
-These upstream source pages were consulted on 2026-10-22 at their then-current `main`; they are conceptual references, not claims about Sirius's pinned DuckDB version. The unresolved decisions are the measured ingress direction/concurrency and whether any more complex reduction or dissemination topology clears the declared gates. All are resolved by the staged user-run experiment, not by assuming the historical host.
+These upstream source pages were consulted on 2026-10-22 at their then-current `main`; they are conceptual references, not claims about Sirius's pinned DuckDB version. The returned screen supports retaining the original direct schedule with bounded HOST fallback and pruning concurrency. The remaining work is final correctness and end-to-end non-regression validation, not advanced-topology selection. On 2026-10-23 the architect refreshed the exact prior chapter record, result/stopping criteria and relevant source interfaces, and reread Document Code with its complete syntax reference; see the additional reading record in [S4_FINALIZATION.md](S4_FINALIZATION.md).

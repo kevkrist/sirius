@@ -1,4 +1,320 @@
-# S4 publication review — ready for first four-GPU handoff
+# S4 publication review — finalization
+
+## Final reviewer verdict — 2026-10-23
+
+**Ready for the final four-GPU validation handoff. No blocking finding remains.**
+Production source, cleanup, fixtures and schema-v2 harness are approved within
+the scope below. Both planned local SQL comparisons pass. The additional Q1
+oracle blocker is closed: its narrow test-side correction, negative controls,
+protocol/artifact identities and retests through all three revisions are verified.
+The inspected worktree is `/home/ubuntu/sirius/build/s4-final`. This is not
+four-GPU performance acceptance.
+The reviewer has not run builds, tests, GPU commands or child agents and changes
+only this report. Publication and source reconstruction belong to the parent.
+
+The three review scopes are:
+
+- Full remaining production against prerequisite commit
+  `78a3e34c66143152ff075729f4c018806c11e67d`, tree
+  `9f59d68e4cdc7ca47999c3579407f6f5168ea652`.
+- Removal of the rejected pilot against screened S4 control
+  `9b2e8201787f381b62715c01405f659b925c49a7`. This comparison assesses cleanup;
+  it cannot establish the overall effect of S4 against its prerequisite.
+- Schema-v2 native fixtures, test-only baseline overlays, build helper,
+  runner/analyzer, CPU tests and executable handoff guides. Tracked and new
+  files are included. The final worktree starts at `d925db5d`; that commit alone
+  does not contain the reviewed cleanup.
+
+[S4_FINALIZATION.md](S4_FINALIZATION.md) supplies the acceptance boundary.
+The historical first-handoff review below remains evidence about its original
+source and runs; its former pilot approval does not describe final production.
+
+### Production and lifetime assessment
+
+Final production has no concurrent-ingress selector, getter, extra ingress
+streams or copied-event schedule. Compile commands contain one Bloom
+implementation translation unit per revision, with no S4 production definition.
+Revision-role and baseline-compatibility definitions apply only to the fixtures.
+
+Removing the allocation-ready event is safe: scratch allocation and ingress
+copies use the same publication stream; the root stream waits on ingress-done
+before the OR. The global chunk sequence preserves alternating-half reuse across
+keys, and ingress waits for the previous merge before overwriting that half.
+Egress waits for the merge; publication completion joins root and target work.
+The task stream and partial streams remain in the pre-reserved drain set.
+Pipeline, staging and scratch owners outlive failure draining; an unjoinable
+failure retains the complete owning state. The bounded HOST path synchronizes
+its staging reuse and completes replication before return. Recoverable fallback
+remains before mutation; fatal CUDA failures are not converted into admission
+refusals. Accurate existing ownership comments are preserved.
+
+The constructor-fault skip of six and delayed-record skip of two match the
+remaining event construction/record sequence. The test-only wrappers exercise
+the owned submission boundary without duplicating the transfer algorithm.
+No speculative abstraction or additional test is required by this review.
+
+### Native, harness and artifact assessment
+
+Both reference overlays contain only the four shared native fixture files,
+including the oracle header, the baseline CMake module and the exact test-gated
+root include. Baseline
+production is unchanged. The prerequisite reports unsupported S4 publication
+metrics as null, even when its real common publication count is positive. Its
+older final-contribution latency is never substituted for S4 preparation time.
+Equal-work query timings remain comparable without that telemetry. Changed
+publication, contribution, admission or filter outcomes are reported and excluded
+from overhead ratios. CPU parity and effective-profile/interception checks remain
+mandatory. Builder and transport observations are final-only diagnostics.
+
+The analyzer retains independent process-pair inference, separate baseline noise
+controls and the per-query 3% guard. Two-GPU screens cannot satisfy that guard.
+Schema-v1 evidence is preserved and uses its original committed analyzer.
+
+Independently inspected both frozen pair manifests:
+
+- `build/s4-final-pair/build-manifest.json`: exact prerequisite versus final.
+- `build/s4-control-artifact/build-manifest.json`: exact screened control versus
+  the same final manifest and artifacts.
+
+The actual fixture, library, extension and CLI hashes match every manifest.
+Manifest/source/configuration digests recompute correctly, and current source
+diffs match the recorded diffs. Dependency identities and shared SQL fixture
+hashes agree. Normalized configuration is identical, with SHA-256
+`1656f1c976965c7a27d9255fdfe67e5c7ae51c589688ca3eb32dc2820623873e`.
+The original strict-oracle final source identity is
+`bb40f2f103b7295996f1993eb0a01550255b18878fea72814332f07fd84d0bc9`.
+Saved loader records resolve each extension to its own frozen library. The
+prerequisite campaign's actual CLI smokes also completed: both logs contain the
+success marker and initialize their matching frozen libraries, with `-bail` and
+`-no-agent` in the recorded commands.
+
+### Fresh validation inspected
+
+These are parent-run results, independently read from the persistent final or
+prerequisite `build/s4-local-validation/` directories; they are not reused `/tmp`
+results from the first handoff.
+
+| Check | Observed result |
+| --- | --- |
+| Prerequisite focused suite | 89 cases / 5,576 assertions passed |
+| Prerequisite isolated faults | 4 cases / 228 assertions passed |
+| Final focused suite | 94 cases / 6,970 assertions passed |
+| Final isolated faults | 7 cases / 835 assertions passed |
+| Original strict-oracle harness CPU checks | 28 tests passed |
+| Corrected-oracle harness CPU checks | 30 tests passed |
+| Focused Q1 comparator checks | 6 cases / 43 assertions passed |
+| Final publication fault memcheck | 3 cases / 607 assertions; zero reported errors |
+| Final late-cancellation memcheck | 2 cases / 54 assertions; zero reported errors |
+| Native direct and forced-HOST memchecks | Both exit zero, zero reported errors |
+
+Six valid native cases passed the complete bitmap and membership oracles: direct
+roots 0/1, HOST roots 0/1, local ordinal 1, and reordered devices 1,0 with a
+noncontributing replica. They include one/two keys, tails and cross-key half reuse.
+The direct/HOST memchecks use root 1, two keys and 8,388,864 bytes per key;
+`native/memcheck-results.json` records explicit API checking and exit zero.
+The rejected noncontributing-root request is retained separately and is not a
+successful runtime case. Source hook evidence inspected covers C++/CMake.
+`harness-doc-hooks.log` also records passing Black, Python debug-statement and
+codespell checks. Its rumdl hook reports that it modified files, followed by
+`Success: No issues found in 3 files`; this is formatting-fix evidence, not a
+clean all-hooks-pass invocation. The parent separately reports the three agent
+guides passing rumdl.
+
+The prerequisite SF100 campaign is complete in
+`build/s4-local-validation/prerequisite-sf100`, with analysis in
+`build/s4-local-validation/prerequisite-analysis.json`. Independently verified the
+completion hashes, all 12 planned processes, 48 unique records and 36 measured
+samples. Aggregated records exactly match native files; each process supplies one
+warmup and three measured repetitions. All records pass CPU parity, GPU
+interception and effective-profile checks. Build manifests and the three harness
+source hashes match the frozen artifacts. Query/preparation SQL and configuration
+hashes match their recorded identities.
+
+Q4 has no accumulated publication in either revision. Q21 reports three
+publications and thirteen completed contributions; final publishes 174,974,624
+bitmap bytes. Q7 reports one publication and two completed contributions; final
+publishes 23,982,720 bitmap bytes. Both positive final cases use direct transport.
+Prerequisite publication timings and bytes remain null. All common outcomes
+match in every measured revision pair and baseline control; no changed-work pair
+is excluded. Independently recomputed query ratios and medians agree with the
+analyzer. Publication ratios are correctly excluded because the prerequisite
+lacks that telemetry. All comparisons remain exploratory one-cluster results,
+with no confidence interval and no all22 acceptance pass.
+
+The separate frozen-control campaign and `control-analysis.json` are also complete
+under `build/s4-local-validation/`. Independently verified its completion hashes,
+12 planned processes, 48 unique records and 36 measured samples against untouched
+native payloads, excluding only the added `harness` metadata. Every record passes
+CPU parity, GPU interception and profile checks. Common outcomes match every
+measured pair and noise control; independent query ratios agree with the analyzer.
+Its CLI smoke logs initialize the correct libraries and contain the success
+markers. Both comparisons reuse the same final manifest, dataset identity and
+configuration; the control campaign uses seed 1824.
+
+Control comparison query median deltas are Q4 -0.279%, Q21 +0.595% and Q7 +0.293%;
+maximum absolute baseline-control median drift is 1.155%. These are one-cluster
+observations without an interval, not a non-regression conclusion. Positive Q7/Q21
+publication intervals are comparable between these two S4 revisions; Q4's absent
+publication is correctly excluded. Across both planned campaigns, all 96 records
+(72 measured) pass, with no changed-work exclusions for query timings.
+
+### Resolved Q1 oracle blocker
+
+The additional Q1 SF100 preflight failed with exit code 1 using the original frozen
+final fixture. This was outside the planned Q4/Q7/Q21 performance comparisons and
+blocked handoff until the correction below. Independently read
+`q1-preflight/request.json`, `native.jsonl`,
+`stderr.log` and `exit-code.json` under `build/s4-local-validation/`; the fixture
+hash still matches its manifest. The sample reports `cpu_gpu_result_mismatch`,
+four result rows, distinct CPU/GPU digests, successful GPU interception, verified
+profile and no accumulated publication. The subsequent process-error record is
+not another measured sample.
+
+The parent subsequently ran a diagnostic through the frozen CLI. Independently
+read its request/SQL, `types.csv`, CPU output, two GPU outputs and
+`q1-diagnostic/differences.json`, and recomputed the cell differences. Both GPU
+outputs are identical. Only `avg_disc`, declared DOUBLE, differs for keys `(N,O)`
+and `(R,F)`: decimal text differences are 1e-17, roughly 2e-16 relative, and the
+parsed binary64 values differ by one ULP. All other 38 cells match exactly,
+including keys, BIGINT counts, DECIMAL sums and the other averages. The diagnostic
+exited zero. This evidence supports correcting the fixture's exact-string oracle
+for floating-point precision; it does not require a production edit.
+
+Additional strict preflights of Q8, Q14 and Q17 each exit zero with matching
+CPU/GPU digests, successful interception, profile checks and oracle results.
+Independently read `float-preflight/results.json`, the three native records and
+requests; each uses the original frozen final fixture, one measured execution
+and no warmups. These are oracle-operability checks, not additional performance
+campaigns, and supply no justification for a general floating-point tolerance.
+
+The architect's quantified correction permits approximation only for Q1's
+`avg_disc` at index 8, of type DOUBLE, after recognizing the expected ten-column
+names/order, matching complete types/shape and exact unique leading group keys.
+Every other value, including other Q1 averages, remains exact; NULLs, one-to-one
+row identity and multiplicity remain protected. Eligible finite numbers must
+parse completely and satisfy relative tolerance 1e-12 or absolute tolerance
+1e-12. Nonfinite values match only through exact equality.
+
+Independently reviewed the frozen shared helper, native call sites/metadata,
+focused comparator tests and the single CMake test-source registration. The
+source remedy establishes the contract with no blocking finding. Complete
+schema/shape validation precedes indexing. Exact key sorting plus duplicate-key
+rejection preserves row identity. The existing `cells_equal` helper receives only
+the two non-NULL column-8 values after Q1 recognition; it rejects partial numeric
+parses and nonfinite mismatches. Every other cell remains exact. Snapshot and
+comparison occur outside the query timer; original digest inputs and algorithms
+are unchanged. Production file hashes match the previously reviewed cleanup.
+
+The actual red-stage log has six cases and 43 assertions: the observed-roundoff
+case and two within-tolerance positive assertions fail, while all 40 remaining
+assertions pass. The preserved red header differs from the frozen helper in the
+small acceptance loop, helper include, policy constants and documentation. Tests
+cover observed values with reordered rows, other workloads/columns, a count
+increment at 1e15, DECIMAL/other-AVG changes, schema, NULLs, shape, duplicate keys,
+nonfinite/partial parses and values outside both tolerance bounds.
+
+The green comparator log now passes all six cases and 43 assertions.
+Independently verified identical overlay bytes in all three worktrees: four shared
+native files, including the oracle header, plus the baseline CMake module. The
+existing gated root include remains the only baseline build registration change.
+
+The frozen runner delta also has no blocking finding. It hashes the oracle header
+as part of the shared fixture identity and validates the three fixed policy fields.
+Partial or altered policies fail; paired identifies and successful SQL samples
+must agree. Both historical strict records lacking these fields remain supported,
+while mixing strict and corrected identities fails. Original digests may differ
+for accepted Q1; no digest-equality gate was added. New CPU controls exercise
+policy changes, omissions, mixed identities and differing accepted digests.
+Independently read `oracle-harness-tests.log`: all 30 tests pass. The separate
+`oracle-source-hooks.log` passes its applicable C++, Python and CMake hooks;
+Markdown was not selected in that invocation.
+
+The analyzer and build helper are unchanged. Independently verified that all
+three restored files under `measured-harness/` match the original campaign's
+recorded SHA-256 values. Independently audited the new pair manifests under
+`build/s4-final-pair-oracle/` and `build/s4-control-artifact-oracle/`: actual artifact
+hashes, manifest/source/configuration digests, current source diffs, untracked
+source hashes, all four shared fixture hashes and dependency identities match.
+Both pairs reuse the same final manifest and the original matched normalized
+configuration. All identifies bind the fixed oracle policy/tolerances. Corrected
+final source identity is
+`41961b96c7679094d7f565d74a30f60cce1d436ac7bae6f74ddd8e1419fae5ac`.
+
+The refreshed shared library for each revision has the identical SHA-256 of its
+original strict-oracle library, independently checked against both artifact sets
+and `oracle-library-proof.json`. The change is test-side.
+
+The current runner's `q1-corrected-campaign` completes all four planned processes
+and four samples, with zero warmups and one repetition per process. Independently
+verified its completion hashes, exact native/aggregate payload correspondence,
+planned identities, refreshed build manifest, current harness hashes and both
+actual CLI loader smokes. Every prerequisite/final record passes CPU parity under
+the fixed policy, effective profile and GPU interception. Its analysis reports
+only exploratory observations, no confidence interval or acceptance guard.
+
+The separate `q1-control-corrected` native run also exits zero. Its one record,
+request and exit-code artifact bind to the refreshed control manifest and exact
+policy/tolerances, using the same configuration and Q1 SQL/preparation files.
+Oracle, profile and GPU interception all pass. All five corrected Q1 records retain
+the original distinct CPU/GPU digests and four result rows, with no accumulated
+publication. Thus Q1 passes through prerequisite, frozen control and final without
+forging exact equality or changing production. These five records are additional
+oracle/protocol checks, not another performance campaign. The blocker is closed.
+
+The failed preflight and strict Q4/Q7/Q21 campaigns remain under their original
+manifests; earlier hashes identify those strict-oracle artifacts, not the correction.
+The local two-GPU configuration and footer-count evidence are recorded in
+[S4_LOCAL_FINALIZATION_VALIDATION.md](S4_LOCAL_FINALIZATION_VALIDATION.md).
+Positive Q7/Q21 publication on the acceptance host, four-GPU memory behavior,
+all22 non-regression and the separate cleanup comparison's performance guards
+remain remote acceptance work. Bounded
+memcheck does not establish race freedom or emulate an unjoinable device loss.
+
+### Handoff boundary
+
+The local evidence is packaged in
+[20261023T182408Z-local-finalization](docs/experiments/s4-results/20261023T182408Z-local-finalization/),
+with `local-evidence.tar.gz`, `archive-files.json`, analyses, audit records and
+`SHA256SUMS`. The parent verified all 1,017 archived members' sizes/hashes and
+extracted them into `build/s4-evidence-audit/`. Independently verified the ten
+listed outer checksums and inspected the inventory and written
+`archive-audit.json`.
+
+Independently compared the saved per-campaign reanalysis outputs against the
+original prerequisite, control and corrected-Q1 reports: each contains its one
+intended campaign, and the only differing value is `campaigns[0].directory`.
+The successful reproduction used one analyzer invocation per campaign, with the
+preserved strict harness for the original comparisons and the current harness
+for corrected Q1. This is evidence reproduction, not a new GPU test or performance
+run. The archive preserves original manifests, caches, commands, raw evidence and
+the strict campaigns' measured harness bytes; binaries and datasets are excluded.
+
+The reviewed guides provide the exact prerequisite/control references, test-only
+overlay, fresh remote builds, final-only diagnostics, paired all22/cleanup commands,
+analysis and evidence-return procedure. Existing user authorization covers the
+specified personal-fork result commit. The parent owns snapshot packaging,
+verified fork publication and the concluding architect step. This review makes
+no claim that publication or remote execution has already occurred. No further
+source remedy or additional local production test is required for this handoff.
+
+### Finalization reading refresh
+
+Reused this reviewer's exact personal book/Core Guidelines scopes recorded below.
+Freshly read the reviewer role, AGENTS, Document Code skill and complete cuDF
+syntax reference; refreshed full Super Sirius README, architecture overview,
+memory management and query lifecycle. Refreshed dynamic-filter sections 71–145
+and 248–277, and multi-GPU sections 98–111, 183–200 and 216–258. Read the full
+finalization contract, accepted experiment report, current guides and changed
+developer/fixture/harness notes, plus the actual source and evidence described
+above. Dependency refresh covers the full RMM stream module and cuCascade memory
+sections 1–106, 194–289 and 360–392; pinned sources remain authoritative.
+
+Additional substantive refresh: complete Core Guidelines R.1, R.12, E.6, E.16,
+E.19 and CP.23; complete Software Design Guideline 4 and Guideline 2's
+premature-separation discussion/summary; complete supplied C++20 sections 5.6,
+7.3 and 23.8.1. These are exact selected scopes, not new full-book claims.
+
+## Historical first four-GPU handoff review
 
 Comparison: frozen prerequisite tree `9f59d68e4cdc7ca47999c3579407f6f5168ea652`
 against tracked S4 changes and new files in `/tmp/sirius-s4-publication`. HEAD and

@@ -1,5 +1,7 @@
 # S4 validation record
 
+This is the historical first-handoff record. Current cleanup, fresh local validation and the final four-GPU handoff are recorded in [S4_LOCAL_FINALIZATION_VALIDATION.md](S4_LOCAL_FINALIZATION_VALIDATION.md) and [S4_FINALIZATION.md](S4_FINALIZATION.md). Original paths and outcomes below are retained as history.
+
 Status: implementation in progress; four-GPU experiments pending. No topology winner is claimed.
 
 ## Combined prerequisite baseline

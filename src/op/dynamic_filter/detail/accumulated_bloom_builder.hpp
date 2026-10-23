@@ -49,11 +49,6 @@ class sirius_dynamic_bloom_filter;
 namespace sirius::op::detail {
 
 /**
- * @brief The immutable publication schedule compiled into the library.
- */
-[[nodiscard]] char const* compiled_publication_schedule() noexcept;
-
-/**
  * @brief Diagnostic transport selection; production uses automatic selection.
  */
 enum class publication_transport { automatic, force_host, require_direct };
@@ -67,7 +62,6 @@ enum class publication_transport { automatic, force_host, require_direct };
  * record through return or unwind. Local GPU stage durations are not measured here.
  */
 struct publication_measurement {
-  char const* schedule                         = "";
   char const* actual_transport                 = "none";
   char const* status                           = "not_started";
   char const* refusal_reason                   = "";
@@ -293,7 +287,7 @@ class accumulated_bloom_builder final {
   /**
    * @brief Runs `finish` with diagnostic transport selection and an optional measurement record.
    *
-   * Uses the compiled schedule and the same ownership and ordering contract as `finish`.
+   * Uses the same ownership and ordering contract as `finish`.
    * `require_direct` returns no filters with status `unavailable` when pool access cannot be
    * established; `automatic` instead uses bounded HOST staging. CUDA errors propagate after
    * accepted work is joined.

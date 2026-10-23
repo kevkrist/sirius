@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 
+from run_s4_experiments import source_identity
+
 
 def run(command: list[str], cwd: Path, env: dict[str, str]) -> None:
     print("+ " + " ".join(command), flush=True)
@@ -29,7 +31,21 @@ def main() -> int:
         required=True,
         help="New directory for immutable artifacts",
     )
-    parser.add_argument("--build-dir", type=Path, default=Path("build/release"))
+    parser.add_argument(
+        "--build-dir",
+        type=Path,
+        default=Path("build/release"),
+        help="Relative build directory inside each source worktree",
+    )
+    parser.add_argument("--baseline-source", type=Path, required=True)
+    parser.add_argument(
+        "--final-source", type=Path, default=Path(__file__).resolve().parents[1]
+    )
+    parser.add_argument(
+        "--baseline-kind",
+        choices=("prerequisite", "s4_control"),
+        default="prerequisite",
+    )
     parser.add_argument(
         "--cuda-architectures",
         required=True,
@@ -43,37 +59,48 @@ def main() -> int:
         help="Additional -D option; use --cmake-option=-DNAME=VALUE",
     )
     parser.add_argument(
-        "--schedule", action="append", choices=["current_direct", "concurrent_ingress"]
+        "--revision-role", action="append", choices=["baseline", "final"]
     )
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
-    root = Path(__file__).resolve().parents[1]
+    harness = Path(__file__).resolve().parents[1]
+    roots = {
+        "baseline": args.baseline_source.resolve(),
+        "final": args.final_source.resolve(),
+    }
     output = args.output.resolve()
-    build = args.build_dir.resolve()
+    if args.build_dir.is_absolute() or ".." in args.build_dir.parts:
+        parser.error("--build-dir must stay inside each source worktree")
     if output.exists():
         parser.error(
             "--output must not exist; existing artifacts are never overwritten"
         )
     if not os.environ.get("CONDA_PREFIX"):
         parser.error("Run with pixi run python scripts/build_s4_experiments.py ...")
-    for name in [
-        "duckdb",
-        "cucascade",
-        "substrait",
-        "sirius-duckdb/duckdb",
-        "sirius-duckdb/extension-ci-tools",
-    ]:
-        if not (root / name / ".git").exists():
-            parser.error(f"Initialize submodule {name} before building")
-    schedules = args.schedule or ["current_direct", "concurrent_ingress"]
-    if len(set(schedules)) != len(schedules):
-        parser.error("--schedule values must be distinct")
+    roles = args.revision_role or ["baseline", "final"]
+    if len(set(roles)) != len(roles):
+        parser.error("--revision-role values must be distinct")
+    identities = {}
+    for role in roles:
+        root = roots[role]
+        for name in (
+            "duckdb",
+            "cucascade",
+            "substrait",
+            "sirius-duckdb/duckdb",
+            "sirius-duckdb/extension-ci-tools",
+        ):
+            if not (root / name / ".git").exists():
+                parser.error(f"Initialize submodule {root / name} before building")
+        identities[role] = source_identity(root, role, args.baseline_kind)
     output.mkdir(parents=True)
     env = dict(os.environ, CMAKE_BUILD_PARALLEL_LEVEL=str(args.jobs))
     manifests: dict[str, str] = {}
-    for schedule in schedules:
-        dest = output / schedule
+    for role in roles:
+        root = roots[role]
+        build = root / args.build_dir
+        dest = output / role
         dest.mkdir()
         install = dest / "install"
         run(
@@ -85,7 +112,6 @@ def main() -> int:
                 str(build),
                 f'-DSIRIUS_DUCKDB_SOURCE_DIR={root / "duckdb"}',
                 f"-DCMAKE_CUDA_ARCHITECTURES={args.cuda_architectures}",
-                f"-DSIRIUS_S4_PUBLICATION_SCHEDULE={schedule}",
                 *args.cmake_option,
             ],
             root,
@@ -149,7 +175,8 @@ def main() -> int:
             json.dumps(
                 {
                     "argv": sys.argv,
-                    "schedule": schedule,
+                    "revision_role": role,
+                    "baseline_kind": args.baseline_kind if role == "baseline" else None,
                     "source": str(root),
                     "build_dir": str(build),
                 },
@@ -158,11 +185,12 @@ def main() -> int:
             + "\n"
         )
         manifest = dest / "manifest.json"
-        # Manifest generation verifies the linked production schedule and hashes the frozen artifacts.
+        if source_identity(root, role, args.baseline_kind) != identities[role]:
+            raise ValueError(f"Source changed while building {role}")
         run(
             [
                 sys.executable,
-                str(root / "scripts/run_s4_experiments.py"),
+                str(harness / "scripts/run_s4_experiments.py"),
                 "manifest",
                 "--fixture",
                 str(artifacts["fixture"]),
@@ -172,30 +200,34 @@ def main() -> int:
                 str(artifacts["extension"]),
                 "--cli",
                 str(artifacts["cli"]),
-                "--schedule",
-                schedule,
+                "--revision-role",
+                role,
+                "--source-root",
+                str(root),
+                "--build-dir",
+                str(build),
+                "--baseline-kind",
+                args.baseline_kind,
                 "--cmake-cache",
                 str(dest / "CMakeCache.txt"),
-                "--baseline-tree",
-                "9f59d68e4cdc7ca47999c3579407f6f5168ea652",
                 "--output",
                 str(manifest),
             ],
             root,
             env,
         )
-        manifests[schedule] = str(manifest)
+        manifests[role] = str(manifest)
     (output / "builds.json").write_text(json.dumps(manifests, indent=2) + "\n")
     if len(manifests) == 2:
         run(
             [
                 sys.executable,
-                str(root / "scripts/run_s4_experiments.py"),
+                str(harness / "scripts/run_s4_experiments.py"),
                 "pair-manifests",
                 "--baseline",
-                manifests["current_direct"],
-                "--candidate",
-                manifests["concurrent_ingress"],
+                manifests["baseline"],
+                "--final",
+                manifests["final"],
                 "--output",
                 str(output / "build-manifest.json"),
             ],

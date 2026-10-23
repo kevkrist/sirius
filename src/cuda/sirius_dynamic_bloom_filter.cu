@@ -567,17 +567,6 @@ bool sirius_dynamic_bloom_filter::prepare_fused_probe(cudf::column_view const& p
 
 namespace detail {
 
-#if defined(SIRIUS_S4_CONCURRENT_INGRESS) && SIRIUS_S4_CONCURRENT_INGRESS
-inline constexpr bool concurrent_ingress = true;
-#else
-inline constexpr bool concurrent_ingress = false;
-#endif
-
-char const* compiled_publication_schedule() noexcept
-{
-  return concurrent_ingress ? "concurrent_ingress" : "current_direct";
-}
-
 //===----------------------------------------------------------------------===//
 // accumulated_bloom_builder::impl
 //===----------------------------------------------------------------------===//
@@ -657,14 +646,14 @@ struct accumulated_bloom_builder::impl {
  *
  * Sources are the non-root partials with at least one contribution; targets are every non-root
  * partial. Each chunk is copied from every source into one of two scratch buffers on the
- * publication stream or exclusive root-device ingress streams, ORed into the root's array on the
- * root partial's stream (merge), and copied from the root into every target on the target's stream
- * (egress). Without sources the root's array is already the union and only egress runs.
+ * publication stream, ORed into the root's array on the root partial's stream (merge), and copied
+ * from the root into every target on the target's stream (egress). Without sources the root's array
+ * is already the union and only egress runs.
  */
 class accumulated_bloom_builder::impl::chunk_pipeline final {
  public:
   /**
-   * @brief Creates the pipeline's events and exclusive root ingress streams; enqueues nothing.
+   * @brief Creates the pipeline's events; enqueues nothing.
    *
    * @param owner The builder state whose arrays are published
    * @param root The reducing partial; its GPU is the current device
@@ -694,15 +683,8 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
   {
     _source_ready.reserve(sources.size());
     _target_done.reserve(targets.size());
-    _ingress.reserve(concurrent_ingress ? sources.size() : 0);
-    _copied.reserve(concurrent_ingress ? sources.size() : 0);
     for (auto* source : sources) {
       _source_ready.push_back(make_event_on(source->device_id));
-      if constexpr (concurrent_ingress) {
-        _ingress.push_back(
-          std::make_unique<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking));
-        _copied.push_back({make_event_on(root.device_id), make_event_on(root.device_id)});
-      }
     }
     for (auto* target : targets) {
       _target_done.push_back(make_event_on(target->device_id));
@@ -710,37 +692,19 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
   }
 
   /**
-   * @brief Registers successfully constructed stream owners before their first submission.
-   *
-   * @pre `joined` has room for every ingress stream without reallocating
-   */
-  void register_ingress_streams(std::vector<::cuda::stream_ref>& joined) const
-  {
-    for (auto const& ingress : _ingress) {
-      joined.emplace_back(ingress->value());
-    }
-  }
-
-  /**
    * @brief Orders the first reads of every partial after all of its inserts.
    *
-   * Every contribution is folded into its partial's stream. Each ingress stream waits for its
+   * Every contribution is folded into its partial's stream. The publication stream waits for each
    * source's stream before ingress; without sources, every target waits for the root's stream
    * before egress. With sources, the merge on the root's stream already follows the root's inserts.
    */
   void order_after_inserts()
   {
-    check_cuda(cudaEventRecord(_allocation_ready.get(), _stream.get()),
-               "cudaEventRecord(scratch allocation ready)");
     for (std::size_t index = 0; index < _sources.size(); ++index) {
       auto const& ready = _source_ready[index];
       record(ready, *_sources[index]);
-      auto const ingress = concurrent_ingress ? _ingress[index]->value() : _stream.get();
-      check_cuda(cudaStreamWaitEvent(ingress, ready.get(), 0), "cudaStreamWaitEvent(source ready)");
-      if constexpr (concurrent_ingress) {
-        check_cuda(cudaStreamWaitEvent(ingress, _allocation_ready.get(), 0),
-                   "cudaStreamWaitEvent(scratch allocation ready)");
-      }
+      check_cuda(cudaStreamWaitEvent(_stream.get(), ready.get(), 0),
+                 "cudaStreamWaitEvent(source ready)");
     }
     if (!_sources.empty()) { return; }
     record(_root_done, _root);
@@ -810,7 +774,7 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
                        std::size_t bytes,
                        std::size_t buffer)
   {
-    if (!concurrent_ingress && _sequence >= 2) {
+    if (_sequence >= 2) {
       // The merge of chunk (sequence - 2) read this buffer.
       check_cuda(cudaStreamWaitEvent(_stream.get(), _merged[buffer].get(), 0),
                  "cudaStreamWaitEvent(scratch reuse)");
@@ -818,45 +782,27 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
     auto* const slots = _scratch + buffer * _slot_bytes;
     for (std::size_t index = 0; index < _sources.size(); ++index) {
       auto const* source = _sources[index];
-      auto const ingress = concurrent_ingress ? _ingress[index]->value() : _stream.get();
-      if (concurrent_ingress && _sequence >= 2) {
-        check_cuda(cudaStreamWaitEvent(ingress, _merged[buffer].get(), 0),
-                   "cudaStreamWaitEvent(ingress scratch reuse)");
-      }
-      auto const status = cudaMemcpyPeerAsync(
+      auto const status  = cudaMemcpyPeerAsync(
         slots + index * _geometry.chunk_bytes,
         _root.device_id,
         static_cast<std::byte const*>(source->arrays[key_index]->data()) + offset,
         source->device_id,
         bytes,
-        ingress);
+        _stream.get());
       _measurement.submitted_bytes_complete &= status == cudaSuccess;
       check_cuda(status, "cudaMemcpyPeerAsync(ingress)");
       _measurement.submitted_logical_edge_bytes += bytes;
-      if constexpr (concurrent_ingress) {
-        check_cuda(cudaEventRecord(_copied[index][buffer].get(), ingress),
-                   "cudaEventRecord(source copied)");
-      }
     }
-    if constexpr (!concurrent_ingress) {
-      check_cuda(cudaEventRecord(_ingress_done[buffer].get(), _stream.get()),
-                 "cudaEventRecord(ingress)");
-    }
+    check_cuda(cudaEventRecord(_ingress_done[buffer].get(), _stream.get()),
+               "cudaEventRecord(ingress)");
   }
 
   void enqueue_merge(std::byte* root_chunk, std::size_t bytes, std::size_t buffer)
   {
     constexpr unsigned threads = 256;
     auto const root_stream     = _root.stream->value();
-    if constexpr (concurrent_ingress) {
-      for (auto const& copied : _copied) {
-        check_cuda(cudaStreamWaitEvent(root_stream, copied[buffer].get(), 0),
-                   "cudaStreamWaitEvent(source copied)");
-      }
-    } else {
-      check_cuda(cudaStreamWaitEvent(root_stream, _ingress_done[buffer].get(), 0),
-                 "cudaStreamWaitEvent(ingress)");
-    }
+    check_cuda(cudaStreamWaitEvent(root_stream, _ingress_done[buffer].get(), 0),
+               "cudaStreamWaitEvent(ingress)");
     auto const words = bytes / sizeof(uint4);
     auto const blocks =
       static_cast<unsigned>(std::min<std::size_t>(::cuda::ceil_div(words, threads), 4096));
@@ -906,12 +852,9 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
   std::size_t _slot_bytes;
   std::array<cuda_event, 2> _ingress_done;  // Per scratch buffer: its ingress landed
   std::array<cuda_event, 2> _merged;        // Per scratch buffer: its merge finished
-  cuda_event _allocation_ready;
   cuda_event _root_done;
   std::vector<cuda_event> _source_ready;
   std::vector<cuda_event> _target_done;
-  std::vector<std::unique_ptr<rmm::cuda_stream>> _ingress;
-  std::vector<std::array<cuda_event, 2>> _copied;
   std::size_t _sequence = 0;  // Global chunk index over (key, offset)
 };
 
@@ -1072,7 +1015,6 @@ accumulated_bloom_builder::finish_for_experiment(rmm::cuda_device_id root_device
   publication_measurement local;
   auto& measured                     = measurement ? *measurement : local;
   measured                           = {};
-  measured.schedule                  = compiled_publication_schedule();
   measured.status                    = "failed";
   measured.root_device               = root_device.value();
   measured.device_count              = _impl->partials.size();
@@ -1114,7 +1056,7 @@ accumulated_bloom_builder::finish_for_experiment(rmm::cuda_device_id root_device
   sources.reserve(_impl->partials.size());
   targets.reserve(_impl->partials.size());
   spaces.reserve(_impl->partials.size());
-  joined.reserve(1 + 2 * _impl->partials.size());
+  joined.reserve(1 + _impl->partials.size());
   joined.push_back(stream);
   for (auto const& entry : _impl->partials) {
     spaces.push_back(entry->space);
@@ -1205,7 +1147,6 @@ accumulated_bloom_builder::finish_for_experiment(rmm::cuda_device_id root_device
           stream,
           scratch ? static_cast<std::byte*>(scratch->data()) : nullptr,
           measured);
-        pipeline->register_ingress_streams(joined);
       }
       measured.refusal_reason = "";
       prepared                = true;
@@ -1294,7 +1235,6 @@ accumulated_bloom_builder::finish_for_experiment(rmm::cuda_device_id root_device
     execute();
   } catch (...) {
     try {
-      // Construct the span after preparation registered every additional ingress stream.
       join_on_failure(joined, [] { throw; });
     } catch (unjoined_gpu_work const&) {
       measured.status = "unjoined";

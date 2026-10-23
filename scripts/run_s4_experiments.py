@@ -26,7 +26,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE_TREE = "9f59d68e4cdc7ca47999c3579407f6f5168ea652"
-SCHEDULES = ("current_direct", "concurrent_ingress")
+REVISION_ROLES = ("baseline", "final")
+BASELINE_REVISIONS = {
+    "prerequisite": "78a3e34c66143152ff075729f4c018806c11e67d",
+    "s4_control": "9b2e8201787f381b62715c01405f659b925c49a7",
+}
+BASELINE_OVERLAY = (
+    "test/cpp/operator/s4_experiment.cpp",
+    "test/cpp/operator/s4_experiment_common.hpp",
+    "test/cpp/operator/s4_experiment_sql.cpp",
+    "test/cpp/operator/s4_experiment_sql_oracle.hpp",
+    "cmake/sirius-s4-baseline-fixture.cmake",
+)
+SQL_ORACLE_POLICY = {
+    "oracle_policy": "exact_except_q1_avg_disc_v1",
+    "oracle_rel_tol": 1e-12,
+    "oracle_abs_tol": 1e-12,
+}
+LEGACY_SCHEMA_MESSAGE = "Schema v2 is required; analyze archived v1 campaigns with the runner and analyzer from commit 9b2e8201787f381b62715c01405f659b925c49a7"
 MIB = 1024**2
 CAPS = {"default256": 256 * MIB, "raised2g": 2048 * MIB}
 METRICS = (
@@ -45,6 +62,26 @@ METRICS = (
     "scratch_requested_bytes",
     "scratch_aligned_bytes",
     "host_staging_physical_bytes",
+)
+COMMON_SQL_OUTCOMES = (
+    "publication_count",
+    "accumulations_started",
+    "accumulation_expected_contributions",
+    "accumulation_completed_contributions",
+    "accumulations_skipped_inventory",
+    "accumulations_skipped_admission",
+    "accumulations_skipped_error",
+    "accumulations_skipped_transient",
+    "accumulations_incomplete",
+    "accumulations_abandoned",
+    "accumulation_storage_leaks",
+    "keys_skipped_bloom_size_gate",
+    "keys_skipped_domain_gate",
+    "keys_skipped_type_mismatch",
+    "keys_build_exceeded_domain",
+    "membership_filters_built",
+    "filters_pushed",
+    "result_rows",
 )
 
 
@@ -189,6 +226,15 @@ def loader_identity(
     return result
 
 
+def oracle_policy(record: dict) -> dict:
+    policy = {name: record[name] for name in SQL_ORACLE_POLICY if name in record}
+    require(
+        not policy or policy == SQL_ORACLE_POLICY,
+        "Unsupported SQL oracle policy or tolerance",
+    )
+    return policy
+
+
 def identify(build: dict, directory: Path) -> dict:
     output = directory / "identify.jsonl"
     fixture = build["artifacts"]["fixture"]["path"]
@@ -199,13 +245,30 @@ def identify(build: dict, directory: Path) -> dict:
     require(len(records) == 1, "identify must emit exactly one record")
     record = records[0]
     require(
-        record.get("schema_version") == 1 and record.get("mode") == "identify",
+        record.get("schema_version") == 2 and record.get("mode") == "identify",
         "Unsupported native identify protocol",
     )
     require(
-        record.get("compiled_schedule") == build["compiled_schedule"],
-        "Fixture schedule mismatch",
+        record.get("revision_role") == build["revision_role"],
+        "Fixture revision role mismatch",
     )
+    require(
+        record.get("identity_source") == "fixture_build_metadata",
+        "Missing fixture identity provenance",
+    )
+    modes = (
+        ["identify", "sql"]
+        if build["revision_role"] == "baseline"
+        else ["identify", "transport", "builder", "sql"]
+    )
+    require(
+        set(record.get("supported_modes", [])) == set(modes), "Unexpected fixture modes"
+    )
+    require(
+        type(record.get("publication_metrics_supported")) is bool,
+        "Missing metric availability",
+    )
+    oracle_policy(record)
     require(
         record.get("linkage") == "static_sirius_core",
         "Unexpected native fixture linkage",
@@ -218,26 +281,83 @@ def identify(build: dict, directory: Path) -> dict:
     return record
 
 
-def source_identity(baseline: str) -> dict:
-    checked(["git", "cat-file", "-e", f"{baseline}^{{tree}}"], cwd=ROOT)
+def baseline_cmake(original: str) -> str:
+    old = "  include(cmake/sirius-s4-experiments.cmake)\n"
+    new = "  include(cmake/sirius-s4-baseline-fixture.cmake)\n"
+    anchor = "  include(cmake/sirius-tests.cmake)\n"
+    require(original.count(anchor) == 1, "Missing baseline test registration anchor")
+    return (
+        original.replace(old, new)
+        if old in original
+        else original.replace(anchor, anchor + new)
+    )
+
+
+def source_identity(root: Path, role: str, baseline_kind: str = "prerequisite") -> dict:
+    head = checked(["git", "rev-parse", "HEAD"], cwd=root)
+    tree = checked(["git", "rev-parse", "HEAD^{tree}"], cwd=root)
+    overlay = {}
+    if role == "baseline":
+        require(
+            head == BASELINE_REVISIONS[baseline_kind],
+            "Baseline must use the exact frozen revision",
+        )
+        if baseline_kind == "prerequisite":
+            require(tree == BASELINE_TREE, "Prerequisite tree mismatch")
+        changed = set(
+            checked(["git", "diff", "--name-only", "HEAD"], cwd=root).splitlines()
+        )
+        require(
+            changed <= {*BASELINE_OVERLAY, "CMakeLists.txt"},
+            f"Baseline contains non-overlay changes: {sorted(changed - {*BASELINE_OVERLAY, 'CMakeLists.txt'})}",
+        )
+        original = checked(["git", "show", "HEAD:CMakeLists.txt"], cwd=root) + "\n"
+        require(
+            (root / "CMakeLists.txt").read_text() == baseline_cmake(original),
+            "Baseline CMake changes exceed the test-only include",
+        )
+        overlay = {name: file_hash(root / name) for name in BASELINE_OVERLAY}
     paths = [
         "CMakeLists.txt",
         "cmake",
         "src",
+        "include",
         "test/cpp",
         "sirius-duckdb/CMakeLists.txt",
     ]
-    diff = checked(["git", "diff", "--binary", baseline, "--", *paths], cwd=ROOT)
+    diff = checked(["git", "diff", "--binary", "HEAD", "--", *paths], cwd=root)
     new_paths = checked(
-        ["git", "ls-files", "--others", "--exclude-standard", "--", *paths], cwd=ROOT
+        ["git", "ls-files", "--others", "--exclude-standard", "--", *paths], cwd=root
     )
     untracked = {
-        p: file_hash(ROOT / p) for p in new_paths.splitlines() if (ROOT / p).is_file()
+        p: file_hash(root / p) for p in new_paths.splitlines() if (root / p).is_file()
     }
-    dependencies = checked(["git", "submodule", "status", "--recursive"], cwd=ROOT)
+    if role == "baseline":
+        require(
+            set(untracked) <= set(BASELINE_OVERLAY),
+            "Untracked baseline production/build source",
+        )
+    dependencies = []
+    for line in checked(
+        ["git", "submodule", "status", "--recursive"], cwd=root
+    ).splitlines():
+        match = re.match(r"\s*([+U-]?)([0-9a-f]{40})\s+(\S+)", line)
+        require(
+            match is not None and match[1] not in ("+", "U"),
+            "Submodule revision differs from its source pin",
+        )
+        dependencies.append(
+            {"path": match[3], "revision": match[2], "initialized": match[1] != "-"}
+        )
     return {
-        "baseline_tree": baseline,
-        "head": checked(["git", "rev-parse", "HEAD"], cwd=ROOT),
+        "head": head,
+        "tree": tree,
+        "baseline_kind": baseline_kind if role == "baseline" else None,
+        "baseline_production_unchanged": role == "baseline",
+        "fixture_overlay_sha256": overlay,
+        "fixture_sources_sha256": {
+            name: file_hash(root / name) for name in BASELINE_OVERLAY[:-1]
+        },
         "diff": diff,
         "untracked_sha256": untracked,
         "submodules": dependencies,
@@ -253,6 +373,33 @@ def cmake_settings(path: Path) -> dict:
     return result
 
 
+def comparable_configuration(
+    config: dict, root: Path, build_dir: Path, install: Path, baseline_kind: str | None
+) -> dict:
+    legacy = "SIRIUS_S4_PUBLICATION_SCHEDULE"
+    if legacy in config:
+        require(
+            baseline_kind == "s4_control" and config[legacy] == "current_direct",
+            "A production schedule selector is only valid in the frozen S4 control",
+        )
+    locations = sorted(
+        (
+            (str(root.resolve()), "<SOURCE>"),
+            (str(build_dir.resolve()), "<BUILD>"),
+            (str(install.resolve()), "<INSTALL>"),
+        ),
+        key=lambda pair: -len(pair[0]),
+    )
+    result = {}
+    for name, value in config.items():
+        if name == legacy:
+            continue
+        for path, token in locations:
+            value = re.sub(re.escape(path) + r"(?=/|;|$)", lambda _: token, value)
+        result[name] = value
+    return result
+
+
 def manifest_command(args) -> None:
     output = args.output.resolve()
     require(not output.exists(), f"Refusing to replace {output}")
@@ -262,13 +409,15 @@ def manifest_command(args) -> None:
     }
     cache = (args.cmake_cache or output.parent / "CMakeCache.txt").resolve(strict=True)
     config = cmake_settings(cache)
-    require(
-        config.get("SIRIUS_S4_PUBLICATION_SCHEDULE") == args.schedule,
-        "CMake cache schedule does not match requested schedule",
+    root = args.source_root.resolve(strict=True)
+    source = source_identity(root, args.revision_role, args.baseline_kind)
+    comparable_config = comparable_configuration(
+        config,
+        root,
+        args.build_dir,
+        args.library.resolve().parent.parent,
+        source["baseline_kind"],
     )
-    comparable_config = {
-        k: v for k, v in config.items() if k != "SIRIUS_S4_PUBLICATION_SCHEDULE"
-    }
     search = [str(Path(artifacts["library"]["path"]).parent)]
     if os.environ.get("CONDA_PREFIX"):
         search.append(str(Path(os.environ["CONDA_PREFIX"]) / "lib"))
@@ -278,15 +427,22 @@ def manifest_command(args) -> None:
         if p
     ]
     build = {
-        "schema_version": 1,
-        "compiled_schedule": args.schedule,
+        "schema_version": 2,
+        "revision_role": args.revision_role,
+        "baseline_kind": source["baseline_kind"],
         "linkage": "static_sirius_core",
         "artifacts": artifacts,
         "library_search_paths": list(dict.fromkeys(search)),
         "cmake_cache": artifact(cache),
+        "build_command": (
+            artifact(output.parent / "build-command.json")
+            if (output.parent / "build-command.json").is_file()
+            else None
+        ),
         "configuration": config,
+        "comparable_configuration": comparable_config,
         "configuration_sha256": digest(comparable_config),
-        "source": source_identity(args.baseline_tree),
+        "source": source,
     }
     build["source_sha256"] = digest(build["source"])
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -310,7 +466,7 @@ def manifest_command(args) -> None:
 
 
 def verify_build(build: dict, *, runtime=True) -> None:
-    require(build.get("schema_version") == 1, "Unsupported build manifest")
+    require(build.get("schema_version") == 2, LEGACY_SCHEMA_MESSAGE)
     require(
         build.get("build_id")
         == digest({k: v for k, v in build.items() if k != "build_id"}),
@@ -319,6 +475,11 @@ def verify_build(build: dict, *, runtime=True) -> None:
     for item in [*build["artifacts"].values(), build["cmake_cache"]]:
         require(
             artifact(Path(item["path"])) == item, f"Artifact changed: {item['path']}"
+        )
+    if build.get("build_command"):
+        require(
+            artifact(Path(build["build_command"]["path"])) == build["build_command"],
+            "Build command provenance changed",
         )
     if runtime:
         with tempfile.TemporaryDirectory(prefix="s4-verify-") as tmp:
@@ -338,10 +499,36 @@ def verify_build(build: dict, *, runtime=True) -> None:
 
 
 def validate_build_pair(builds: dict) -> None:
-    baseline, candidate = (builds[name] for name in SCHEDULES)
-    for schedule, build in builds.items():
-        require(build["compiled_schedule"] == schedule, "Mislabeled paired schedule")
-    for field in ("source_sha256", "configuration_sha256"):
+    baseline, candidate = (builds[name] for name in REVISION_ROLES)
+    for role, build in builds.items():
+        require(build["revision_role"] == role, "Mislabeled revision role")
+    require(
+        baseline["source"]["baseline_production_unchanged"],
+        "Baseline production was modified",
+    )
+    require(
+        baseline["source"]["head"] == BASELINE_REVISIONS[baseline["baseline_kind"]],
+        "Wrong baseline revision",
+    )
+    require(
+        baseline["source"]["submodules"] == candidate["source"]["submodules"],
+        "Dependency revisions differ",
+    )
+    require(
+        baseline["source"]["fixture_sources_sha256"]
+        == candidate["source"]["fixture_sources_sha256"],
+        "SQL fixture overlay differs between revisions",
+    )
+    require(
+        baseline["identify"]["duckdb_version"]
+        == candidate["identify"]["duckdb_version"],
+        "DuckDB versions differ",
+    )
+    require(
+        oracle_policy(baseline["identify"]) == oracle_policy(candidate["identify"]),
+        "SQL oracle policies differ between revisions",
+    )
+    for field in ("configuration_sha256",):
         require(baseline[field] == candidate[field], f"Paired builds differ in {field}")
     for field in ("bloom_block_bytes", "cuda_allocation_alignment"):
         require(
@@ -352,19 +539,19 @@ def validate_build_pair(builds: dict) -> None:
         require(
             baseline["artifacts"][name]["sha256"]
             != candidate["artifacts"][name]["sha256"],
-            f"Identical {name} hashes for different compiled schedules",
+            f"Identical {name} hashes for different revisions",
         )
 
 
 def pair_manifests(args) -> None:
     builds = {
-        SCHEDULES[0]: load_json(args.baseline),
-        SCHEDULES[1]: load_json(args.candidate),
+        REVISION_ROLES[0]: load_json(args.baseline),
+        REVISION_ROLES[1]: load_json(args.final),
     }
     for build in builds.values():
         verify_build(build)
     validate_build_pair(builds)
-    write_json(args.output, {"schema_version": 1, "builds": builds})
+    write_json(args.output, {"schema_version": 2, "builds": builds})
     print(args.output)
 
 
@@ -373,10 +560,10 @@ def load_builds(path: Path) -> dict:
     if "builds" in value:
         builds = value["builds"]
     else:
-        builds = {name: load_json(Path(value[name])) for name in SCHEDULES}
+        builds = {name: load_json(Path(value[name])) for name in REVISION_ROLES}
     require(
-        set(builds) == set(SCHEDULES),
-        "Require current_direct and concurrent_ingress builds",
+        set(builds) == set(REVISION_ROLES),
+        "Require baseline and final revision builds",
     )
     validate_build_pair(builds)
     for build in builds.values():
@@ -649,8 +836,8 @@ def execution_plan(workloads: list[dict], args) -> list[dict]:
             for workload in stage_work:
                 comparisons = (
                     ["diagnostic"]
-                    if stage == "transport"
-                    else ["baseline_candidate", "baseline_baseline"]
+                    if stage != "sql"
+                    else ["baseline_final", "baseline_baseline"]
                 )
                 rng.shuffle(comparisons)
                 for comparison in comparisons:
@@ -658,16 +845,17 @@ def execution_plan(workloads: list[dict], args) -> list[dict]:
                     next_cluster += 1
                     seed = rng.randrange(1, 2**31)
                     arms = (
-                        ["baseline"]
+                        ["candidate"]
                         if comparison == "diagnostic"
                         else ["baseline", "candidate"]
                     )
                     rng.shuffle(arms)
                     for order, arm in enumerate(arms):
-                        schedule = (
-                            "concurrent_ingress"
-                            if comparison == "baseline_candidate" and arm == "candidate"
-                            else "current_direct"
+                        role = (
+                            "final"
+                            if comparison == "diagnostic"
+                            or (comparison == "baseline_final" and arm == "candidate")
+                            else "baseline"
                         )
                         jobs.append(
                             {
@@ -679,7 +867,7 @@ def execution_plan(workloads: list[dict], args) -> list[dict]:
                                 "order": order,
                                 "pair": cluster,
                                 "seed": seed,
-                                "schedule": schedule,
+                                "revision_role": role,
                                 "warmups": args.warmups,
                                 "repetitions": repeats,
                             }
@@ -745,7 +933,7 @@ def validate_native(
     seen = set()
     for record in records:
         for key, expected in {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": run["run_id"],
             "build_id": build["build_id"],
             "mode": workload["mode"],
@@ -753,7 +941,7 @@ def validate_native(
             "pair": job["pair"],
             "order": job["order"],
             "seed": job["seed"],
-            "compiled_schedule": job["schedule"],
+            "revision_role": job["revision_role"],
             "devices": run["devices"],
             "profile": run["profile"],
             "cap_bytes": run["cap_bytes"],
@@ -809,9 +997,40 @@ def validate_native(
             )
             if workload["mode"] == "sql":
                 require(
+                    oracle_policy(record) == oracle_policy(build["identify"]),
+                    "SQL oracle policy differs from the fixture identity",
+                )
+                require(
                     type(record.get("gpu_intercepted")) is bool,
                     "Missing SQL interception evidence",
                 )
+                require(
+                    record.get("profile_verified") is True,
+                    "SQL profile was not verified",
+                )
+                require(
+                    record.get("publication_metrics_supported")
+                    == build["identify"]["publication_metrics_supported"],
+                    "SQL metric availability differs from identify",
+                )
+                for name in COMMON_SQL_OUTCOMES:
+                    require(
+                        type(record.get(name)) is int and record[name] >= 0,
+                        f"Missing/invalid common SQL outcome: {name}",
+                    )
+                if not record["publication_metrics_supported"]:
+                    require(
+                        all(
+                            record[name] is None
+                            for name in (
+                                "host_elapsed_ns",
+                                "input_bitmap_bytes",
+                                "ready_replica_bytes",
+                                "published_bitmap_bytes",
+                            )
+                        ),
+                        "Unsupported publication metrics must remain null",
+                    )
             if workload["mode"] == "builder":
                 require(record.get("root") == workload["root"], "Builder root mismatch")
                 require(
@@ -956,7 +1175,7 @@ def campaign(args) -> None:
     require(not output.exists(), f"Refusing to reuse result directory {output}")
     builds = load_builds(args.build_manifest)
     output.mkdir(parents=True)
-    identify_record = builds["current_direct"]["identify"]
+    identify_record = builds["final"]["identify"]
     roots = comma_integers(args.roots) if args.roots else None
     require(
         roots is None or set(roots) <= set(devices),
@@ -1008,7 +1227,9 @@ def campaign(args) -> None:
         job["sample_prefix"] = f"{run_id}:p{index:05d}"
         job["process_id"] = f"p{index:05d}"
     run = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "comparison_contract": "revision_sql_v2",
+        "baseline_kind": builds["baseline"]["baseline_kind"],
         "run_id": run_id,
         "phase": args.command,
         "devices": devices,
@@ -1042,7 +1263,6 @@ def campaign(args) -> None:
             else None
         ),
         "thresholds": {
-            "publication_reduction": 0.10,
             "query_slowdown_upper": 0.03,
             "interval": "two-sided 95% Student-t on independent process-pair mean log ratios",
             "minimum_clusters": 5,
@@ -1117,12 +1337,12 @@ def campaign(args) -> None:
     workload_by_id = {w["id"]: w for w in workloads}
     completed = 0
     try:
-        for schedule, build in builds.items():
-            cli_smoke(build, config, output / "cli-smoke" / schedule, args.timeout)
+        for role, build in builds.items():
+            cli_smoke(build, config, output / "cli-smoke" / role, args.timeout)
         with (output / "samples.jsonl").open("x") as aggregate:
             for job in jobs:
                 workload = workload_by_id[job["workload"]]
-                build = builds[job["schedule"]]
+                build = builds[job["revision_role"]]
                 verify_inputs(run)
                 directory = output / "processes" / job["process_id"]
                 directory.mkdir(parents=True)
@@ -1139,12 +1359,12 @@ def campaign(args) -> None:
                             suffix = "warmup" if warmup else "sample"
                             record = {k: None for k in METRICS}
                             record.update(
-                                schema_version=1,
+                                schema_version=2,
                                 run_id=run_id,
                                 sample_id=f"{job['sample_prefix']}:{suffix}:{repetition}",
                                 build_id=build["build_id"],
                                 mode=workload["mode"],
-                                compiled_schedule=job["schedule"],
+                                revision_role=job["revision_role"],
                                 process_cluster=job["process_cluster"],
                                 pair=job["pair"],
                                 order=job["order"],
@@ -1239,17 +1459,21 @@ def parser() -> argparse.ArgumentParser:
     sub = result.add_subparsers(dest="command", required=True)
     manifest = sub.add_parser(
         "manifest",
-        help="Hash frozen artifacts and verify the compiled native schedule (CPU only)",
+        help="Hash frozen artifacts and verify fixture revision metadata (CPU only)",
     )
     for name in ("fixture", "library", "extension", "cli", "output"):
         manifest.add_argument("--" + name, type=Path, required=True)
-    manifest.add_argument("--schedule", choices=SCHEDULES, required=True)
+    manifest.add_argument("--revision-role", choices=REVISION_ROLES, required=True)
+    manifest.add_argument("--source-root", type=Path, required=True)
+    manifest.add_argument("--build-dir", type=Path, required=True)
+    manifest.add_argument(
+        "--baseline-kind", choices=BASELINE_REVISIONS, default="prerequisite"
+    )
     manifest.add_argument("--cmake-cache", type=Path)
-    manifest.add_argument("--baseline-tree", default=BASELINE_TREE)
     pair = sub.add_parser(
         "pair-manifests", help="Validate and freeze two compatible build manifests"
     )
-    for name in ("baseline", "candidate", "output"):
+    for name in ("baseline", "final", "output"):
         pair.add_argument("--" + name, type=Path, required=True)
     for name in ("screen", "confirm", "regression"):
         run = sub.add_parser(
@@ -1305,7 +1529,7 @@ def parser() -> argparse.ArgumentParser:
         run.add_argument(
             "--stage-a-results",
             type=Path,
-            help="Prior transport screen directory, required for performance interpretation",
+            help="Optional prior final-host transport diagnostics directory",
         )
         run.add_argument(
             "--extend-from",

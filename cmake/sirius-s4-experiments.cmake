@@ -8,7 +8,8 @@ target_include_directories(
   PRIVATE $<TARGET_PROPERTY:sirius_unittest,INCLUDE_DIRECTORIES>)
 target_compile_definitions(
   sirius_s4_experiment
-  PRIVATE $<TARGET_PROPERTY:sirius_unittest,COMPILE_DEFINITIONS>)
+  PRIVATE $<TARGET_PROPERTY:sirius_unittest,COMPILE_DEFINITIONS>
+          SIRIUS_S4_REVISION_ROLE="final")
 target_link_libraries(
   sirius_s4_experiment PRIVATE sirius_core duckdb_static ZLIB::ZLIB
                                ${SIRIUS_CURL_TARGET} ${CMAKE_DL_LIBS})
