@@ -1,0 +1,52 @@
++ ['pixi', 'run', '--as-is', '--manifest-path', '/home/ubuntu/sirius/pixi.toml', 'python', 'scripts/build_s4_experiments.py', '--output', 'build/s4-retry-xxhsum', '--cuda-architectures', 'native', '--jobs', '24', '--cmake-option=-DXXHSUM_EXECUTABLE=/home/ubuntu/.cache/rattler/cache/pkgs/xxhash-0.8.3-hec8ed23_1/bin/xxhsum']
++ cmake --preset release -B /tmp/s4-four-gpu-20261023/build/release -DSIRIUS_DUCKDB_SOURCE_DIR=/tmp/s4-four-gpu-20261023/duckdb -DCMAKE_CUDA_ARCHITECTURES=native -DSIRIUS_S4_PUBLICATION_SCHEDULE=current_direct -DXXHSUM_EXECUTABLE=/home/ubuntu/.cache/rattler/cache/pkgs/xxhash-0.8.3-hec8ed23_1/bin/xxhsum
+-- git hash 88ecd0a49d, version v2.0.0-dev87629, extension folder 88ecd0a49d
+-- Build workers: compile=24 link_release=4 link_non_release=2
+-- Extensions will be deployed to: /tmp/s4-four-gpu-20261023/build/release/repository
+-- Load extension 'core_functions' from '/tmp/s4-four-gpu-20261023/duckdb/extensions' @ 88ecd0a49d
+-- Load extension 'parquet' from '/tmp/s4-four-gpu-20261023/duckdb/extensions' @ 88ecd0a49d
+-- Load extension 'json' from '/tmp/s4-four-gpu-20261023/duckdb/extensions' @ 88ecd0a49d
+-- Load extension 'icu' from '/tmp/s4-four-gpu-20261023/duckdb/extensions' @ 88ecd0a49d
+-- Linked into DuckDB: extensions [core_functions, parquet, json, icu], capabilities [httplib, loadable_extensions, local_extension_repository]
+-- DuckDB CLI Release architecture flags: -march=x86-64-v3 -mtune=generic
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Finding CCCL components: Thrust;CUB;libcudacxx
+-- Found nvcomp: (Version:5.3.0.16
+           CMakePackageDir:/home/ubuntu/sirius/.pixi/envs/default/lib/cmake/nvcomp
+           IncludeDir:/home/ubuntu/sirius/.pixi/envs/default/include
+           LibraryDir:/home/ubuntu/sirius/.pixi/envs/default/lib
+           ComponentsFound:[nvcomp;nvcomp_cpu])
+CMake Error at src/compression/simpatico_codegen/cmake/cache_identity.cmake:2 (find_path):
+  Could not find SIMPATICO_XXHASH_INCLUDE_DIR using the following files:
+  xxhash.h
+Call Stack (most recent call first):
+  src/compression/simpatico_codegen/CMakeLists.txt:16 (include)
+
+
+-- Configuring incomplete, errors occurred!
+Traceback (most recent call last):
+  File "/tmp/s4-four-gpu-20261023/scripts/build_s4_experiments.py", line 210, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/tmp/s4-four-gpu-20261023/scripts/build_s4_experiments.py", line 79, in main
+    run(
+  File "/tmp/s4-four-gpu-20261023/scripts/build_s4_experiments.py", line 21, in run
+    subprocess.run(command, cwd=cwd, env=env, check=True)
+  File "/home/ubuntu/sirius/.pixi/envs/default/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['cmake', '--preset', 'release', '-B', '/tmp/s4-four-gpu-20261023/build/release', '-DSIRIUS_DUCKDB_SOURCE_DIR=/tmp/s4-four-gpu-20261023/duckdb', '-DCMAKE_CUDA_ARCHITECTURES=native', '-DSIRIUS_S4_PUBLICATION_SCHEDULE=current_direct', '-DXXHSUM_EXECUTABLE=/home/ubuntu/.cache/rattler/cache/pkgs/xxhash-0.8.3-hec8ed23_1/bin/xxhsum']' returned non-zero exit status 1.
