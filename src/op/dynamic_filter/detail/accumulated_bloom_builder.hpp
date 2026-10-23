@@ -33,6 +33,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -46,6 +47,50 @@ class sirius_dynamic_bloom_filter;
 }  // namespace sirius::op
 
 namespace sirius::op::detail {
+
+/**
+ * @brief The immutable publication schedule compiled into the library.
+ */
+[[nodiscard]] char const* compiled_publication_schedule() noexcept;
+
+/**
+ * @brief Diagnostic transport selection; production uses automatic selection.
+ */
+enum class publication_transport { automatic, force_host, require_direct };
+
+/**
+ * @brief Publication work and resources observed from preparation entry through completion or
+ * failure cleanup.
+ *
+ * Strings have static lifetime. Submitted bytes count successful copy submissions, separately from
+ * the complete plan; a failed batch can have an unknown accepted prefix. The caller owns this
+ * record through return or unwind. Local GPU stage durations are not measured here.
+ */
+struct publication_measurement {
+  char const* schedule                         = "";
+  char const* actual_transport                 = "none";
+  char const* status                           = "not_started";
+  char const* refusal_reason                   = "";
+  int root_device                              = -1;
+  std::size_t device_count                     = 0;
+  std::size_t key_count                        = 0;
+  std::size_t bitmap_bytes                     = 0;
+  std::size_t chunk_bytes                      = 0;
+  std::size_t contributing_gpu_count           = 0;
+  std::uint64_t input_bitmap_bytes             = 0;
+  std::uint64_t ready_replica_bytes            = 0;
+  std::uint64_t planned_logical_edge_bytes     = 0;
+  std::uint64_t submitted_logical_edge_bytes   = 0;
+  std::uint64_t planned_d2h_bytes              = 0;
+  std::uint64_t submitted_d2h_bytes            = 0;
+  std::uint64_t planned_h2d_bytes              = 0;
+  std::uint64_t submitted_h2d_bytes            = 0;
+  std::uint64_t requested_device_scratch_bytes = 0;
+  std::uint64_t aligned_device_scratch_bytes   = 0;
+  std::uint64_t physical_host_bytes            = 0;
+  std::uint64_t host_elapsed_ns                = 0;
+  bool submitted_bytes_complete                = true;
+};
 
 /**
  * @brief A CUDA runtime failure whose construction cannot turn a fatal error into recoverable host
@@ -226,7 +271,7 @@ class accumulated_bloom_builder final {
 
   /**
    * @brief Reduces every contributed partial into @p root's, overwrites every other partial with
-   * the union, and waits on the host once.
+   * the union, and waits for every replica on the host.
    *
    * The builder retains every completed filter owner. The returned span borrows those owners until
    * builder destruction; channels may share them. Scratch uses @p scratch_mr only during this call
@@ -239,11 +284,26 @@ class accumulated_bloom_builder final {
    * @param root The reducing GPU, current on the calling thread
    * @param stream The publication stream of @p root
    * @param scratch_mr Resource borrowing the task's reservation
-   * @return One ready filter per key, or no value when @p root holds no partial or scratch
-   * allocation is refused
+   * @return One ready filter per key, or no value when @p root holds no partial or publication
+   * workspace allocation is refused
    */
   [[nodiscard]] std::optional<std::span<std::shared_ptr<sirius_dynamic_bloom_filter> const>> finish(
     rmm::cuda_device_id root, ::cuda::stream_ref stream, rmm::device_async_resource_ref scratch_mr);
+
+  /**
+   * @brief Runs `finish` with diagnostic transport selection and an optional measurement record.
+   *
+   * Uses the compiled schedule and the same ownership and ordering contract as `finish`.
+   * `require_direct` returns no filters with status `unavailable` when pool access cannot be
+   * established; `automatic` instead uses bounded HOST staging. CUDA errors propagate after
+   * accepted work is joined.
+   */
+  [[nodiscard]] std::optional<std::span<std::shared_ptr<sirius_dynamic_bloom_filter> const>>
+  finish_for_experiment(rmm::cuda_device_id root,
+                        ::cuda::stream_ref stream,
+                        rmm::device_async_resource_ref scratch_mr,
+                        publication_transport transport,
+                        publication_measurement* measurement = nullptr);
 
   /**
    * @brief True iff releasing this builder's storage now credits no allocation tracker.
@@ -261,6 +321,16 @@ class accumulated_bloom_builder final {
     std::vector<std::byte> bytes;  ///< The replica's filter array
     bool stream_idle;              ///< Whether the replica's stream had no pending work at the call
   };
+
+  /**
+   * @brief Copies a private partial to owned host bytes after waiting for its insertions.
+   *
+   * @pre All `enqueue_add` calls returned and publication has not begun; the caller is the
+   * builder's only user
+   * @return The partial contents, or no value for an absent key or GPU
+   */
+  [[nodiscard]] std::optional<replica_contents> inspect_partial(std::size_t key_index,
+                                                                rmm::cuda_device_id device) const;
 
   /**
    * @brief Copies @p filter's accumulated replica on @p device to the host.

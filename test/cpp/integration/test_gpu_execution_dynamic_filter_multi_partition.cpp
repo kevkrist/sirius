@@ -82,21 +82,6 @@ void require_complete_publication(observed_run const& run, result_rows const& cp
           run.before.publications_skipped_build_not_whole);
 }
 
-/**
- * @brief Checks a run whose accumulation declined at start because a pair of its GPUs has no
- * available pool access: the results still match the CPU and nothing else ended the attempt.
- */
-void require_pool_access_decline(observed_run const& run, result_rows const& cpu_rows)
-{
-  REQUIRE(run.rows == cpu_rows);
-  REQUIRE(run.after.accumulations_started == run.before.accumulations_started);
-  REQUIRE(run.after.accumulations_skipped_admission ==
-          run.before.accumulations_skipped_admission + 1);
-  REQUIRE(run.after.accumulations_skipped_error == run.before.accumulations_skipped_error);
-  REQUIRE(run.after.accumulation_publications_finished ==
-          run.before.accumulation_publications_finished);
-}
-
 void run_ok(duckdb::Connection& con, std::string const& sql)
 {
   auto result = con.Query(sql);
@@ -119,19 +104,9 @@ result_rows run_on_cpu(duckdb::Connection& con, std::string const& query)
  * port of the union operator, so the build PARTITION still has one finished source pipeline, and a
  * probe-side union exposes one scan target per arm.
  *
- * @param pool_access Whether each of the session's GPUs was granted access to every other GPU's
- * allocation pool; without it the accumulation declines by design and only the results and the
- * decline are checked
  */
-void check_union_all_accumulation(duckdb::Connection& con, bool pool_access = true)
+void check_union_all_accumulation(duckdb::Connection& con)
 {
-  auto const require_outcome = [pool_access](observed_run const& run, result_rows const& cpu_rows) {
-    if (pool_access) {
-      require_complete_publication(run, cpu_rows);
-    } else {
-      require_pool_access_decline(run, cpu_rows);
-    }
-  };
   scoped_sirius_setting gpu_on(con, "gpu_execution", true);
   scoped_sirius_setting master_on(con, "enable_dynamic_filter", true);
   scoped_sirius_setting accumulation_on(con, "enable_dynamic_filter_multi_partition", true);
@@ -162,7 +137,7 @@ void check_union_all_accumulation(duckdb::Connection& con, bool pool_access = tr
       "SELECT k, payload, marker FROM df_union_build WHERE marker >= 2) b "
       "ON p.k = b.k WHERE b.marker <> 0";
     auto const cpu_rows = run_on_cpu(con, query);
-    require_outcome(run_on_gpu(con, query), cpu_rows);
+    require_complete_publication(run_on_gpu(con, query), cpu_rows);
   }
   SECTION("a probe side that is a UNION ALL of two scans receives the filter in both arms")
   {
@@ -173,8 +148,8 @@ void check_union_all_accumulation(duckdb::Connection& con, bool pool_access = tr
       "JOIN df_union_build b ON p.k = b.k WHERE b.marker <> 0";
     auto const cpu_rows = run_on_cpu(con, query);
     auto const run      = run_on_gpu(con, query);
-    require_outcome(run, cpu_rows);
-    if (pool_access) { REQUIRE(run.after.filters_pushed - run.before.filters_pushed >= 2); }
+    require_complete_publication(run, cpu_rows);
+    REQUIRE(run.after.filters_pushed - run.before.filters_pushed >= 2);
   }
 }
 
@@ -209,12 +184,12 @@ TEST_CASE("gpu_execution - multi-partition accumulation through UNION ALL on two
     bool const pool_access = !sirius::memory::find_pair_without_pool_access(
       manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU));
     if (!pool_access) {
-      WARN("pool access unavailable; checking SQL results and admission decline");
+      WARN("pool access unavailable; checking bounded HOST publication and SQL results");
     }
 
     run_ok(*con, "ATTACH '" + database.string() + "' AS df_union_mgpu;");
     run_ok(*con, "USE df_union_mgpu;");
-    check_union_all_accumulation(*con, pool_access);
+    check_union_all_accumulation(*con);
     con->Query("USE memory;");
     con->Query("DETACH df_union_mgpu;");
   }

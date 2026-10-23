@@ -1,3 +1,20 @@
+set(SIRIUS_S4_PUBLICATION_SCHEDULE
+    "current_direct"
+    CACHE STRING "Private S4 experiment: current_direct or concurrent_ingress")
+set_property(CACHE SIRIUS_S4_PUBLICATION_SCHEDULE
+             PROPERTY STRINGS current_direct concurrent_ingress)
+if(SIRIUS_S4_PUBLICATION_SCHEDULE STREQUAL "concurrent_ingress")
+  set_property(
+    SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/sirius_dynamic_bloom_filter.cu"
+           TARGET_DIRECTORY sirius_objects
+    APPEND
+    PROPERTY COMPILE_DEFINITIONS SIRIUS_S4_CONCURRENT_INGRESS=1)
+elseif(NOT SIRIUS_S4_PUBLICATION_SCHEDULE STREQUAL "current_direct")
+  message(
+    FATAL_ERROR
+      "Unknown S4 publication schedule: ${SIRIUS_S4_PUBLICATION_SCHEDULE}")
+endif()
+
 target_sources(
   sirius_objects
   PRIVATE date_cast.cu

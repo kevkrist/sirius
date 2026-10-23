@@ -36,6 +36,7 @@
 
 #include <catch.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 
 #include <algorithm>
@@ -49,6 +50,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -542,7 +544,7 @@ TEST_CASE("duplicates and retries count once and only the final original ID publ
   REQUIRE(fixture.channel->snapshot().terminal());
 }
 
-TEST_CASE("a refused task scratch allocation skips publication before enqueueing anything",
+TEST_CASE("a refused direct scratch allocation uses the smaller bounded HOST workspace",
           "[dynamic_filter][multi_partition][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
@@ -561,11 +563,13 @@ TEST_CASE("a refused task scratch allocation skips publication before enqueueing
   REQUIRE(cudaStreamQuery(fixture.publication_stream(0).get()) == cudaSuccess);
   refusing_task.reset();
   auto const counters = fixture.stats.snapshot();
-  REQUIRE(counters.accumulations_skipped_admission == 1);
-  REQUIRE(counters.accumulation_publications_finished == 0);
-  REQUIRE(counters.filters_pushed == 0);
+  REQUIRE(counters.accumulations_skipped_admission == 0);
+  REQUIRE(counters.accumulation_publications_finished == 1);
+  REQUIRE(counters.accumulation_host_publications == 1);
+  REQUIRE(counters.filters_pushed == 2);
   REQUIRE(fixture.channel->snapshot().terminal());
-  REQUIRE(fixture.channel->snapshot().empty());
+  REQUIRE_FALSE(fixture.channel->snapshot().empty());
+  fixture.require_members({first, second});
 }
 
 TEST_CASE("closing or cancelling collecting input never waits for queued inserts",
@@ -1595,6 +1599,10 @@ TEST_CASE("a key accepted by no channel stays owned until safe retirement",
     REQUIRE(fixture.allocated_bytes()[0] ==
             baseline[0] + mib + partial_bytes(600, per_stream ? 1 : 2));
   }
+  auto const counts = fixture.stats.snapshot();
+  REQUIRE(counts.accumulation_input_bitmap_bytes == 2 * acc::bloom_geometry(600).raw_bytes);
+  REQUIRE(counts.accumulation_ready_replica_bytes == 2 * acc::bloom_geometry(600).raw_bytes);
+  REQUIRE(counts.accumulation_published_bitmap_bytes == acc::bloom_geometry(600).raw_bytes);
   fixture.session->release_retired_storage();
   REQUIRE(fixture.allocated_bytes()[0] == baseline[0] + partial_bytes(600, 1));
   REQUIRE(fixture.possible_rows(0, first, 0) == 300);
@@ -1764,4 +1772,212 @@ TEST_CASE("cached fusion probes accumulated Bloom replicas through narrower carr
   REQUIRE(sirius::test::operator_utils::copy_column_to_host<int32_t>(positions_a->view(), stream) ==
           sirius::test::operator_utils::copy_column_to_host<int32_t>(positions_b->view(), stream));
   REQUIRE(ordinary.finish(std::move(left), 1).applied == fused.finish(std::move(right), 1).applied);
+}
+
+TEST_CASE("S4 publication matches the complete partial union and bounded workspace",
+          "[dynamic_filter][multi_partition][s4_publication][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  using transport         = op::detail::publication_transport;
+  auto const mode         = GENERATE(transport::force_host, transport::require_direct);
+  auto const root         = GENERATE(0, 1);
+  auto const contributors = GENERATE(0, 1, 2);
+  auto const keys         = GENERATE(std::size_t{1}, std::size_t{2});
+  auto const devices      = static_cast<std::size_t>(std::min(acc::visible_gpus(), 4));
+  acc::fixture fixture({.devices = devices});
+  if (mode == transport::require_direct && !acc::has_pool_access(fixture.spaces)) { return; }
+  // Three chunks per key, including an aligned short tail; key 1 starts on the other half.
+  auto const geometry = acc::bloom_geometry(2'097'153, keys);
+  REQUIRE(geometry.chunks_per_key() == 3);
+  auto builder = acc::make_builder(fixture, geometry, keys);
+  auto local   = fixture.make_batch(root, 0, 100);
+  auto remote  = fixture.make_batch(1 - root, 1000, 100);
+  if (contributors == 2) { acc::add_to_builder(builder, fixture, remote); }
+  if (contributors != 0) { acc::add_to_builder(builder, fixture, local); }
+  auto const expected = acc::partial_union(builder, keys, devices);
+  auto* host          = fixture.spaces[root]
+                 .get_host_staging_space()
+                 .get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host);
+  auto const host_before = host->get_total_allocated_bytes();
+  auto const baseline    = fixture.allocated_bytes();
+  op::detail::publication_measurement measured;
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root}};
+  auto const stream = fixture.publication_stream(root);
+  auto filters      = builder.finish_for_experiment(
+    rmm::cuda_device_id{root}, stream, fixture.gpu(root).get_default_allocator(), mode, &measured);
+  REQUIRE(filters);
+  acc::require_exact_union(*filters, expected, devices);
+  REQUIRE(std::string_view{measured.status} == "completed");
+  REQUIRE(measured.input_bitmap_bytes ==
+          static_cast<std::size_t>(contributors) * keys * geometry.raw_bytes);
+  REQUIRE(measured.ready_replica_bytes == devices * keys * geometry.raw_bytes);
+  auto const sources = contributors == 2 ? 1u : 0u;
+  auto const logical = (sources + devices - 1) * keys * geometry.raw_bytes;
+  REQUIRE(measured.planned_logical_edge_bytes == logical);
+  REQUIRE(measured.submitted_logical_edge_bytes == logical);
+  REQUIRE(measured.submitted_bytes_complete);
+  auto const scratch = sources == 0                    ? 0
+                       : mode == transport::force_host ? geometry.chunk_bytes
+                                                       : acc::merge_scratch_bytes(geometry, keys);
+  REQUIRE(measured.requested_device_scratch_bytes == scratch);
+  REQUIRE(measured.aligned_device_scratch_bytes ==
+          op::detail::tracked_replica_allocation_bytes(scratch));
+  if (mode == transport::force_host) {
+    auto const block = host->get_block_size();
+    REQUIRE(measured.physical_host_bytes == ((geometry.chunk_bytes + block - 1) / block) * block);
+    REQUIRE(measured.submitted_d2h_bytes == (sources + 1) * keys * geometry.raw_bytes);
+    REQUIRE(measured.submitted_h2d_bytes == logical);
+  } else {
+    REQUIRE(measured.physical_host_bytes == 0);
+    REQUIRE(measured.submitted_h2d_bytes == 0);
+    REQUIRE(measured.submitted_d2h_bytes == 0);
+  }
+  REQUIRE(measured.host_elapsed_ns > 0);
+  REQUIRE(host->get_total_allocated_bytes() == host_before);
+  REQUIRE(fixture.allocated_bytes() == baseline);
+  for (std::size_t key = 0; key < keys && contributors != 0; ++key) {
+    auto const mask = acc::probe_membership(
+      *(*filters)[key],
+      sirius::get_cudf_table_view(*local).column(static_cast<cudf::size_type>(key)),
+      root,
+      stream,
+      fixture.gpu(root).get_default_allocator());
+    REQUIRE(mask);
+    REQUIRE(std::ranges::all_of(*mask, [](bool present) { return present; }));
+  }
+}
+
+TEST_CASE("S4 local-only staged publication allocates no transfer workspace",
+          "[dynamic_filter][multi_partition][s4_publication]")
+{
+  acc::fixture fixture;
+  auto const geometry = acc::bloom_geometry(64);
+  auto builder        = acc::make_builder(fixture, geometry);
+  auto batch          = fixture.make_batch(0, 0, 64);
+  acc::add_to_builder(builder, fixture, batch);
+  auto const expected = acc::partial_union(builder, 2, 1);
+  op::detail::publication_measurement measured;
+  auto result = builder.finish_for_experiment(rmm::cuda_device_id{0},
+                                              fixture.publication_stream(0),
+                                              fixture.gpu(0).get_default_allocator(),
+                                              op::detail::publication_transport::force_host,
+                                              &measured);
+  REQUIRE(result);
+  acc::require_exact_union(*result, expected, 1);
+  REQUIRE(measured.physical_host_bytes == 0);
+  REQUIRE(measured.requested_device_scratch_bytes == 0);
+  REQUIRE(measured.submitted_logical_edge_bytes == 0);
+  REQUIRE(measured.submitted_d2h_bytes == 0);
+  REQUIRE(measured.submitted_h2d_bytes == 0);
+}
+
+TEST_CASE("S4 HOST exhaustion refuses preparation without changing any partial",
+          "[dynamic_filter][multi_partition][s4_publication][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  acc::fixture fixture({.devices = 2});
+  auto const geometry = acc::bloom_geometry(8000);
+  auto builder        = acc::make_builder(fixture, geometry);
+  auto batch          = fixture.make_batch(1, 0, 100);
+  acc::add_to_builder(builder, fixture, batch);
+  std::array<std::vector<std::byte>, 2> before;
+  for (int device = 0; device < 2; ++device) {
+    before[device] = builder.inspect_partial(0, rmm::cuda_device_id{device})->bytes;
+  }
+  auto* host = fixture.spaces[0]
+                 .get_host_staging_space()
+                 .get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  auto blocker = host->reserve_upto(host->get_available_memory());
+  REQUIRE(blocker);
+  auto remaining      = host->allocate_multiple_blocks(host->get_available_memory());
+  auto const baseline = fixture.allocated_bytes();
+  op::detail::publication_measurement measured;
+  auto result = builder.finish_for_experiment(rmm::cuda_device_id{0},
+                                              fixture.publication_stream(0),
+                                              fixture.gpu(0).get_default_allocator(),
+                                              op::detail::publication_transport::force_host,
+                                              &measured);
+  REQUIRE_FALSE(result);
+  REQUIRE(std::string_view{measured.status} == "resource_refused");
+  REQUIRE(std::string_view{measured.refusal_reason} == "host_staging");
+  REQUIRE(measured.submitted_logical_edge_bytes == 0);
+  REQUIRE(measured.ready_replica_bytes == 0);
+  REQUIRE(fixture.allocated_bytes() == baseline);
+  for (int device = 0; device < 2; ++device) {
+    auto const partial = builder.inspect_partial(0, rmm::cuda_device_id{device});
+    REQUIRE(partial->stream_idle);
+    REQUIRE(partial->bytes == before[device]);
+  }
+}
+
+TEST_CASE("S4 staged scratch uses the unused task reservation and returns its excess",
+          "[dynamic_filter][multi_partition][s4_publication][multi_gpu]")
+{
+  if (!sirius::test::has_gpus(2)) { return; }
+  acc::fixture fixture({.devices = 2});
+  auto const geometry = acc::bloom_geometry(8000);
+  auto builder        = acc::make_builder(fixture, geometry);
+  auto batch          = fixture.make_batch(1, 0, 100);
+  acc::add_to_builder(builder, fixture, batch);
+  auto const expected = acc::partial_union(builder, 2, 2);
+  auto const before   = fixture.allocated_bytes();
+  auto const stream   = fixture.publication_stream(0);
+  auto& allocator     = fixture.allocator(0);
+  op::detail::publication_measurement measured;
+  {
+    acc::task_reservation task{fixture.gpu(0), mib, stream};
+    rmm::device_buffer live{mib - 256, stream, fixture.gpu(0).get_default_allocator()};
+    auto const tracked  = allocator.get_allocated_bytes(stream);
+    auto const reserved = allocator.get_total_reserved_bytes();
+    auto filters        = builder.finish_for_experiment(rmm::cuda_device_id{0},
+                                                 stream,
+                                                 fixture.gpu(0).get_default_allocator(),
+                                                 op::detail::publication_transport::force_host,
+                                                 &measured);
+    REQUIRE(filters);
+    REQUIRE(measured.requested_device_scratch_bytes == geometry.chunk_bytes);
+    REQUIRE(allocator.get_peak_allocated_bytes(stream) ==
+            tracked + measured.aligned_device_scratch_bytes);
+    REQUIRE(allocator.get_allocated_bytes(stream) == tracked);
+    REQUIRE(allocator.get_total_reserved_bytes() == reserved);
+    REQUIRE(fixture.allocated_bytes()[0] == before[0] + mib);
+    auto* host = fixture.spaces[0]
+                   .get_host_staging_space()
+                   .get_memory_resource_of<cucascade::memory::Tier::HOST>();
+    REQUIRE(geometry.chunk_bytes < host->get_block_size());
+    REQUIRE(measured.physical_host_bytes == host->get_block_size());
+    acc::require_exact_union(*filters, expected, 2);
+  }
+  REQUIRE(fixture.allocated_bytes() == before);
+}
+
+TEST_CASE("S4 publication bitmap bytes count a key once across accepting bindings",
+          "[dynamic_filter][multi_partition][s4_publication]")
+{
+  using plan_type = op::dynamic_filter_publish_plan;
+  constexpr cudf::data_type int32{cudf::type_id::INT32};
+  acc::fixture fixture;
+  auto batch = fixture.make_batch(0, 0, 100);
+  auto other = std::make_shared<op::sirius_dynamic_filter_set>();
+  plan_type plan{{{.planner_condition_index = 0, .build_key_ordinal = 0, .storage_type = int32}},
+                 {{fixture.channel, op::dynamic_filter_route_class::scan, false, {{0, 0, int32}}},
+                  {other, op::dynamic_filter_route_class::scan, false, {{0, 1, int32}}}},
+                 fixture.spaces,
+                 {.enable_multi_partition = true, .max_bloom_bytes_per_gpu = 256 * mib}};
+  REQUIRE(fixture.begin({batch}, std::move(plan)));
+  fixture.contribute(batch);
+  fixture.publish(0, batch->get_batch_id());
+  auto const counts = fixture.stats.snapshot();
+  auto const bytes  = acc::bloom_geometry(100, 1).raw_bytes;
+  REQUIRE(counts.filters_pushed == 2);
+  REQUIRE(counts.accumulation_admitted_keys == 1);
+  REQUIRE(counts.accumulation_contributing_gpus == 1);
+  REQUIRE(counts.accumulation_input_bitmap_bytes == bytes);
+  REQUIRE(counts.accumulation_ready_replica_bytes == bytes);
+  REQUIRE(counts.accumulation_published_bitmap_bytes == bytes);
+  REQUIRE(counts.accumulation_prepare_to_completion_ns > 0);
+  REQUIRE(counts.accumulation_publication_latency_ns > 0);
+  REQUIRE(fixture.channel->snapshot().terminal());
+  REQUIRE(other->snapshot().terminal());
 }

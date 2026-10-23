@@ -195,8 +195,9 @@ TEST_CASE("managed pools grant actual allocations without changing a control poo
   }
 }
 
-TEST_CASE("unknown pools stage replicas and decline accumulation before allocating",
-          "[pool_peer_access][dynamic_filter][multi_gpu]")
+TEST_CASE(
+  "unknown pools stage replicas and publish accumulated filters through bounded HOST staging",
+  "[pool_peer_access][dynamic_filter][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
   auto manager = sirius::test::operator_utils::initialize_memory_manager(
@@ -226,8 +227,18 @@ TEST_CASE("unknown pools stage replicas and decline accumulation before allocati
      }}};
   std::vector batches{fixture.make_batch(0, 0, 8), fixture.make_batch(1, 8, 8)};
   auto const before_admission = fixture.allocated_bytes();
-  REQUIRE_FALSE(fixture.begin(batches));
-  REQUIRE(fixture.allocated_bytes() == before_admission);
+  REQUIRE(fixture.begin(batches));
+  for (auto const& batch : batches) {
+    fixture.contribute(batch);
+  }
+  fixture.publish(1, batches.back()->get_batch_id());
+  fixture.require_members(batches);
+  auto const counts = fixture.stats.snapshot();
+  REQUIRE(counts.accumulations_started == 1);
+  REQUIRE(counts.accumulation_publications_finished == 1);
+  REQUIRE(counts.accumulation_host_publications == 1);
+  REQUIRE(counts.accumulations_skipped_admission == 0);
+  fixture.require_storage_returned(before_admission);
 }
 
 TEST_CASE("pool grants validate an invalid native request", "[.pool_peer_access_invalid]")

@@ -63,6 +63,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -127,6 +128,7 @@ struct key_filters {
   std::shared_ptr<sirius_dynamic_filter> membership;
   /// The domain the membership filter was built over.
   std::optional<membership_key_domain> membership_domain;
+  bool membership_pushed = false;
 };
 
 struct fanout_counts {
@@ -152,15 +154,16 @@ struct fanout_counts {
 template <std::invocable OnFirstPush>
 fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
                       std::span<sirius_dynamic_filter_set::producer const> producers,
-                      std::span<key_filters const> filters,
+                      std::span<key_filters> filters,
                       OnFirstPush&& on_first_push) noexcept
 {
   fanout_counts counts;
   auto const push = [&](sirius_dynamic_filter_set::producer const& producer,
                         std::size_t ordinal,
                         std::shared_ptr<sirius_dynamic_filter> const& filter) noexcept {
-    if (!producer.push_filter(ordinal, filter)) { return; }
+    if (!producer.push_filter(ordinal, filter)) { return false; }
     if (counts.pushed++ == 0) { std::invoke(on_first_push); }
+    return true;
   };
   auto const& probe_targets = plan.probe_targets();
   for (std::size_t target_index = 0; target_index < probe_targets.size(); ++target_index) {
@@ -169,7 +172,7 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
     ++counts.active_targets;
     auto const& producer = producers[target_index];
     for (auto const& binding : target.key_bindings) {
-      auto const& key = filters[binding.admitted_key_index];
+      auto& key = filters[binding.admitted_key_index];
       if (key.zone_map && target.accepts_zone_map_filters &&
           binding.probe_storage_type == key.zone_map_type) {
         push(producer, binding.channel_push_ordinal, key.zone_map);
@@ -189,7 +192,7 @@ fanout_counts fan_out(dynamic_filter_publish_plan const& plan,
         ++counts.incompatible_probes;
         continue;
       }
-      push(producer, binding.channel_push_ordinal, key.membership);
+      key.membership_pushed |= push(producer, binding.channel_push_ordinal, key.membership);
     }
   }
   return counts;
@@ -379,6 +382,20 @@ struct dynamic_filter_publication_session::state {
    */
   void publish(cucascade::memory::memory_space const& task_space, ::cuda::stream_ref stream)
   {
+    detail::publication_measurement measurement;
+    absl::Cleanup const record_measurement = [&] {
+      std::scoped_lock lock(mutex);
+      outcome.accumulation_input_bitmap_bytes       = measurement.input_bitmap_bytes;
+      outcome.accumulation_ready_replica_bytes      = measurement.ready_replica_bytes;
+      outcome.accumulation_contributing_gpus        = measurement.contributing_gpu_count;
+      outcome.accumulation_prepare_to_completion_ns = measurement.host_elapsed_ns;
+      if (std::string_view{measurement.status} == "completed") {
+        outcome.accumulation_direct_publications =
+          std::string_view{measurement.actual_transport} == "direct";
+        outcome.accumulation_host_publications =
+          std::string_view{measurement.actual_transport} == "host";
+      }
+    };
     try {
       {
         std::scoped_lock lock(mutex);
@@ -388,11 +405,18 @@ struct dynamic_filter_publication_session::state {
       if (task_space.get_tier() != cucascade::memory::Tier::GPU) {
         throw detail::accumulation_invariant_error{"publication task space must be a GPU space"};
       }
-      auto const filters = builder->finish(rmm::cuda_device_id{task_space.get_device_id()},
-                                           stream,
-                                           task_space.get_default_allocator());
+      auto const filters =
+        builder->finish_for_experiment(rmm::cuda_device_id{task_space.get_device_id()},
+                                       stream,
+                                       task_space.get_default_allocator(),
+                                       detail::publication_transport::automatic,
+                                       &measurement);
       if (!filters) {
-        skip_locked(&dynamic_filter_stats_snapshot::accumulations_skipped_admission);
+        std::scoped_lock lock(mutex);
+        outcome.accumulations_skipped_resource =
+          std::string_view{measurement.status} == "resource_refused";
+        end_attempt(completion::SKIPPED,
+                    &dynamic_filter_stats_snapshot::accumulations_skipped_admission);
         return;
       }
       {
@@ -425,6 +449,10 @@ struct dynamic_filter_publication_session::state {
       outcome.filters_pushed                      = counts.pushed;
       outcome.bindings_skipped_incompatible_probe = counts.incompatible_probes;
       outcome.accumulation_publications_finished  = published ? 1 : 0;
+      outcome.accumulation_published_bitmap_bytes =
+        static_cast<std::uint64_t>(
+          std::ranges::count(per_key, true, &key_filters::membership_pushed)) *
+        measurement.bitmap_bytes;
       if (latency) {
         outcome.accumulation_publication_latency_ns = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(*latency).count());
@@ -437,6 +465,7 @@ struct dynamic_filter_publication_session::state {
       {
         std::scoped_lock lock(mutex);
         count_failure(outcome, kind);
+        outcome.accumulations_skipped_resource = kind == detail::accumulation_failure::ADMISSION;
         end_attempt(recoverable(kind) ? completion::SKIPPED : completion::FAILED);
       }
       // Optional OOM must not escape into gpu_pipeline_task's reschedule handler after the pending
@@ -629,6 +658,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       rows, keys.size(), plan.max_bloom_bytes_per_gpu());
     if (!geometry) {
       selection.keys_skipped_bloom_size_gate = keys.size();
+      selection.accumulations_skipped_cap    = 1;
       auto const required                    = detail::accumulated_bloom_geometry::try_create(
         rows, keys.size(), std::numeric_limits<std::uint64_t>::max());
       SIRIUS_LOG_INFO(
@@ -646,15 +676,6 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       selection.accumulations_skipped_admission = 1;
       return false;
     }
-    if (auto const broken = find_pair_without_pool_access(replicas)) {
-      SIRIUS_LOG_INFO(
-        "[dynamic_filter_publication_session] accumulated Bloom skipped: unavailable pool access "
-        "from GPU {} to GPU {}.",
-        broken->first,
-        broken->second);
-      selection.accumulations_skipped_admission = 1;
-      return false;
-    }
 
     // Allocation happens outside the mutex; the builder is installed only if nothing closed the
     // session meanwhile.
@@ -664,6 +685,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
         "[dynamic_filter_publication_session] accumulated Bloom skipped: partial-array lease "
         "refused.");
       selection.accumulations_skipped_admission = 1;
+      selection.accumulations_skipped_resource  = 1;
       return false;
     }
     auto const expected = inventory->batches().size();
@@ -680,6 +702,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
       operation.current     = state::phase::COLLECTING;
       // Start counters are visible at once; the attempt's outcome is recorded when it settles.
       selection.accumulations_started               = 1;
+      selection.accumulation_admitted_keys          = keys.size();
       selection.accumulation_expected_contributions = expected;
       if (operation.stats) {
         operation.stats->publication_attempts.fetch_add(1, std::memory_order_relaxed);
@@ -700,6 +723,7 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
     auto const error = std::current_exception();
     auto const kind  = classify_failure(error);
     count_failure(selection, kind);
+    selection.accumulations_skipped_resource = kind == detail::accumulation_failure::ADMISSION;
     if (!recoverable(kind)) { std::rethrow_exception(error); }
     return false;
   }
