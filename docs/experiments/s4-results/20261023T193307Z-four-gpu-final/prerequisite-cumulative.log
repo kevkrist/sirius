@@ -1,0 +1,96 @@
++ ['pixi', 'run', '--as-is', '--manifest-path', '/home/ubuntu/sirius/pixi.toml', '/home/ubuntu/sirius/build/s4-final-validation/build/s4-revisions/prerequisite-artifacts/baseline/sirius_unittest', '[dynamic_filter][multi_partition],[in_task_publication],[pool_peer_access],[fused_membership],[fused_consumer]', '--order', 'decl']
+/home/ubuntu/sirius/build/s4-final-validation/build/s4-revisions/prerequisite-artifacts/baseline/sirius_unittest: /home/ubuntu/sirius/.pixi/envs/default/lib/libcusolver.so.12: no version information available (required by /home/ubuntu/sirius/.pixi/envs/default/lib/libcuvs.so)
+Filters: [dynamic_filter] [multi_partition],[in_task_publication],[pool_peer_access],[fused_membership],[fused_consumer]
+Randomness seeded to: 2688627563
+Running: multi-partition dynamic-filter settings preserve defaults and parse byte budgets
+Running: multi-partition dynamic-filter byte budgets reject zero and negative YAML
+Running: pool permission outcomes distinguish unavailable capability from CUDA errors
+Running: pool policy rejects invalid inputs and unknown allocation domains
+Running: managed pools grant actual allocations without changing a control pool
+Running: unknown pools stage replicas and decline accumulation before allocating
+Running: bare managers respect configured subsets and recreate their pools
+Running: gpu_execution - multi-partition accumulation through UNION ALL matches the CPU
+Running: gpu_execution - multi-partition accumulation through UNION ALL on two GPUs
+Running: gpu_execution - complete multi-partition dynamic filters match the CPU
+Running: build PARTITION certifies its pushed input once before any batch leaves
+Running: a push after certification fails, and is harmless once the ledger is abandoned
+Running: build PARTITION declines inputs it cannot account for
+Running: a build input that cannot be read fails the task and leaves the accumulation to cancel
+Running: a final contributor rescheduled before its scatter publishes once on its retry
+Running: the build PARTITION's finalize releases storage a task thread retired
+Running: drained finalization closes and releases unfinished accumulated input
+Running: whole-build publication survives single-partition and broadcast build finalization
+Running: a non-FULL build input never accumulates and never blocks
+Running: a FULL build input is certified only after its source pipeline finished
+Running: BOOL8 prior probes accumulated Bloom replicas
+Running: arrival ledger certifies exactly the pushed batches as a sorted inventory
+Running: arrival ledger declines when the repository holds a batch it never saw
+Running: arrival ledger is poisoned by unprovable arrivals without blocking
+Running: certified inventories need no downstream partition count and transfer on move
+Running: inventory records top-level key types without constraining payload children
+Running: a missing or changed key type stays unavailable while siblings remain usable
+Running: accumulated Bloom geometry uses global rows and sums aligned key arrays
+Running: accumulated Bloom transfer chunks are aligned and cover non-aligned arrays
+Running: join_on_failure joins listed streams only when the body throws
+Running: begin allocates zeroed partials under exact per-GPU leases
+Running: accumulation never starts without a usable geometry or inventory
+Running: contributions enqueue without a host wait and publish from another stream
+Running: publication waits for contributions still queued on the root's task stream
+Running: publication waits for contributions still queued on every GPU
+Running: the chunk pipeline publishes the exact union to every GPU
+Running: non-aligned geometries publish with exactly the scratch lease free
+Running: duplicates and retries count once and only the final original ID publishes, once
+Running: a refused task scratch allocation skips publication before enqueueing anything
+Running: closing or cancelling collecting input never waits for queued inserts
+Running: input closure during publication does not retire the builder early
+Running: a tracked task thread publishes without releasing partial storage
+Running: a tracked task thread charges the merge scratch to its own reservation
+Running: a tracked task thread admits a merge scratch larger than its reservation as its task would
+Running: input closed before every batch contributed ends without a filter
+Running: a contribution that does not match its partial's GPU fails the attempt
+Running: a late batch without rows is ignored by contributions
+Running: only retryable kernel-launch failures are transient
+Running: each accumulation failure kind sets exactly its counters
+Running: a pending CUDA error propagates from contribution
+Running: a pending CUDA error propagates from reduction
+Running: a mismatched planned key type is omitted without losing its sibling
+Running: a tracked thread never releases partial storage
+Running: a refused partial lease on a later GPU rolls back every partial
+Running: a publication root without a partial declines and settles
+Running: a publication on another GPU's stream fails before it enqueues anything
+Running: an owed publication that never runs ends the attempt without a filter
+Running: cancellation during the late wait prevents fan-out
+Running: accumulation declines admitted key types it cannot insert
+Running: an accumulated filter probes like every other membership filter
+Running: accumulation skips a key none of whose bindings can read its filter
+Running: an accumulated fan-out skips bindings whose probe type the key cannot read
+Running: a certified build survives payload canonicalization during spill and re-upgrade
+Running: a completed original ID is deduplicated before its changed representation is inspected
+Running: an unclaimed batch with a changed active key or row count declines
+Running: late cancellation or drain retains completed wrappers outside task accounting
+Running: inconsistent arrivals omit one key without suppressing its valid sibling
+Running: a key accepted by no channel stays owned until safe retirement
+Running: cached fusion probes accumulated Bloom replicas through narrower carriers
+Running: the elected PARTITION task publishes before its first repository deposit
+Running: mandatory scatter OOM retries the elected identity through the executor
+Running: a migrated final PARTITION accounts merge scratch in task history
+Running: scheduler error drain joins collecting and publishing PARTITION tasks before reuse
+Running: optional publication scratch OOM deposits without rescheduling the PARTITION task
+Running: publication scratch allocation failure retires ordinary-pool partials
+Running: a fatal PARTITION task drains its collecting publication and leaves the worker reusable
+Running: fused membership preserves ordered prefixes across rounds
+Running: fused membership handles empty and all-null hash-set and Bloom builds
+Running: fused membership shares signed conversion and sentinel semantics
+Running: fused membership accepts compatible narrow temporal and decimal carriers
+Running: fused membership honors sliced validity while aliasing residual values
+Running: fused membership preflights late refusals before changing device buffers
+Running: fused membership rejects incompatible domains through forwarding wrappers
+Running: fused membership empty inputs submit no rounds
+Running: cached fusion pairs fixed programs across rounds and dead suffixes
+Running: cached fusion keeps alias identities and decode history across distinct columns
+Running: cached fusion falls back for a string unsigned or decimal probe among several filters
+Running: cached fused residual peak excludes the ordinary probe mask
+Running: cached fusion retires submitted residual reads on host preflight failure
+===============================================================================
+All tests passed (5798 assertions in 89 test cases)
+

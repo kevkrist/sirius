@@ -1,0 +1,27 @@
++ ['pixi', 'run', '--as-is', '--manifest-path', '/home/ubuntu/sirius/pixi.toml', 'python', '/tmp/s4f_preflight.py']
+{
+  "dataset": "/data/tpch_parquet_sf100",
+  "scale": 100,
+  "rows": {
+    "customer": 15000000,
+    "lineitem": 600037902,
+    "nation": 25,
+    "orders": 150000000,
+    "part": 20000000,
+    "partsupp": 80000000,
+    "region": 5,
+    "supplier": 1000000
+  },
+  "files": 14,
+  "gpu_capture": {
+    "command": [
+      "nvidia-smi",
+      "--query-gpu=index,uuid,name,pci.bus_id,memory.total,driver_version,pstate,clocks.current.sm,clocks.current.memory,power.limit",
+      "--format=csv"
+    ],
+    "returncode": 0,
+    "stdout": "index, uuid, name, pci.bus_id, memory.total [MiB], driver_version, pstate, clocks.current.sm [MHz], clocks.current.memory [MHz], power.limit [W]\n0, GPU-874bc7df-e2cc-9ff8-6c5b-6c7972cf7cf0, NVIDIA L40S, 00000002:00:01.0, 46068 MiB, 615.71.09, P0, 210 MHz, 405 MHz, 350.00 W\n1, GPU-20d23e0a-42ef-3ed4-a307-d190b4ed0c05, NVIDIA L40S, 00000002:00:02.0, 46068 MiB, 615.71.09, P8, 210 MHz, 405 MHz, 350.00 W\n2, GPU-1775fd41-525a-5ff6-e62d-ac61b1651418, NVIDIA L40S, 00000002:00:03.0, 46068 MiB, 615.71.09, P0, 210 MHz, 405 MHz, 350.00 W\n3, GPU-9014ca3c-c056-2956-06ce-72492b72ab80, NVIDIA L40S, 00000002:00:04.0, 46068 MiB, 615.71.09, P0, 210 MHz, 405 MHz, 350.00 W\n",
+    "stderr": "",
+    "availability": "available"
+  }
+}
