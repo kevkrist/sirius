@@ -33,6 +33,7 @@
 
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -225,12 +226,32 @@ class accumulated_bloom_builder final {
                                  ::cuda::stream_ref stream);
 
   /**
+   * @brief How `finish` moved partials and the union between GPUs.
+   */
+  enum class publication_transport : std::uint8_t {
+    peer_copy,   ///< `cudaMemcpyPeerAsync`; every replica pool grants every other replica GPU
+    host_staged  ///< Bounded pinned HOST staging, when a grant is unavailable or direct scratch
+                 ///< is refused
+  };
+
+  /**
+   * @brief A completed publication.
+   */
+  struct publication {
+    /// One ready filter per key; borrows owners the builder retains until its destruction
+    std::span<std::shared_ptr<sirius_dynamic_bloom_filter> const> filters;
+    publication_transport transport;  ///< The transport that produced every replica
+  };
+
+  /**
    * @brief Reduces every contributed partial into @p root's, overwrites every other partial with
-   * the union, and waits on the host once.
+   * the union, and waits for every replica on the host.
    *
-   * The builder retains every completed filter owner. The returned span borrows those owners until
-   * builder destruction; channels may share them. Scratch uses @p scratch_mr only during this call
-   * and is freed after every submitted transfer has retired.
+   * Uses peer copies when every replica pool grants every other replica GPU and direct scratch is
+   * admitted; otherwise stages through the root's HOST space. The transport is chosen before any
+   * transfer is submitted and never changes afterwards. The builder retains every completed filter
+   * owner; channels may share them. Scratch uses @p scratch_mr only during this call and is freed
+   * after every submitted transfer has retired.
    *
    * @pre Every `enqueue_add` returned; this is the only `finish` call; the caller is the only user
    * of the builder
@@ -239,11 +260,12 @@ class accumulated_bloom_builder final {
    * @param root The reducing GPU, current on the calling thread
    * @param stream The publication stream of @p root
    * @param scratch_mr Resource borrowing the task's reservation
-   * @return One ready filter per key, or no value when @p root holds no partial or scratch
-   * allocation is refused
+   * @return The published filters, or no value when @p root holds no partial or publication
+   * workspace allocation is refused
    */
-  [[nodiscard]] std::optional<std::span<std::shared_ptr<sirius_dynamic_bloom_filter> const>> finish(
-    rmm::cuda_device_id root, ::cuda::stream_ref stream, rmm::device_async_resource_ref scratch_mr);
+  [[nodiscard]] std::optional<publication> finish(rmm::cuda_device_id root,
+                                                  ::cuda::stream_ref stream,
+                                                  rmm::device_async_resource_ref scratch_mr);
 
   /**
    * @brief True iff releasing this builder's storage now credits no allocation tracker.
@@ -263,6 +285,16 @@ class accumulated_bloom_builder final {
   };
 
   /**
+   * @brief Copies a private partial to owned host bytes after waiting for its insertions.
+   *
+   * @pre All `enqueue_add` calls returned and publication has not begun; the caller is the
+   * builder's only user
+   * @return The partial contents, or no value for an absent key or GPU
+   */
+  [[nodiscard]] std::optional<replica_contents> inspect_partial(std::size_t key_index,
+                                                                rmm::cuda_device_id device) const;
+
+  /**
    * @brief Copies @p filter's accumulated replica on @p device to the host.
    *
    * Queries the replica's stream before enqueueing the copy on it, then waits for the copy on the
@@ -277,6 +309,27 @@ class accumulated_bloom_builder final {
     sirius_dynamic_bloom_filter const& filter, rmm::cuda_device_id device);
 
  private:
+  /**
+   * @brief Successfully acquired workspace charges for one finish attempt, retained after cleanup.
+   */
+  struct workspace_observation {
+    std::size_t device_scratch_bytes{};  ///< Aligned device allocation charge
+    std::size_t host_staging_bytes{};    ///< Physical fixed-block HOST allocation charge
+  };
+
+  friend struct accumulated_bloom_test_access;
+
+  /**
+   * @brief `finish`, optionally forcing HOST staging and reporting the workspace it acquired.
+   *
+   * Tests reach it through `accumulated_bloom_test_access`; production calls `finish`.
+   */
+  [[nodiscard]] std::optional<publication> finish_impl(rmm::cuda_device_id root,
+                                                       ::cuda::stream_ref stream,
+                                                       rmm::device_async_resource_ref scratch_mr,
+                                                       bool force_host,
+                                                       workspace_observation* observation);
+
   struct impl;
   explicit accumulated_bloom_builder(std::unique_ptr<impl> state) noexcept;
 
