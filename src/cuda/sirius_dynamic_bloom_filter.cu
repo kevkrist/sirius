@@ -1212,8 +1212,8 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
   scratch.reset();
   staging.reset();
   SIRIUS_LOG_DEBUG(
-    "[accumulated_bloom_builder::finish] root GPU {} published {} key(s) of {} bytes through {}: "
-    "{} contributing source(s), {} target(s).",
+    "[accumulated_bloom_builder::finish] root GPU {} reduced and replicated {} key(s) of {} bytes "
+    "through {}: {} contributing source(s), {} target(s).",
     root->device_id,
     _impl->keys.size(),
     geometry.raw_bytes,
