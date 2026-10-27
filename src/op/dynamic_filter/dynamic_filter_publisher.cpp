@@ -63,6 +63,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -105,7 +106,9 @@ std::vector<std::vector<cudf::data_type>> binding_probe_types(
 bool consider_bound_key(dynamic_filter_stats_snapshot& counts,
                         dynamic_filter_publish_plan const& plan,
                         dynamic_filter_publish_plan::admitted_key const& key,
-                        std::size_t build_rows) noexcept
+                        std::size_t build_rows,
+                        std::string_view path,
+                        bool applicable = true) noexcept
 {
   ++counts.keys_considered;
   auto const key_domain = key.build_key_domain_cardinality;
@@ -113,8 +116,34 @@ bool consider_bound_key(dynamic_filter_stats_snapshot& counts,
     ++counts.keys_with_known_domain;
     if (build_rows > key_domain) { ++counts.keys_build_exceeded_domain; }
   }
-  return domain_coverage_gate_fires(
-    build_rows, key_domain, key.build_key_proven_unique, plan.domain_coverage_threshold());
+  bool const eligible =
+    applicable && build_rows != 0 && key_domain != 0 && build_rows <= key_domain &&
+    (key.build_key_proven_unique ||
+     (key.build_key_declared_unique &&
+      key.build_key_domain_source == dynamic_filter_domain_source::pinned_parquet_exact));
+  bool const gated =
+    domain_coverage_gate_fires(build_rows, key_domain, eligible, plan.domain_coverage_threshold());
+  log::log_noexcept([&] {
+    auto const provenance = [&] {
+      switch (key.build_key_domain_source) {
+        case dynamic_filter_domain_source::catalog_bound: return "catalog_bound";
+        case dynamic_filter_domain_source::pinned_parquet_exact: return "pinned_parquet_exact";
+        default: return "unknown";
+      }
+    }();
+    SIRIUS_LOG_DEBUG(
+      "[dynamic_filter_domain] path={} condition={} rows={} domain={} provenance={} eligible={} "
+      "threshold={} decision={}",
+      path,
+      key.planner_condition_index,
+      build_rows,
+      key_domain,
+      provenance,
+      static_cast<int>(eligible),
+      plan.domain_coverage_threshold(),
+      gated ? "skip" : "keep");
+  });
+  return gated;
 }
 
 /**
@@ -601,21 +630,12 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
     for (std::size_t index = 0; index < probe_types.size(); ++index) {
       auto const& bindings = probe_types[index];
       if (bindings.empty()) { continue; }
-      auto const& key  = admitted_keys[index];
-      bool const gated = consider_bound_key(selection, plan, key, rows);
-      if (key.build_key_ordinal < 0 || inventory->consistent_type_at(static_cast<std::size_t>(
-                                         key.build_key_ordinal)) != key.storage_type) {
-        ++selection.keys_skipped_type_mismatch;
-        continue;
-      }
-      if (gated) {
-        ++selection.keys_skipped_domain_gate;
-        continue;
-      }
-      if (!detail::accumulated_bloom_builder::supports(key.storage_type)) {
-        ++selection.keys_skipped_bloom_unsupported;
-        continue;
-      }
+      auto const& key = admitted_keys[index];
+      bool const type_matches =
+        key.build_key_ordinal >= 0 &&
+        inventory->consistent_type_at(static_cast<std::size_t>(key.build_key_ordinal)) ==
+          key.storage_type;
+      bool const supported = detail::accumulated_bloom_builder::supports(key.storage_type);
       // The fan-out's rule, applied before any array is allocated: a key whose domain can read
       // none of its bindings' probe types would publish only filters that decline every batch.
       auto const domain   = classify_membership_key(key.storage_type);
@@ -623,8 +643,27 @@ bool dynamic_filter_publication_session::try_begin_accumulation(
         return probe.id() == cudf::type_id::EMPTY ||
                (domain && membership_probe_compatible(*domain, probe));
       };
-      if (std::ranges::none_of(bindings, readable)) {
+      bool const has_readable_binding = std::ranges::any_of(bindings, readable);
+      bool const gated                = consider_bound_key(selection,
+                                            plan,
+                                            key,
+                                            rows,
+                                            "accumulated",
+                                            type_matches && supported && has_readable_binding);
+      if (!type_matches) {
+        ++selection.keys_skipped_type_mismatch;
+        continue;
+      }
+      if (!supported) {
+        ++selection.keys_skipped_bloom_unsupported;
+        continue;
+      }
+      if (!has_readable_binding) {
         selection.bindings_skipped_incompatible_probe += bindings.size();
+        continue;
+      }
+      if (gated) {
+        ++selection.keys_skipped_domain_gate;
         continue;
       }
       if (rows == 0) { continue; }
@@ -1019,15 +1058,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       if (probe_types[admitted_key_index].empty()) { continue; }
       auto const& admitted_key = admitted_keys[admitted_key_index];
       auto& filters            = per_key[admitted_key_index];
-      if (consider_bound_key(outcome, plan, admitted_key, build_rows)) {
-        auto const key_domain = admitted_key.build_key_domain_cardinality;
-        SIRIUS_LOG_DEBUG(
-          "[publish_dynamic_filters] publish gate: key {}: build {} rows cover {:.2f} of key "
-          "domain (~{} rows) -> skip key.",
-          admitted_key_index,
-          build_view.num_rows(),
-          static_cast<double>(build_rows) / static_cast<double>(key_domain),
-          key_domain);
+      if (consider_bound_key(outcome, plan, admitted_key, build_rows, "ordinary")) {
         ++outcome.keys_skipped_domain_gate;
         continue;
       }

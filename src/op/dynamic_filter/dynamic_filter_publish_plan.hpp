@@ -18,6 +18,7 @@
 
 #include "op/dynamic_filter/config.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
+#include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
 
 #include <cudf/types.hpp>
 
@@ -52,8 +53,9 @@ struct dynamic_filter_condition_shape {
 enum class dynamic_filter_route_class : std::uint8_t { scan, direct };
 
 struct dynamic_filter_publication_policy {
-  static constexpr double k_default_domain_coverage_threshold = 0.9;
-  static constexpr double k_default_inlist_max_l2_fraction    = 0.125;
+  static constexpr double k_default_domain_coverage_threshold =
+    default_dynamic_filter_domain_coverage_threshold;
+  static constexpr double k_default_inlist_max_l2_fraction = 0.125;
 
   bool emit_zone_map_filters            = false;
   double domain_coverage_threshold      = k_default_domain_coverage_threshold;
@@ -81,8 +83,10 @@ class dynamic_filter_publish_plan final {
     dynamic_filter_condition_shape key_shape{};
     // Exact base-table row bound; 0 disables coverage gating.
     std::size_t build_key_domain_cardinality = 0;
-    // Required before row count can represent key-domain coverage.
-    bool build_key_proven_unique = false;
+    // Genuine uniqueness proof, independent of usefulness declarations.
+    bool build_key_proven_unique                         = false;
+    bool build_key_declared_unique                       = false;
+    dynamic_filter_domain_source build_key_domain_source = dynamic_filter_domain_source::unknown;
 
     [[nodiscard]] bool operator==(admitted_key const&) const = default;
   };

@@ -60,7 +60,7 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
   sirius::join_condition const& condition,
   op::dynamic_filter_condition_shape shape,
   std::size_t condition_index,
-  std::size_t domain_cardinality,
+  build_key_domain_evidence const& domain,
   std::optional<std::size_t> build_side_unique_column)
 {
   // Null-equal keys could turn a pruned LEFT join match into an accepted NULL-padded row.
@@ -91,9 +91,11 @@ std::optional<op::dynamic_filter_publish_plan::admitted_key> admit_scan_route_ke
     .storage_type                 = *storage_type,
     .probe_storage_type           = probe_storage_type,
     .key_shape                    = shape,
-    .build_key_domain_cardinality = domain_cardinality,
+    .build_key_domain_cardinality = domain.cardinality,
     .build_key_proven_unique =
-      build_side_unique_column == std::optional{static_cast<std::size_t>(build_key_ordinal)}};
+      build_side_unique_column == std::optional{static_cast<std::size_t>(build_key_ordinal)},
+    .build_key_declared_unique = domain.declared_unique,
+    .build_key_domain_source   = domain.source};
 }
 
 }  // namespace
@@ -129,7 +131,7 @@ std::vector<op::dynamic_filter_condition_shape> classify_join_key_shapes(
 std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_keys(
   duckdb::vector<sirius::join_condition> const& conditions,
   std::vector<op::dynamic_filter_condition_shape> const& condition_shapes,
-  std::vector<std::size_t> const& condition_domain_cardinalities,
+  std::vector<build_key_domain_evidence> const& condition_domain_evidence,
   std::optional<std::size_t> build_side_unique_column)
 {
   if (condition_shapes.size() != conditions.size()) {
@@ -137,22 +139,21 @@ std::vector<op::dynamic_filter_publish_plan::admitted_key> admit_dynamic_filter_
       "[dynamic_filter_key_admission] Condition shapes must be aligned one-to-one with the join "
       "conditions");
   }
-  if (!condition_domain_cardinalities.empty() &&
-      condition_domain_cardinalities.size() != conditions.size()) {
+  if (!condition_domain_evidence.empty() && condition_domain_evidence.size() != conditions.size()) {
     throw std::invalid_argument(
-      "[dynamic_filter_key_admission] Domain cardinalities must be empty or aligned one-to-one "
+      "[dynamic_filter_key_admission] Domain evidence must be empty or aligned one-to-one "
       "with the join conditions");
   }
 
   std::vector<op::dynamic_filter_publish_plan::admitted_key> admitted_keys;
   for (std::size_t condition_index = 0; condition_index < conditions.size(); ++condition_index) {
-    auto const domain_cardinality = condition_index < condition_domain_cardinalities.size()
-                                      ? condition_domain_cardinalities[condition_index]
-                                      : 0;
-    auto admitted                 = admit_scan_route_key(conditions[condition_index],
+    auto const domain = condition_index < condition_domain_evidence.size()
+                          ? condition_domain_evidence[condition_index]
+                          : build_key_domain_evidence{};
+    auto admitted     = admit_scan_route_key(conditions[condition_index],
                                          condition_shapes[condition_index],
                                          condition_index,
-                                         domain_cardinality,
+                                         domain,
                                          build_side_unique_column);
     if (!admitted.has_value()) { continue; }
     admitted_keys.push_back(*std::move(admitted));

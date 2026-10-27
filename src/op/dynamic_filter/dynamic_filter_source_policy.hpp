@@ -21,6 +21,13 @@
 
 namespace sirius::op {
 
+/// Origin of the row-count evidence used only to decide dynamic-filter usefulness.
+enum class dynamic_filter_domain_source : std::uint8_t {
+  unknown,
+  catalog_bound,
+  pinned_parquet_exact
+};
+
 enum class membership_filter_kind : std::uint8_t { none, small_in_list, hash_in_list, bloom };
 
 struct membership_choice_inputs {
@@ -56,18 +63,19 @@ struct membership_choice_inputs {
 }
 
 /**
- * @brief Tests whether a proven-unique build covers the configured fraction of a known domain
+ * @brief Tests whether an eligible build covers the configured fraction of a known domain
  *
- * Unknown domains, non-unique keys, and thresholds above 1 disable the gate.
+ * Unknown domains, build counts larger than the domain, keys without uniqueness eligibility, and
+ * thresholds above 1 disable the gate.
  */
 [[nodiscard]] constexpr bool domain_coverage_gate_fires(std::size_t build_rows,
                                                         std::size_t domain_cardinality,
-                                                        bool build_key_proven_unique,
+                                                        bool build_key_eligible,
                                                         double threshold) noexcept
 {
   if (threshold > 1.0) { return false; }
-  if (!build_key_proven_unique) { return false; }
-  if (domain_cardinality == 0) { return false; }
+  if (!build_key_eligible) { return false; }
+  if (domain_cardinality == 0 || build_rows > domain_cardinality) { return false; }
   return static_cast<double>(build_rows) / static_cast<double>(domain_cardinality) >= threshold;
 }
 
