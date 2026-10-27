@@ -313,6 +313,48 @@ class retire_lane {
     return idle() ? cudaSuccess : cudaErrorNotReady;
   }
 
+  // Fences producers and waits for synchronization or a callback covering the latest submitted
+  // ticket before retirement. A rejected tail needs its own recovery callback. Failure without
+  // either proof retains captures; callers keep this explicit stream alive and select its device.
+  [[nodiscard]] cudaError_t recover_after_error() noexcept
+  {
+    cudaError_t result = cudaSuccess;
+    {
+      std::lock_guard lock(submit_m_);
+      closed_ = true;
+      if (detached_) { return cudaErrorInvalidResourceHandle; }
+      if (completed() < submitted_) {
+        result = api_.synchronize(stream_);
+        if (result != cudaSuccess) {
+          remember_host_error(result);
+          auto delay = std::chrono::microseconds{4};
+          if (failed_enqueue_ticket_.load(std::memory_order_relaxed) <= submitted_) {
+            // This latch covers the missing tail without changing normal callback ticket numbering.
+            std::atomic<bool> boundary{false};
+            auto const callback = [](cudaStream_t, cudaError_t, void* state) noexcept {
+              static_cast<std::atomic<bool>*>(state)->store(true, std::memory_order_release);
+            };
+            if (api_.add_callback(stream_, callback, &boundary, 0) != cudaSuccess) {
+              return result;
+            }
+            while (!boundary.load(std::memory_order_acquire)) {
+              detail::completion_backoff(delay);
+            }
+          } else {
+            while (slot_.completed.load(std::memory_order_acquire) < submitted_) {
+              detail::completion_backoff(delay);
+            }
+          }
+        }
+        recovered_.store(submitted_, std::memory_order_release);
+      }
+    }
+    claim_drainer();
+    drain_owned(completed(), false, cudaSuccess);
+    release_drainer();
+    return result;
+  }
+
  private:
   friend class submission;
   std::uint64_t completed() const noexcept

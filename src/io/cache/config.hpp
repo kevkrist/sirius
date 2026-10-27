@@ -98,8 +98,8 @@ inline bool enum_to_string(eviction_policy policy, std::string& out)
  * @c mode and @c eviction are the two knobs; everything the read path derives
  * from caching (O_DIRECT vs buffered reads, whether the prefetching cache is
  * armed, whether idle chunks are dropped) follows from them, so those derived
- * settings are not separately configurable. The remaining fields size the
- * prefetching cache and only matter under @ref cache_mode::sirius.
+ * settings are not separately configurable. The remaining fields control prefetching budget and
+ * eviction and only matter under @ref cache_mode::sirius.
  */
 struct config {
   /// Which cache the read path goes through.

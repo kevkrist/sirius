@@ -71,6 +71,7 @@ struct controlled_stream {
   std::atomic<cudaError_t> query_error{cudaSuccess};
   std::atomic<cudaError_t> sync_error{cudaSuccess};
   std::atomic<int> queries{0}, synchronizations{0};
+  std::atomic<int> registrations{0};
   std::binary_semaphore* query_entered{nullptr};
   std::binary_semaphore* query_release{nullptr};
 
@@ -82,6 +83,7 @@ struct controlled_stream {
     if (self.install_error.load() != cudaSuccess) { return self.install_error; }
     std::lock_guard lock(self.mutex);
     self.callbacks.push_back({fn, data});
+    ++self.registrations;
     return cudaSuccess;
   }
   static cudaError_t query(cudaStream_t s)
@@ -113,6 +115,17 @@ struct controlled_stream {
       cb.fn(stream(), status, cb.data);
     }
   }
+  void complete_one(cudaError_t status = cudaSuccess)
+  {
+    callback next;
+    {
+      std::lock_guard lock(mutex);
+      REQUIRE_FALSE(callbacks.empty());
+      next = callbacks.front();
+      callbacks.pop_front();
+    }
+    next.fn(stream(), status, next.data);
+  }
   // Models externally established stop of device work AND callback delivery.
   void stop()
   {
@@ -121,6 +134,34 @@ struct controlled_stream {
   }
   static sirius::exec::detail::completion_cuda_api api() { return {add, query, synchronize}; }
 };
+
+struct pending_recovery {
+  controlled_stream& stream;
+  std::future<cudaError_t> result;
+
+  pending_recovery(controlled_stream& stream, retire_lane& lane)
+    : stream(stream),
+      result(std::async(std::launch::async, [&lane] { return lane.recover_after_error(); }))
+  {
+  }
+  ~pending_recovery()
+  {
+    if (!result.valid()) { return; }
+    stream.sync_error = cudaSuccess;
+    while (result.wait_for(std::chrono::milliseconds{1}) != std::future_status::ready) {
+      stream.complete();
+    }
+  }
+};
+
+bool reaches(std::atomic<int> const& value, int target)
+{
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  while (value.load() < target && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::microseconds{100});
+  }
+  return value.load() >= target;
+}
 
 template <class Fn>
 void submit(retire_lane& lane, Fn&& fn)
@@ -307,6 +348,148 @@ TEST_CASE("failed callback installation retains ownership until safe",
   REQUIRE(seen.size() == 2);
   CHECK(seen[0] == cudaSuccess);
   CHECK(seen[1] == cudaErrorNotSupported);
+}
+
+TEST_CASE("lane recovery fences producers without retiring another stream",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream failed, held;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& failed_lane = poll.lane_for(failed.stream());
+  auto& held_lane   = poll.lane_for(held.stream());
+  int failed_calls = 0, held_calls = 0;
+  submit(failed_lane, [&](cudaError_t) noexcept { ++failed_calls; });
+  submit(held_lane, [&](cudaError_t) noexcept { ++held_calls; });
+  failed.query_error = cudaErrorUnknown;
+  CHECK(poll.wait_for_progress() == cuda_event_completion_poll::progress::undelivered);
+  CHECK(failed_calls == 0);
+  CHECK(held_calls == 0);
+
+  CHECK(failed_lane.recover_after_error() == cudaSuccess);
+  CHECK(failed_calls == 1);
+  CHECK(held_calls == 0);
+  CHECK(held.synchronizations == 0);
+  CHECK_THROWS_AS(failed_lane.begin(), std::logic_error);
+  CHECK_FALSE(held_lane.idle());
+  held.complete();
+  CHECK(poll.drain_all() == 1);
+  CHECK(held_calls == 1);
+}
+
+TEST_CASE("failed lane recovery retains captures until successful drainage",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane              = poll.lane_for(stream.stream());
+  auto owner              = std::make_shared<int>(7);
+  std::weak_ptr<int> weak = owner;
+  cudaError_t seen        = cudaSuccess;
+  stream.install_error    = cudaErrorNotSupported;
+  stream.sync_error       = cudaErrorUnknown;
+  {
+    auto submission = lane.begin();
+    submission.on_retire(
+      [owner = std::move(owner), &seen](cudaError_t status) noexcept { seen = status; });
+    CHECK(submission.commit() == cudaErrorUnknown);
+  }
+  CHECK(lane.recover_after_error() == cudaErrorUnknown);
+  CHECK_FALSE(weak.expired());
+  CHECK_FALSE(lane.idle());
+  CHECK_THROWS_AS(lane.begin(), std::logic_error);
+
+  stream.sync_error = cudaSuccess;
+  CHECK(lane.recover_after_error() == cudaSuccess);
+  CHECK(weak.expired());
+  CHECK(seen == cudaErrorNotSupported);
+  CHECK(lane.idle());
+}
+
+TEST_CASE("failed recovery synchronization waits for its accepted callback",
+          "[exec][cuda_event_completion_poll][callback_recovery]")
+{
+  using namespace std::chrono_literals;
+  auto const callback_status = GENERATE(cudaSuccess, cudaErrorLaunchFailure);
+  controlled_stream stream, other;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane              = poll.lane_for(stream.stream());
+  auto& other_lane        = poll.lane_for(other.stream());
+  auto owner              = std::make_shared<int>(7);
+  std::weak_ptr<int> weak = owner;
+  std::atomic<int> calls{0};
+  cudaError_t seen = cudaSuccess;
+  submit(lane, [owner = std::move(owner), &calls, &seen](cudaError_t error) noexcept {
+    seen = error;
+    ++calls;
+  });
+  int other_calls = 0;
+  submit(other_lane, [&](cudaError_t) noexcept { ++other_calls; });
+  stream.sync_error = cudaErrorUnknown;
+  pending_recovery recovery(stream, lane);
+  REQUIRE(reaches(stream.synchronizations, 1));
+  CHECK(recovery.result.wait_for(20ms) == std::future_status::timeout);
+  CHECK_FALSE(weak.expired());
+  CHECK(calls == 0);
+  CHECK(stream.registrations == 1);
+  other.complete();
+  CHECK(poll.drain_all() == 1);
+  CHECK(other_calls == 1);
+  CHECK(other.synchronizations == 0);
+  stream.complete(callback_status);
+  REQUIRE(recovery.result.wait_for(5s) == std::future_status::ready);
+  CHECK(recovery.result.get() == cudaErrorUnknown);
+  CHECK(weak.expired());
+  CHECK(calls == 1);
+  CHECK(seen == callback_status);
+  CHECK(lane.fault_error() ==
+        (callback_status == cudaSuccess ? cudaErrorUnknown : callback_status));
+  CHECK(lane.drain() == 0);
+  CHECK(lane.recover_after_error() == cudaSuccess);
+  CHECK(stream.synchronizations == 1);
+  CHECK_THROWS_AS(lane.begin(), std::logic_error);
+}
+
+TEST_CASE("an accepted prefix callback cannot retire a failed publication tail",
+          "[exec][cuda_event_completion_poll][callback_recovery]")
+{
+  using namespace std::chrono_literals;
+  auto const callback_status = GENERATE(cudaSuccess, cudaErrorLaunchFailure);
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane = poll.lane_for(stream.stream());
+  std::atomic<int> prefix_calls{0}, tail_calls{0};
+  auto owner              = std::make_shared<int>(7);
+  std::weak_ptr<int> weak = owner;
+  cudaError_t tail_status = cudaSuccess;
+  submit(lane, [&](cudaError_t) noexcept { ++prefix_calls; });
+  stream.install_error = cudaErrorNotSupported;
+  stream.sync_error    = cudaErrorUnknown;
+  {
+    auto submission = lane.begin();
+    submission.on_retire(
+      [owner = std::move(owner), &tail_calls, &tail_status](cudaError_t error) noexcept {
+        tail_status = error;
+        ++tail_calls;
+      });
+    CHECK(submission.commit() == cudaErrorUnknown);
+  }
+  stream.install_error = cudaSuccess;
+  pending_recovery recovery(stream, lane);
+  REQUIRE(reaches(stream.registrations, 2));
+  stream.complete_one();
+  CHECK(poll.drain_all() == 1);
+  CHECK(prefix_calls == 1);
+  CHECK(tail_calls == 0);
+  CHECK_FALSE(weak.expired());
+  CHECK(recovery.result.wait_for(20ms) == std::future_status::timeout);
+  stream.complete_one(callback_status);
+  REQUIRE(recovery.result.wait_for(5s) == std::future_status::ready);
+  CHECK(recovery.result.get() == cudaErrorUnknown);
+  CHECK(tail_calls == 1);
+  CHECK(tail_status == cudaErrorNotSupported);
+  CHECK(weak.expired());
+  CHECK(lane.idle());
+  CHECK(lane.drain() == 0);
 }
 
 TEST_CASE("terminal retirement delivers the exact requested failure once",

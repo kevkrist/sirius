@@ -1219,6 +1219,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
         if (result == query_result::success) {
           it->req->op->finish_success();
         } else {
+          it->req->op->device_copy->drain_after_error();
           it->req->op->finish_error(
             std::make_exception_ptr(std::runtime_error("rest_reactor: device H2D copy failed")),
             true);
@@ -1651,6 +1652,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
             copy.req->op->finish_error(terminal_error, true);
           }
         } catch (...) {
+          copy.req->op->device_copy->drain_after_error();
           copy.req->op->finish_error(std::current_exception(), true);
         }
       }

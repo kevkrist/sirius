@@ -27,12 +27,31 @@
 // whole buffered DataChunk (<= 2048 rows) as one row group, so a smaller table
 // would land in a single row group and barely exercise the stats path.
 
+#include <rmm/cuda_stream.hpp>
+
+#include <cuda_runtime_api.h>
+
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/filter/expression_filter.hpp>
+#include <expression/ast/from_duckdb.hpp>
+#include <expression_evaluator/gpu_expression_translator_internal.hpp>
+#include <io/cache/controlled_backend.hpp>
+#include <io/uring/uring_ioctx.hpp>
+#include <op/scan/parquet_gpu_ingestible.hpp>
+#include <op/scan/parquet_materialize.hpp>
+#include <scan/test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 
+#include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -265,4 +284,147 @@ TEST_CASE_METHOD(ParquetNullPredicateFixture,
   compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + scan_ + " WHERE NOT flag");
   compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + scan_ + " WHERE v IN (1, 2, 3)");
   compare_gpu_vs_cpu("SELECT COUNT(*) FROM " + scan_ + " WHERE v BETWEEN 10 AND 20");
+}
+
+TEST_CASE(
+  "parquet materialization routes retain residual filtering when reader pushdown cannot run",
+  "[integration][gpu_execution][scan][parquet][pushdown][bulk_residual][materialize_dispatch]")
+{
+  namespace scan                = sirius::op::scan;
+  auto const translator_rejects = GENERATE(false, true);
+  CAPTURE(translator_rejects);
+  sirius::test::scratch_dir scratch{"bulk_residual"};
+  auto const path = scratch.file("rows.parquet");
+  duckdb::DuckDB database{nullptr};
+  duckdb::Connection cpu{database};
+  std::vector<std::int32_t> expected;
+  {
+    scoped_sirius_disable disabled;
+    auto written = cpu.Query(
+      "COPY (SELECT i::INTEGER id, CASE WHEN i%3=0 THEN NULL ELSE (i%17-8)::INTEGER END v "
+      "FROM range(8192) t(i)) TO '" +
+      path + "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    REQUIRE_FALSE(written->HasError());
+    auto result = cpu.Query("SELECT id FROM read_parquet('" + path + "') WHERE " +
+                            (translator_rejects ? "coalesce(v,100)>0" : "v>0") + " ORDER BY id");
+    REQUIRE_FALSE(result->HasError());
+    for (duckdb::idx_t row = 0; row < result->RowCount(); ++row) {
+      expected.push_back(result->Collection().GetValue(0, row).GetValue<std::int32_t>());
+    }
+  }
+
+  auto memory = initialize_memory_manager(1);
+  auto* host  = sirius::scan_test_utils::get_space(*memory, cucascade::memory::Tier::HOST);
+  auto* gpu   = sirius::scan_test_utils::get_space(*memory, cucascade::memory::Tier::GPU);
+  REQUIRE(host != nullptr);
+  REQUIRE(gpu != nullptr);
+  auto reactor_context = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
+    sirius::io::uring::config{}, host->get_memory_resource_of<cucascade::memory::Tier::HOST>());
+  auto context = std::make_shared<sirius::io::uring::uring_ioctx>(1, std::move(reactor_context));
+  context->start();
+  sirius::io::cache::config cache_config;
+  cache_config.mode = sirius::io::cache::cache_mode::sirius;
+  cache_config.apply_mode();
+  context->initialize_cache(*memory, cache_config, sirius::test::controlled::single_gpu_topology());
+  REQUIRE(context->uses_prefetching_cache());
+  rmm::cuda_stream stream;
+
+  duckdb::unique_ptr<duckdb::Expression> operand =
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  if (translator_rejects) {
+    auto coalesce = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
+      duckdb::ExpressionType::OPERATOR_COALESCE, duckdb::LogicalType::INTEGER);
+    coalesce->GetChildrenMutable().push_back(std::move(operand));
+    coalesce->GetChildrenMutable().push_back(
+      duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(100)));
+    operand = std::move(coalesce);
+  }
+  auto predicate = duckdb::BoundComparisonExpression::Create(
+    duckdb::ExpressionType::COMPARE_GREATERTHAN,
+    std::move(operand),
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::INTEGER(0)));
+  auto ast = sirius::ast::from_duckdb(*predicate);
+  REQUIRE(ast != nullptr);
+  sirius::gpu_expression_translator translator{
+    stream, rmm::device_async_resource_ref{gpu->get_default_allocator()}};
+  auto translated = translator.translate_expression_with_names(
+    *ast, [](duckdb::idx_t) { return std::string{"v"}; });
+  REQUIRE(translated.has_value() == !translator_rejects);
+
+  auto info                    = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->resolved_file_paths    = {path};
+  info->names                  = {"id", "v"};
+  info->returned_types         = {sirius::logical_type::make(sirius::type_id::INTEGER),
+                                  sirius::logical_type::make(sirius::type_id::INTEGER)};
+  info->column_ids             = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(1)};
+  info->projection_ids         = {duckdb::ProjectionIndex(0), duckdb::ProjectionIndex(1)};
+  info->projected_output_count = 1;
+  info->approximate_batch_size = std::size_t{1} << 30;
+  info->table_filters          = duckdb::make_uniq<duckdb::TableFilterSet>();
+  info->table_filters->PushFilter(
+    duckdb::ProjectionIndex(1), duckdb::make_uniq<duckdb::ExpressionFilter>(std::move(predicate)));
+  auto reader = scan::make_ingestible(std::move(info));
+  REQUIRE(reader->has_row_filter());
+  auto metadata_task = reader->next_split_provider(
+    [context](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return context; });
+  REQUIRE(metadata_task);
+  auto coalescer = reader->create_batch_coalescer();
+  auto splits    = coalescer->push(metadata_task({}));
+  for (auto& split : coalescer->flush()) {
+    splits.push_back(std::move(split));
+  }
+  REQUIRE(splits.size() == 1);
+  auto* split = dynamic_cast<scan::parquet_split_info*>(splits.front().get());
+  REQUIRE(split != nullptr);
+  REQUIRE_FALSE(split->disable_filter_pushdown);
+  REQUIRE_FALSE(split->plan->has_partitions());
+  auto const filter_only = split->plan->filter_only_batch_positions();
+  REQUIRE(filter_only.size() == 1);
+  REQUIRE(filter_only.contains(1));
+  REQUIRE(split->rg_slices.size() == 1);
+  auto const& slice = split->rg_slices.front();
+  REQUIRE(slice.row_group_indices.size() == 4);
+  REQUIRE(slice.datasource->uses_prefetching_cache());
+  std::vector<scan::parquet_source> sources{
+    {slice.datasource, slice.file_metadata, slice.row_group_indices}};
+  REQUIRE(scan::prefers_bulk_materialize(sources, *split->reader_options));
+  REQUIRE_FALSE(split->reader_options->get_filter().has_value());
+  split->disable_filter_pushdown = !translator_rejects;
+  auto expected_raw_rows         = 8192;
+  SECTION("ordinary cached bulk") {}
+  SECTION("ordinary datasource with unsupported bulk options")
+  {
+    split->reader_options =
+      std::make_shared<cudf::io::parquet_reader_options>(*split->reader_options);
+    split->reader_options->enable_use_pandas_metadata(false);
+    REQUIRE_FALSE(scan::prefers_bulk_materialize(sources, *split->reader_options));
+  }
+  SECTION("path-only source") { split->rg_slices.front().datasource.reset(); }
+  SECTION("initially all-pruned source")
+  {
+    split->rg_slices.front().row_group_indices.clear();
+    expected_raw_rows = 0;
+    expected.clear();
+  }
+
+  auto decoded = reader->materialize_metadata_to_table(*split, *gpu, stream, false, nullptr);
+  REQUIRE(decoded.state == scan::filter_state::UNFILTERED);
+  REQUIRE(decoded.table.view().num_rows() == expected_raw_rows);
+  REQUIRE(decoded.table.view().num_columns() == 2);
+  auto filtered =
+    reader->post_filter_and_project(std::move(decoded), *gpu, stream, false, nullptr, nullptr, {});
+  REQUIRE(filtered != nullptr);
+  REQUIRE(filtered->num_columns() == 1);
+  REQUIRE(filtered->view().column(0).type() == cudf::data_type{cudf::type_id::INT32});
+  REQUIRE(filtered->num_rows() == expected.size());
+  std::vector<std::int32_t> actual(expected.size());
+  if (!actual.empty()) {
+    REQUIRE(cudaMemcpyAsync(actual.data(),
+                            filtered->view().column(0).data<std::int32_t>(),
+                            actual.size() * sizeof(std::int32_t),
+                            cudaMemcpyDeviceToHost,
+                            stream.value()) == cudaSuccess);
+  }
+  stream.synchronize();
+  CHECK(actual == expected);
 }

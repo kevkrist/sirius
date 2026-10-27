@@ -166,12 +166,14 @@ set(TEST_SOURCES
     test/cpp/io/s3/test_static_credentials.cpp
     test/cpp/io/cache/test_cache_read_arbitration.cpp
     test/cpp/io/cache/test_chunk_state.cpp
+    test/cpp/io/test_datasource_reads.cpp
     test/cpp/io/cache/test_dispose_eviction.cpp
     test/cpp/io/cache/test_explicit_eviction.cpp
     test/cpp/io/cache/test_stage_machines.cpp
     test/cpp/io/kvikio/test_kvikio_remote.cpp
     test/cpp/io/test_io_request.cpp
     test/cpp/io/test_parquet_helpers.cpp
+    test/cpp/io/test_parquet_materialize_lifetime.cpp
     test/cpp/io/test_templated_ioctx.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp

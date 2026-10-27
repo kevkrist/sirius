@@ -84,31 +84,17 @@ class column_chunk_range_cache {
   std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader> _reader;
 };
 
-/// Materialize @p sources into one table.
+/// Materialize @p sources with the caller's current device, stream and allocator. Eligible sources
+/// use one vectored read per file and hybrid decode; others use `cudf::io::read_parquet`. Bulk
+/// validates all original schemas, prunes with the final filter, prepares all destinations before
+/// issuance, and drains every submitted read before propagating an error or releasing destinations.
+/// No failed bulk read is retried through the general reader.
 ///
-/// Takes one of two routes, picked from what the backend says it wants:
-///
-///   bulk    - when every source's backend reports @c prefers_bulk_io().  Each
-///             source's column chunks are read in a single vectored device
-///             request straight into their own device buffers, and the table is
-///             decoded from those buffers by the hybrid scan reader —
-///             @c hybrid_scan_reader for one source, @c hybrid_scan_multifile
-///             for several.  One round trip per file for the whole split
-///             instead of one per chunk, which is what makes this worth doing
-///             against an object store.
-///
-///   general - otherwise.  cudf::io::read_parquet over the datasources and
-///             their pre-parsed footers, which reads as it decodes.
-///
-/// Both routes honor @p options' row filter: @c materialize_all_columns applies
-/// it at row level exactly as @c read_parquet does, so the route never changes
-/// which rows come back.  With the reader options Sirius uses, both routes
-/// also refuse sources whose schemas differ.
-///
-/// @param ranges  column-chunk ranges, one vector per entry of @p sources and in
-///                the same order.  Only read on the bulk route; any source whose
-///                entry is missing or empty has its ranges derived from the
-///                metadata.  Pass an empty span to derive them all.
+/// @param ranges Column-chunk ranges in source order. Unfiltered bulk reads may reuse them only
+/// when metadata, row groups and projection match those used to derive them. Pass an empty span
+/// after changing any of these. Unless every source has a nonempty entry, all ranges are derived;
+/// filtered reads always recompute ranges after final statistics pruning. The caller retains the
+/// filter AST until this call returns.
 [[nodiscard]] std::unique_ptr<cudf::table> materialize_parquet(
   std::span<parquet_source const> sources,
   cudf::io::parquet_reader_options const& options,
@@ -116,12 +102,12 @@ class column_chunk_range_cache {
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
-/// Whether @c materialize_parquet would take the bulk route for @p sources and
-/// @p options.  Exposed so a caller can decide *before* paying to build the
-/// ranges.
-[[nodiscard]] bool prefers_bulk_materialize(
-  std::span<parquet_source const> sources,
-  cudf::io::parquet_reader_options const& options) noexcept;
+/// Whether every source has metadata, selected groups and either bulk I/O preference or a
+/// prefetching cache, and @p options contains only default decoding settings plus optional name
+/// projection/filter. Inspects options before any read publication; copying custom schema settings
+/// may allocate.
+[[nodiscard]] bool prefers_bulk_materialize(std::span<parquet_source const> sources,
+                                            cudf::io::parquet_reader_options const& options);
 
 /// Throw unless every entry of @p sources has the same footer schema as the
 /// first, compared as cudf::io::read_parquet compares several sources.  The

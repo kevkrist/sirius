@@ -36,6 +36,8 @@ class scoped_host_allocation_fault {
   static constexpr int filter_shell_scope = 1;
   /** @brief Matches every allocation. */
   static constexpr int every_allocation_scope = 2;
+  /** @brief Fails every allocation from the selected ordinal until disarmed. */
+  static constexpr int sustained_allocation_scope = 3;
 
   /**
    * @brief Counts allocations in @p scope and fails the @p ordinal-th; zero only counts.

@@ -7,9 +7,13 @@
 
 #include "catch.hpp"
 #include "cudf/ast_compat.hpp"
+#include "io/cache/controlled_backend.hpp"
 #include "io/parquet_helpers.hpp"
 #include "io/templated_ioctx.hpp"
+#include "io/uring/uring_ioctx.hpp"
 #include "op/scan/parquet_materialize.hpp"
+#include "scan/test_utils.hpp"
+#include "utils/test_validation_utility.hpp"
 #include "utils/utils.hpp"
 
 #include <cudf/io/datasource.hpp>
@@ -21,6 +25,7 @@
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <duckdb.hpp>
@@ -304,8 +309,7 @@ cudf::size_type bulk_row_count(fs::path const& path,
     .tbl->num_rows();
 }
 
-/// A backend that prefers bulk IO -- the one thing `prefers_bulk_materialize`
-/// asks a source's datasource.
+/// An I/O object for metadata-only bulk-backend fixtures.
 class bulk_object final : public sirius::io::io_object {
  public:
   explicit bulk_object(std::string path = "bulk", std::size_t size = 0)
@@ -370,6 +374,93 @@ class bulk_context final : public sirius::io::templated_ioctx<bulk_reactor> {
   }
 };
 
+struct cached_file_context {
+  cached_file_context() : memory{initialize_memory_manager(1)}
+  {
+    auto* host = sirius::scan_test_utils::get_space(*memory, cucascade::memory::Tier::HOST);
+    REQUIRE(host != nullptr);
+    auto reactor_context = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
+      sirius::io::uring::config{}, host->get_memory_resource_of<cucascade::memory::Tier::HOST>());
+    context = std::make_shared<sirius::io::uring::uring_ioctx>(1, std::move(reactor_context));
+    sirius::io::cache::config config;
+    config.mode = sirius::io::cache::cache_mode::sirius;
+    config.apply_mode();
+    context->initialize_cache(*memory, config, sirius::test::controlled::single_gpu_topology());
+    REQUIRE(context->uses_prefetching_cache());
+    context->start();
+  }
+
+  ~cached_file_context()
+  {
+    context->shutdown_cache();
+    context->shutdown();
+  }
+
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory;
+  std::shared_ptr<sirius::io::uring::uring_ioctx> context;
+};
+
+std::vector<sirius::op::scan::parquet_source> cached_sources(
+  cached_file_context& fixture,
+  std::vector<std::string> const& paths,
+  cudf::io::parquet_reader_options const& options)
+{
+  std::vector<sirius::op::scan::parquet_source> sources;
+  for (auto const& path : paths) {
+    auto metadata = std::make_shared<cudf::io::parquet::FileMetaData const>(read_metadata(path));
+    cudf::io::parquet::experimental::hybrid_scan_reader reader{*metadata, options};
+    auto groups     = reader.all_row_groups(options);
+    auto ranges     = reader.all_column_chunks_byte_ranges(groups, options);
+    auto datasource = fixture.context->open_datasource(path);
+    datasource->fadvise(ranges, 0);
+    REQUIRE(datasource->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+    sources.push_back({std::move(datasource), std::move(metadata), std::move(groups)});
+  }
+  return sources;
+}
+
+void check_cpu_parity(duckdb::Connection& connection,
+                      cudf::table_view table,
+                      std::vector<std::string> const& names,
+                      std::string const& expected_sql,
+                      fs::path const& output,
+                      ::cuda::stream_ref stream)
+{
+  cudf::io::table_input_metadata metadata{table};
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    metadata.column_metadata[i].set_name(names[i]);
+    if (names[i] == "amount") { metadata.column_metadata[i].set_decimal_precision(24); }
+    if (names[i] == "nested") {
+      metadata.column_metadata[i].child(0).set_name("a");
+      metadata.column_metadata[i].child(1).set_name("b");
+    }
+  }
+  auto writer =
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{output.string()}, table)
+      .metadata(metadata)
+      .utc_timestamps(false)
+      .build();
+  cudf::io::write_parquet(writer, stream);
+  auto const actual_sql = "SELECT * FROM read_parquet('" + output.string() + "')";
+  auto expected         = connection.Query(expected_sql);
+  auto actual           = connection.Query(actual_sql);
+  REQUIRE_FALSE(expected->HasError());
+  REQUIRE_FALSE(actual->HasError());
+  auto const& expected_types = expected->GetTypes();
+  auto const& actual_types   = actual->GetTypes();
+  REQUIRE(expected_types.size() == actual_types.size());
+  for (std::size_t i = 0; i < expected_types.size(); ++i) {
+    INFO("column " << names[i] << ": expected " << expected_types[i].ToString() << ", exported "
+                   << actual_types[i].ToString());
+    CHECK(expected_types[i] == actual_types[i]);
+  }
+  auto differences =
+    connection.Query("SELECT count(*) FROM ((" + expected_sql + " EXCEPT ALL " + actual_sql +
+                     ") UNION ALL (" + actual_sql + " EXCEPT ALL " + expected_sql + ")) d");
+  REQUIRE_FALSE(differences->HasError());
+  CHECK(differences->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 0);
+}
+
 sirius::op::scan::parquet_source schema_source(fs::path const& path,
                                                std::shared_ptr<bulk_context> const& ioctx)
 {
@@ -432,6 +523,177 @@ TEST_CASE("bulk materialize rejects sources whose schemas differ before reading"
     Catch::Matchers::ContainsSubstring("All sources must have the same schema") &&
       Catch::Matchers::ContainsSubstring("drift_a") &&
       Catch::Matchers::ContainsSubstring("drift_b") && Catch::Matchers::ContainsSubstring("'x'"));
+}
+
+TEST_CASE("bulk materialization accepts only the supported reader options",
+          "[scan][parquet][bulk_route]")
+{
+  auto context = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  std::vector<sirius::op::scan::parquet_source> sources{
+    {std::make_shared<sirius::io::sirius_datasource>(context, std::make_shared<bulk_object>()),
+     std::make_shared<cudf::io::parquet::FileMetaData>(),
+     {0}}};
+  cudf::io::parquet_reader_options options;
+  REQUIRE(sirius::op::scan::prefers_bulk_materialize(sources, options));
+  SECTION("row skip") { options.set_skip_rows(1); }
+  SECTION("row limit") { options.set_num_rows(1); }
+  SECTION("byte skip") { options.set_skip_bytes(1); }
+  SECTION("byte limit") { options.set_num_bytes(1); }
+  SECTION("options row groups") { options.set_row_groups({{0}}); }
+  SECTION("column indices") { options.set_column_indices({0}); }
+  SECTION("column field IDs") { options.set_column_field_ids({1}); }
+  SECTION("custom column schema") { options.set_column_schema({}); }
+  SECTION("timestamp cast")
+  {
+    options.set_timestamp_type(cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS});
+  }
+  SECTION("decimal cast") { options.set_decimal_width(cudf::type_id::DECIMAL128); }
+  SECTION("categorical strings") { options.enable_convert_strings_to_categories(true); }
+  SECTION("pandas metadata") { options.enable_use_pandas_metadata(false); }
+  SECTION("Arrow metadata") { options.enable_use_arrow_schema(false); }
+  SECTION("missing columns") { options.enable_ignore_missing_columns(false); }
+  SECTION("case insensitive names") { options.enable_case_sensitive_names(false); }
+  SECTION("JIT filter") { options.enable_use_jit_filter(true); }
+  SECTION("mismatched schemas") { options.enable_allow_mismatched_pq_schemas(true); }
+  SECTION("source indices") { options.enable_prepend_source_index_column(true); }
+  SECTION("row indices") { options.enable_prepend_row_index_column(true); }
+  CHECK_FALSE(sirius::op::scan::prefers_bulk_materialize(sources, options));
+}
+
+TEST_CASE("bulk materialization requires every source to qualify",
+          "[scan][parquet][bulk_route][gpu_execution]")
+{
+  cached_file_context cached;
+  auto uncached = std::make_shared<sirius::test::controlled::controlled_context>(
+    std::vector<std::unique_ptr<sirius::test::controlled::controlled_reactor>>{});
+  auto bulk = std::make_shared<bulk_context>(std::vector<std::unique_ptr<bulk_reactor>>{});
+  cudf::io::parquet_reader_options options;
+  auto metadata = std::make_shared<cudf::io::parquet::FileMetaData>();
+  std::vector<sirius::op::scan::parquet_source> sources{
+    {std::make_shared<sirius::io::sirius_datasource>(cached.context,
+                                                     std::make_shared<bulk_object>()),
+     metadata,
+     {0}}};
+  REQUIRE_FALSE(sources.front().datasource->prefers_bulk_io());
+  REQUIRE(sirius::op::scan::prefers_bulk_materialize(sources, options));
+  sources.push_back(
+    {std::make_shared<sirius::io::sirius_datasource>(bulk, std::make_shared<bulk_object>()),
+     metadata,
+     {0}});
+  CHECK(sirius::op::scan::prefers_bulk_materialize(sources, options));
+  sources.push_back({uncached->open_datasource("controlled://not-bulk"), metadata, {0}});
+  CHECK_FALSE(sirius::op::scan::prefers_bulk_materialize(sources, options));
+  sources.pop_back();
+  SECTION("missing datasource") { sources.front().datasource.reset(); }
+  SECTION("missing metadata") { sources.front().metadata.reset(); }
+  SECTION("no initial groups") { sources.front().row_group_indices.clear(); }
+  SECTION("no sources") { sources.clear(); }
+  CHECK_FALSE(sirius::op::scan::prefers_bulk_materialize(sources, options));
+}
+
+TEST_CASE("cached bulk materialization preserves flat and nested values on cold and retained reads",
+          "[scan][parquet][bulk_parity][gpu_execution]")
+{
+  auto const compression = GENERATE("UNCOMPRESSED", "SNAPPY", "ZSTD");
+  auto const file_count  = GENERATE(1, 2);
+  CAPTURE(compression, file_count);
+  auto const directory = fresh_tmp_dir("bulk_parity");
+  duckdb::DuckDB database{nullptr};
+  duckdb::Connection connection{database};
+  require_ok(connection.Query(
+    "CREATE TABLE input AS SELECT i::BIGINT id, "
+    "CASE WHEN i%7=0 THEN NULL ELSE 'value_' || (i%23)::VARCHAR END payload, "
+    "(i::DECIMAL(24,4)/16)::DECIMAL(24,4) amount, "
+    "TIMESTAMP '2025-01-01' + i * INTERVAL 1 MICROSECOND ts, "
+    "struct_pack(a := i::INTEGER, b := CASE WHEN i%5=0 THEN NULL ELSE 's' END) nested, "
+    "[i::BIGINT, NULL, (i+1)::BIGINT] items FROM range(8192) t(i)"));
+  std::vector<std::string> paths;
+  std::string file_list = "[";
+  for (int i = 0; i < file_count; ++i) {
+    auto path = (directory / ("input" + std::to_string(i) + ".parquet")).string();
+    require_ok(connection.Query(
+      "COPY (SELECT * FROM input WHERE id >= " + std::to_string(i * 4096) + " AND id < " +
+      std::to_string((i + 1) * 4096) + ") TO '" + path +
+      "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048, COMPRESSION '" + compression + "')"));
+    if (i != 0) { file_list += ","; }
+    file_list += "'" + path + "'";
+    paths.push_back(std::move(path));
+  }
+  file_list += "]";
+  cached_file_context fixture;
+  rmm::cuda_stream stream;
+  std::vector<std::string> names{"items", "payload", "nested", "amount", "ts", "id"};
+  auto options = cudf::io::parquet_reader_options::builder(cudf::io::source_info{paths}).build();
+  options.set_column_names(names);
+  auto sources = cached_sources(fixture, paths, options);
+  REQUIRE(sirius::op::scan::prefers_bulk_materialize(sources, options));
+  auto expected = cudf::io::read_parquet(options, stream).tbl;
+  for (int pass = 0; pass < 2; ++pass) {
+    CAPTURE(pass);
+    auto actual = sirius::op::scan::materialize_parquet(
+      sources, options, {}, stream, cudf::get_current_device_resource_ref());
+    REQUIRE(actual != nullptr);
+    CHECK(sirius::test::expect_tables_equivalent_impl(actual->view(), expected->view(), stream));
+    check_cpu_parity(
+      connection,
+      actual->view(),
+      names,
+      "SELECT items, payload, nested, amount, ts, id FROM read_parquet(" + file_list + ")",
+      directory / "result.parquet",
+      stream);
+  }
+}
+
+TEST_CASE("final bulk filters ignore split ranges and prune files before uploading",
+          "[scan][parquet][bulk_filter][bulk_parity][gpu_execution]")
+{
+  auto const all_pruned = GENERATE(false, true);
+  auto const directory  = fresh_tmp_dir("bulk_final_filter");
+  duckdb::DuckDB database{nullptr};
+  duckdb::Connection connection{database};
+  std::vector<std::string> paths;
+  for (int i = 0; i < 2; ++i) {
+    auto path = (directory / ("input" + std::to_string(i) + ".parquet")).string();
+    require_ok(
+      connection.Query("COPY (SELECT i::BIGINT id, 'row_' || i::VARCHAR payload "
+                       "FROM range(" +
+                       std::to_string(i * 8192) + "," + std::to_string((i + 1) * 8192) +
+                       ") t(i)) TO '" + path + "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"));
+    paths.push_back(std::move(path));
+  }
+  cached_file_context fixture;
+  rmm::cuda_stream stream;
+  auto initial_options =
+    cudf::io::parquet_reader_options::builder(cudf::io::source_info{paths}).build();
+  initial_options.set_column_names({"payload"});
+  auto sources = cached_sources(fixture, paths, initial_options);
+  std::vector<std::vector<cudf::io::text::byte_range_info>> split_ranges;
+  for (auto const& source : sources) {
+    split_ranges.push_back(sirius::op::scan::column_chunk_ranges(
+      *source.metadata, initial_options, source.row_group_indices));
+  }
+  cudf::numeric_scalar<std::int64_t> limit{all_pruned ? 20000 : 12287};
+  cudf::ast::literal literal{limit};
+  cudf::ast::column_name_reference column{"id"};
+  cudf::ast::operation filter{cudf::ast::ast_operator::GREATER, column, literal};
+  auto options = initial_options;
+  options.set_filter(filter);
+  auto expected = cudf::io::read_parquet(options, stream).tbl;
+  for (int pass = 0; pass < 2; ++pass) {
+    CAPTURE(all_pruned, pass);
+    auto actual = sirius::op::scan::materialize_parquet(
+      sources, options, split_ranges, stream, cudf::get_current_device_resource_ref());
+    REQUIRE(actual != nullptr);
+    CHECK(sirius::test::expect_tables_equivalent_impl(actual->view(), expected->view(), stream));
+    CHECK(actual->num_rows() == (all_pruned ? 0 : 4096));
+    check_cpu_parity(connection,
+                     actual->view(),
+                     {"payload"},
+                     "SELECT payload FROM read_parquet(['" + paths[0] + "','" + paths[1] +
+                       "']) WHERE id > " + std::to_string(all_pruned ? 20000 : 12287),
+                     directory / "result.parquet",
+                     stream);
+  }
 }
 
 TEST_CASE("require_same_parquet_schema accepts a shared schema", "[scan][parquet][bulk_schema]")

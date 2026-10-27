@@ -318,7 +318,8 @@ class prefetching_cache {
   prefetching_cache(cucascade::memory::memory_reservation_manager& reservation_manager,
                     ioctx* io_ctx,
                     const config& cfg,
-                    std::shared_ptr<const sirius::memory::topology_index> topology_index);
+                    std::shared_ptr<const sirius::memory::topology_index> topology_index,
+                    exec::detail::completion_cuda_api completion_api = {});
   ~prefetching_cache();
 
   prefetching_cache(prefetching_cache const&)            = delete;

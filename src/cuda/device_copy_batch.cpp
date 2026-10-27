@@ -18,7 +18,42 @@
 
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 
+#include <rmm/cuda_device.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <exception>
+#include <thread>
+
 namespace sirius::cuda {
+
+cudaError_t drain_copy_stream_or_terminate(::cuda::stream_ref stream,
+                                           int device,
+                                           detail::copy_completion_api api) noexcept
+{
+  try {
+    if (device < 0 && cudaGetDevice(&device) != cudaSuccess) { std::terminate(); }
+    rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{device}};
+    auto const status = api.synchronize(stream.get());
+    if (status == cudaSuccess) { return status; }
+    std::atomic<bool> completed{false};
+    auto const callback = [](cudaStream_t, cudaError_t, void* state) noexcept {
+      static_cast<std::atomic<bool>*>(state)->store(true, std::memory_order_release);
+    };
+    if (api.add_callback(stream.get(), callback, &completed, 0) != cudaSuccess) {
+      std::terminate();
+    }
+    auto delay = std::chrono::microseconds{4};
+    while (!completed.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(delay);
+      delay = std::min(std::chrono::microseconds{256}, delay * 2);
+    }
+    return status;
+  } catch (...) {
+    std::terminate();
+  }
+}
 
 void device_copy_batch::reserve(std::size_t n)
 {

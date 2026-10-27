@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <future>
 #include <memory>
 #include <stdexcept>
@@ -69,8 +70,6 @@ sirius_datasource::sirius_datasource(std::shared_ptr<ioctx> io_ctx,
 {
   if (_io_ctx && _io_object) _io_ctx->metadata_store().open_observed(*_io_object);
 }
-
-sirius_datasource::~sirius_datasource() {}
 
 std::shared_ptr<io_object_metadata> sirius_datasource::metadata() const
 {
@@ -171,8 +170,8 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
 {
   return bridge_semi_to_std([&] {
     if (uses_prefetching_cache()) {
-      auto* cache = _io_ctx->cache();
-      return cache->device_read_async(*_io_object, offset, size, dst, stream, &_cache_handle);
+      return _io_ctx->cache()->device_read_async(
+        *_io_object, offset, size, dst, stream, &_cache_handle);
     }
     return _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
   });
@@ -223,7 +222,7 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   if (_cache_handle && _cache_handle.is_active()) {
     SIRIUS_LOG_WARN(
       "sirius_datasource::fadvise: a cache_handle was already stored on "
-      "this datasource (path={}); cancelling the stale request.  Each scan "
+      "this datasource (path={}); keeping the active request.  Each scan "
       "should own a unique datasource.",
       _io_object->object_path());
     return;

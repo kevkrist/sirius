@@ -2022,13 +2022,9 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
       table = cudf::concatenate(views, stream, mr_ref);
     }
   } else {
-    // materialize_parquet picks the route: a bulk hybrid scan (hybrid_scan_reader
-    // for one file, hybrid_scan_multifile for several) when every slice's backend
-    // prefers it, otherwise read_parquet.  Both routes apply `opts`' row filter
-    // identically, so `reader_applied_full_filter` below stays route-independent.
-    // The all-pruned split is left to read_parquet: it has no row groups to
-    // enumerate, and set_num_rows(0) already builds the schema-correct empty
-    // table without touching a data page.
+    // Bulk uses this final filter for statistics pruning and range derivation, including late
+    // dynamic filters. Both routes apply its row predicate, preserving the filter-state bookkeeping
+    // below. Initially all-pruned splits retain the metadata-only general read.
     std::vector<parquet_source> sources;
     sources.reserve(split.rg_slices.size());
     for (auto const& slice : split.rg_slices) {
@@ -2038,8 +2034,9 @@ filtered_table parquet_scan_core::materialize_metadata_to_table(
     if (!all_slices_pruned && _info->profiles->counters)
       for (auto const& slice : split.rg_slices)
         _info->profiles->counters->reader_call(slice.file_path);
-    bool const bulk = !all_slices_pruned && prefers_bulk_materialize(sources, opts);
-    if (bulk) {
+    bool const has_datasources =
+      std::ranges::all_of(sources, [](auto const& source) { return source.datasource != nullptr; });
+    if (!all_slices_pruned && has_datasources) {
       table = materialize_parquet(sources, opts, split.column_chunk_byte_ranges(), stream, mr_ref);
     } else {
       std::vector<std::unique_ptr<cudf::io::datasource>> cudf_sources;
