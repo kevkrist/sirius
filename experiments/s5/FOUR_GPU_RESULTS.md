@@ -11,7 +11,7 @@ published S4 commit `4d4bfdda12a88ec13b7e577b17ca40feea0316c0` (PR #2349).
 - **Worktree**: `/home/ubuntu/sirius-s5-four-gpu`
 - **Fetched branch**: `kevkrist/sirius:df/05-domain-evidence`
 - **HEAD commit**: `da7b8ab777dda089ae9087ad35cf5d7263180aea`
-- **Tree hash (`HEAD^{tree}`)**: `29fd4e80e8eb74f4c85ff8ce294c9d3f4d8e5f9f` (recorded in `source-tree.txt`)
+- **Tree hash (`HEAD^{tree}`)**: `a14106e78858717667e9762454b1437477da14bc` (recorded in `source-tree.txt`)
 - **Tracked source diff against `HEAD`**: empty (`0` bytes in `source-diff.patch`)
 - **Submodule revisions**:
   - `cucascade`: `1a9281093a0fe49634594d541d7ce327129f53d6`
@@ -85,7 +85,7 @@ Session settings verified on every GPU process via `settings.json`:
 
 ### Dataset manifest
 
-The TPC-H SF100 Parquet dataset was generated into `/home/ubuntu/sirius-s5-four-gpu/test_datasets/tpch_parquet_sf100` using `test/tpch_performance/generate_tpch_data.sh 100 --format parquet` (`tpchgen-rs` `v2.0.2`). It contains all eight tables across 14 Parquet files (18,546,230,327 bytes total):
+The TPC-H SF100 Parquet dataset was generated into `/home/ubuntu/sirius-s5-four-gpu/test_datasets/tpch_parquet_sf100` using `test/tpch_performance/generate_tpch_data.sh 100 --format parquet` (`tpchgen-rs` `v2.0.2`). It contains all eight tables across 14 Parquet files (27,679,630,327 bytes total):
 
 | Table | File path (relative to `S5_DATA`) | Size (bytes) | `mtime_ns` |
 |---|---|---:|---:|
@@ -234,7 +234,7 @@ Each process ran 2 warmups followed by 3 measured repetitions (`--blocks 2 --war
 
 ### Screen block median ratios and qualification check
 
-Ratios below `1.0` favor the candidate (`candidate / reference`). By predeclared rule (`S5_DESIGN.md` and `S5_4GPU_EXPERIMENTS.md`), a contrast qualifies for the 5-block confirmation only if it is **evidence-active** (shows an actual coverage-gate difference between the compared arms) and improves by **at least 5% (`ratio <= 0.95`) in both blocks**, or exhibits a suspected regression.
+Ratios below `1.0` favor the candidate (`candidate / reference`). By predeclared rule (the [fixed protocol](README.md#fixed-experiment-protocol)), a contrast qualifies for the 5-block confirmation only if it is **evidence-active** (shows an actual coverage-gate difference between the compared arms) and improves by **at least 5% (`ratio <= 0.95`) in both blocks**, or exhibits a suspected regression.
 
 | Query | Contrast (`candidate : reference`) | Evidence-active? | Block 0 ratio | Block 1 ratio | Geometric mean ratio | Meets $\ge 5\%$ in both blocks? |
 |---|---|---|---:|---:|---:|---|
@@ -258,15 +258,26 @@ Ratios below `1.0` favor the candidate (`candidate / reference`). By predeclared
 - For `Q21 0.45 : 0.9`, both blocks favored `0.45` (`0.963951` and `0.989834`, geometric mean `0.976807` or `2.32%` faster), but neither block reached the predeclared `5%` (`<= 0.95`) continuation threshold.
 - For `Q21 0.45 : 2.0`, block 0 improved by `9.67%` (`0.903310`), but block 1 improved by only `0.17%` (`0.998304`), failing the **both-blocks** requirement.
 - No evidence-active contrast showed a suspected regression (`Q21` ratios were `< 1.0` in every block for both `0.45 : 0.9` and `0.45 : 2.0`).
-- Per `S5_4GPU_EXPERIMENTS.md` ("Select at most one evidence-active query/contrast improving by at least 5% in **both** blocks, plus one observed no-gate control... If no contrast qualifies, report that outcome and finish; do not search more queries or thresholds for a winner"), no confirmation run was executed.
+- The [fixed protocol](README.md#fixed-experiment-protocol) required stopping when no contrast qualified. No confirmation run was executed.
 
 ## 6. Recommendation for `0.45` vs `0.9` on this four-GPU workload
 
-1. **Keep the production default at `0.9`.**
-2. **Distinguishing evidence from conjecture**:
-   - **Demonstrated mechanism (evidence)**: On 4 GPUs, the S5 domain-evidence plumbing works as designed and passes all 71 focused C++ test cases (8,088 assertions), 18 runner tests, and all 22 TPC-H queries (`88` GPU processes across `df_off`, `0.9`, `0.45`, and `2.0`). In Q21, `0.45` deterministically skips the `73,072,502`-row `orders` accumulated Bloom filter (`48.715%` of the `150,000,000`-row pinned `o_orderkey` domain), avoiding `146,145,024` bytes per GPU (`584,580,096` bytes across 4 GPUs) of partial-array allocation, reduction and peer-copy replication on every execution.
-   - **Measured 4-GPU latency impact (evidence)**: Unlike the 2-GPU host where Q21 took ~0.40s and `0.45` achieved a confirmed `5.15%` latency reduction over `0.9`, on 4 GPUs Q21 executes in ~0.21–0.23s and the `0.45 / 0.9` screen ratios were `0.9640` and `0.9898` (geometric mean `0.9768`, `-2.32%`), which is smaller than the predeclared `5%` continuation threshold. Thus `0.45` does not establish a >=5% end-to-end latency claim on this 4-GPU workload, while still reliably saving ~146 MiB/GPU of Bloom filter memory and build/replication work on Q21.
-   - **Conjecture (not claimed as measured fact)**: With 4 GPUs dividing scan/join work and peer-copying over 4 devices, the ~25 ms post-final-contribution publication latency of the 146 MiB filter overlaps differently with the probe pipeline than on 2 GPUs, reducing the net wall-clock savings below 5%. Isolating kernel/pipeline overlap would require separate profiling outside this bounded protocol.
+Keep the production default at **0.9** and retain 0.45 as an experimental profile.
+The four-GPU screen establishes the intended work avoidance and correct results,
+but does not confirm a latency gain or a 3% nonregression guarantee.
+
+Q21 at 0.45 avoids a 146,145,024-byte Bloom array per GPU (**139.4 MiB per GPU**,
+584,580,096 bytes across four GPUs), together with its construction and publication.
+This is avoided array allocation, not a measurement of total peak memory or transfer
+bytes. Actual INFO timing logs show zero large-array starts at 0.45 versus ten at
+0.9 and ten at 2.0, across ten executions per arm including warmups. Both smaller
+filters remain, and no cap/resource refusals were observed.
+
+The Q21 0.45/0.9 screen ratios were 0.963951 and 0.989834: a descriptive geometric
+reduction of 2.32%, without a confirmation interval. The earlier confirmed 5.15%
+two-GPU improvement applies to its own measured environment. These experiments do
+not establish total S5-versus-S4 overhead or explain the difference between hosts;
+no cross-host scaling or pipeline-overlap conclusion is claimed.
 
 ## 7. Raw artifacts and protocol notes
 
@@ -275,16 +286,35 @@ Ratios below `1.0` favor the candidate (`candidate / reference`). By predeclared
 1. **CUDA architecture (`120-real` vs `89-real`)**: The host has four NVIDIA RTX PRO 4500 Blackwell Server Edition GPUs (`sm_120`), not L40S (`sm_89`). As instructed ("If the hardware differs, use its actual CUDA architecture and record it"), CMake was configured with `-DCMAKE_CUDA_ARCHITECTURES=120-real`.
 2. **Pixi invocation path**: The worktree uses the repository's identical Pixi manifest via `/home/ubuntu/.pixi/bin/pixi run --manifest-path /home/ubuntu/sirius/pixi.toml` ("or a compatible existing Pixi manifest with the chosen path recorded").
 3. **Dataset generation**: Because `/home/ubuntu` on this fresh 4-GPU instance did not have a pre-existing `tpch_parquet_sf100` directory, the reference SF100 Parquet dataset was generated into `/home/ubuntu/sirius-s5-four-gpu/test_datasets/tpch_parquet_sf100` using `test/tpch_performance/generate_tpch_data.sh 100 --format parquet` (`tpchgen-rs` `v2.0.2`) before running the key audit and campaigns.
-4. **Archive splitting for the 500 KiB repository hook**: Because the full unsplit archive (`four-gpu.tar.gz`, `19,708,832` bytes, SHA-256 `446a3213bb15c7d98a8062ec1cf2d0e32a8b782b273def6c2466be5e600026bd`, retained on the experiment host at `/home/ubuntu/s5-four-gpu-archives/four-gpu.tar.gz`) exceeds the repository's 500 KiB `check-added-large-files` pre-commit limit, the complete `$S5_OUT` tree (`3,915` files, `0` bytes omitted) is packaged under `experiments/s5/results/` into `162` `.tar.xz` archives (maximum archive size `446,400` bytes), accompanied by `experiments/s5/results/index.json`, `experiments/s5/results/sha256sums.txt`, and per-file SHA-256 manifests (`build-and-tests-files.sha256`, `smoke/files.sha256`, `all22/files-part1.sha256`, `all22/files-part2.sha256`, `screen/files.sha256`).
+4. **Archive splitting for the 500 KiB repository hook**: The complete output tree
+   (3,915 files) is packaged in [results/](results/) as 162 `.tar.xz` archives,
+   each at most 446,400 bytes. [index.json](results/index.json) records the archive
+   paths, sizes and hashes; [sha256sums.txt](results/sha256sums.txt) verifies the
+   archives. Per-file manifests record hash, byte count, containing archive and
+   original extracted path. No separate host-local archive is needed.
 
 ### Reconstructing and auditing the full directory from Git
 
-Every file in `$S5_OUT` (`build-and-tests/`, `smoke/`, `all22/`, `screen/`) can be reconstructed bit-for-bit from the committed archives and verified with `s5_compare.py analyze`:
+Use the [replay instructions](README.md#replay-the-returned-evidence) to verify
+archive checksums, reconstruct the output and rerun the saved-result analyzer.
+The archive filenames use `processes/`; their contents and the corrected original
+paths in the index/manifests use `runs/`.
 
-```bash
-mkdir -p /tmp/s5-four-gpu-reconstructed
-find experiments/s5/results -name '*.tar.xz' -print0 | sort -z | xargs -0 -n1 tar -xJf -C /tmp/s5-four-gpu-reconstructed
-pixi run python tools/experiments/s5_compare.py analyze --out /tmp/s5-four-gpu-reconstructed/smoke
-pixi run python tools/experiments/s5_compare.py analyze --out /tmp/s5-four-gpu-reconstructed/all22
-pixi run python tools/experiments/s5_compare.py analyze --out /tmp/s5-four-gpu-reconstructed/screen
-```
+### Independent evaluation and source review
+
+The returned snapshot was audited at
+`0e963345aa59ec2c70615530d30a3bea6d467c51`. All 162 archive checksums and all 3,915
+file hashes/sizes matched. The frozen analyzer reproduced the smoke, all-22 and
+screen summaries exactly. GPU activity records contained 4,322 observations across
+136 GPU processes, with idle start/end observations and at most one process ID per
+run. The reviewer independently reproduced all twelve contrasts from the 24 timing
+processes and accepted the decision to stop without confirmation.
+
+A subsequent standards and specification review of S5 against its S4 base found
+no actionable code findings. The architect retained S5 at production 0.9; no
+additional experiment or implementation change was indicated. This does not
+expand the performance claims above.
+
+This final report corrects the originally returned source-tree value, dataset
+byte total, MiB conversion and archive-index paths. Raw experiment files, binary
+identities, timings and results remain unchanged.
