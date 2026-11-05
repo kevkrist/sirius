@@ -1,0 +1,387 @@
+<title>Sirius 4-GPU Scaling Diagnosis</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<style>
+/* Layout: single reading column (max 1040px), sections separated by whitespace and a thin rule; data tables scroll inside their own box. */
+:root {
+  --bg: #f6f7f8;
+  --surface: #ffffff;
+  --fg: #16202a;
+  --muted: #5a6875;
+  --line: #d9dee3;
+  --accent: #0b6e8a;
+  --accent-soft: #e2f0f4;
+  --k-hw: #8a5a00;      --k-hw-bg: #fbefd9;
+  --k-mech: #9b2c3a;    --k-mech-bg: #f8e3e6;
+  --k-design: #2b5aa8;  --k-design-bg: #e3ebf8;
+  --k-config: #2f7a4b;  --k-config-bg: #e1f1e6;
+  --k-meas: #5c5f66;    --k-meas-bg: #eceef0;
+  --k-none: #9aa4ad;
+  --base: #c9d2da;
+  --good: #2f7a4b; --bad: #9b2c3a;
+  --font-display: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f151b; --surface: #151d25; --fg: #e3e9ee; --muted: #93a1ad; --line: #2a3540;
+    --accent: #5cc2dd; --accent-soft: #15303a;
+    --k-hw: #f0c27a; --k-hw-bg: #3a2c12; --k-mech: #f19aa6; --k-mech-bg: #3d1d23;
+    --k-design: #92b5f2; --k-design-bg: #1c2b45; --k-config: #8fd3a7; --k-config-bg: #17321f;
+    --k-meas: #b5bac2; --k-meas-bg: #262b31; --k-none: #6b7781; --base: #3a4651;
+    --good: #8fd3a7; --bad: #f19aa6; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f151b; --surface: #151d25; --fg: #e3e9ee; --muted: #93a1ad; --line: #2a3540;
+  --accent: #5cc2dd; --accent-soft: #15303a;
+  --k-hw: #f0c27a; --k-hw-bg: #3a2c12; --k-mech: #f19aa6; --k-mech-bg: #3d1d23;
+  --k-design: #92b5f2; --k-design-bg: #1c2b45; --k-config: #8fd3a7; --k-config-bg: #17321f;
+  --k-meas: #b5bac2; --k-meas-bg: #262b31; --k-none: #6b7781; --base: #3a4651;
+  --good: #8fd3a7; --bad: #f19aa6; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px; line-height: 1.55; }
+.wrap { max-width: 1040px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 40px 64px; display: flex; flex-direction: column; gap: 44px; }
+h1, h2 { font-family: var(--font-display); font-weight: 600; text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(28px, 4vw, 38px); line-height: 1.15; letter-spacing: -0.01em; }
+h2 { font-size: 22px; line-height: 1.25; }
+h3 { font-size: 15px; font-weight: 600; margin: 0; }
+p { margin: 0; max-width: 68ch; }
+.mono, code { font-family: var(--font-mono); font-size: 0.88em; }
+code { background: var(--accent-soft); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+.eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.muted { color: var(--muted); }
+section { display: flex; flex-direction: column; gap: 16px; }
+section + section { border-top: 1px solid var(--line); padding-top: 36px; }
+header { display: flex; flex-direction: column; gap: 14px; }
+.lede { font-size: 17px; max-width: 70ch; }
+
+.figures { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.fig { background: var(--surface); padding: 14px 16px; display: flex; flex-direction: column; gap: 2px; }
+.fig .v { font-family: var(--font-mono); font-size: 24px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.fig .l { font-size: 13px; color: var(--muted); }
+.fig.hl .v { color: var(--accent); }
+
+/* waterfall */
+.wf { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 18px 16px 12px; display: flex; flex-direction: column; gap: 6px; }
+.wf-row { display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr) 4.2rem; align-items: center; gap: 12px; min-height: 26px; }
+.wf-label { font-size: 13.5px; line-height: 1.25; min-width: 0; }
+.wf-label .n { font-family: var(--font-mono); color: var(--muted); margin-right: 6px; font-size: 12px; }
+.wf-track { position: relative; height: 16px; }
+.wf-bar { position: absolute; top: 0; height: 100%; border-radius: 2px; }
+.wf-val { font-family: var(--font-mono); font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; }
+.wf-row.total .wf-label { font-weight: 600; }
+.wf-axis { display: grid; grid-template-columns: minmax(0, 15rem) minmax(0, 1fr) 4.2rem; gap: 12px; }
+.wf-ticks { position: relative; height: 18px; border-top: 1px solid var(--line); }
+.wf-ticks span { position: absolute; top: 3px; transform: translateX(-50%); font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+.wf-grid { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 12.5px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+
+.chip { display: inline-block; font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.03em; padding: 1px 7px; border-radius: 10px; white-space: nowrap; }
+.k-hw { color: var(--k-hw); background: var(--k-hw-bg); }
+.k-mech { color: var(--k-mech); background: var(--k-mech-bg); }
+.k-design { color: var(--k-design); background: var(--k-design-bg); }
+.k-config { color: var(--k-config); background: var(--k-config-bg); }
+.k-meas { color: var(--k-meas); background: var(--k-meas-bg); }
+
+/* ranked list */
+.ranked { display: flex; flex-direction: column; gap: 0; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.item { display: grid; grid-template-columns: 2.4rem minmax(0, 1fr) 6.5rem; gap: 14px; padding: 16px; border-top: 1px solid var(--line); }
+.item:first-child { border-top: 0; }
+.item .rk { font-family: var(--font-display); font-size: 22px; color: var(--muted); line-height: 1.1; }
+.item .body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.item .ttl { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; }
+.item .ttl h3 { font-size: 15.5px; }
+.item .ev { font-size: 13.5px; color: var(--muted); }
+.item .fix { font-size: 13.5px; }
+.item .fix b { font-weight: 600; }
+.item .cost { text-align: right; display: flex; flex-direction: column; gap: 2px; }
+.item .cost .s { font-family: var(--font-mono); font-size: 20px; font-variant-numeric: tabular-nums; }
+.item .cost .r { font-size: 12px; color: var(--muted); font-family: var(--font-mono); }
+
+/* tables */
+.tbl { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { padding: 9px 14px; text-align: left; border-top: 1px solid var(--line); vertical-align: top; }
+thead th { border-top: 0; font-size: 12px; font-weight: 500; color: var(--muted); font-family: var(--font-mono); letter-spacing: 0.03em; text-transform: uppercase; white-space: nowrap; }
+td.n, th.n { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr.best td { background: var(--accent-soft); }
+.up { color: var(--good); } .down { color: var(--bad); }
+
+/* topology */
+.two { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+.topo { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow-x: auto; }
+.topo svg { display: block; width: 100%; min-width: 380px; height: auto; }
+.topo .box { fill: var(--surface); stroke: var(--fg); stroke-width: 1.2; }
+.topo .sw-box { fill: var(--k-hw-bg); stroke: var(--k-hw); stroke-width: 1.2; }
+.topo .gpu { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+.topo .link { stroke: var(--muted); stroke-width: 2; fill: none; }
+.topo .uplink { stroke: var(--k-hw); stroke-width: 4; fill: none; }
+.topo .np { stroke: var(--bad); stroke-width: 1.4; stroke-dasharray: 5 4; fill: none; }
+.topo .p2p { stroke: var(--good); stroke-width: 1.4; fill: none; }
+.topo text { fill: var(--fg); font-family: var(--font-mono); font-size: 12px; }
+.topo text.m { fill: var(--muted); font-size: 11px; }
+.topo text.hw { fill: var(--k-hw); font-size: 11px; }
+.topo text.bad { fill: var(--bad); font-size: 11px; }
+.topo text.good { fill: var(--good); font-size: 11px; }
+
+ol.fixes { margin: 0; padding-left: 1.4em; display: flex; flex-direction: column; gap: 10px; max-width: 78ch; }
+ol.fixes li::marker { font-family: var(--font-mono); color: var(--muted); }
+ol.fixes .g { font-family: var(--font-mono); font-size: 13px; color: var(--accent); white-space: nowrap; }
+ul.plain { margin: 0; padding-left: 1.2em; display: flex; flex-direction: column; gap: 6px; max-width: 78ch; }
+.note { border-left: 3px solid var(--accent); padding: 10px 14px; background: var(--surface); border-radius: 0 6px 6px 0; max-width: 78ch; font-size: 14px; }
+
+@media (max-width: 720px) {
+  .two { grid-template-columns: minmax(0, 1fr); }
+  .wf-row, .wf-axis { grid-template-columns: minmax(0, 9.5rem) minmax(0, 1fr) 3.4rem; gap: 8px; }
+  .wf-label { font-size: 12.5px; }
+  .item { grid-template-columns: 1.8rem minmax(0, 1fr); }
+  .item .cost { grid-column: 2; text-align: left; flex-direction: row; gap: 10px; align-items: baseline; }
+}
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">TPC-H SF1000 · host-pinned · 4× RTX PRO 6000 Blackwell · sirius bb557b1a · 2026-11-05</div>
+  <h1>Sirius 4-GPU Scaling Diagnosis</h1>
+  <p class="lede">Going from 1 to 4 GPUs gives 1.79×, not 4×. Each bottleneck below has a measured price in seconds of 4-GPU wall time, and two adversarial reviewers re-derived the top eight. The biggest item is hardware: four GPUs share two PCIe uplinks. Most of the rest is cross-GPU exchange work and a driver allocator lock that only bite when more than one GPU is active.</p>
+  <div class="figures" role="list">
+    <div class="fig" role="listitem"><span class="v">35.82 s</span><span class="l">1 GPU, warm suite</span></div>
+    <div class="fig" role="listitem"><span class="v">20.04 s</span><span class="l">4 GPUs, warm suite</span></div>
+    <div class="fig" role="listitem"><span class="v">8.96 s</span><span class="l">ideal 4-GPU (1 GPU ÷ 4)</span></div>
+    <div class="fig" role="listitem"><span class="v">11.08 s</span><span class="l">gap to linear</span></div>
+    <div class="fig hl" role="listitem"><span class="v">16.91 s</span><span class="l">4 GPUs with 4 GB scan batches (1.95×)</span></div>
+  </div>
+</header>
+
+<section aria-labelledby="wf-h">
+  <div class="eyebrow">Where the 11.08 s goes</div>
+  <h2 id="wf-h">From the ideal 8.96 s to the measured 20.04 s</h2>
+  <p class="muted">Each bar adds one bottleneck's verified cost to the 4-GPU suite time. Costs overlap in reality; this is the attribution the synthesis settled on after the reviewers' corrections. About 2 s is left unattributed.</p>
+  <div class="wf" id="wf" aria-label="Waterfall chart of 4-GPU suite time"></div>
+  <div class="legend">
+    <span><i class="sw" style="background:var(--k-hw)"></i>hardware</span>
+    <span><i class="sw" style="background:var(--k-mech)"></i>mechanical</span>
+    <span><i class="sw" style="background:var(--k-design)"></i>design</span>
+    <span><i class="sw" style="background:var(--k-config)"></i>config</span>
+    <span><i class="sw" style="background:var(--k-meas)"></i>measurement credit</span>
+    <span><i class="sw" style="background:var(--k-none)"></i>not attributed</span>
+  </div>
+</section>
+
+<section aria-labelledby="rk-h">
+  <div class="eyebrow">Ranked bottlenecks</div>
+  <h2 id="rk-h">What blocks linear scaling, largest first</h2>
+  <div class="ranked">
+    <div class="item"><div class="rk">1</div><div class="body">
+      <div class="ttl"><h3>Two PCIe uplinks feed four GPUs</h3><span class="chip k-hw">hardware</span></div>
+      <p class="ev">GPU0+1 sit behind one PCIe switch and GPU2+3 behind another, each with a single Gen5 x16 uplink. Pinned host→GPU bandwidth: 52 GB/s for one GPU, 52 for GPUs 0+1, 102 for 0+2, 105 for all four. Two GPUs on one switch scale 1.22×; across switches 1.61×. With the host link removed (GPU-tier pin), 19 clean queries lose 3.8 s. Q17, Q19 and Q20 sit at the link floor at both GPU counts.</p>
+      <p class="fix"><b>Lever:</b> send fewer bytes (compression coverage, below). The hardware caps this box at about 12.2–12.4 s (≈2.9×) at today's wire bytes.</p>
+    </div><div class="cost"><span class="s">2.9 s</span><span class="r">synth 3.48</span></div></div>
+
+    <div class="item"><div class="rk">2</div><div class="body">
+      <div class="ttl"><h3>Process-wide CUDA driver allocator lock</h3><span class="chip k-mech">mechanical</span></div>
+      <p class="ev">Every device allocation goes from the cucascade reservation adaptor straight to <code>cudaMallocFromPoolAsync</code>/<code>cudaFreeAsync</code> with no caching layer. The driver serializes these across all GPUs at about 280–385k calls/s total. Mean call latency is 11 µs with 4 threads on 1 GPU and 56 µs with 4 threads on each of 4 GPUs; pool peer-access grants make no difference. In nsys, alloc+free thread-time grows from 10 s to 78 s, 81% of it waiting on driver locks. The allocator is busy 53% of 4-GPU wall time. Raising threads to 8 per GPU makes 4 GPUs 1.19 s slower.</p>
+      <p class="fix"><b>Fix:</b> a per-GPU user-space sub-allocator (arena or thread-local bins for small sizes) between the reservation adaptor and <code>cuda_async</code>; stop deep-copying P×C partition slices (<code>gpu_partition_impl.cpp:212-221</code>).</p>
+    </div><div class="cost"><span class="s">2.0 s</span><span class="r">range 1.5–2.4</span></div></div>
+
+    <div class="item"><div class="rk">3</div><div class="body">
+      <div class="ttl"><h3>Cross-GPU clones of hundreds of small fragments</h3><span class="chip k-design">design</span></div>
+      <p class="ev">627 scan tasks each emit P partition fragments, and the consuming task clones every remote fragment one at a time during its prepare step, with syncs per buffer. Clone thread-time is 0.23 s at 1 GPU and 25.4 s at 4. The Q1 "straggler GPU" is one merge task cloning 470 partials serially (148 ms). Q18's merge prepare grows from 27 ms to 6.1 s of thread-time. Finer partitions (256 MB) take the suite to 23.66 s.</p>
+      <p class="fix"><b>Fix:</b> coalesce fragments per producer GPU and partition before cloning; batch clones and order them with events instead of host syncs. Larger scan batches (4 GB) already cut this exchange cost by about 2.1 s.</p>
+    </div><div class="cost"><span class="s">1.2 s</span><span class="r">synth 1.72</span></div></div>
+
+    <div class="item"><div class="rk">4</div><div class="body">
+      <div class="ttl"><h3>Cross-switch shuffles go through host memory</h3><span class="chip k-hw">hardware</span><span class="chip k-design">design</span></div>
+      <p class="ev">The platform reports P2P only within a switch (0↔1, 2↔3). Of 176.6 GB moved per suite, 117.6 GB (66.6%) is cross-switch and host-staged: device→host, sync, host→device, sync, per 1 MiB chunk. A staged clone costs 3.6× a peer clone per byte, with 6.4 host syncs each. Switch-aware partition placement does not help uniform hash shuffles; only key co-location would.</p>
+      <p class="fix"><b>Fix:</b> overlap the two copy legs with chunked double-buffering; co-locate lineitem and orders by key range.</p>
+    </div><div class="cost"><span class="s">0.9 s</span><span class="r">≈0.5 hw + 0.4 staging</span></div></div>
+
+    <div class="item"><div class="rk">5</div><div class="body">
+      <div class="ttl"><h3>Scans wait for the previous exchange to finish</h3><span class="chip k-design">design</span></div>
+      <p class="ev">The next scan pipeline is created only after the previous exchange barrier, and multi-GPU prefetch is off, so the uplinks sit idle during exchanges. Per-switch idle time barely shrinks: 10.25 s at 1 GPU, 8.05 s at 4 GPUs, including 4.6 s of interior gaps of 5 ms or more. The per-task prepare itself does not starve the link (5–7 prepares in flight per switch).</p>
+      <p class="fix"><b>Fix:</b> cross-pipeline scan lookahead so the next scan's uploads run during the current exchange.</p>
+    </div><div class="cost"><span class="s">0.7 s</span><span class="r">synth 1.20</span></div></div>
+
+    <div class="item"><div class="rk">6</div><div class="body">
+      <div class="ttl"><h3>Exchange policy forces shuffles</h3><span class="chip k-design">design</span><span class="chip k-config">config</span></div>
+      <p class="ev">At 4 GPUs, every exchange above 64 MB must split into at least 4 partitions, and BUILD_PROBE joins use min(natural, N) partitions. Exchanges that pass data straight through at 1 GPU hash-partition at 4: PARTITION thread-time for that class is 0.13 s vs 16.0 s. Low caps (<code>max_broadcast_join_size</code> 256 MB, <code>max_build_hash_table_bytes</code> 2 GB) pick shuffles where a broadcast would do. Raising both to 8 GB saves 0.97 s at 4 GPUs (per-query best 1.4 s) but regresses Q7 and Q14.</p>
+      <p class="fix"><b>Fix:</b> cost-based broadcast choice; skip the P≥N floor when a local or broadcast plan exists.</p>
+    </div><div class="cost"><span class="s">0.7 s</span><span class="r">synth 0.76</span></div></div>
+
+    <div class="item"><div class="rk">7</div><div class="body">
+      <div class="ttl"><h3>Fixed per-query work outside execution</h3><span class="chip k-design">design</span></div>
+      <p class="ev">Parse, bind, optimize and result return take about 442 ms per suite at both GPU counts, so they don't shrink with more GPUs.</p>
+    </div><div class="cost"><span class="s">0.34 s</span><span class="r">verified</span></div></div>
+
+    <div class="item"><div class="rk">8</div><div class="body">
+      <div class="ttl"><h3>Granularity tails</h3><span class="chip k-config">config</span></div>
+      <p class="ev">Partition counts not divisible by 4 put extra partitions on GPU0/GPU1 (the same switch); scan-task quantization and single-GPU tails. Small queries run at 50–85% occupancy.</p>
+    </div><div class="cost"><span class="s">0.24 s</span><span class="r">synth 0.31</span></div></div>
+
+    <div class="item"><div class="rk">9</div><div class="body">
+      <div class="ttl"><h3>Bloom filter publication always host-staged</h3><span class="chip k-design">design</span></div>
+      <p class="ev">The transport is all-or-nothing (<code>sirius_dynamic_bloom_filter.cu:1080</code>): one GPU pair without pool access stages the whole publication. All 60 publications staged at 4 GPUs (mean 20 ms after the final contribution) vs peer copies on GPUs {0,1} (5.8 ms). Most of the latency is off the critical path.</p>
+      <p class="fix"><b>Fix:</b> reduce within each P2P island over peer copies; stage only the inter-island leg.</p>
+    </div><div class="cost"><span class="s">≤0.3 s</span><span class="r">measured ≥0.05</span></div></div>
+
+    <div class="item"><div class="rk">10</div><div class="body">
+      <div class="ttl"><h3>One small pinned-memory pool for all GPUs</h3><span class="chip k-design">design</span></div>
+      <p class="ev">With one NUMA node, all GPUs share one small pinned pool. A reused slab carries another GPU's ready event, so <code>device_scalar</code> syncs wait on that GPU's queued work: 105k such syncs, 13.1 thread-s at 4 GPUs, none at 1.</p>
+      <p class="fix"><b>Fix:</b> key small pinned pools by CUDA device (<code>sirius_context.cpp:1060-1073</code>).</p>
+    </div><div class="cost"><span class="s">0.2 s</span><span class="r">estimate</span></div></div>
+  </div>
+</section>
+
+<section aria-labelledby="topo-h">
+  <div class="eyebrow">The machine</div>
+  <h2 id="topo-h">PCIe topology and measured bandwidth</h2>
+  <div class="two">
+    <div class="topo">
+      <svg viewBox="0 0 460 300" role="img" aria-label="PCIe topology: CPU root complex with two Gen5 x16 uplinks, each to a switch serving two GPUs. P2P works within a switch and is not supported across switches.">
+        <rect class="box" x="140" y="14" width="180" height="40" rx="5"/>
+        <text x="230" y="38" text-anchor="middle">Xeon 8559C · 1 NUMA</text>
+        <path class="uplink" d="M190 54 L120 116"/>
+        <path class="uplink" d="M270 54 L340 116"/>
+        <text class="hw" x="88" y="84">Gen5 x16</text>
+        <text class="hw" x="88" y="98">52 GB/s</text>
+        <text class="hw" x="318" y="84">Gen5 x16</text>
+        <text class="hw" x="318" y="98">52 GB/s</text>
+        <rect class="sw-box" x="60" y="116" width="120" height="34" rx="5"/>
+        <text x="120" y="137" text-anchor="middle">switch A</text>
+        <rect class="sw-box" x="280" y="116" width="120" height="34" rx="5"/>
+        <text x="340" y="137" text-anchor="middle">switch B</text>
+        <path class="link" d="M95 150 L60 206"/>
+        <path class="link" d="M145 150 L180 206"/>
+        <path class="link" d="M315 150 L280 206"/>
+        <path class="link" d="M365 150 L400 206"/>
+        <rect class="gpu" x="20" y="206" width="80" height="34" rx="5"/><text x="60" y="227" text-anchor="middle">GPU0</text>
+        <rect class="gpu" x="140" y="206" width="80" height="34" rx="5"/><text x="180" y="227" text-anchor="middle">GPU1</text>
+        <rect class="gpu" x="240" y="206" width="80" height="34" rx="5"/><text x="280" y="227" text-anchor="middle">GPU2</text>
+        <rect class="gpu" x="360" y="206" width="80" height="34" rx="5"/><text x="400" y="227" text-anchor="middle">GPU3</text>
+        <path class="p2p" d="M100 248 Q120 262 140 248"/>
+        <text class="good" x="120" y="276" text-anchor="middle">P2P ok 54 GB/s</text>
+        <path class="p2p" d="M320 248 Q340 262 360 248"/>
+        <text class="good" x="340" y="276" text-anchor="middle">P2P ok</text>
+        <path class="np" d="M220 223 L240 223"/>
+        <text class="bad" x="230" y="292" text-anchor="middle">across switches: no P2P, host-staged</text>
+      </svg>
+    </div>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>Measured (GB/s)</th><th class="n">aggregate</th><th class="n">per GPU / pair</th></tr></thead>
+        <tbody>
+          <tr><td>Host→GPU, 1 GPU</td><td class="n">52</td><td class="n">52</td></tr>
+          <tr><td>Host→GPU, GPUs 0+1</td><td class="n">52</td><td class="n">26</td></tr>
+          <tr><td>Host→GPU, GPUs 0+2</td><td class="n">102</td><td class="n">51</td></tr>
+          <tr><td>Host→GPU, all 4</td><td class="n">105</td><td class="n">26</td></tr>
+          <tr><td>GPU→GPU, 4 intra-switch pairs</td><td class="n">209</td><td class="n">52</td></tr>
+          <tr><td>GPU→GPU, 4 cross-switch pairs</td><td class="n">77</td><td class="n">19</td></tr>
+          <tr><td>Driver allocator calls/s, 1 GPU × 4 threads</td><td class="n">340k</td><td class="n">85k</td></tr>
+          <tr><td>Driver allocator calls/s, 4 GPUs × 4 threads</td><td class="n">279k</td><td class="n">17k</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <p class="muted">Under load the 4 GPUs stay task-busy about 95% of the time but draw about 135 W of 600 W with about 11% memory-bandwidth use. PCIe receive averages 13–16 GB/s per GPU, hitting the ~30 GB/s per-GPU share only in bursts.</p>
+</section>
+
+<section aria-labelledby="cfg-h">
+  <div class="eyebrow">Config experiments</div>
+  <h2 id="cfg-h">What changing settings did (no code changes)</h2>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Setting</th><th class="n">1 GPU (s)</th><th class="n">4 GPUs (s)</th><th class="n">scaling</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td>Baseline (specific_config, host capacity 600 GB)</td><td class="n">35.82</td><td class="n">20.04</td><td class="n">1.79×</td><td class="muted">suite noise ±0.03 s at 4 GPUs</td></tr>
+        <tr class="best"><td><code>scan_task_batch_size: 4GB</code></td><td class="n">33.04</td><td class="n">16.91</td><td class="n">1.95×</td><td>fewer tasks: fewer allocations, fragments, clones</td></tr>
+        <tr><td><code>scan_task_batch_size: 8GB</code></td><td class="n">–</td><td class="n">17.34</td><td class="n">–</td><td class="muted">past the sweet spot</td></tr>
+        <tr><td>4 GB batches + join caps 8 GB</td><td class="n">31.93</td><td class="n">16.92</td><td class="n">1.89×</td><td class="muted">join caps add nothing on top at 4 GPUs</td></tr>
+        <tr><td>Join caps 8 GB (build + broadcast)</td><td class="n">34.74</td><td class="n">19.07</td><td class="n">1.82×</td><td class="muted">Q3 changes join mode at 1 GPU; Q7, Q14 regress</td></tr>
+        <tr><td><code>hash_partition_bytes: 4GB</code></td><td class="n">–</td><td class="n">19.91</td><td class="n">–</td><td class="muted">Q18 1.56→1.25 s</td></tr>
+        <tr><td><code>hash_partition_bytes: 256MB</code></td><td class="n">–</td><td class="n down">23.66</td><td class="n">–</td><td class="muted">Q18 1.56→3.67 s</td></tr>
+        <tr><td><code>pipeline.num_threads: 8</code></td><td class="n">35.55</td><td class="n down">21.23</td><td class="n">1.67×</td><td class="muted">more threads, more allocator contention</td></tr>
+        <tr><td>Pin tier GPU (no host link)</td><td class="n">–</td><td class="n">18.26</td><td class="n">–</td><td class="muted">confounded by GPU memory pressure on Q3, Q10, Q18</td></tr>
+        <tr><td>2 GPUs: {0,1} same switch</td><td class="n">35.82</td><td class="n">29.40</td><td class="n down">1.22×</td><td class="muted">what <code>num_gpus: 2</code> selects</td></tr>
+        <tr><td>2 GPUs: {0,2} across switches</td><td class="n">35.82</td><td class="n">22.21</td><td class="n up">1.61×</td><td class="muted">use <code>gpu_ids: [0, 2]</code></td></tr>
+        <tr><td>Quent telemetry off</td><td class="n">–</td><td class="n">20.00</td><td class="n">–</td><td class="muted">telemetry costs nothing measurable</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section aria-labelledby="fix-h">
+  <div class="eyebrow">What to do</div>
+  <h2 id="fix-h">Fixes, by expected gain at 4 GPUs</h2>
+  <ol class="fixes">
+    <li><b>Config today:</b> set <code>scan_task_batch_size: 4GB</code>, keep 4 pipeline threads per GPU, and choose 2-GPU subsets across switches. <span class="g">−3.1 s measured</span></li>
+    <li><b>Sub-allocator</b> between the reservation adaptor and <code>cuda_async</code>, plus no P×C deep-copy slices in partitioning. <span class="g">≈2.3–3.7 s (also 0.9–2.1 s at 1 GPU)</span></li>
+    <li><b>Exchange redesign:</b> coalesce fragments before cloning, async and batched clone legs, cost-based broadcast, no forced P≥N floor when a local plan exists. <span class="g">≈2–3 s</span></li>
+    <li><b>Scan lookahead</b> across pipelines so uploads continue during exchanges. <span class="g">≈0.7–1 s</span></li>
+    <li><b>Fewer wire bytes:</b> compression plans for customer, part, partsupp and supplier; better encodings for <code>o_comment</code> and <code>l_shipmode</code> (−233 GB, 19% of scan bytes). <span class="g">≈1.1 s</span></li>
+    <li><b>Smaller items:</b> hierarchical Bloom publication; per-device small pinned pools. <span class="g">≈0.2–0.5 s</span></li>
+  </ol>
+  <p class="note">Even with every software fix, this machine tops out near 12.2–12.4 s at 4 GPUs (≈2.9×) at today's wire bytes. Reaching 4× needs fewer bytes on the uplinks or a PCIe topology with one uplink per GPU.</p>
+</section>
+
+<section aria-labelledby="m-h">
+  <div class="eyebrow">Method</div>
+  <h2 id="m-h">How this was measured</h2>
+  <ul class="plain">
+    <li>Regime: one DuckDB session per run; all TPC-H columns pinned with <code>pin_table(..., tier='host')</code>; lineitem and orders Simpatico-compressed; 22 queries × 4 iterations, iteration 1 discarded as warm-up. Figure of merit: sum of hot-iteration means.</li>
+    <li>Runs: 1, 2 (same and cross switch) and 4 GPUs repeated twice; 12 config flips at 1 and 4 GPUs. 1-GPU totals reproduce within 0.04 s, 4-GPU within 0.10 s.</li>
+    <li>Profiling: nsys (CUDA, NVTX, OS runtime) on warm iteration 2 of every query at 1 and 4 GPUs, mapped to queries by absolute time against Quent labels. Quent telemetry from un-profiled runs for task lifecycles, per-GPU busy time and bytes. Microbenchmarks for host→GPU, P2P and driver allocator throughput.</li>
+    <li>Analysis: 7 query-family analysts and 3 cross-cutting analysts (allocator, exchange, link) priced every finding in 4-GPU wall seconds; a synthesis mapped 61 findings onto 11 root causes; two independent reviewers per top-8 item re-derived the numbers and corrected the estimates shown here.</li>
+    <li>Caveats: costs overlap, so the waterfall is an attribution, not a sum of independent savings. About 2 s of the gap stayed unattributed after the reviewers' trims. The 1-GPU Q13 baseline was not fully warm, which flatters 4-GPU scaling slightly.</li>
+  </ul>
+  <p class="muted mono">Data and reports: /home/ubuntu/sirius-scaling-20261105/ (30-diagnosis/FINAL.md, RANKED.md, 10-analysis/, 20-experiments/)</p>
+</section>
+
+</div>
+
+<script>
+(function () {
+  var rows = [
+    { n: "",   label: "Ideal: 1 GPU ÷ 4",               v: 8.96, k: "base", total: true },
+    { n: "1",  label: "PCIe uplink sharing",            v: 2.9,  k: "hw" },
+    { n: "2",  label: "Driver allocator lock",          v: 2.0,  k: "mech" },
+    { n: "3",  label: "Fragment clones",                v: 1.2,  k: "design" },
+    { n: "4",  label: "Host-staged cross-switch shuffle", v: 0.9, k: "hw" },
+    { n: "5",  label: "Scans wait on exchanges",        v: 0.7,  k: "design" },
+    { n: "6",  label: "Forced shuffles (policy)",       v: 0.7,  k: "config" },
+    { n: "7",  label: "Fixed per-query work",           v: 0.34, k: "design" },
+    { n: "8",  label: "Granularity tails",              v: 0.24, k: "config" },
+    { n: "9",  label: "Bloom publication staging",      v: 0.15, k: "design" },
+    { n: "10", label: "Shared small pinned pool",       v: 0.2,  k: "design" },
+    { n: "",   label: "Measurement credits",            v: -0.25, k: "meas" },
+    { n: "",   label: "Not attributed",                 v: 0, k: "none", rest: true },
+    { n: "",   label: "Measured 4 GPUs",                v: 20.04, k: "base", total: true, final: true }
+  ];
+  var MAX = 21, colors = { base: "var(--base)", hw: "var(--k-hw)", mech: "var(--k-mech)", design: "var(--k-design)", config: "var(--k-config)", meas: "var(--k-meas)", none: "var(--k-none)" };
+  var el = document.getElementById("wf"), cum = 0;
+  function pct(x) { return (x / MAX * 100).toFixed(3) + "%"; }
+  var ticks = [0, 5, 8.96, 10, 15, 20.04];
+  rows.forEach(function (r) {
+    var start, end, shown;
+    if (r.total) { start = 0; end = r.v; shown = r.v.toFixed(2) + " s"; cum = r.final ? cum : r.v; }
+    else if (r.rest) { start = cum; end = 20.04; shown = "+" + (20.04 - cum).toFixed(2); cum = 20.04; }
+    else { start = Math.min(cum, cum + r.v); end = Math.max(cum, cum + r.v); shown = (r.v > 0 ? "+" : "−") + Math.abs(r.v).toFixed(2); cum += r.v; }
+    var row = document.createElement("div");
+    row.className = "wf-row" + (r.total ? " total" : "");
+    var grid = ticks.map(function (t) { return '<i class="wf-grid" style="left:' + pct(t) + '"></i>'; }).join("");
+    row.innerHTML = '<div class="wf-label">' + (r.n ? '<span class="n">' + r.n + '</span>' : '') + r.label + '</div>' +
+      '<div class="wf-track">' + grid + '<span class="wf-bar" style="left:' + pct(start) + ';width:' + pct(end - start) + ';background:' + colors[r.k] + '"></span></div>' +
+      '<div class="wf-val">' + shown + '</div>';
+    el.appendChild(row);
+  });
+  var axis = document.createElement("div");
+  axis.className = "wf-axis";
+  axis.innerHTML = '<div></div><div class="wf-ticks">' + [0, 5, 10, 15, 20].map(function (t) { return '<span style="left:' + pct(t) + '">' + t + ' s</span>'; }).join("") + '</div><div></div>';
+  el.appendChild(axis);
+})();
+</script>

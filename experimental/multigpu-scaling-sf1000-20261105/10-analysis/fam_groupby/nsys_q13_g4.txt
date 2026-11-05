@@ -1,0 +1,90 @@
+window 1103.1 ms
+dev0: kernel busy(union)    110.1 ms  kernel sum    115.5 ms  n=1167
+dev1: kernel busy(union)    111.4 ms  kernel sum    117.6 ms  n=1200
+dev2: kernel busy(union)    111.2 ms  kernel sum    117.3 ms  n=1188
+dev3: kernel busy(union)    111.1 ms  kernel sum    116.9 ms  n=1187
+dev0 DtoD :    23.87 GB  n=    432  sum     49.1 ms  busy     44.7 ms   534.4 GB/s(busy)
+dev0 DtoH :     2.26 GB  n=   2393  sum     50.3 ms  busy     50.3 ms    45.0 GB/s(busy)
+dev0 HtoD :    12.67 GB  n=  12425  sum    424.3 ms  busy    424.3 ms    29.9 GB/s(busy)
+dev0 PtoP :    11.80 GB  n=  10461  sum    398.6 ms  busy    398.5 ms    29.6 GB/s(busy)
+dev1 DtoD :    24.44 GB  n=    441  sum     51.4 ms  busy     42.6 ms   573.5 GB/s(busy)
+dev1 DtoH :     0.00 GB  n=     98  sum      0.3 ms  busy      0.3 ms     0.0 GB/s(busy)
+dev1 HtoD :    11.34 GB  n=  10881  sum    395.3 ms  busy    395.3 ms    28.7 GB/s(busy)
+dev1 PtoP :    15.97 GB  n=  14870  sum    489.6 ms  busy    470.9 ms    33.9 GB/s(busy)
+dev2 DtoD :    24.46 GB  n=    442  sum     49.9 ms  busy     45.5 ms   538.0 GB/s(busy)
+dev2 DtoH :     0.00 GB  n=     95  sum      0.3 ms  busy      0.3 ms     0.0 GB/s(busy)
+dev2 HtoD :    10.96 GB  n=  10514  sum    388.5 ms  busy    388.5 ms    28.2 GB/s(busy)
+dev2 PtoP :    16.35 GB  n=  15212  sum    502.5 ms  busy    483.9 ms    33.8 GB/s(busy)
+dev3 DtoD :    24.38 GB  n=    442  sum     47.8 ms  busy     42.9 ms   568.3 GB/s(busy)
+dev3 DtoH :     0.00 GB  n=     95  sum      0.3 ms  busy      0.3 ms     0.0 GB/s(busy)
+dev3 HtoD :    10.57 GB  n=  10138  sum    375.0 ms  busy    375.0 ms    28.2 GB/s(busy)
+dev3 PtoP :    16.65 GB  n=  15505  sum    513.1 ms  busy    496.6 ms    33.5 GB/s(busy)
+top kernels (sum ms, count):
+      233.3     776  accumulate_kernel
+       68.3     163  like_multiliteral_kernel
+       50.1     357  copy_block_partitions
+       32.8     407  transform_kernel
+       22.5     714  DeviceScanKernel
+       16.5     194  compute_row_partition_numbers
+        9.6     163  simpatico_decode_bp_int32_t
+        7.9     172  DeviceSelectSweepKernel
+        6.2     105  simpatico_decode_dl_bp_int64_t
+        5.0       4  emit_kernel
+        4.7       5  mapping_indices_kernel
+        2.5     128  DeviceReduceKernel
+top runtime APIs (thread-ms, count):
+    11737.9     3160  cudaStreamSynchronize_v3020
+      807.3     3876  cuStreamSynchronize
+      441.3   101005  cudaMemcpyAsync_v3020
+      164.9     9282  cudaMallocFromPoolAsync_v11020
+      115.1     9282  cudaFreeAsync_v11020
+      110.2     3079  cudaMemcpyBatchAsync_v13000
+       30.4     4416  cudaLaunchKernel_v7000
+        7.4     1413  cudaStreamWaitEvent_v3020
+        5.7     2761  cudaEventRecord_v3020
+        4.8     4138  cudaMemsetAsync_v3020
+        4.5     1929  cudaEventCreateWithFlags_v3020
+        4.1     1926  cudaEventDestroy_v3020
+        3.4      359  cudaMemcpyPeerAsync_v4000
+        2.2      326  cuLaunchKernel
+top NVTX ranges (thread-ms, count):
+    13616.2      404  Pipeline*Task 
+    10240.9      163  sirius::compression::host_to_gpu
+     9819.5      163  simpatico::decompress_table[selected,streams]
+     1678.1      163  Pipeline 2: GPU_SCAN (id=2)
+     1632.6      163  apply_retention_mask
+     1632.3      163  copy_if
+     1624.5      167  thrust::copy_if
+     1103.1        1  sirius::query
+      829.3      585  convert:gpu_to_gpu
+      722.7      390  convert:gpu_to_gpu:host_staging
+      406.6      163  simpatico::io::read_table[memory,subset]
+      402.1      163  simpatico::io::fetch_payload
+      391.9      198  sirius_physical_partition::execute
+      368.3      163  Pipeline 3: PARTITION (id=3)
+      290.2      194  hash_partition
+      283.1        4  Pipeline 4: DENSE_COUNT_JOIN (id=4)
+      278.2        4  sirius_physical_dense_count_join::execute
+      234.5        4  thrust::count_if
+      100.4      195  convert:gpu_to_gpu:peer_copy
+       77.4      776  table
+       73.8       31  convert:host_to_gpu
+       67.0       31  convert:host_to_gpu:flush_submit
+       57.7       31  Pipeline 1: PARTITION (id=1)
+       40.0      388  thrust::exclusive_scan
+       34.6     2132  make_fixed_width_column
+       33.4     2134  make_numeric_column
+       28.3      124  minmax
+       10.1        4  Pipeline 5: HASH_GROUP_BY (id=6)
+        9.6      326  cub::DeviceScan::ExclusiveSum
+        9.5        4  sirius_physical_grouped_aggregate::execute
+        9.3        5  aggregate
+        7.7      669  allocate_like
+        4.4      395  cub::DeviceTransform::TransformIfStableArgumentAddresses
+        3.9      333  thrust::gather
+        3.4      167  cub::DeviceSelect::FlaggedIf
+        3.1      163  simpatico::io::parse_header
+        2.8       31  convert:host_to_gpu:presync
+        2.0      128  cub::DeviceReduce::Reduce
+        2.0     1271  create_null_mask
+        1.9       31  convert:host_to_gpu:reconstruct

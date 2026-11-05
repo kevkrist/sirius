@@ -1,0 +1,52 @@
+wall g1=1173 g4=656 ms  (quent, mean iters [2, 3, 4])
+pipe label                                                   n1    n4    pH1    pH4    pG1    pG4     c1     c4  GBin1  GBin4       span1       span4
+P0   GPU_SCAN(0)                                              1     1      1      1      0      0      0      0    0.1    0.1     1-2         1-2    
+P1   PARTITION(1)                                             1     1      0      0      0      0      0      0    0.1    0.1     2-2         2-2    
+P2   CONCAT(2)                                                1     4      0      0      0     14      0      0    0.1    0.3     2-2         2-9    
+P3   GPU_SCAN(3)                                              1     1      0      0      0      0      0      0    0.0    0.0     2-3         9-10   
+P4   PARTITION(4)                                             1     1      0      0      0      0      0      0    0.0    0.0     3-3        10-10   
+P5   CONCAT(5)                                                1     4      0      0      0      0      0      0    0.0    0.0     3-3        10-10   
+P6   GPU_SCAN(6) -> DYNAMIC_FILTER(7)                         1     1      0      0      0      0      0      0    0.0    0.0     3-3        10-10   
+P7   PARTITION(8)                                             1     1      0      0      0      0      0      0    0.0    0.0     3-3        10-11   
+P8   CONCAT(9)                                                1     1      0      0      0      0      0      0    0.0    0.0     4-4        11-11   
+P9   HASH_JOIN(10) -> PROJECTION(11)                          1     1      0      0      0      0      0      0    0.0    0.0     4-4        11-11   
+P10  PARTITION(12)                                            1     1      0      0      0      0      0      0    0.0    0.0     4-4        11-11   
+P11  CONCAT(13)                                               1     4      0      0      0      1      0      0    0.0    0.0     4-4        11-12   
+P12  GPU_SCAN(14) -> DYNAMIC_FILTER(15)                       7     7     43     39      0      0      4      4    0.8    0.8     4-18       12-21   
+P13  PARTITION(16)                                            7     7      0      0      0      0      0      0    0.2    0.2    13-18       16-21   
+P14  CONCAT(17)                                               1     4      0      0      0      0      1      1    0.2    0.2    19-19       21-21   
+P15  HASH_JOIN(18)                                            1     4      0      0      0      0      2      4    0.2    0.2    19-21       21-22   
+P16  PARTITION(19)                                            1     4      0      0      0      0      0     18    0.6    0.6    22-22       22-35   
+P17  CONCAT(20)                                               1     4      0      0      0     26      1      3    0.6    0.6    22-22       35-43   
+P18  GPU_SCAN(21) -> DYNAMIC_FILTER(22)                      38    38    514    822      0      0    166    329   18.9   18.9    22-199      43-129  
+P19  PARTITION(23)                                           38    38      0      0      0      1      0     29    0.5    0.5   188-199      97-129  
+P20  CONCAT(24)                                               1     4      0      0      0     33      1      4    0.5    0.5   199-200     129-139  
+P21  HASH_JOIN(25)                                            1     4      0      0      0      0     21     10    1.1    1.1   200-222     138-141  
+P22  PARTITION(26)                                            1     4      0      0      0      0      0     28    1.1    1.1   222-222     142-161  
+P23  CONCAT(27)                                               1     4      0      0      0     48      2      4    1.1    1.1   222-224     161-175  
+P24  GPU_SCAN(28) -> DYNAMIC_FILTER(29)                     145   145   2641   4782      0      0    917   1306  111.5  111.5   224-1122    175-569  
+P25  PARTITION(30)                                          145   145      0      0      1      3      2    218    3.8    3.8  1113-1124    533-575  
+P26  CONCAT(31)                                               4     4      0      0      0    218     21     25    3.8    3.8  1119-1129    576-638  
+P27  HASH_JOIN(32)                                            4     4      0      0      0      1     82     29    4.9    4.9  1123-1154    635-645  
+P28  PARTITION(33)                                            4     4      0      0      0      0      0      0    5.1    5.1  1148-1154    642-645  
+P29  CONCAT(34)                                               4     4      0      0      0      1      0      0    5.1    5.1  1152-1154    646-646  
+P30  HASH_JOIN(35) -> PROJECTION(36) -> HASH_GROUP_BY(37)     4     4      0      0      0      0     64     27    5.2    5.4  1153-1171    646-653  
+P31  PARTITION(38)                                            4     4      0      0      0      0      0      0    0.0    0.0  1171-1171    653-653  
+P32  MERGE_GROUP_BY(39) -> ORDER_BY(40)                       1     1      0      0      0      1      1      1    0.0    0.0  1171-1172    653-655  
+P33  SORT_SAMPLE(41) -> SORT_PARTITION(42)                    1     1      0      0      0      0      0      0    0.0    0.0  1172-1172    655-655  
+P34  MERGE_SORT(43)                                           1     1      0      0      0      0      0      0    0.0    0.0  1172-1172    655-655  
+P35  RESULT_COLLECTOR(44)                                     1     1      0      0      0      0      0      0    0.0    0.0  1172-1172    655-655  
+TOTAL n1=428 n4=461 pH1=3199 pH4=5644 pG1=3 pG4=346 c1=1286 c4=2042 thread g1=4488 g4=8032 occ g1=0.957 g4=0.765
+
+per-operator compute (thread-ms)
+  P18  GPU_SCAN(21)          165     327  1.99
+  P19  PARTITION(23)            0      29 57.87
+  P21  HASH_JOIN(25)           21      10  0.48
+  P22  PARTITION(26)            0      281508.10
+  P24  GPU_SCAN(28)          258     404  1.57
+  P24  DYNAMIC_FILTER(29)          659     902  1.37
+  P25  PARTITION(30)            2     218112.29
+  P26  CONCAT(31)           21      25  1.16
+  P27  HASH_JOIN(32)           82      29  0.35
+  P30  HASH_JOIN(35)           54      20  0.37
+by op type: DYNAMIC_FILTER 660->904, GPU_SCAN 426->736, PARTITION 3->293, HASH_JOIN 160->63, CONCAT 26->37, HASH_GROUP_BY 9->6, PROJECTION 1->1, MERGE_GROUP_BY 1->1, ORDER_BY 0->0, RESULT_COLLECTOR 0->0, MERGE_SORT 0->0, SORT_PARTITION 0->0, SORT_SAMPLE 0->0

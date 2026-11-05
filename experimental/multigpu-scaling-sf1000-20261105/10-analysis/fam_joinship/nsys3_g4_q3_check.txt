@@ -1,0 +1,22 @@
+pipe label                              tasks  task_ms |  nStg   msStg  GBStg  copyms  syncms |  nP2P   msP2P  GBP2P
+   2 CONCAT -> CONCAT -> CONCAT             4     42.5 |    62    20.4   0.24    10.1    15.1 |    31     3.9   0.12
+   8 CONCAT -> CONCAT -> CONCAT             4    102.6 |     8    87.1   1.10    52.1    74.9 |     4    11.2   0.55
+  11 CONCAT -> CONCAT -> CONCAT            56   6149.7 |  1254  5315.3  25.68  1519.5  4866.8 |   627   537.4  12.84
+  14 MERGE_GROUP_BY -> MERGE_GROUP_BY -     4     85.0 |   112    34.5   0.15     6.7    17.0 |    56     6.3   0.08
+  15 MERGE_TOP_N -> MERGE_TOP_N -> RESU     1      1.3 |     2     0.4   0.00     0.0     0.2 |     1     0.1   0.00
+
+pipe op             tasks  task_ms alloc_ms n_alloc alloc%  sync_ms  kern_ms
+   0 GPU_SCAN          31    328.0      4.3    1271    1.3     19.9      4.1
+   2 CONCAT             4     42.5      0.8     249    1.9     33.0      1.3
+   3 GPU_SCAN         163   1277.0    264.5   11924   20.7    780.4     82.7
+   4 PARTITION        163      8.9      0.0       0    0.0      5.1      0.0
+   5 CONCAT             4     18.0      4.9     764   27.0      8.3      5.2
+   6 HASH_JOIN          4     55.2      0.3      88    0.5     53.7     53.6
+   7 PARTITION          4     13.0      1.0     176    7.7      9.5      7.9
+   8 CONCAT             4    102.6      0.5     176    0.5     88.5      0.0
+   9 GPU_SCAN         627   5055.5    659.4   44965   13.0   3600.8    351.8
+  10 PARTITION        627   1848.9   1302.1   23199   70.4    182.9    175.6
+  11 CONCAT            56   6149.7     70.3   19914    1.1   5523.0     73.7
+  12 HASH_JOIN         56    345.5     17.0    4656    4.9    270.9    145.0
+  13 PARTITION         56    211.3    163.7    2576   77.4      9.4      2.4
+  14 MERGE_GROUP_BY     4     85.0     17.9    2584   21.1     35.8     16.0

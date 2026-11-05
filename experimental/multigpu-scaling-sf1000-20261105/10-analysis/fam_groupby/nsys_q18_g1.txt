@@ -1,0 +1,74 @@
+window 2351.0 ms
+dev0: kernel busy(union)   1167.2 ms  kernel sum   1495.2 ms  n=45429
+dev0 DtoD :    46.98 GB  n=  47765  sum    239.3 ms  busy    196.4 ms   239.2 GB/s(busy)
+dev0 DtoH :     0.00 GB  n=   9552  sum     19.6 ms  busy     19.6 ms     0.0 GB/s(busy)
+dev0 HtoD :    44.60 GB  n=  67417  sum   1011.7 ms  busy   1001.8 ms    44.5 GB/s(busy)
+top kernels (sum ms, count):
+      605.7   11023  transform_kernel
+      156.1    4076  static_kernel
+      126.2    3934  DeviceScanKernel
+      121.9    1326  _kernel_agent
+       81.9    1290  find_kernel
+       66.2    1580  simpatico_decode_bp_int32_t
+       52.0     124  fused_concatenate_kernel
+       47.2     628  DeviceReduceKernel
+       44.9    2508  DeviceRadixSortOnesweepKernel
+       43.7     911  simpatico_decode_dl_bp_int64_t
+       37.0    1528  DeviceSelectSweepKernel
+       25.1       9  insert_if_n
+top runtime APIs (thread-ms, count):
+     3586.3    42526  cudaStreamSynchronize_v3020
+      983.4    67327  cudaMemcpyBatchAsync_v13000
+      698.7   109800  cudaMallocFromPoolAsync_v11020
+      491.6    57405  cudaMemcpyAsync_v3020
+      366.5   109798  cudaFreeAsync_v11020
+      348.3    27960  cudaEventCreateWithFlags_v3020
+      303.5    42269  cudaLaunchKernel_v7000
+      220.5     9513  cuStreamSynchronize
+      174.0    27960  cudaEventDestroy_v3020
+       79.4    41309  cudaEventRecord_v3020
+       24.4    14769  cudaStreamWaitEvent_v3020
+       20.2    70122  cudaStreamGetDevice_v12080
+       19.7     1417  cuEventCreate
+       18.0     3160  cuLaunchKernel
+top NVTX ranges (thread-ms, count):
+     9056.2     2998  Pipeline*Task 
+     2586.9     1417  sirius::compression::host_to_gpu
+     2351.0        1  sirius::query
+     2308.9     1491  sirius_physical_partition::execute
+     2222.4      627  Pipeline 4: PARTITION (id=5)
+     1977.3     1417  simpatico::decompress_table[selected,streams]
+     1651.6      627  Pipeline 3: HASH_GROUP_BY (id=4)
+     1536.6      628  sirius_physical_grouped_aggregate::execute
+     1208.1      664  aggregate
+     1033.3    22763  table
+      525.9       36  Pipeline 5: MERGE_GROUP_BY (id=6)
+      490.7     2580  thrust::is_sorted_until
+      486.8     1417  simpatico::io::read_table[memory,subset]
+      479.7       37  sirius_physical_grouped_aggregate_merge::execute
+      427.0     1417  simpatico::io::fetch_payload
+      418.3      663  thrust::reduce_by_key
+      353.4      857  apply_retention_mask
+      351.6      857  copy_if
+      327.9      790  sirius_physical_dynamic_filter::execute
+      311.9      790  dynfilter::apply_output
+      300.8      858  thrust::copy_if
+      283.3      628  minmax
+      262.0       31  convert:host_to_gpu
+      259.6    19171  make_fixed_width_column
+      251.3    21263  make_numeric_column
+      246.8     1290  thrust::is_sorted
+      243.8     1290  thrust::find_if
+      210.1      163  Pipeline 8: DYNAMIC_FILTER (id=11)
+      153.8      627  lower_bound
+      153.4       31  convert:host_to_gpu:flush_submit
+      147.9      627  Pipeline 3: GPU_SCAN (id=3)
+      147.5      627  Pipeline 17: DYNAMIC_FILTER (id=21)
+      142.8       87  concatenate
+      122.7    10510  allocate_like
+      120.2       36  Pipeline 5: FILTER (id=7)
+      117.1       31  Pipeline 1: PARTITION (id=1)
+      112.0       36  sirius_physical_filter::execute
+      105.6       31  convert:host_to_gpu:reconstruct
+      104.4       31  convert:host_to_gpu:offsets_cast
+      100.0      663  stable_sorted_order

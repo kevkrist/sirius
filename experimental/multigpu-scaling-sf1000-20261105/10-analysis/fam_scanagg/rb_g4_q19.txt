@@ -1,0 +1,65 @@
+######## g4 Q19 window 2943966261,3920733524
+== sirius::compression::host_to_gpu: n=627 wall=8042.8ms launched_kernels=338.5ms
+   memcpy Peer-to-Peer: 2914.5ms 86.21GB (29.6 GB/s)
+   memcpy Device-to-Device: 110.1ms 75.43GB (685.3 GB/s)
+   memcpy Host-to-Device: 102.5ms 2.82GB (27.5 GB/s)
+   api: cudaStreamSynchronize=5246.9, cudaMallocFromPoolAsync=817.5, cudaMemcpyAsync=704.4, cudaFreeAsync=632.8, cudaLaunchKernel=110.7, cudaMemcpyBatchAsync=42.5, cuLaunchKernel=23.9
+   osrt: pthread_rwlock_wrlock=667.1, pthread_mutex_lock=408.8, pthread_rwlock_rdlock=285.8
+== Pipeline 3: GPU_SCAN: n=627 wall=4106.5ms launched_kernels=341.0ms
+   memcpy Peer-to-Peer: 34.8ms 0.00GB (0.0 GB/s)
+   memcpy Host-to-Device: 7.4ms 0.00GB (0.1 GB/s)
+   memcpy Device-to-Host: 6.9ms 0.00GB (0.0 GB/s)
+   api: cudaStreamSynchronize=3044.1, cudaMallocFromPoolAsync=302.8, cudaFreeAsync=219.4, cudaMemcpyBatchAsync=152.9, cudaLaunchKernel=55.6, cudaStreamWaitEvent=47.1, cudaMemcpyAsync=22.2
+   osrt: pthread_mutex_lock=239.8, pthread_rwlock_wrlock=223.8, pthread_rwlock_rdlock=53.2, futex=0.5
+== Pipeline 3: FILTER: n=1254 wall=1149.3ms launched_kernels=9.9ms
+   memcpy Peer-to-Peer: 10.6ms 0.00GB (0.0 GB/s)
+   memcpy Device-to-Host: 3.8ms 0.00GB (0.0 GB/s)
+   memcpy Host-to-Device: 3.6ms 0.00GB (0.1 GB/s)
+   api: cudaStreamSynchronize=613.9, cudaMallocFromPoolAsync=178.4, cudaFreeAsync=122.8, cudaMemcpyBatchAsync=52.1, cudaLaunchKernel=31.5, cudaMemcpyAsync=20.1, cudaStreamWaitEvent=13.2
+   osrt: pthread_mutex_lock=130.6, pthread_rwlock_wrlock=127.7, pthread_rwlock_rdlock=20.7, futex=0.2
+== convert:host_to_gpu: n=23 wall=598.0ms launched_kernels=2.3ms
+   memcpy Host-to-Device: 126.0ms 3.60GB (28.6 GB/s)
+   memcpy Peer-to-Peer: 73.0ms 2.12GB (29.0 GB/s)
+   api: cudaMemcpyBatchAsync=589.9, cudaMallocFromPoolAsync=3.4, cuStreamSynchronize=1.6, cudaLaunchKernel=0.7, cudaFreeAsync=0.3, cudaEventRecord=0.1, cudaEventCreateWithFlags=0.1
+   osrt: pthread_rwlock_rdlock=4.0, pthread_rwlock_wrlock=1.8, pthread_mutex_lock=0.9
+== convert:host_to_gpu:reconstruct: n=23 wall=383.6ms launched_kernels=2.3ms
+   memcpy Host-to-Device: 86.9ms 2.49GB (28.6 GB/s)
+   memcpy Peer-to-Peer: 60.0ms 1.71GB (28.6 GB/s)
+   api: cudaMemcpyBatchAsync=377.5, cudaMallocFromPoolAsync=3.4, cudaLaunchKernel=0.7, cudaFreeAsync=0.3, cudaMemsetAsync=0.0, cuKernelGetName=0.0
+   osrt: pthread_rwlock_rdlock=3.7, pthread_rwlock_wrlock=1.8, pthread_mutex_lock=0.4
+== convert:host_to_gpu:offsets_cast: n=46 wall=379.5ms launched_kernels=2.3ms
+   memcpy Host-to-Device: 86.9ms 2.49GB (28.6 GB/s)
+   memcpy Peer-to-Peer: 60.0ms 1.71GB (28.6 GB/s)
+   api: cudaMemcpyBatchAsync=377.5, cudaLaunchKernel=0.7, cudaMallocFromPoolAsync=0.4, cudaFreeAsync=0.3, cuKernelGetName=0.0
+   osrt: pthread_rwlock_rdlock=3.7, pthread_rwlock_wrlock=0.1, pthread_mutex_lock=0.1
+== convert:host_to_gpu:flush_submit: n=23 wall=212.4ms launched_kernels=0.0ms
+   memcpy Host-to-Device: 39.1ms 1.11GB (28.5 GB/s)
+   memcpy Peer-to-Peer: 13.1ms 0.40GB (30.7 GB/s)
+   api: cudaMemcpyBatchAsync=212.4
+   osrt: pthread_rwlock_rdlock=0.3
+== Pipeline 0: GPU_SCAN: n=23 wall=208.4ms launched_kernels=31.5ms
+   memcpy Peer-to-Peer: 2.8ms 0.00GB (0.0 GB/s)
+   memcpy Host-to-Device: 0.8ms 0.00GB (0.1 GB/s)
+   memcpy Device-to-Host: 0.4ms 0.00GB (0.0 GB/s)
+   api: cudaStreamSynchronize=138.7, cudaMallocFromPoolAsync=9.8, cudaMemcpyBatchAsync=9.2, cudaFreeAsync=6.1, cudaStreamWaitEvent=3.7, cudaLaunchKernel=1.9, cudaEventRecord=1.5
+   osrt: pthread_mutex_lock=35.7, pthread_rwlock_wrlock=6.3, pthread_rwlock_rdlock=1.7, futex=0.0
+== Pipeline 0: FILTER: n=46 wall=196.4ms launched_kernels=2.7ms
+   memcpy Peer-to-Peer: 3.1ms 0.00GB (0.0 GB/s)
+   memcpy Host-to-Device: 0.5ms 0.00GB (0.1 GB/s)
+   memcpy Device-to-Host: 0.4ms 0.00GB (0.0 GB/s)
+   api: cudaStreamSynchronize=116.6, cudaMallocFromPoolAsync=16.9, cudaMemcpyBatchAsync=12.3, cudaFreeAsync=11.9, cudaStreamWaitEvent=4.2, cudaLaunchKernel=1.7, cudaEventRecord=1.7
+   osrt: pthread_mutex_lock=36.6, pthread_rwlock_wrlock=12.9, pthread_rwlock_rdlock=4.5, futex=0.0
+== Pipeline 3: DYNAMIC_FILTER: n=627 wall=22.5ms launched_kernels=0.0ms
+   api: cudaStreamSynchronize=17.1
+   osrt: pthread_mutex_lock=2.5, pthread_rwlock_rdlock=0.0
+== convert:host_to_gpu:device_alloc: n=138 wall=3.3ms launched_kernels=0.0ms
+   api: cudaMallocFromPoolAsync=3.0
+   osrt: pthread_rwlock_wrlock=1.7, pthread_mutex_lock=0.4
+== convert:host_to_gpu:presync: n=23 wall=0.9ms launched_kernels=0.0ms
+   api: cuStreamSynchronize=0.9
+   osrt: pthread_mutex_lock=0.4
+== convert:host_to_gpu:final_sync: n=23 wall=0.7ms launched_kernels=0.0ms
+   api: cuStreamSynchronize=0.7
+   osrt: pthread_mutex_lock=0.1
+== convert:host_to_gpu:acquire_stream: n=23 wall=0.0ms launched_kernels=0.0ms
+   api: 

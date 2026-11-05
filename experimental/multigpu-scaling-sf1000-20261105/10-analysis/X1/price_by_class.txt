@@ -1,0 +1,48 @@
+class                    thread_excess_s wall_soft_s(prof)
+PARTITION                          25.27             1.619
+task:other                          8.26             0.633
+prep:compressed_h2d                18.90             0.561
+HASH_GROUP_BY                       6.10             0.302
+GPU_SCAN                            4.17             0.150
+prep:gpu_to_gpu                     0.83             0.074
+PROJECTION                          1.02             0.044
+UNGROUPED_AGGREGATE                 0.65             0.026
+DYNAMIC_FILTER                      1.06             0.026
+FILTER                              0.88             0.022
+prep:host_to_gpu                    0.09             0.008
+HASH_JOIN                           0.04             0.007
+MERGE_GROUP_BY                      0.06             0.005
+CONCAT                              0.03             0.004
+TOP_N                               0.00             0.000
+outside-task                        0.00             0.000
+DENSE_COUNT_JOIN                    0.00             0.000
+MERGE_TOP_N                         0.00             0.000
+ORDER_BY                            0.00             0.000
+MERGE_SORT                          0.00             0.000
+NESTED_LOOP_JOIN                    0.00             0.000
+MERGE_AGGREGATE                     0.00             0.000
+SORT_SAMPLE                         0.00             0.000
+BUILD_FILTER                        0.00             0.000
+total 67.361913173 3.4812452686948787
+1 HASH_GROUP_BY=195 prep:compressed_h2d=173 GPU_SCAN=56
+2 task:other=2 prep:host_to_gpu=1 HASH_JOIN=0
+3 PARTITION=101 task:other=17 prep:compressed_h2d=10
+4 PARTITION=110 prep:compressed_h2d=70 task:other=21
+5 PARTITION=120 task:other=41 prep:compressed_h2d=9
+6 prep:compressed_h2d=35 UNGROUPED_AGGREGATE=26 GPU_SCAN=23
+7 PARTITION=17 task:other=15 prep:compressed_h2d=8
+8 PARTITION=150 task:other=53 prep:compressed_h2d=8
+9 PARTITION=165 task:other=80 prep:gpu_to_gpu=12
+10 PARTITION=107 prep:compressed_h2d=44 task:other=32
+11 prep:host_to_gpu=1 PARTITION=1 task:other=0
+12 PARTITION=118 prep:compressed_h2d=47 task:other=38
+13 PARTITION=11 task:other=1 prep:compressed_h2d=1
+14 PARTITION=88 task:other=23 prep:compressed_h2d=5
+15 PARTITION=89 prep:compressed_h2d=20 HASH_GROUP_BY=19
+16 PARTITION=4 prep:host_to_gpu=1 task:other=1
+17 task:other=8 prep:compressed_h2d=2 prep:host_to_gpu=0
+18 PARTITION=305 task:other=173 HASH_GROUP_BY=75
+19 prep:compressed_h2d=15 task:other=12 GPU_SCAN=10
+20 task:other=6 prep:compressed_h2d=3 GPU_SCAN=2
+21 PARTITION=233 task:other=51 prep:compressed_h2d=47
+22 FILTER=1 prep:compressed_h2d=1 task:other=1

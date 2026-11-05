@@ -1,0 +1,170 @@
+## 1. API totals (suite, iter2 windows)
+windows: g1 36.86s g4 21.78s
+api                                nA       nB      sA      sB    usA    usB
+cudaStreamSynchronize          443802   498536   87.32  115.86  196.8  232.4
+cudaMallocFromPoolAsync        911291  1197402    7.33   42.43    8.0   35.4
+cudaFreeAsync                  911242  1197206    2.66   35.65    2.9   29.8
+cudaMemcpyBatchAsync           304334   413946   13.33   22.17   43.8   53.6
+cuStreamSynchronize             95412   386895    3.81   21.80   39.9   56.4
+cudaMemcpyAsync               1308636  1659755    6.07   12.31    4.6    7.4
+cudaLaunchKernel               439958   503495    2.98    3.92    6.8    7.8
+cudaStreamWaitEvent            145348   219987    0.24    1.21    1.6    5.5
+cudaEventCreateWithFlags       105888   180431    0.78    0.91    7.4    5.1
+cudaEventRecord                242043   340213    0.38    0.81    1.6    2.4
+cudaEventDestroy               105871   180390    0.40    0.70    3.8    3.9
+cudaMemcpyPeerAsync                 0    43679    0.00    0.53    0.0   12.2
+cudaMemsetAsync                430604   576841    0.15    0.35    0.4    0.6
+cuLaunchKernel                  58674    58674    0.31    0.33    5.2    5.5
+cudaEventSynchronize            14859    14839    0.10    0.21    6.9   14.0
+cudaStreamGetDevice            337778   403762    0.10    0.15    0.3    0.4
+
+## 2. OSRT lock time nested in CUDA calls (s), g1 -> g4
+g1
+  cudaMallocFromPoolAsync    mutex_lock=1.39s/143145 rwlock_rdlock=0.00s/36 rwlock_wrlock=0.15s/27295
+  cudaFreeAsync              mutex_lock=0.51s/73284 rwlock_rdlock=0.13s/29365 rwlock_wrlock=0.24s/48065
+  cudaStreamSynchronize      mutex_lock=0.83s/78364 rwlock_rdlock=0.02s/2862 rwlock_wrlock=0.01s/2151
+  cudaEventCreateWithFlags   rwlock_wrlock=0.61s/39118
+  cudaMemcpyAsync            mutex_lock=0.26s/57573 rwlock_rdlock=0.31s/66909
+  <none>                     futex=198.97s/633763 mutex_lock=0.31s/16209 rwlock_rdlock=0.01s/1990
+  cudaEventDestroy           rwlock_wrlock=0.26s/13018
+  cudaMemcpyBatchAsync       mutex_lock=0.06s/11800 rwlock_rdlock=0.15s/28196
+  cuStreamSynchronize        mutex_lock=0.16s/13556 rwlock_rdlock=0.00s/132 rwlock_wrlock=0.00s/339
+  cudaLaunchKernel           mutex_lock=0.05s/9842 rwlock_rdlock=0.03s/4881
+g4
+  cudaMallocFromPoolAsync    mutex_lock=13.98s/370178 rwlock_rdlock=0.00s/11 rwlock_wrlock=19.54s/621824
+  cudaFreeAsync              mutex_lock=12.43s/331301 rwlock_rdlock=1.84s/355942 rwlock_wrlock=15.47s/618191
+  cudaMemcpyAsync            mutex_lock=0.34s/56987 rwlock_rdlock=3.07s/562728 rwlock_wrlock=0.00s/3
+  cudaStreamSynchronize      mutex_lock=2.47s/189431 rwlock_rdlock=0.06s/10235 rwlock_wrlock=0.09s/6112
+  cudaMemcpyBatchAsync       mutex_lock=0.06s/9444 rwlock_rdlock=1.57s/273989
+  <none>                     futex=139.46s/692459 mutex_lock=0.95s/63234 rwlock_rdlock=0.01s/1085
+  cuStreamSynchronize        mutex_lock=0.70s/61811 rwlock_rdlock=0.01s/1938 rwlock_wrlock=0.00s/258
+  cudaEventCreateWithFlags   rwlock_wrlock=0.69s/33706
+  cudaEventDestroy           mutex_lock=0.00s/4 rwlock_wrlock=0.43s/28250
+  cudaStreamWaitEvent        mutex_lock=0.08s/602 rwlock_rdlock=0.01s/1901
+
+## 3. allocator latency vs in-flight allocator calls at call start (pooled)
+g1 1:70%@3.7us 2:22%@8.4us 3-4:8%@12.5us 5-8:0%@0.0us 9-12:0%@0.0us 13+:0%@0.0us
+g4 1:26%@3.4us 2:11%@7.7us 3-4:12%@15.8us 5-8:14%@35.9us 9-12:23%@59.6us 13+:13%@75.5us
+
+## 4. per query: allocator calls, rate, mean threads in allocator, union occupancy, alloc thread-s
+  q   callsA   callsB   winA   winB  kcps_A  kcps_B  thrA  thrB  occA  occB excess_s
+  1   205866   216206   2.58   1.35      80     161   0.5   7.5  0.35  0.82     8.71
+  2     3396     7000   0.59   0.37       6      19   0.0   0.1  0.03  0.06    -0.00
+  3    92239   112818   2.08   1.12      44     100   0.4   2.8  0.30  0.48     1.97
+  4    70897   106956   0.89   0.75      80     142   0.5   7.9  0.34  0.79     5.32
+  5    58180   117408   1.30   0.98      45     120   0.3   3.2  0.21  0.55     2.46
+  6    80280    81220   1.08   0.52      74     157   0.4   5.7  0.31  0.86     2.49
+  7    78606    82124   1.52   0.77      52     107   0.3   1.7  0.22  0.49     0.81
+  8    78701   151884   1.86   1.32      42     115   0.2   3.0  0.16  0.50     3.22
+  9    91903   173094   3.07   1.88      30      92   0.1   2.7  0.11  0.44     4.16
+ 10    75576   132860   1.76   1.32      43     100   0.1   4.1  0.12  0.48     4.95
+ 11     1094     2874   0.39   0.25       3      12   0.1   0.1  0.05  0.04    -0.04
+ 12   112937   170456   1.78   1.19      64     144   0.4   4.3  0.27  0.71     4.21
+ 13    18556    18564   2.72   1.10       7      17   0.0   0.3  0.02  0.06     0.22
+ 14    93452    92930   1.57   0.90      59     103   0.3   2.6  0.22  0.46     1.85
+ 15   116030   125564   1.37   0.83      85     152   0.6   7.4  0.41  0.86     5.17
+ 16     3861    10738   0.45   0.31       9      35   0.0   0.4  0.04  0.11     0.05
+ 17    58750    60182   1.89   0.82      31      73   0.1   0.4  0.08  0.22     0.16
+ 18   219598   288990   2.35   1.86      93     155   0.5   6.9  0.33  0.81    11.53
+ 19   126917   128674   2.20   0.98      58     132   0.2   2.6  0.19  0.58     2.02
+ 20    51631    53860   1.65   0.76      31      71   0.1   0.6  0.10  0.29     0.23
+ 21   172906   247774   3.40   2.17      51     114   0.3   3.1  0.19  0.52     5.53
+ 22    11157    12432   0.38   0.23      29      53   0.1   0.3  0.10  0.17     0.03
+suite allocator excess thread-s at g1 per-call latency (per query, per api): 65.07
+
+## 5. allocator calls by op-level NVTX class (suite)
+op                            mallocA  mallocB    freeA    freeB     sA     sB   usA   usB excess_s
+op:PARTITION                   145631   294102    54727   129600   1.01  27.83   5.1  65.7    25.68
+prep:compressed_host_to_gpu    446757   446757   385876   385876   4.67  22.62   5.6  27.2    17.95
+task:other                          0        0   234333   440296   0.84   9.34   3.6  21.2     7.76
+op:HASH_GROUP_BY                79411    80846    69345    70616   0.98   6.89   6.6  45.5     5.89
+op:GPU_SCAN                    115512   115533    85216    85237   1.39   5.15   6.9  25.6     3.76
+prep:gpu_to_gpu                     0   130974        0        0   0.00   1.47   0.0  11.3     0.76
+op:DYNAMIC_FILTER               50988    50883    26982    26901   0.41   1.42   5.2  18.2     1.01
+op:PROJECTION                   15523    15782    10860    11041   0.14   1.16   5.4  43.4     1.02
+op:FILTER                       31286    31850    23130    23568   0.23   1.13   4.2  20.3     0.89
+op:UNGROUPED_AGGREGATE          10926    10977    10215    10263   0.09   0.75   4.2  35.3     0.66
+prep:host_to_gpu                 3898     2825      561      561   0.07   0.11  15.2  31.6     0.06
+op:MERGE_GROUP_BY                2624     3819     2378     3473   0.05   0.09   9.3  12.0     0.02
+op:HASH_JOIN                     3782     5861     2451     3529   0.06   0.07   9.0   6.9    -0.02
+op:CONCAT                        3071     4816     2155     3123   0.04   0.05   8.6   6.9    -0.01
+op:TOP_N                          634      778      489      579   0.01   0.01   7.0   4.0    -0.00
+op:DENSE_COUNT_JOIN               768      768      760      760   0.00   0.00   2.2   2.5     0.00
+
+## 6. allocator calls by leaf NVTX range (top 30 by g4 calls)
+  make_numeric_column                                            339539   341668   3.15  10.02
+  sirius::compression::host_to_gpu                               251261   251261   0.66   6.48
+  simpatico::decompress_table[selected,streams]                  216839   216839   0.84   5.04
+  Pipeline # Task # [CONCAT -> CONCAT -> CONCAT]                  70180   206497   0.28   1.90
+  table                                                           91066   164648   0.45  10.59
+  hash_partition                                                  51981   147455   0.33   9.92
+  convert:gpu_to_gpu:host_staging                                     0    87328   0.00   1.00
+  Pipeline # Task # [MERGE_GROUP_BY -> MERGE_GROUP_BY -> FILTE    45216    79074   0.17   2.69
+  allocate_like                                                   65169    66879   0.61   1.61
+  copy_if                                                         61705    61980   0.50   1.68
+  aggregate                                                       59430    61537   0.39   2.69
+  thrust::exclusive_scan                                          26602    52808   0.13   2.84
+  Pipeline #: GPU_SCAN (id=#)                                     52289    52668   0.23   1.43
+  convert:gpu_to_gpu:peer_copy                                        0    43646   0.00   0.48
+  dynfilter::apply_output                                         43600    43221   0.13   0.67
+  minmax                                                          42264    42528   0.30   1.82
+  sirius_physical_partition::execute                              19008    40772   0.07   2.79
+  simpatico::decompress_table[selected,predicated,streams]        38485    38485   0.12   1.40
+  thrust::copy_if                                                 37740    37786   0.14   0.81
+  sirius_physical_grouped_aggregate::execute                      30101    30487   0.12   1.47
+  Pipeline # Task # [GPU_SCAN -> GPU_SCAN -> DYNAMIC_FILTER ->    29921    29885   0.07   0.53
+  Pipeline # Task # [PARTITION -> PARTITION -> PARTITION]          9605    28872   0.04   1.99
+  compute_column                                                  26124    26184   0.12   0.59
+  Pipeline # Task # [GPU_SCAN -> GPU_SCAN -> DYNAMIC_FILTER ->    21945    21945   0.06   0.59
+  cast                                                            18735    19060   0.20   0.77
+  sirius_physical_filter::execute                                 18040    18411   0.05   0.33
+  sirius_physical_projection::execute                             14851    15045   0.05   0.66
+  Pipeline # Task # [GPU_SCAN -> GPU_SCAN -> PROJECTION -> PRO    13794    13794   0.05   0.77
+  lower_bound                                                     10032    12720   0.04   0.92
+  Pipeline # Task # [MERGE_GROUP_BY -> MERGE_GROUP_BY -> MERGE     6447    12263   0.06   0.05
+
+## 7. allocs per task by task signature (suite; ntasks, mallocs/task, frees/task, alloc ms/task)
+  PARTITION..PARTITION                     g1[ 15521    9.4    4.1   0.07]  g4[ 15669   18.8   10.1   1.90]
+  GPU_SCAN..HASH_GROUP_BY                  g1[  1881   92.1   87.1   1.24]  g4[  1881   92.1   87.1   8.89]
+  GPU_SCAN..DYNAMIC_FILTER                 g1[  8299   34.8   31.5   0.36]  g4[  8299   34.8   31.4   1.27]
+  GPU_SCAN..FILTER                         g1[  3212   58.2   55.7   0.54]  g4[  3212   58.2   55.7   2.71]
+  MERGE_GROUP_BY..FILTER                   g1[    36   40.0 1293.0   5.74]  g4[    36  980.5 2233.5 100.09]
+  GPU_SCAN..UNGROUPED_AGGREGATE            g1[   658   64.3   63.3   0.73]  g4[   658   64.3   63.3   4.55]
+  CONCAT..CONCAT                           g1[   326    9.4  221.9   1.01]  g4[   629  140.0  333.3   3.94]
+  GPU_SCAN..GPU_SCAN                       g1[  1500   29.2   27.0   0.30]  g4[  1500   29.2   27.0   1.04]
+  GPU_SCAN..LEFT_DELIM_JOIN                g1[   163   57.4   54.4   1.01]  g4[   163   57.4   54.4   6.83]
+  HASH_GROUP_BY..HASH_GROUP_BY             g1[   174   12.6   11.6   0.20]  g4[   185   12.3   11.2   1.01]
+  MERGE_GROUP_BY..MERGE_GROUP_BY           g1[    12   18.0  553.9   5.39]  g4[    27  211.1  469.1   5.45]
+  HASH_JOIN..HASH_GROUP_BY                 g1[   102   56.5   56.4   0.57]  g4[   141   57.4   56.6   0.50]
+  MERGE_GROUP_BY..TOP_N                    g1[    12  131.7  218.1   1.69]  g4[    15  210.5  325.7   3.14]
+  MERGE_GROUP_BY..ORDER_BY                 g1[    10   34.2  732.7   0.83]  g4[    13  489.2 1037.5   2.31]
+
+## 8. stream syncs: class split (s) by api|op-level, g1 -> g4
+g1 {'cuStreamSynchronize:blocked': 1.22, 'cuStreamSynchronize:busy': 1.43, 'cuStreamSynchronize:nowork': 0.95, 'cuStreamSynchronize:tail': 0.21, 'cudaStreamSynchronize:blocked': 69.21, 'cudaStreamSynchronize:busy': 12.76, 'cudaStreamSynchronize:nowork': 3.02, 'cudaStreamSynchronize:tail': 2.33}
+   cudaStreamSynchronize|prep:compressed_host_to n=  29582 blocked=49.35 busy=3.56 nowork=0.02 tail=0.43
+   cudaStreamSynchronize|op:GPU_SCAN             n= 161139 blocked=7.41 busy=2.19 nowork=1.15 tail=0.73
+   cudaStreamSynchronize|op:HASH_JOIN            n=   3177 blocked=3.49 busy=2.33 nowork=0.06 tail=0.02
+   cudaStreamSynchronize|op:DYNAMIC_FILTER       n=  27516 blocked=3.18 busy=1.16 nowork=0.17 tail=0.09
+   cudaStreamSynchronize|op:HASH_GROUP_BY        n=  83955 blocked=1.32 busy=1.25 nowork=0.64 tail=0.35
+   cudaStreamSynchronize|op:FILTER               n=  38684 blocked=1.17 busy=0.21 nowork=0.26 tail=0.20
+   cudaStreamSynchronize|op:PARTITION            n=  45818 blocked=0.61 busy=0.59 nowork=0.27 tail=0.18
+   cudaStreamSynchronize|op:CONCAT               n=   8585 blocked=0.92 busy=0.34 nowork=0.14 tail=0.10
+   cudaStreamSynchronize|op:PROJECTION           n=  17553 blocked=0.75 busy=0.46 nowork=0.08 tail=0.12
+   cuStreamSynchronize|op:HASH_GROUP_BY          n=   5548 blocked=0.67 busy=0.51 nowork=0.00 tail=0.17
+g4 {'cuStreamSynchronize:blocked': 1.48, 'cuStreamSynchronize:busy': 4.17, 'cuStreamSynchronize:nomatch': 0.0, 'cuStreamSynchronize:nowork': 14.74, 'cuStreamSynchronize:tail': 1.41, 'cudaStreamSynchronize:blocked': 92.43, 'cudaStreamSynchronize:busy': 8.66, 'cudaStreamSynchronize:nomatch': 0.0, 'cudaStreamSynchronize:nowork': 11.14, 'cudaStreamSynchronize:tail': 3.64}
+   cudaStreamSynchronize|prep:compressed_host_to n=  25303 blocked=73.43 busy=2.53 nowork=0.05 tail=0.56
+   cudaStreamSynchronize|op:GPU_SCAN             n= 161160 blocked=10.20 busy=1.37 nowork=6.02 tail=1.23
+   cuStreamSynchronize|prep:gpu_to_gpu           n= 286472 blocked=1.02 busy=3.00 nomatch=0.00 nowork=12.96 tail=1.05
+   cudaStreamSynchronize|op:DYNAMIC_FILTER       n=  27486 blocked=5.22 busy=1.04 nowork=0.33 tail=0.15
+   cudaStreamSynchronize|op:HASH_GROUP_BY        n=  85191 blocked=0.45 busy=0.66 nowork=1.61 tail=0.37
+   cudaStreamSynchronize|op:PARTITION            n=  91415 blocked=0.23 busy=0.52 nowork=1.20 tail=0.47
+   cudaStreamSynchronize|op:FILTER               n=  39530 blocked=1.00 busy=0.17 nowork=0.70 tail=0.39
+   cudaStreamSynchronize|op:HASH_JOIN            n=   4991 blocked=0.60 busy=1.34 nowork=0.04 tail=0.03
+   cuStreamSynchronize|task:other                n=  81612 nowork=1.65
+   cudaStreamSynchronize|op:UNGROUPED_AGGREGATE  n=  20684 blocked=0.48 busy=0.01 nowork=0.69 tail=0.11
+
+## 9. nowork sync duration histogram (counts), g1 -> g4
+g1 cuStreamSynchronize {'lt5': 41880, 'lt20': 29852, 'lt50': 12869, 'lt200': 515, 'lt1000': 72, 'ge1000': 12}
+g1 cudaStreamSynchronize {'lt5': 146277, 'lt20': 84851, 'lt50': 17267, 'lt200': 2297, 'lt1000': 1252, 'ge1000': 219}
+g4 cuStreamSynchronize {'lt5': 2605, 'lt20': 179688, 'lt50': 74154, 'lt200': 18572, 'lt1000': 7697, 'ge1000': 2567}
+g4 cudaStreamSynchronize {'lt5': 87, 'lt20': 219185, 'lt50': 68208, 'lt200': 17726, 'lt1000': 3362, 'ge1000': 984}

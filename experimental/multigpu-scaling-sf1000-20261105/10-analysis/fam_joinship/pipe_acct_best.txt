@@ -1,0 +1,88 @@
+# 10-analysis/fam_joinship/qf_g1_best tpch_q3_iter[2, 3, 4] mean wall 1067.3 ms
+pid label                                                       tasks    prepH    prepG     comp   start     end   GB_H   GB_G
+  0 GPU_SCAN(0) -> FILTER(1)                                        7    155.5      0.0      6.3     0.9    48.0    2.5    0.0
+  1 PARTITION(2)                                                    7      0.0      0.1      0.1    48.1    48.2    0.0    0.1
+  2 CONCAT(3)                                                       1      0.0      0.0      0.9    48.3    49.1    0.0    0.1
+  3 GPU_SCAN(4) -> DYNAMIC_FILTER(5)                               38    489.2      0.0    246.1    49.2   249.4   20.4    0.0
+  4 PARTITION(6)                                                   38      0.0      0.3      0.5   223.9   249.5    0.0    2.2
+  5 CONCAT(7)                                                       3      0.0      0.1     22.8   225.1   258.3    0.0    2.2
+  6 HASH_JOIN(8)                                                    3      0.0      0.0     44.1   230.5   265.5    0.0    2.3
+  7 PARTITION(9)                                                    3      0.0      0.0      0.1   265.6   265.7    0.0    2.2
+  8 CONCAT(10)                                                      1      0.0      0.0     24.3   265.7   290.1    0.0    2.2
+  9 GPU_SCAN(11) -> DYNAMIC_FILTER(12)                            145   1988.7      0.0    860.4   290.1  1007.4   99.5    0.0
+ 10 PARTITION(13)                                                 145      0.0      1.2      2.0   999.4  1007.5    0.0    0.5
+ 11 CONCAT(14)                                                      1      0.0      0.3      2.0  1007.7  1010.0    0.0    0.5
+ 12 HASH_JOIN(15) -> PROJECTION(16) -> HASH_GROUP_BY(17)            1      0.0      0.0     39.6  1010.1  1049.6    0.0    2.8
+ 13 PARTITION(18)                                                   1      0.0      0.0      0.0  1049.7  1049.8    0.0    0.3
+ 14 MERGE_GROUP_BY(19) -> PROJECTION(20) -> PROJECTION(21) ->       1      0.0      0.0     17.0  1049.8  1066.8    0.0    0.3
+ 15 MERGE_TOP_N(23) -> RESULT_COLLECTOR(24)                         1      0.0      0.0      0.4  1066.9  1067.3    0.0    0.0
+TOT                                                               396   2633.4      2.1   1266.4  thread-total 3901.9
+# 10-analysis/fam_joinship/qf_g4_best tpch_q3_iter[2, 3, 4] mean wall 632.3 ms
+pid label                                                       tasks    prepH    prepG     comp   start     end   GB_H   GB_G
+  0 GPU_SCAN(0) -> FILTER(1)                                        7    145.4      0.0      7.4     0.9    29.7    2.5    0.0
+  1 PARTITION(2)                                                    7      0.0      0.4      0.3    29.8    30.0    0.0    0.1
+  2 CONCAT(3)                                                       4      0.0     22.8     27.1    30.0    59.9    0.0    0.5
+  3 GPU_SCAN(4) -> DYNAMIC_FILTER(5)                               38    867.5      0.0    257.3    38.1   120.4   20.4    0.0
+  4 PARTITION(6)                                                   38      0.0      0.5      0.8    94.8   120.5    0.0    3.1
+  5 CONCAT(7)                                                       4      0.0      0.2      9.1   118.9   123.3    0.0    3.1
+  6 HASH_JOIN(8)                                                    4      0.0      0.1     57.9   120.9   137.7    0.0    3.5
+  7 PARTITION(9)                                                    4      0.0      0.1      0.1   137.8   137.9    0.0    2.2
+  8 CONCAT(10)                                                      4      0.0    377.9    129.4   138.0   341.0    0.0    8.8
+  9 GPU_SCAN(11) -> DYNAMIC_FILTER(12)                            145   3650.6      0.0   1404.5   246.1   606.3   99.5    0.0
+ 10 PARTITION(13)                                                 145      0.0      1.8      3.0   536.2   607.8    0.0   13.0
+ 11 CONCAT(14)                                                     19      0.0      0.5    139.4   537.9   611.1    0.0   13.0
+ 12 HASH_JOIN(15) -> PROJECTION(16) -> HASH_GROUP_BY(17)           19      0.0      0.4    260.4   542.8   615.8    0.0   21.8
+ 13 PARTITION(18)                                                  19      0.0      0.8     56.3   615.9   620.1    0.0    0.3
+ 14 MERGE_GROUP_BY(19) -> PROJECTION(20) -> PROJECTION(21) ->       4      0.0     22.2     20.9   620.1   631.2    0.0    0.3
+ 15 MERGE_TOP_N(23) -> RESULT_COLLECTOR(24)                         1      0.0      0.5      0.5   631.3   632.3    0.0    0.0
+TOT                                                               462   4663.5    428.0   2374.4  thread-total 7465.8
+# 10-analysis/fam_joinship/qf_g1_best tpch_q10_iter[2, 3, 4] mean wall 1542.3 ms
+pid label                                                       tasks    prepH    prepG     comp   start     end   GB_H   GB_G
+  0 GPU_SCAN(0)                                                     1      0.1      0.0      0.0     0.9     1.0    0.0    0.0
+  1 PARTITION(1)                                                    1      0.0      0.0      0.0     1.1     1.2    0.0    0.0
+  2 CONCAT(2)                                                       1      0.0      0.0      0.0     1.2     1.3    0.0    0.0
+  3 GPU_SCAN(3)                                                    38    513.5      0.0    169.7     1.3   177.8   18.9    0.0
+  4 PARTITION(4)                                                   38      0.0      0.3      0.6   178.0   178.5    0.0    0.7
+  5 CONCAT(5)                                                       1      0.0      0.1      5.0   178.6   183.7    0.0    0.7
+  6 GPU_SCAN(6) -> DYNAMIC_FILTER(7)                              145   2101.6      0.0    143.7   183.8   758.5  117.5    0.0
+  7 PARTITION(8)                                                  145      0.0      1.2      1.9   734.8   758.6    0.0    1.9
+  8 CONCAT(9)                                                       2      0.0      0.3      5.8   740.4   761.4    0.0    1.9
+  9 HASH_JOIN(10)                                                   2      0.0      0.0     20.2   743.9   765.6    0.0    2.6
+ 10 PARTITION(11)                                                   2      0.0      0.0      0.1   765.7   765.8    0.0    1.4
+ 11 CONCAT(12)                                                      1      0.0      0.0      8.8   765.8   774.7    0.0    1.4
+ 12 GPU_SCAN(13) -> DYNAMIC_FILTER(14)                              7   1423.2      0.0     91.1   774.8  1217.2   23.3    0.0
+ 13 PARTITION(15)                                                   7      0.0      0.1      0.1  1033.5  1217.2    0.0    6.9
+ 14 CONCAT(16)                                                      7      0.0      0.1      0.1  1033.8  1217.4    0.0    6.9
+ 15 HASH_JOIN(17) -> PROJECTION(18)                                 7      0.0      0.1    191.7  1034.0  1262.6    0.0    8.3
+ 16 PARTITION(19)                                                   7      0.0      0.1      0.1  1066.4  1262.7    0.0   19.1
+ 17 CONCAT(20)                                                      7      0.0      0.1      0.1  1092.7  1262.8    0.0   19.1
+ 18 HASH_JOIN(21) -> PROJECTION(22) -> HASH_GROUP_BY(23)            7      0.0      0.1    681.0  1092.8  1397.9    0.0   19.1
+ 19 PARTITION(24)                                                   7      0.0      0.1    190.7  1398.0  1451.0    0.0    8.1
+ 20 MERGE_GROUP_BY(25) -> PROJECTION(26) -> PROJECTION(27) ->       9      0.0      0.4    319.2  1451.0  1540.0    0.0    8.1
+ 21 MERGE_TOP_N(29) -> RESULT_COLLECTOR(30)                         1      0.0      0.1      2.1  1540.1  1542.3    0.0    0.0
+TOT                                                               443   4038.4      3.0   1832.1  thread-total 5873.6
+# 10-analysis/fam_joinship/qf_g4_best tpch_q10_iter[2, 3, 4] mean wall 1015.4 ms
+pid label                                                       tasks    prepH    prepG     comp   start     end   GB_H   GB_G
+  0 GPU_SCAN(0)                                                     1      0.2      0.0      0.1     0.9     1.1    0.0    0.0
+  1 PARTITION(1)                                                    1      0.0      0.1      0.0     1.2     1.4    0.0    0.0
+  2 CONCAT(2)                                                       4      0.0      1.0      0.1     1.4     1.8    0.0    0.0
+  3 GPU_SCAN(3)                                                    38    870.9      0.0    260.5     1.9    86.2   18.9    0.0
+  4 PARTITION(4)                                                   38      0.0      0.9     95.6    86.4   112.3    0.0    0.7
+  5 CONCAT(5)                                                       4      0.0     36.7      3.8   112.4   122.9    0.0    0.7
+  6 GPU_SCAN(6) -> DYNAMIC_FILTER(7)                              145   3600.2      0.0    136.4   123.0   368.1  117.5    0.0
+  7 PARTITION(8)                                                  145      0.0      2.5    178.0   344.5   371.7    0.0    1.9
+  8 CONCAT(9)                                                       4      0.0    121.8     18.2   372.1   408.0    0.0    1.9
+  9 HASH_JOIN(10)                                                   4      0.0      0.4     17.0   405.7   412.4    0.0    2.6
+ 10 PARTITION(11)                                                   4      0.0      0.6     55.8   412.6   457.3    0.0    1.4
+ 11 CONCAT(12)                                                      4      0.0     52.3      2.3   457.4   472.5    0.0    1.4
+ 12 GPU_SCAN(13) -> DYNAMIC_FILTER(14)                              7   1288.6      0.0     47.4   472.6   721.5   23.3    0.0
+ 13 PARTITION(15)                                                   7      0.0      0.2     53.1   606.8   729.3    0.0    6.9
+ 14 CONCAT(16)                                                      8      0.0    388.1     40.9   680.6   803.1    0.0    6.9
+ 15 HASH_JOIN(17) -> PROJECTION(18)                                 8      0.0      0.3    107.7   713.5   812.4    0.0    8.3
+ 16 PARTITION(19)                                                   8      0.0      0.2      0.2   729.0   812.6    0.0   19.1
+ 17 CONCAT(20)                                                      8      0.0      0.3      0.3   777.0   812.7    0.0   19.1
+ 18 HASH_JOIN(21) -> PROJECTION(22) -> HASH_GROUP_BY(23)            8      0.0      0.3    364.1   777.1   871.6    0.0   19.1
+ 19 PARTITION(24)                                                   8      0.0      0.5    142.9   871.8   889.9    0.0    8.1
+ 20 MERGE_GROUP_BY(25) -> PROJECTION(26) -> PROJECTION(27) ->       9      0.0    697.5    198.3   890.0  1009.7    0.0    8.1
+ 21 MERGE_TOP_N(29) -> RESULT_COLLECTOR(30)                         1      0.0      2.9      2.7  1009.8  1015.4    0.0    0.0
+TOT                                                               464   5759.8   1306.7   1725.3  thread-total 8791.8

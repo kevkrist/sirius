@@ -1,0 +1,112 @@
+== Q3: staged clones with legs 1440
+   start->firstD2Hissue             34.1 us/clone  total 0.049 thread-s
+   D2Hissue->firstD2Hexec          563.2 us/clone  total 0.811 thread-s
+   D2H exec span                  2985.0 us/clone  total 4.298 thread-s
+   D2H busy (union)                506.6 us/clone  total 0.730 thread-s
+   lastD2H end->firstH2D exec    -2394.4 us/clone  total -3.448 thread-s
+   H2D exec span                  2675.3 us/clone  total 3.852 thread-s
+   H2D busy (union)                596.3 us/clone  total 0.859 thread-s
+   lastH2D end->clone end           34.4 us/clone  total 0.049 thread-s
+   clone dur                      3897.6 us/clone  total 5.613 thread-s
+   API in st clones: cuStreamSynchronize 5123ms/10080 (508us); cudaMemcpyAsync 330ms/53684 (6us); cudaMallocFromPoolAsync 27ms/4320 (6us); cudaStreamWaitEvent 10ms/1440 (7us); cudaEventCreateWithFlags 4ms/1440 (3us); cudaEventRecord 4ms/1440 (3us); cudaMemsetAsync 1ms/4320 (0us); cudaStreamGetDevice 1ms/1440 (0us)
+   API in pe clones: cuStreamSynchronize 513ms/720 (713us); cudaMemcpyPeerAsync 24ms/2160 (11us); cudaMallocFromPoolAsync 11ms/2160 (5us); cudaStreamWaitEvent 5ms/720 (7us); cudaEventCreateWithFlags 3ms/720 (4us); cudaEventRecord 2ms/720 (3us); cudaMemsetAsync 0ms/2160 (0us); cudaStreamGetDevice 0ms/720 (0us)
+   dev0 D2H staged-leg busy-union 182 ms (sum 182 ms, mean concurrency 1.00) of staged union 497 ms
+   dev0 H2D staged-leg busy-union 214 ms (sum 214 ms, mean concurrency 1.00) of staged union 497 ms
+   dev1 D2H staged-leg busy-union 184 ms (sum 184 ms, mean concurrency 1.00) of staged union 497 ms
+   dev1 H2D staged-leg busy-union 214 ms (sum 214 ms, mean concurrency 1.00) of staged union 497 ms
+   dev2 D2H staged-leg busy-union 182 ms (sum 182 ms, mean concurrency 1.00) of staged union 497 ms
+   dev2 H2D staged-leg busy-union 216 ms (sum 216 ms, mean concurrency 1.00) of staged union 497 ms
+   dev3 D2H staged-leg busy-union 181 ms (sum 181 ms, mean concurrency 1.00) of staged union 497 ms
+   dev3 H2D staged-leg busy-union 214 ms (sum 214 ms, mean concurrency 1.00) of staged union 497 ms
+== Q9: staged clones with legs 2637
+   start->firstD2Hissue             41.8 us/clone  total 0.110 thread-s
+   D2Hissue->firstD2Hexec          157.4 us/clone  total 0.415 thread-s
+   D2H exec span                  1154.9 us/clone  total 3.046 thread-s
+   D2H busy (union)                167.5 us/clone  total 0.442 thread-s
+   lastD2H end->firstH2D exec     -951.4 us/clone  total -2.509 thread-s
+   H2D exec span                  1051.1 us/clone  total 2.772 thread-s
+   H2D busy (union)                195.3 us/clone  total 0.515 thread-s
+   lastH2D end->clone end           42.6 us/clone  total 0.112 thread-s
+   clone dur                      1496.5 us/clone  total 3.946 thread-s
+   API in st clones: cuStreamSynchronize 3073ms/24359 (126us); cudaMemcpyAsync 410ms/45999 (9us); cudaMallocFromPoolAsync 160ms/10746 (15us); cudaEventCreateWithFlags 23ms/2637 (9us); cudaStreamWaitEvent 19ms/2637 (7us); cudaEventRecord 7ms/2637 (3us); cudaMemsetAsync 2ms/10746 (0us); cudaStreamGetDevice 1ms/2637 (1us)
+   API in pe clones: cuStreamSynchronize 389ms/1427 (273us); cudaMemcpyPeerAsync 75ms/5365 (14us); cudaMallocFromPoolAsync 75ms/5365 (14us); cudaStreamWaitEvent 9ms/1317 (7us); cudaEventCreateWithFlags 9ms/1317 (7us); cudaMemcpyAsync 4ms/55 (73us); cudaEventRecord 3ms/1317 (2us); cudaMemsetAsync 1ms/5365 (0us)
+   dev0 D2H staged-leg busy-union 106 ms (sum 106 ms, mean concurrency 1.00) of staged union 464 ms
+   dev0 H2D staged-leg busy-union 137 ms (sum 137 ms, mean concurrency 1.00) of staged union 464 ms
+   dev1 D2H staged-leg busy-union 105 ms (sum 105 ms, mean concurrency 1.00) of staged union 464 ms
+   dev1 H2D staged-leg busy-union 136 ms (sum 136 ms, mean concurrency 1.00) of staged union 464 ms
+   dev2 D2H staged-leg busy-union 114 ms (sum 114 ms, mean concurrency 1.00) of staged union 464 ms
+   dev2 H2D staged-leg busy-union 132 ms (sum 132 ms, mean concurrency 1.00) of staged union 464 ms
+   dev3 D2H staged-leg busy-union 117 ms (sum 117 ms, mean concurrency 1.00) of staged union 464 ms
+   dev3 H2D staged-leg busy-union 110 ms (sum 110 ms, mean concurrency 1.00) of staged union 464 ms
+== Q13: staged clones with legs 390
+   start->firstD2Hissue             27.5 us/clone  total 0.011 thread-s
+   D2Hissue->firstD2Hexec          140.3 us/clone  total 0.055 thread-s
+   D2H exec span                  1406.6 us/clone  total 0.549 thread-s
+   D2H busy (union)                506.5 us/clone  total 0.198 thread-s
+   lastD2H end->firstH2D exec     -790.7 us/clone  total -0.308 thread-s
+   H2D exec span                  1042.2 us/clone  total 0.406 thread-s
+   H2D busy (union)                580.8 us/clone  total 0.227 thread-s
+   lastH2D end->clone end           27.4 us/clone  total 0.011 thread-s
+   clone dur                      1853.2 us/clone  total 0.723 thread-s
+   API in st clones: cuStreamSynchronize 613ms/1826 (336us); cudaMemcpyAsync 84ms/18212 (5us); cudaMallocFromPoolAsync 3ms/718 (4us); cudaStreamWaitEvent 2ms/390 (6us); cudaEventRecord 1ms/390 (2us); cudaEventCreateWithFlags 1ms/390 (1us); cudaStreamGetDevice 0ms/390 (0us); cudaMemsetAsync 0ms/718 (0us)
+   API in pe clones: cuStreamSynchronize 91ms/195 (466us); cudaMemcpyPeerAsync 3ms/359 (9us); cudaMallocFromPoolAsync 1ms/359 (4us); cudaStreamWaitEvent 1ms/195 (6us); cudaEventRecord 0ms/195 (2us); cudaEventCreateWithFlags 0ms/195 (2us); cudaStreamGetDevice 0ms/195 (0us); cudaMemsetAsync 0ms/359 (0us)
+   dev0 D2H staged-leg busy-union 50 ms (sum 50 ms, mean concurrency 1.00) of staged union 214 ms
+   dev0 H2D staged-leg busy-union 57 ms (sum 57 ms, mean concurrency 1.00) of staged union 214 ms
+   dev1 D2H staged-leg busy-union 51 ms (sum 51 ms, mean concurrency 1.00) of staged union 214 ms
+   dev1 H2D staged-leg busy-union 57 ms (sum 57 ms, mean concurrency 1.00) of staged union 214 ms
+   dev2 D2H staged-leg busy-union 49 ms (sum 49 ms, mean concurrency 1.00) of staged union 214 ms
+   dev2 H2D staged-leg busy-union 57 ms (sum 57 ms, mean concurrency 1.00) of staged union 214 ms
+   dev3 D2H staged-leg busy-union 48 ms (sum 48 ms, mean concurrency 1.00) of staged union 214 ms
+   dev3 H2D staged-leg busy-union 57 ms (sum 57 ms, mean concurrency 1.00) of staged union 214 ms
+== Q18: staged clones with legs 11438
+   start->firstD2Hissue             53.6 us/clone  total 0.613 thread-s
+   D2Hissue->firstD2Hexec           28.4 us/clone  total 0.325 thread-s
+   D2H exec span                   199.8 us/clone  total 2.285 thread-s
+   D2H busy (union)                 41.3 us/clone  total 0.472 thread-s
+   lastD2H end->firstH2D exec     -149.5 us/clone  total -1.709 thread-s
+   H2D exec span                   216.6 us/clone  total 2.478 thread-s
+   H2D busy (union)                 47.1 us/clone  total 0.539 thread-s
+   lastH2D end->clone end           53.3 us/clone  total 0.610 thread-s
+   clone dur                       402.2 us/clone  total 4.601 thread-s
+   API in st clones: cuStreamSynchronize 2267ms/57430 (39us); cudaMemcpyAsync 869ms/71902 (12us); cudaMallocFromPoolAsync 559ms/22924 (24us); cudaEventCreateWithFlags 172ms/11438 (15us); cudaStreamWaitEvent 120ms/11438 (10us); cudaEventRecord 69ms/11438 (6us); cudaStreamGetDevice 5ms/11438 (0us); cudaMemsetAsync 4ms/22924 (0us)
+   API in pe clones: cuStreamSynchronize 319ms/5791 (55us); cudaMallocFromPoolAsync 274ms/11462 (24us); cudaMemcpyPeerAsync 201ms/11462 (18us); cudaEventCreateWithFlags 76ms/5719 (13us); cudaStreamWaitEvent 67ms/5719 (12us); cudaEventRecord 28ms/5719 (5us); cudaStreamGetDevice 2ms/5719 (0us); cudaMemsetAsync 2ms/11462 (0us)
+   dev0 D2H staged-leg busy-union 118 ms (sum 118 ms, mean concurrency 1.00) of staged union 681 ms
+   dev0 H2D staged-leg busy-union 134 ms (sum 134 ms, mean concurrency 1.00) of staged union 681 ms
+   dev1 D2H staged-leg busy-union 118 ms (sum 118 ms, mean concurrency 1.00) of staged union 681 ms
+   dev1 H2D staged-leg busy-union 134 ms (sum 134 ms, mean concurrency 1.00) of staged union 681 ms
+   dev2 D2H staged-leg busy-union 118 ms (sum 118 ms, mean concurrency 1.00) of staged union 681 ms
+   dev2 H2D staged-leg busy-union 135 ms (sum 135 ms, mean concurrency 1.00) of staged union 681 ms
+   dev3 D2H staged-leg busy-union 118 ms (sum 118 ms, mean concurrency 1.00) of staged union 681 ms
+   dev3 H2D staged-leg busy-union 136 ms (sum 136 ms, mean concurrency 1.00) of staged union 681 ms
+== Q21: staged clones with legs 4944
+   start->firstD2Hissue             29.0 us/clone  total 0.143 thread-s
+   D2Hissue->firstD2Hexec           23.9 us/clone  total 0.118 thread-s
+   D2H exec span                   182.1 us/clone  total 0.900 thread-s
+   D2H busy (union)                 56.0 us/clone  total 0.277 thread-s
+   lastD2H end->firstH2D exec     -104.3 us/clone  total -0.516 thread-s
+   H2D exec span                   168.0 us/clone  total 0.831 thread-s
+   H2D busy (union)                 63.8 us/clone  total 0.315 thread-s
+   lastH2D end->clone end           30.1 us/clone  total 0.149 thread-s
+   clone dur                       328.8 us/clone  total 1.625 thread-s
+   API in st clones: cuStreamSynchronize 1086ms/23832 (46us); cudaMemcpyAsync 235ms/36510 (6us); cudaMallocFromPoolAsync 51ms/9422 (5us); cudaStreamWaitEvent 28ms/4960 (6us); cudaEventRecord 11ms/4960 (2us); cudaEventCreateWithFlags 11ms/4960 (2us); cudaStreamGetDevice 2ms/4960 (0us); cudaMemsetAsync 2ms/9462 (0us)
+   API in pe clones: cuStreamSynchronize 144ms/2492 (58us); cudaMemcpyPeerAsync 49ms/4708 (10us); cudaMallocFromPoolAsync 24ms/4708 (5us); cudaStreamWaitEvent 14ms/2478 (6us); cudaEventRecord 5ms/2478 (2us); cudaEventCreateWithFlags 5ms/2478 (2us); cudaStreamGetDevice 1ms/2478 (0us); cudaMemsetAsync 1ms/4728 (0us)
+   dev0 D2H staged-leg busy-union 64 ms (sum 64 ms, mean concurrency 1.00) of staged union 499 ms
+   dev0 H2D staged-leg busy-union 84 ms (sum 84 ms, mean concurrency 1.00) of staged union 499 ms
+   dev1 D2H staged-leg busy-union 65 ms (sum 65 ms, mean concurrency 1.00) of staged union 499 ms
+   dev1 H2D staged-leg busy-union 86 ms (sum 86 ms, mean concurrency 1.00) of staged union 499 ms
+   dev2 D2H staged-leg busy-union 74 ms (sum 74 ms, mean concurrency 1.00) of staged union 499 ms
+   dev2 H2D staged-leg busy-union 72 ms (sum 72 ms, mean concurrency 1.00) of staged union 499 ms
+   dev3 D2H staged-leg busy-union 75 ms (sum 75 ms, mean concurrency 1.00) of staged union 499 ms
+   dev3 H2D staged-leg busy-union 73 ms (sum 73 ms, mean concurrency 1.00) of staged union 499 ms
+== ALL 20849
+   start->firstD2Hissue             44.4 us/clone  total 0.927 thread-s
+   D2Hissue->firstD2Hexec           82.7 us/clone  total 1.724 thread-s
+   D2H exec span                   531.3 us/clone  total 11.077 thread-s
+   D2H busy (union)                101.6 us/clone  total 2.118 thread-s
+   lastD2H end->firstH2D exec     -407.2 us/clone  total -8.490 thread-s
+   H2D exec span                   495.9 us/clone  total 10.339 thread-s
+   H2D busy (union)                117.7 us/clone  total 2.454 thread-s
+   lastH2D end->clone end           44.7 us/clone  total 0.931 thread-s
+   clone dur                       791.8 us/clone  total 16.508 thread-s
+   API st: cuStreamSynchronize 12.16s/117527 (103us); cudaMemcpyAsync 1.93s/226307 (9us); cudaMallocFromPoolAsync 0.80s/48130 (17us); cudaEventCreateWithFlags 0.21s/20865 (10us); cudaStreamWaitEvent 0.18s/20865 (9us); cudaEventRecord 0.09s/20865 (4us); cudaMemsetAsync 0.01s/48170 (0us); cudaStreamGetDevice 0.01s/20865 (0us)
+   API pe: cuStreamSynchronize 1.46s/10625 (137us); cudaMallocFromPoolAsync 0.39s/24054 (16us); cudaMemcpyPeerAsync 0.35s/24054 (15us); cudaStreamWaitEvent 0.10s/10429 (9us); cudaEventCreateWithFlags 0.09s/10429 (9us); cudaEventRecord 0.04s/10429 (4us); cudaMemcpyAsync 0.00s/98 (48us); cudaMemsetAsync 0.00s/24074 (0us); cudaStreamGetDevice 0.00s/10429 (0us)

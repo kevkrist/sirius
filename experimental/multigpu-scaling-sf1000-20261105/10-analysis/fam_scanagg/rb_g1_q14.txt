@@ -1,0 +1,53 @@
+######## g1 Q14 window 60659291,1632074732
+== Pipeline 4: PARTITION: n=1254 wall=551.4ms launched_kernels=16.5ms
+   memcpy Device-to-Device: 16.7ms 0.93GB (55.4 GB/s)
+   memcpy Device-to-Host: 0.3ms 0.00GB (0.1 GB/s)
+   memcpy Host-to-Device: 0.2ms 0.00GB (0.2 GB/s)
+   api: cudaMallocFromPoolAsync=134.1, cudaMemcpyBatchAsync=89.6, cudaStreamSynchronize=42.6, cudaFreeAsync=35.9, cudaEventCreateWithFlags=33.5, cudaLaunchKernel=29.4, cudaMemsetAsync=9.1
+   osrt: pthread_rwlock_wrlock=51.9, pthread_mutex_lock=49.4, pthread_rwlock_rdlock=20.3, futex=4.3, write=0.8
+== convert:host_to_gpu: n=23 wall=395.5ms launched_kernels=1.2ms
+   memcpy Host-to-Device: 104.1ms 5.72GB (54.9 GB/s)
+   api: cudaMemcpyBatchAsync=392.0, cudaMallocFromPoolAsync=1.2, cuStreamSynchronize=0.4, cudaLaunchKernel=0.3, cudaEventRecord=0.1, cudaFreeAsync=0.0, cudaEventCreateWithFlags=0.0
+   osrt: pthread_mutex_lock=0.2, pthread_rwlock_rdlock=0.1, pthread_rwlock_wrlock=0.0
+== hash_partition: n=650 wall=328.4ms launched_kernels=55.9ms
+   memcpy Device-to-Host: 0.4ms 0.00GB (0.0 GB/s)
+   memcpy Host-to-Device: 0.3ms 0.00GB (0.1 GB/s)
+   api: cudaStreamSynchronize=74.5, cuStreamSynchronize=67.6, cudaMallocFromPoolAsync=54.7, cudaLaunchKernel=31.2, cudaFreeAsync=26.1, cudaMemcpyBatchAsync=17.7, cudaMemsetAsync=9.4
+   osrt: pthread_mutex_lock=20.6, pthread_rwlock_wrlock=11.2, pthread_rwlock_rdlock=6.3, write=0.9
+== convert:host_to_gpu:flush_submit: n=23 wall=223.4ms launched_kernels=0.0ms
+   memcpy Host-to-Device: 74.6ms 4.12GB (55.2 GB/s)
+   api: cudaMemcpyBatchAsync=223.4
+== convert:host_to_gpu:reconstruct: n=23 wall=171.4ms launched_kernels=1.2ms
+   memcpy Host-to-Device: 29.5ms 1.60GB (54.3 GB/s)
+   api: cudaMemcpyBatchAsync=168.6, cudaMallocFromPoolAsync=1.2, cudaLaunchKernel=0.3, cudaFreeAsync=0.0, cudaMemsetAsync=0.0, cuKernelGetName=0.0
+   osrt: pthread_mutex_lock=0.2, pthread_rwlock_rdlock=0.1, pthread_rwlock_wrlock=0.0
+== convert:host_to_gpu:offsets_cast: n=23 wall=169.6ms launched_kernels=1.2ms
+   memcpy Host-to-Device: 29.5ms 1.60GB (54.3 GB/s)
+   api: cudaMemcpyBatchAsync=168.6, cudaMallocFromPoolAsync=0.3, cudaLaunchKernel=0.3, cudaFreeAsync=0.0, cuKernelGetName=0.0
+   osrt: pthread_mutex_lock=0.1, pthread_rwlock_rdlock=0.1
+== concatenate: n=22 wall=98.8ms launched_kernels=5.9ms
+   memcpy Device-to-Device: 25.9ms 8.24GB (318.3 GB/s)
+   memcpy Device-to-Host: 0.7ms 0.00GB (0.0 GB/s)
+   memcpy Host-to-Device: 0.1ms 0.00GB (7.4 GB/s)
+   api: cudaStreamSynchronize=64.2, cudaMemcpyBatchAsync=11.5, cudaMallocFromPoolAsync=3.4, cuStreamSynchronize=1.5, cudaStreamWaitEvent=1.1, cudaEventRecord=1.0, cudaLaunchKernel=0.6
+   osrt: pthread_rwlock_rdlock=3.7, pthread_mutex_lock=3.6, pthread_rwlock_wrlock=0.1, write=0.0
+== Pipeline 2: CONCAT: n=14 wall=38.9ms launched_kernels=2.5ms
+   memcpy Device-to-Device: 12.9ms 4.12GB (318.3 GB/s)
+   memcpy Device-to-Host: 0.4ms 0.00GB (0.0 GB/s)
+   memcpy Host-to-Device: 0.0ms 0.00GB (2.1 GB/s)
+   api: cudaStreamSynchronize=27.6, cudaMemcpyBatchAsync=3.7, cudaMallocFromPoolAsync=1.6, cuStreamSynchronize=0.7, cudaStreamWaitEvent=0.5, cudaEventRecord=0.5, cudaLaunchKernel=0.2
+   osrt: pthread_mutex_lock=1.8, futex=0.0, pthread_rwlock_wrlock=0.0, write=0.0, pthread_rwlock_rdlock=0.0
+== Pipeline 5: CONCAT: n=14 wall=33.2ms launched_kernels=2.1ms
+   memcpy Host-to-Device: 0.1ms 0.00GB (8.8 GB/s)
+   api: cudaStreamSynchronize=16.8, cudaMemcpyBatchAsync=4.2, cudaMallocFromPoolAsync=0.6, cudaLaunchKernel=0.2, cudaFreeAsync=0.2, cudaEventRecord=0.1, cudaStreamWaitEvent=0.1
+   osrt: pthread_rwlock_rdlock=3.7, pthread_mutex_lock=0.4, pthread_rwlock_wrlock=0.0, futex=0.0
+== convert:host_to_gpu:device_alloc: n=69 wall=1.0ms launched_kernels=0.0ms
+   api: cudaMallocFromPoolAsync=0.9
+   osrt: pthread_mutex_lock=0.1, pthread_rwlock_wrlock=0.0
+== convert:host_to_gpu:presync: n=23 wall=0.3ms launched_kernels=0.0ms
+   api: cuStreamSynchronize=0.2
+   osrt: pthread_mutex_lock=0.1
+== convert:host_to_gpu:final_sync: n=23 wall=0.1ms launched_kernels=0.0ms
+   api: cuStreamSynchronize=0.1
+== convert:host_to_gpu:acquire_stream: n=23 wall=0.0ms launched_kernels=0.0ms
+   api: 

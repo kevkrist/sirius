@@ -1,0 +1,36 @@
+sirius:
+  topology:
+    gpu_ids:
+    - 0
+    - 1
+    - 2
+    - 3
+  executor:
+    pipeline:
+      num_threads: 4
+    task_creator:
+      num_threads: 4
+    downgrade:
+      num_threads: 1
+  operator_params:
+    scan_task_batch_size: 1GB
+    max_sort_partition_bytes: 0
+    hash_partition_bytes: 1GB
+    concat_batch_bytes: 1GB
+    max_build_hash_table_bytes: 2GB
+  memory:
+    gpu:
+      usage_limit_fraction: 0.9
+      reservation_limit_fraction: 1.0
+    host:
+      capacity_bytes: 600GB
+      initial_number_pools: 10
+      pool_size: 512
+      block_size: 1048576
+  compression:
+    enable_pin_table_compression: true
+    input_plan_dir: /home/ubuntu/sirius/src/compression/simpatico_codegen/plans/tpch_sf1000
+  telemetry:
+    enable_quent: true
+    output_directory: /home/ubuntu/sirius-scaling-20261105/01-nsys/nsys3_g4/telemetry
+    engine_name: siriusDB

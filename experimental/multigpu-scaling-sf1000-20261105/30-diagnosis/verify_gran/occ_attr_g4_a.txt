@@ -1,0 +1,58 @@
+by class (ms, suite, per hot iter): {'skew': 323.8, 'modN': 268.0, 'single': 194.5, 'underN': 82.9}
+by head op:
+  PARTITION                      254.1
+  MERGE_GROUP_BY                 186.4
+  GPU_SCAN                       171.2
+  CONCAT                         109.7
+  HASH_JOIN                       92.9
+  MERGE_AGGREGATE                 22.7
+  MERGE_TOP_N                      9.5
+  RESULT_COLLECTOR                 6.4
+  HASH_GROUP_BY                    3.7
+  DENSE_COUNT_JOIN                 3.3
+  SORT_SAMPLE                      3.0
+  NESTED_LOOP_JOIN                 2.8
+  MERGE_SORT                       2.2
+  PROJECTION                       0.9
+  BUILD_FILTER                     0.2
+top pipelines (query, label, task count per iter*iters):
+   111.3  tpch_q1   c=   1  MERGE_GROUP_BY(6) -> PROJECTION(7) -> ORDER_BY(8)
+    30.8  tpch_q10  c=   4  PARTITION(11)
+    24.5  tpch_q8   c=   4  PARTITION(35)
+    23.4  tpch_q9   c=   4  PARTITION(23)
+    22.7  tpch_q9   c=  21  HASH_JOIN(32) -> PROJECTION(33) -> HASH_GROUP_BY(34)
+    20.7  tpch_q18  c=  36  MERGE_GROUP_BY(6) -> FILTER(7)
+    19.7  tpch_q21  c=   4  PARTITION(26)
+    18.9  tpch_q21  c=   4  PARTITION(45)
+    18.0  tpch_q6   c=   1  MERGE_AGGREGATE(3)
+    17.4  tpch_q21  c=   6  HASH_JOIN(18)
+    16.1  tpch_q22  c=   2  CONCAT(14)
+    15.7  tpch_q10  c= 163  PARTITION(4)
+    15.4  tpch_q4   c=   4  PARTITION(5)
+    14.4  tpch_q11  c=   2  CONCAT(42)
+    13.5  tpch_q1   c= 627  GPU_SCAN(0) -> PROJECTION(1) -> PROJECTION(2) -> PROJECTION(3) -> HASH
+    13.0  tpch_q2   c=   2  GPU_SCAN(29) -> DYNAMIC_FILTER(30)
+    12.3  tpch_q5   c=   4  PARTITION(26)
+    12.3  tpch_q10  c=   9  MERGE_GROUP_BY(25) -> PROJECTION(26) -> PROJECTION(27) -> TOP_N(28)
+    11.8  tpch_q19  c= 627  GPU_SCAN(4) -> DYNAMIC_FILTER(5) -> FILTER(6)
+     9.5  tpch_q15  c=   5  MERGE_GROUP_BY(4)
+     9.3  tpch_q12  c= 627  PARTITION(2)
+     8.4  tpch_q9   c=  12  PARTITION(30)
+     8.3  tpch_q16  c=  23  PARTITION(5)
+     8.2  tpch_q5   c=   4  PARTITION(19)
+     8.2  tpch_q8   c=   4  PARTITION(28)
+     7.6  tpch_q16  c=   2  GPU_SCAN(0)
+     7.1  tpch_q21  c=   4  HASH_JOIN(39) -> FILTER(40) -> LEFT_DELIM_JOIN(41)
+     7.0  tpch_q21  c=   1  MERGE_GROUP_BY(63) -> TOP_N(64)
+     7.0  tpch_q15  c=   2  GPU_SCAN(16)
+     6.4  tpch_q11  c=  17  GPU_SCAN(31) -> DYNAMIC_FILTER(32)
+     6.0  tpch_q13  c= 163  GPU_SCAN(2)
+     5.9  tpch_q16  c=  23  GPU_SCAN(3) -> FILTER(4)
+     5.5  tpch_q12  c= 627  GPU_SCAN(0) -> FILTER(1)
+     5.4  tpch_q21  c=   4  CONCAT(35)
+     5.4  tpch_q2   c=  17  GPU_SCAN(39) -> DYNAMIC_FILTER(40)
+     5.4  tpch_q2   c=  23  GPU_SCAN(36)
+     5.2  tpch_q2   c=  17  GPU_SCAN(54) -> DYNAMIC_FILTER(55)
+     5.1  tpch_q9   c=  17  GPU_SCAN(15) -> DYNAMIC_FILTER(16)
+     4.9  tpch_q9   c=  21  CONCAT(2)
+     4.7  tpch_q9   c=  23  GPU_SCAN(12)
