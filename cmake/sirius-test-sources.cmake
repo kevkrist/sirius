@@ -320,6 +320,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_union_plan.cpp
     test/cpp/operator/test_dynamic_filter_union_transfer.cpp
     test/cpp/operator/test_build_input_certification.cpp
+    test/cpp/operator/test_dynamic_filter_construction_plan.cpp
     test/cpp/operator/test_physical_build_filter.cpp
     test/cpp/operator/test_dynamic_filter_accumulation.cpp
     test/cpp/operator/test_dynamic_filter_source_policy.cpp
