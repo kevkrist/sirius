@@ -8,6 +8,7 @@ target_sources(
           device_copy_batch.cpp
           device_transfer.cpp
           dynamic_filter_mask_ops.cu
+          dynamic_filter_prepared_keys.cu
           dynamic_filter_replica_transfer.cu
           union_transfer.cu
           sirius_dynamic_bloom_filter.cu
