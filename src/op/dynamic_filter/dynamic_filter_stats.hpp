@@ -49,19 +49,22 @@ namespace sirius::op {
  * separately counted position selection.
  *
  * Accumulation counters: `accumulations_started` counts attempts that allocated their partial
- * arrays. `accumulations_skipped_inventory` counts builds whose input could not be certified and
- * attempts ended because a task input could not be matched to exactly one certified batch.
+ * arrays. `accumulations_skipped_inventory` counts builds whose input had the wrong shape or whose
+ * arrival ledger disagreed with its repository, and attempts ended because a task input could not
+ * be matched to exactly one certified batch. The other certification declines are counted by
+ * reason: `accumulations_declined_pipeline_barrier` (an ORDER BY producer's PIPELINE barrier),
+ * `accumulations_declined_port_directive` (a late-materialization directive),
+ * `accumulations_declined_unreadable_arrival` (an arrival the ledger cannot accept, including any
+ * non-GPU arrival), and `accumulations_declined_compressed_arrival` (a compressed arrival).
  * `accumulations_skipped_admission` counts allocation or admission refusals before any filter is
- * published, including initialization leases, publication workspace, and a contribution or
- * publication GPU without an admitted partial. `accumulations_skipped_error` counts unexpected or
- * fatal failures before they propagate, and `accumulations_skipped_transient` counts retryable
- * kernel-launch errors. `accumulations_incomplete` counts inputs that closed before every batch
- * contributed, `accumulations_abandoned` publications owed by a task that never ran them before
- * input closed in an uncancelled session, and `accumulation_publications_finished` fan-outs that
- * pushed at least one filter; `accumulation_publications_host_staged` counts those whose Bloom
- * arrays crossed pinned HOST memory between GPUs that cannot copy to each other directly, and
- * `accumulation_publications_degraded` those whose Bloom transfer was refused workspace and used
- * the host in place of device-to-device copies, or fewer chunks in flight.
+ * published, including initialization leases, publication workspace, and a
+ * contribution or publication GPU without an admitted partial. `accumulations_skipped_error` counts
+ * unexpected or fatal failures before they propagate, and `accumulations_skipped_transient` counts
+ * retryable kernel-launch errors. `accumulations_incomplete` counts inputs that closed before every
+ * batch contributed, `accumulations_abandoned` publications owed by a task that never ran them
+ * before input closed in an uncancelled session, and `accumulation_publications_finished` fan-outs
+ * that pushed at least one filter; `accumulation_publications_host_staged` counts those whose
+ * replicas were staged through HOST memory instead of copied between GPU pools.
  * `accumulation_storage_leaks` counts partial storage deliberately leaked because GPU work might
  * still use it after a failed host join. `accumulation_publication_latency_ns` sums the time from
  * final contribution to first push for every attempt that published a filter.
@@ -73,6 +76,10 @@ struct dynamic_filter_counters {
   Counter accumulation_completed_contributions{};
   Counter accumulation_duplicate_contributions{};
   Counter accumulations_skipped_inventory{};
+  Counter accumulations_declined_pipeline_barrier{};
+  Counter accumulations_declined_port_directive{};
+  Counter accumulations_declined_unreadable_arrival{};
+  Counter accumulations_declined_compressed_arrival{};
   Counter accumulations_skipped_admission{};
   Counter accumulations_skipped_error{};
   Counter accumulations_skipped_transient{};
@@ -124,6 +131,10 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::accumulation_completed_contributions,
   &dynamic_filter_counters<Counter>::accumulation_duplicate_contributions,
   &dynamic_filter_counters<Counter>::accumulations_skipped_inventory,
+  &dynamic_filter_counters<Counter>::accumulations_declined_pipeline_barrier,
+  &dynamic_filter_counters<Counter>::accumulations_declined_port_directive,
+  &dynamic_filter_counters<Counter>::accumulations_declined_unreadable_arrival,
+  &dynamic_filter_counters<Counter>::accumulations_declined_compressed_arrival,
   &dynamic_filter_counters<Counter>::accumulations_skipped_admission,
   &dynamic_filter_counters<Counter>::accumulations_skipped_error,
   &dynamic_filter_counters<Counter>::accumulations_skipped_transient,
