@@ -315,6 +315,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_probe.cpp
     test/cpp/operator/test_dynamic_filter_publication_claim.cpp
     test/cpp/operator/test_dynamic_filter_publisher.cpp
+    test/cpp/operator/test_dynamic_filter_key_outcome.cpp
     test/cpp/operator/test_complete_build_inventory.cpp
     test/cpp/operator/test_dynamic_filter_union_plan.cpp
     test/cpp/operator/test_dynamic_filter_union_transfer.cpp
