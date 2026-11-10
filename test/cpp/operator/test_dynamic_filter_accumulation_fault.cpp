@@ -250,7 +250,7 @@ TEST_CASE("a held upload does not stop the other leaders' uploads or the next do
 TEST_CASE(
   "a HOST pool with room for one chunk in flight publishes; with less it refuses and "
   "changes no partial",
-  "[dynamic_filter][multi_partition][accumulation_fault][multi_gpu][cuda_status_fault]")
+  "[dynamic_filter][construction][accumulation_fault][multi_gpu][cuda_status_fault]")
 {
   if (!has_two_gpus()) { return; }
   bool const one_chunk_fits = GENERATE(true, false);
