@@ -173,11 +173,6 @@ struct operator_options : block_base<operator_options> {
                                                 .fallback(defaults().enable_dynamic_filter)
                                                 .describe("runtime filters for eligible hash joins")
                                                 .build();
-  config_option<bool> enable_dynamic_filter_multi_partition =
-    option<bool>("enable_dynamic_filter_multi_partition")
-      .fallback(defaults().enable_dynamic_filter_multi_partition)
-      .describe("Bloom filters for multi-partition hash join builds")
-      .build();
   config_option<bool> enable_dynamic_zone_map_filter =
     option<bool>("enable_dynamic_zone_map_filter")
       .fallback(defaults().enable_dynamic_zone_map_filter)
@@ -310,8 +305,10 @@ struct operator_options : block_base<operator_options> {
               "removed; runtime distinct build probing is an internal join policy (temporarily "
               "disabled pending issue #1600); remove this key"),
       removed("max_dynamic_filter_bloom_bytes_per_gpu",
-              "removed; the Bloom budget is always 4x scan_task_batch_size; remove this key. Set "
-              "enable_dynamic_filter_multi_partition to false to disable Bloom accumulation"),
+              "removed; the Bloom budget is always 4x scan_task_batch_size; remove this key"),
+      removed("enable_dynamic_filter_multi_partition",
+              "removed; every build constructs its dynamic filters, governed by "
+              "enable_dynamic_filter; remove this key"),
       removed("dense_count_join_max_bytes",
               "removed; dense count-join histogram sizing is an internal engine policy; remove "
               "this key"),
@@ -339,7 +336,6 @@ struct operator_options : block_base<operator_options> {
       max_broadcast_join_size,
       mark_join_build_switch_ratio,
       enable_dynamic_filter,
-      enable_dynamic_filter_multi_partition,
       enable_dynamic_zone_map_filter,
       dynamic_filter_domain_coverage_threshold,
       dynamic_filter_inlist_max_l2_fraction,

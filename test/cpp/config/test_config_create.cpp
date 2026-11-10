@@ -245,7 +245,7 @@ std::string describe(const sirius::sirius_config& c, bool in_effect = false)
     "op.resident", o.max_build_probe_resident_bytes)("op.broadcast", o.max_broadcast_join_size)(
     "op.mark", o.mark_join_build_switch_ratio)(
     "op.distinct", o.enable_runtime_distinct_build_probe)("op.df", o.enable_dynamic_filter)(
-    "op.df_multi", o.enable_dynamic_filter_multi_partition)("op.peers", o.exchange_peers)(
+    "op.peers", o.exchange_peers)(
     "op.rank", o.exchange_rank)("op.staging", o.exchange_host_staging)(
     "op.df_zone", o.enable_dynamic_zone_map_filter)("op.df_cover",
                                                     o.dynamic_filter_domain_coverage_threshold)(
@@ -601,7 +601,6 @@ TEST_CASE("every key of a configuration reaches its runtime field", "[config][co
   CHECK(o.max_broadcast_join_size == 128 * MiB);
   CHECK(o.mark_join_build_switch_ratio == 4.0);
   CHECK_FALSE(o.enable_dynamic_filter);
-  CHECK_FALSE(o.enable_dynamic_filter_multi_partition);
   CHECK(o.enable_dynamic_zone_map_filter);
   CHECK(o.dynamic_filter_domain_coverage_threshold == 0.8);
   CHECK(o.dynamic_filter_inlist_max_l2_fraction == 0.25);
