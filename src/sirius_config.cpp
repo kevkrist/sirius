@@ -679,7 +679,6 @@ try {
   ops.max_broadcast_join_size                  = op.max_broadcast_join_size.get().count();
   ops.mark_join_build_switch_ratio             = op.mark_join_build_switch_ratio.get();
   ops.enable_dynamic_filter                    = op.enable_dynamic_filter.get();
-  ops.enable_dynamic_filter_multi_partition    = op.enable_dynamic_filter_multi_partition.get();
   ops.enable_dynamic_zone_map_filter           = op.enable_dynamic_zone_map_filter.get();
   ops.dynamic_filter_domain_coverage_threshold = op.dynamic_filter_domain_coverage_threshold.get();
   ops.dynamic_filter_inlist_max_l2_fraction    = op.dynamic_filter_inlist_max_l2_fraction.get();

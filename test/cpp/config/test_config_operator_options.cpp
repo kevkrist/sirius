@@ -169,8 +169,11 @@ TEST_CASE("operator option messages", "[config][config_operator]")
   REQUIRE(
     read_error("sirius:\n  operator_params:\n    max_dynamic_filter_bloom_bytes_per_gpu: ~\n") ==
     "'sirius.operator_params.max_dynamic_filter_bloom_bytes_per_gpu': removed; the Bloom budget "
-    "is always 4x scan_task_batch_size; remove this key. Set "
-    "enable_dynamic_filter_multi_partition to false to disable Bloom accumulation");
+    "is always 4x scan_task_batch_size; remove this key");
+  REQUIRE(
+    read_error("sirius:\n  operator_params:\n    enable_dynamic_filter_multi_partition: true\n") ==
+    "'sirius.operator_params.enable_dynamic_filter_multi_partition': removed; every build "
+    "constructs its dynamic filters, governed by enable_dynamic_filter; remove this key");
   REQUIRE(read_error("sirius:\n  operator_params:\n    enable_dynamic_filter_pushdown: true\n") ==
           "unknown config key: 'enable_dynamic_filter_pushdown' in sirius.operator_params");
   // An infinite switch ratio is accepted, as before.
@@ -237,7 +240,6 @@ TEST_CASE("every operator option's fallback and audience", "[config][config_oper
   check(op.max_broadcast_join_size, true);
   check(op.mark_join_build_switch_ratio, true);
   check(op.enable_dynamic_filter, true);
-  check(op.enable_dynamic_filter_multi_partition, true);
   check(op.enable_dynamic_zone_map_filter, true);
   check(op.dynamic_filter_domain_coverage_threshold, true);
   check(op.dynamic_filter_inlist_max_l2_fraction, true);
