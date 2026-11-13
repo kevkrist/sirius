@@ -1,0 +1,60 @@
+Running: zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
+0.360 s: zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
+Running: small IN-list replica built on GPU 0 computes an exact mask on GPU 1
+0.362 s: small IN-list replica built on GPU 0 computes an exact mask on GPU 1
+Running: scan receipt identity survives real cross-GPU replacements
+0.184 s: scan receipt identity survives real cross-GPU replacements
+Running: operator-data provenance survives cross-GPU preparation and OOM rescheduling
+0.173 s: operator-data provenance survives cross-GPU preparation and OOM rescheduling
+Running: lock_or_prepare_batch cross-GPU returns a clone and leaves the source in place
+0.187 s: lock_or_prepare_batch cross-GPU returns a clone and leaves the source in place
+Running: lock_or_prepare_batch cross-GPU does not block on concurrent readers
+0.202 s: lock_or_prepare_batch cross-GPU does not block on concurrent readers
+Running: LIST columns survive a cross-GPU clone with INT32 offsets
+0.191 s: LIST columns survive a cross-GPU clone with INT32 offsets
+Running: prepare_for_processing rebinds idle batches to the prepared clones
+0.192 s: prepare_for_processing rebinds idle batches to the prepared clones
+Running: bytes_to_materialize_input counts cross-GPU inputs for the target space
+0.180 s: bytes_to_materialize_input counts cross-GPU inputs for the target space
+Running: single-consumer source is freed promptly after a cross-GPU prepare
+0.182 s: single-consumer source is freed promptly after a cross-GPU prepare
+Running: cached scan assigned away from its pin clones and reserves on the target GPU
+0.192 s: cached scan assigned away from its pin clones and reserves on the target GPU
+Running: a migrated final PARTITION accounts merge scratch in task history
+0.365 s: a migrated final PARTITION accounts merge scratch in task history
+0.368 s: a migrated final PARTITION accounts merge scratch in task history
+Running: scheduler error drain joins collecting and publishing PARTITION tasks before reuse
+0.833 s: scheduler error drain joins collecting and publishing PARTITION tasks before reuse
+0.840 s: scheduler error drain joins collecting and publishing PARTITION tasks before reuse
+Running: optional publication scratch OOM deposits without rescheduling the PARTITION task
+0.381 s: optional publication scratch OOM deposits without rescheduling the PARTITION task
+0.378 s: optional publication scratch OOM deposits without rescheduling the PARTITION task
+Running: publication scratch allocation failure retires ordinary-pool partials
+0.381 s: publication scratch allocation failure retires ordinary-pool partials
+Running: Task scheduler dispatches tasks with device preference
+0.397 s: Task scheduler dispatches tasks with device preference
+Running: consumer passes a batch on another device through without filtering or claims
+0.362 s: consumer passes a batch on another device through without filtering or claims
+Running: telemetry_context nests threads under per-GPU device groups
+0.399 s: telemetry_context nests threads under per-GPU device groups
+Running: pinned_column_chunk_views rejects chunks on a different GPU
+0.462 s: pinned_column_chunk_views rejects chunks on a different GPU
+===============================================================================
+test cases:     142 |     140 passed | 2 failed
+assertions: 5659726 | 5659724 passed | 2 failed
+
+Stopping after the failed multi_gpu step
+
+Unit test summary (logs in /opt/dlami/nvme/s5b-mgpu/wt-tip/build/release/test/cpp/log/<process>/):
+shard-0        exit 0      278s  All tests passed (2035276 assertions in 705 test cases)
+shard-1        exit 0      194s  test cases:   705 |   704 passed | 1 failed as expected
+shard-2        exit 0      236s  All tests passed (3002907 assertions in 705 test cases)
+shard-3        exit 0      219s  All tests passed (32514774 assertions in 705 test cases)
+shard-4        exit 0       88s  All tests passed (6953650 assertions in 704 test cases)
+shard-5        exit 0      112s  All tests passed (183038 assertions in 704 test cases)
+shard-6        exit 0      210s  All tests passed (1060640 assertions in 704 test cases)
+shard-7        exit 0       75s  test cases:    704 |    703 passed | 1 skipped
+cuda_fault     exit 0        5s  All tests passed (349 assertions in 5 test cases)
+fault_mgpu     exit 0       18s  All tests passed (961 assertions in 12 test cases)
+multi_gpu      exit 42     206s  test cases:     142 |     140 passed | 2 failed
+make: *** [Makefile:91: test_release] Error 1

@@ -1,0 +1,60 @@
+...............................................................................
+
+/opt/dlami/nvme/s5b-mgpu/wt-tip/test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp:225: warning:
+  dynamic-filter overlap test requires source-pool access from GPUs 1 and 2;
+  skipping
+
+0.538 s: IN-list peer copies fan out to three GPUs before publication
+Running: dynamic-filter replica transfer borrows fixed blocks from a Sirius HOST space
+0.361 s: dynamic-filter replica transfer borrows fixed blocks from a Sirius HOST space
+Running: Bloom replica built on GPU 0 has no false negatives on GPU 1
+0.348 s: Bloom replica built on GPU 0 has no false negatives on GPU 1
+Running: zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
+0.364 s: zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
+Running: small IN-list replica built on GPU 0 computes an exact mask on GPU 1
+0.351 s: small IN-list replica built on GPU 0 computes an exact mask on GPU 1
+Running: scan receipt identity survives real cross-GPU replacements
+0.180 s: scan receipt identity survives real cross-GPU replacements
+Running: operator-data provenance survives cross-GPU preparation and OOM rescheduling
+0.169 s: operator-data provenance survives cross-GPU preparation and OOM rescheduling
+Running: lock_or_prepare_batch cross-GPU returns a clone and leaves the source in place
+0.176 s: lock_or_prepare_batch cross-GPU returns a clone and leaves the source in place
+Running: lock_or_prepare_batch cross-GPU does not block on concurrent readers
+0.167 s: lock_or_prepare_batch cross-GPU does not block on concurrent readers
+Running: LIST columns survive a cross-GPU clone with INT32 offsets
+0.174 s: LIST columns survive a cross-GPU clone with INT32 offsets
+Running: prepare_for_processing rebinds idle batches to the prepared clones
+0.169 s: prepare_for_processing rebinds idle batches to the prepared clones
+Running: bytes_to_materialize_input counts cross-GPU inputs for the target space
+0.188 s: bytes_to_materialize_input counts cross-GPU inputs for the target space
+Running: single-consumer source is freed promptly after a cross-GPU prepare
+0.178 s: single-consumer source is freed promptly after a cross-GPU prepare
+Running: cached scan assigned away from its pin clones and reserves on the target GPU
+0.180 s: cached scan assigned away from its pin clones and reserves on the target GPU
+Running: a migrated final PARTITION accounts merge scratch in task history
+0.367 s: a migrated final PARTITION accounts merge scratch in task history
+0.376 s: a migrated final PARTITION accounts merge scratch in task history
+Running: scheduler error drain joins collecting and publishing PARTITION tasks before reuse
+0.845 s: scheduler error drain joins collecting and publishing PARTITION tasks before reuse
+0.819 s: scheduler error drain joins collecting and publishing PARTITION tasks before reuse
+Running: optional publication scratch OOM deposits without rescheduling the PARTITION task
+0.370 s: optional publication scratch OOM deposits without rescheduling the PARTITION task
+0.374 s: optional publication scratch OOM deposits without rescheduling the PARTITION task
+Running: publication scratch allocation failure retires ordinary-pool partials
+0.355 s: publication scratch allocation failure retires ordinary-pool partials
+Running: Task scheduler dispatches tasks with device preference
+0.391 s: Task scheduler dispatches tasks with device preference
+Running: consumer passes a batch on another device through without filtering or claims
+0.354 s: consumer passes a batch on another device through without filtering or claims
+Running: telemetry_context nests threads under per-GPU device groups
+0.387 s: telemetry_context nests threads under per-GPU device groups
+Running: pinned_column_chunk_views rejects chunks on a different GPU
+0.460 s: pinned_column_chunk_views rejects chunks on a different GPU
+===============================================================================
+test cases:     142 |     140 passed | 2 failed
+assertions: 5659726 | 5659724 passed | 2 failed
+
+Stopping after the failed multi_gpu step
+
+Unit test summary (logs in /opt/dlami/nvme/s5b-mgpu/wt-tip/build/release/test/cpp/log/<process>/):
+multi_gpu      exit 42     199s  test cases:     142 |     140 passed | 2 failed
