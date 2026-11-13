@@ -70,7 +70,7 @@ step_hardware() {
     echo '```'
     nvidia-smi -L
     nvidia-smi --query-gpu=index,name,memory.total,pci.bus_id,pcie.link.gen.max,pcie.link.width.max,clocks.max.sm,persistence_mode,driver_version --format=csv
-    nvidia-smi | head -4 | tail -2
+    nvidia-smi | sed -n 3,4p
     echo '```'
     echo
     echo '## PCIe topology (`nvidia-smi topo -m`)'

@@ -28,7 +28,7 @@ check_sizes() {
   local path="$1" big
   big="$(find "$path" -type f -size +"${MAX_FILE_BYTES}"c -printf '%s %p\n')"
   [[ -z "$big" ]] || s5b_die "files above $((MAX_FILE_BYTES / 1024 / 1024)) MiB (keep results small):"$'\n'"$big"
-  if find "$path" -type f \( -name '*.log' -o -name '*.log.gz' -o -name 'sirius_*' \) | grep -q .; then
+  if find "$path" -type f \( -name '*.log' -o -name '*.log.gz' -o -name 'sirius_*.log*' \) | grep -q .; then
     s5b_die "raw log files under $path; results keep only excerpts"
   fi
 }

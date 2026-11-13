@@ -61,7 +61,7 @@ def probe(build: str, gpus: int) -> dict[str, str]:
                 ".mode trash",
                 f"SET sirius_log_dir = {duck.sql_string(str(directory / 'pin'))};",
                 *duck.pin_statements(nation),
-                "SELECT count(*) FROM nation;",
+                "SELECT sum(n_nationkey) FROM nation;",
                 f"SET sirius_log_dir = {duck.sql_string(str(directory / 'end'))};",
             ]
         )
