@@ -143,6 +143,10 @@ def fold_cells(args: argparse.Namespace, gpus: int) -> list[session.Cell]:
             ),
             ("enable_dynamic_filter", "true" if filters == "on" else "false"),
         )
+        # Optional fixed Bloom Filter budget per GPU for every cell (local.env), SET explicitly.
+        bloom_bytes = os.environ.get("S5B_MAX_BLOOM_BYTES_PER_GPU")
+        if bloom_bytes:
+            settings += (("max_dynamic_filter_bloom_bytes_per_gpu", str(int(bloom_bytes))),)
         cells.append(
             session.Cell(
                 cell_label(experiment, divisor, policy, filters),
