@@ -372,6 +372,10 @@ class Sessions(unittest.TestCase):
         self.assertEqual(text.count("SELECT 1;"), 4)
         self.assertEqual(text.count("@@S5B "), 4)
         self.assertEqual(text.count(".once "), 2)  # warm pass only
+        # `.once` redirects only the next shell command, so the query must follow it directly.
+        for at, line in enumerate(lines):
+            if line.startswith(".once "):
+                self.assertEqual(lines[at + 1], "SELECT 1;")
         self.assertIn("SET enable_dynamic_filter = true;", text)
 
     def test_pin_glob_matches_the_view_file_list(self):

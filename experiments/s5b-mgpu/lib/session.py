@@ -182,9 +182,11 @@ def script(
         else:
             lines.append(".mode trash")
         lines.append(f".print {formats.STEP_MARKER} {step.index}")
+        lines.append(".timer on 6")
+        # `.once` applies to the next shell command, dot-commands included: it must come last.
         if step.pass_ == 0:
             lines.append(f'.once "{result_csv(directory, step.cell, step.query)}"')
-        lines += [".timer on 6", query_texts[step.query], ".timer off"]
+        lines += [query_texts[step.query], ".timer off"]
     # Switching the sink once more closes and flushes the last run's log file.
     lines.append(f"SET sirius_log_dir = {duck.sql_string(str(directory / 'end'))};")
     return "\n".join(lines) + "\n"
