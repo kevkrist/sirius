@@ -169,7 +169,7 @@ TEST_CASE("operator option messages", "[config][config_operator]")
   REQUIRE(
     read_error("sirius:\n  operator_params:\n    max_dynamic_filter_bloom_bytes_per_gpu: ~\n") ==
     "'sirius.operator_params.max_dynamic_filter_bloom_bytes_per_gpu': removed; the Bloom budget "
-    "is always 4x scan_task_batch_size; remove this key");
+    "is derived from scan_task_batch_size and max_build_hash_table_bytes; remove this key");
   REQUIRE(
     read_error("sirius:\n  operator_params:\n    enable_dynamic_filter_multi_partition: true\n") ==
     "'sirius.operator_params.enable_dynamic_filter_multi_partition': removed; every build "
