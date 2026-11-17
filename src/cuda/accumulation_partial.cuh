@@ -17,7 +17,8 @@
 /**
  * @file accumulation_partial.cuh
  * @brief The per-GPU storage shared by the build-filter accumulators: `accumulated_bloom_builder`,
- * `exact_key_stager`, and `bounds_accumulator`.
+ * `exact_key_stager`, and `bounds_accumulator` (for Bloom filters, IN-lists, and zone maps,
+ * respectively).
  *
  * Each accumulator keeps one `accumulation_partial` per replica GPU: arrays leased on the untracked
  * creator thread, and an exclusive stream that orders every later use and every free of them.
@@ -59,8 +60,8 @@ struct accumulation_partial {
   cucascade::memory::memory_space const* host_space;
   int device_id;
   std::shared_ptr<rmm::cuda_stream> stream;
-  std::vector<std::unique_ptr<rmm::device_buffer>> arrays;  // Null for an array of no bytes
-  std::optional<cuda_event> init;  // Recorded after allocation; every contribution waits on it.
+  std::vector<std::unique_ptr<rmm::device_buffer>> arrays;  ///< Null for an array of no bytes
+  std::optional<cuda_event> init;  ///< Recorded after allocation; every contribution waits on it.
   std::atomic<bool> contributed{false};
   std::atomic<bool> const* leak_storage;
 
@@ -100,7 +101,7 @@ struct accumulation_partial {
   }
 
   /**
-   * @brief Makes @p contribution wait for this partial's allocation, runs @p enqueue on it, and
+   * @brief Makes `contribution` wait for this partial's allocation, runs `enqueue` on it, and
    * folds its completion into this partial's stream.
    *
    * The caller wraps the call in `join_on_failure`.
@@ -130,10 +131,10 @@ struct accumulation_partial {
 };
 
 /**
- * @brief Creates one partial per distinct GPU of @p targets, each holding one array of
+ * @brief Creates one partial per distinct GPU of `targets`, each holding one array of
  * `array_bytes[i]` bytes per entry, under a single exact lease per GPU.
  *
- * Arrays of zero bytes stay null and take no lease. With @p zero_fill, every array is zeroed on its
+ * Arrays of zero bytes stay null and take no lease. With `zero_fill`, every array is zeroed on its
  * partial's stream. Nothing waits on the host. The calling thread must hold no allocation tracker
  * for those GPUs.
  *
@@ -184,7 +185,7 @@ lease_partials(std::span<dynamic_filter_replica_space const> targets,
 }
 
 /**
- * @brief The partial of @p partials on @p device_id, or null.
+ * @brief The partial of `partials` on `device_id`, or null.
  */
 [[nodiscard]] inline accumulation_partial* find_partial(
   std::span<std::unique_ptr<accumulation_partial> const> partials, int device_id) noexcept
