@@ -29,6 +29,6 @@ inline constexpr double default_dynamic_filter_domain_coverage_threshold = 0.9;
  * @brief Default per-GPU cap on one join's accumulated Bloom arrays
  * (`max_dynamic_filter_bloom_bytes_per_gpu`).
  */
-inline constexpr std::uint64_t default_max_dynamic_filter_bloom_bytes_per_gpu = 256ULL << 20;
+inline constexpr std::uint64_t default_max_dynamic_filter_bloom_bytes_per_gpu = 1ULL << 30;
 
 }  // namespace sirius::op

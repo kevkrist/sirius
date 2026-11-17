@@ -852,13 +852,13 @@ TEST_CASE("the dynamic-filter Bloom budget preserves its default and parses byte
   }
 
   sirius_config cfg;
-  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == 256ULL * 1024 * 1024);
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == (1ULL << 30));
   cfg.load_from_file(path);
   CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == expected_bytes);
   CHECK(cfg.get_operator_params().enable_dynamic_filter);
   CHECK(cfg.get_operator_params().dynamic_filter_domain_coverage_threshold == Approx(0.9));
   cfg.apply_defaults();
-  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == 256ULL * 1024 * 1024);
+  CHECK(cfg.get_operator_params().max_dynamic_filter_bloom_bytes_per_gpu == (1ULL << 30));
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

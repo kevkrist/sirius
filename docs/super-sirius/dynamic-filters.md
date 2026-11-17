@@ -313,7 +313,7 @@ The settings live under `sirius.operator_params`:
 | Setting | Default | Meaning |
 |---|---:|---|
 | `enable_dynamic_filter` | `true` | Enable key discovery, membership publication, scan targets, and join-edge endpoints |
-| `max_dynamic_filter_bloom_bytes_per_gpu` | 256 MiB | Per-GPU cap on one join's Bloom arrays (the sum over Bloom keys of each array rounded up to 256 bytes), applied to every build; must be greater than zero |
+| `max_dynamic_filter_bloom_bytes_per_gpu` | 1 GiB | Per-GPU cap on one join's Bloom arrays (the sum over Bloom keys of each array rounded up to 256 bytes), applied to every build; must be greater than zero |
 | `enable_dynamic_zone_map_filter` | `false` | Also emit a global min/max filter; requires dynamic filters |
 | `dynamic_filter_domain_coverage_threshold` | `0.9` | Skip an eligible key at or above this known row-domain coverage; values above `1.0` disable the gate |
 | `dynamic_filter_inlist_max_l2_fraction` | `0.125` | Maximum fraction of the smallest probe-GPU L2 used by the hash IN-list estimate |
