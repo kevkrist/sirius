@@ -305,7 +305,8 @@ struct operator_options : block_base<operator_options> {
               "removed; runtime distinct build probing is an internal join policy (temporarily "
               "disabled pending issue #1600); remove this key"),
       removed("max_dynamic_filter_bloom_bytes_per_gpu",
-              "removed; the Bloom budget is always 4x scan_task_batch_size; remove this key"),
+              "removed; the Bloom budget is derived from scan_task_batch_size and "
+              "max_build_hash_table_bytes; remove this key"),
       removed("enable_dynamic_filter_multi_partition",
               "removed; every build constructs its dynamic filters, governed by "
               "enable_dynamic_filter; remove this key"),
