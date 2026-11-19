@@ -41,6 +41,8 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/eager_probe_throttle.hpp"
+#include "op/scan/dynamic_filter_merge.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/key_preparation.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -935,6 +937,35 @@ int eager_env(char const* name, int fallback)
   auto const* value = std::getenv(name);
   return value ? std::atoi(value) : fallback;
 }
+
+// PROTO S6 gate. Collects the scans that releasing a probe side starts: the walk the task creator
+// makes from the probe head. A lower hash join releases its own probe side later (its own gate),
+// so only its build side is followed (the build goes first).
+void eager_collect_started_scans(sirius_physical_operator* op,
+                                 std::vector<scan::sirius_gpu_scan_operator*>& out,
+                                 int depth)
+{
+  if (op == nullptr || depth > 64) { return; }
+  if (op->type == SiriusPhysicalOperatorType::GPU_SCAN) {
+    out.push_back(static_cast<scan::sirius_gpu_scan_operator*>(op));
+    return;
+  }
+  auto const follow = [&](sirius_physical_operator::port const* port) {
+    if (port == nullptr || !port->src_pipeline || port->src_pipeline->is_pipeline_finished()) {
+      return;
+    }
+    auto operators = port->src_pipeline->get_operators();
+    if (operators.empty() || &operators[0].get() == op) { return; }
+    eager_collect_started_scans(&operators[0].get(), out, depth + 1);
+  };
+  if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
+    follow(op->try_get_port("build"));
+    return;
+  }
+  for (auto const& port : op->get_ports()) {
+    follow(port.get());
+  }
+}
 }  // namespace
 
 void sirius_physical_hash_join::activate_probe_after_build_partition(
@@ -943,6 +974,14 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
   try {
     static int const mode         = eager_env("SIRIUS_EAGER_PROBE", 0);
     static int const concat_first = eager_env("SIRIUS_EAGER_CONCAT_FIRST", 1);
+    // Gate on dynamic-filter producers (besides this join's own session, always required):
+    // 0 = none (first prototype: other producers are terminal by induction),
+    // 1 = S6 literal: every Relevant Producer (every producer on a channel this join publishes
+    //     to, including producers held by other joins) is Terminal,
+    // 2 = every scan this activation starts has a Terminal channel (all its filters are visible).
+    static int const gate = eager_env("SIRIUS_EAGER_GATE", 0);
+    // Memory Admission placeholder: 0 = off, N > 0 = every GPU must have N GiB available.
+    static int const admit_gib = eager_env("SIRIUS_EAGER_ADMIT_GIB", 0);
     if (mode == 0) { return; }
     if (_join_mode != HASH_JOIN_MODE::BUILD_PROBE || join_type == duckdb::JoinType::MARK ||
         is_right_family()) {
@@ -960,18 +999,64 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
     auto const pipeline = get_pipeline();
     auto* const creator = pipeline ? pipeline->get_task_creator() : nullptr;
     if (!creator) { return; }
-    if (_eager_probe_activated.exchange(true, std::memory_order_acq_rel)) { return; }
+    if (_eager_probe_activated.load(std::memory_order_acquire)) { return; }
     auto* probe_head = &probe_port->src_pipeline->get_operators()[0].get();
-    eager_throttle::build_move_begin(_eager_move_state);
-    if (concat_first != 0 && build_concat != nullptr) { creator->schedule(build_concat); }
-    creator->schedule(probe_head);
-    SIRIUS_LOG_INFO("[eager] join {} probe activated {} (filter_plan={}, session_terminal={}, "
-                    "concat_first={})",
+
+    // Relevant Producers (S6 literal).
+    std::size_t relevant_channels = 0;
+    std::size_t relevant_pending  = 0;
+    for (auto const& target : session.plan().probe_targets()) {
+      if (!target.filter_set) { continue; }
+      ++relevant_channels;
+      if (!target.filter_set->snapshot().terminal()) { ++relevant_pending; }
+    }
+    // Scans this activation starts, and their channels.
+    std::vector<scan::sirius_gpu_scan_operator*> started;
+    eager_collect_started_scans(probe_head, started, 0);
+    std::size_t started_filtered = 0;
+    std::size_t started_pending  = 0;
+    for (auto const* scan_op : started) {
+      auto const& consumer = scan_op->consumer();
+      if (!consumer || !consumer->channel()) { continue; }
+      ++started_filtered;
+      if (!consumer->channel()->snapshot().terminal()) { ++started_pending; }
+    }
+    // Memory Admission placeholder: available bytes of the tightest GPU.
+    double min_avail_gib = -1.0;
+    for (auto const* space :
+         creator->eager_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      auto const gib = static_cast<double>(space->get_available_memory()) / (1024.0 * 1024 * 1024);
+      if (min_avail_gib < 0 || gib < min_avail_gib) { min_avail_gib = gib; }
+    }
+    bool const producers_ok =
+      gate == 1 ? relevant_pending == 0 : (gate == 2 ? started_pending == 0 : true);
+    bool const memory_ok = admit_gib <= 0 || min_avail_gib >= static_cast<double>(admit_gib);
+    bool const go        = producers_ok && memory_ok;
+    if (go && _eager_probe_activated.exchange(true, std::memory_order_acq_rel)) { return; }
+    if (go) {
+      eager_throttle::build_move_begin(_eager_move_state);
+      if (concat_first != 0 && build_concat != nullptr) { creator->schedule(build_concat); }
+      creator->schedule(probe_head);
+    }
+    SIRIUS_LOG_INFO("[eager] join {} probe {} {} (filter_plan={}, session_terminal={}, "
+                    "concat_first={}, gate={}, relevant_channels={}, relevant_pending={}, "
+                    "started_scans={}, started_filtered={}, started_pending={}, "
+                    "min_gpu_avail_gib={:.1f}, admit_gib={}, memory_ok={})",
                     get_operator_id(),
+                    go ? "activated" : "held",
                     build_concat != nullptr ? "at build PARTITION finalize" : "after deferred publication",
                     has_plan,
                     terminal,
-                    concat_first);
+                    concat_first,
+                    gate,
+                    relevant_channels,
+                    relevant_pending,
+                    started.size(),
+                    started_filtered,
+                    started_pending,
+                    min_avail_gib,
+                    admit_gib,
+                    memory_ok);
   } catch (std::exception const& e) {
     SIRIUS_LOG_ERROR("[eager] join {}: early probe activation failed: {}", get_operator_id(), e.what());
   } catch (...) {

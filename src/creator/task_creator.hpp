@@ -224,6 +224,11 @@ class task_creator {
    * @param info The task creation info to schedule.
    */
   virtual void schedule(op::sirius_physical_operator* request);
+  /// PROTOTYPE (eager probe): Memory Admission placeholder reads the GPU spaces.
+  [[nodiscard]] sirius::memory::sirius_memory_reservation_manager& eager_memory_manager() noexcept
+  {
+    return _mem_res_mgr;
+  }
 
   /// \brief Overload for callers that already know the query; avoids re-deriving it.
   void schedule(op::sirius_physical_operator* request, sirius::query_id_t query_id);

@@ -24,6 +24,7 @@
 #include "memory/defragmenter_oom_policy.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/eager_probe_throttle.hpp"
+#include <cstdlib>
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "creator/task_creator.hpp"
@@ -752,7 +753,14 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
   }
   // PROTOTYPE (eager probe): optionally hold back scan tasks while an overlapped build move runs.
   op::eager_throttle::scan_slot eager_scan_slot;
-  if (op::eager_throttle::limit() > 0 && source_op && requested_memory_space != nullptr) {
+  // Scan tasks only by default; SIRIUS_EAGER_THROTTLE_ALL=1 restores the first version, which
+  // counted every task (the build CONCAT's own tasks included).
+  static bool const eager_throttle_all = [] {
+    auto const* text = std::getenv("SIRIUS_EAGER_THROTTLE_ALL");
+    return text != nullptr && std::atoi(text) != 0;
+  }();
+  if (op::eager_throttle::limit() > 0 && source_op && requested_memory_space != nullptr &&
+      (eager_throttle_all || source_op->type == op::SiriusPhysicalOperatorType::GPU_SCAN)) {
     eager_scan_slot.device =
       op::eager_throttle::scan_acquire(requested_memory_space->get_device_id())
         ? requested_memory_space->get_device_id()
