@@ -23,7 +23,10 @@
 
 #include <compression/decompression_pushdown_policy.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cuda_runtime_api.h>
+
 #include <data/sirius_converter_registry.hpp>
+#include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -95,7 +98,22 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
                                 std::uint32_t const* prior_mask_words,
                                 ::cuda::stream_ref stream,
                                 rmm::device_async_resource_ref mr) {
-         return applicable->compute_mask(keys, prior_mask_words, use_current_device, stream, mr);
+         auto mask =
+           applicable->compute_mask(keys, prior_mask_words, use_current_device, stream, mr);
+         if (!mask) {
+           int device = -1;
+           (void)cudaGetDevice(&device);
+           SIRIUS_LOG_DEBUG(
+             "[df_gate] decode-probe DECLINED filter@{} kind={} key_type={} rows={} device={} "
+             "available_on_device={}",
+             reinterpret_cast<std::uintptr_t>(f.get()) & 0xffffff,
+             static_cast<int>(f->kind()),
+             static_cast<int>(keys.type().id()),
+             keys.size(),
+             device,
+             f->is_available_on_device(device));
+         }
+         return mask;
        },
        0,
        order + 1,

@@ -53,6 +53,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -439,6 +440,32 @@ struct static_selectivity {
   return {};
 }
 
+/// PROTO(op2) diagnostic: one-token description of a filter for the gate-state DEBUG lines.
+[[nodiscard]] std::string describe_filter(sirius::op::sirius_dynamic_filter const& filter)
+{
+  std::string out;
+  if (auto const* small =
+        dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(&filter)) {
+    out = "small_in_list:" + std::to_string(small->size());
+  } else if (auto const* set =
+               dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(&filter)) {
+    out = "hash_in_list:" + std::to_string(set->size());
+  } else if (auto const* bloom =
+               dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(&filter)) {
+    out = "bloom:" + std::to_string(bloom->storage_bytes());
+  } else {
+    out = "other";
+  }
+  out += "@" + std::to_string(reinterpret_cast<std::uintptr_t>(&filter) & 0xffffff);
+  if (auto const est = filter.estimated_selectivity()) { out += " est=" + std::to_string(*est); }
+  return out;
+}
+
+[[nodiscard]] std::string keep_text(std::optional<double> const& keep)
+{
+  return keep ? std::to_string(*keep) : std::string{"?"};
+}
+
 struct candidate {
   applied_entry identity;
   cudf::size_type column_index;
@@ -532,6 +559,17 @@ std::unique_ptr<application_program_state> prepare_state(
   if (input.source.num_rows() == 0 || input.source.num_columns() == 0) { return nullptr; }
   gate_selection selection{};
   auto candidates = capture_candidates(snapshot, gate, input.bindings, selection);
+  SIRIUS_LOG_DEBUG(
+    "[df_gate] endpoint ch={} gen={} rows={} candidates={} applicable={} needs_combined={} "
+    "decode_trains={} history_known={}",
+    static_cast<void const*>(endpoint.get()),
+    snapshot.generation(),
+    input.source.num_rows(),
+    candidates.size(),
+    selection.applicable,
+    selection.needs_combined_sample,
+    selection.decode_trains,
+    history_known);
   if (!selection.applicable) { return nullptr; }
   auto program              = std::make_unique<application_program_state>();
   program->snapshot         = std::move(snapshot);
@@ -559,6 +597,19 @@ std::unique_ptr<application_program_state> prepare_state(
     if (covered_by(program->receipt.applied) ||
         !current.identity.filter->is_available_on_device(program->device_id) ||
         !accepts_carrier(*current.identity.filter, program->types[current.column_index])) {
+      SIRIUS_LOG_DEBUG(
+        "[df_gate] endpoint ch={} gen={} rows={} filter=[{}] ord={} col={} decision=skip reason={}",
+        static_cast<void const*>(endpoint.get()),
+        program->snapshot.generation(),
+        program->rows,
+        describe_filter(*current.identity.filter),
+        current.identity.output_ordinal,
+        current.column_index,
+        covered_by(program->receipt.applied)
+          ? "already_applied"
+          : (!current.identity.filter->is_available_on_device(program->device_id)
+               ? "no_replica_on_device"
+               : "carrier_type"));
       continue;
     }
     auto const* mask =
@@ -577,7 +628,19 @@ std::unique_ptr<application_program_state> prepare_state(
       if (!representative || in_normal_order(*alias, *representative)) { representative = alias; }
       represented.push_back(alias->identity);
     }
-    if (!representative) { continue; }
+    if (!representative) {
+      SIRIUS_LOG_DEBUG(
+        "[df_gate] endpoint ch={} gen={} rows={} filter=[{}] ord={} col={} decision=skip "
+        "reason=measured_weak keep={}",
+        static_cast<void const*>(endpoint.get()),
+        program->snapshot.generation(),
+        program->rows,
+        describe_filter(*current.identity.filter),
+        current.identity.output_ordinal,
+        current.column_index,
+        keep_text(current.expected_keep));
+      continue;
+    }
     selected_step step{
       .identity      = representative->identity,
       .column_index  = current.column_index,
@@ -615,8 +678,28 @@ std::unique_ptr<application_program_state> prepare_state(
       if (step.estimated_selectivity && survival < 1.0 &&
           survival * (1.0 - *step.estimated_selectivity) < k_negligible_removed_share) {
         program->sample_combined = false;
+        SIRIUS_LOG_DEBUG(
+          "[df_gate] endpoint ch={} gen={} rows={} filter=[{}] ord={} decision=skip "
+          "reason=negligible_removed_share survival={}",
+          static_cast<void const*>(endpoint.get()),
+          program->snapshot.generation(),
+          program->rows,
+          describe_filter(*step.identity.filter),
+          step.identity.output_ordinal,
+          survival);
         continue;
       }
+      SIRIUS_LOG_DEBUG(
+        "[df_gate] endpoint ch={} gen={} rows={} filter=[{}] ord={} decision=apply keep={} "
+        "sample={} decode_attached={}",
+        static_cast<void const*>(endpoint.get()),
+        program->snapshot.generation(),
+        program->rows,
+        describe_filter(*step.identity.filter),
+        step.identity.output_ordinal,
+        keep_text(step.expected_keep),
+        step.sample,
+        contains(program->receipt.decode_attached, step.identity));
       kept.push_back(step);
     }
     program->membership = std::move(kept);
@@ -1296,8 +1379,28 @@ decode_selection dynamic_filter_consumer::select_for_decode(std::span<binding co
   decode_selection result{_channel, snapshot.generation(), {}};
   // An undecided gate lets the decode apply the filters and measure them; waiting for a clean
   // endpoint sample instead would leave every batch decoded before that sample unfiltered.
+  SIRIUS_LOG_DEBUG(
+    "[df_gate] decode ch={} gen={} bound={} applicable={} needs_combined={} decode_trains={}",
+    static_cast<void const*>(_channel.get()),
+    snapshot.generation(),
+    candidates.size(),
+    selection.applicable,
+    selection.needs_combined_sample,
+    selection.decode_trains);
   if (!selection.applicable || (selection.needs_combined_sample && !selection.decode_trains)) {
     return result;
+  }
+  for (auto const& current : candidates) {
+    auto const weak =
+      current.expected_keep && skip_measured_filter(*current.expected_keep, std::nullopt);
+    SIRIUS_LOG_DEBUG("[df_gate] decode ch={} gen={} filter=[{}] ord={} col={} keep={} decision={}",
+                     static_cast<void const*>(_channel.get()),
+                     snapshot.generation(),
+                     describe_filter(*current.identity.filter),
+                     current.identity.output_ordinal,
+                     current.column_index,
+                     keep_text(current.expected_keep),
+                     weak ? "skip_measured_weak" : "attach");
   }
   auto const bound_entries = candidates.size();
   for (auto& current : candidates) {
@@ -1335,6 +1438,13 @@ void dynamic_filter_consumer::record_decode_keep_ratio(std::size_t rows_before,
                                                        std::size_t generation,
                                                        bool complete) noexcept
 {
+  SIRIUS_LOG_DEBUG("[df_gate] decode-combined ch={} gen={} rows={}->{} keep={} complete={}",
+                   static_cast<void const*>(_channel.get()),
+                   generation,
+                   rows_before,
+                   rows_after,
+                   rows_before ? static_cast<double>(rows_after) / rows_before : 0.0,
+                   complete);
   _gate.record_decode_keep_ratio(rows_before, rows_after, generation, complete);
 }
 
@@ -1343,6 +1453,14 @@ void dynamic_filter_consumer::record_decode_filter_keep_ratio(applied_entry cons
                                                               std::size_t rows_after,
                                                               std::size_t generation) noexcept
 {
+  SIRIUS_LOG_DEBUG("[df_gate] decode-probe ch={} gen={} filter=[{}] ord={} rows={}->{} keep={}",
+                   static_cast<void const*>(_channel.get()),
+                   generation,
+                   describe_filter(*filter.filter),
+                   filter.output_ordinal,
+                   rows_before,
+                   rows_after,
+                   rows_before ? static_cast<double>(rows_after) / rows_before : 0.0);
   if (rows_before == 0 || rows_after > rows_before) { return; }
   _gate.record_filter_keep_ratio({filter.filter.get(), filter.output_ordinal},
                                  static_cast<double>(rows_after) / static_cast<double>(rows_before),
@@ -1691,6 +1809,12 @@ void dynamic_filter_gate::record_filter_keep_ratio(bound_filter_key filter,
       return;
     }
     _filter_keep_ratios.insert_or_assign(filter, filter_measurement{kept, observed_filter_count});
+    SIRIUS_LOG_DEBUG("[df_gate] gate={} marginal filter@{} ord={} keep={} gen={}",
+                     static_cast<void const*>(this),
+                     reinterpret_cast<std::uintptr_t>(filter.filter) & 0xffffff,
+                     filter.output_ordinal,
+                     kept,
+                     observed_filter_count);
   } catch (...) {
     // Optional hints cannot invalidate an already constructed output.
   }
@@ -1731,6 +1855,12 @@ void dynamic_filter_gate::record_decode_keep_ratio(std::size_t rows_before,
     std::scoped_lock decision_lock(_decision_mu);
     if (_state.load(std::memory_order_relaxed) != state::UNKNOWN) { return; }
     auto const kept = static_cast<double>(rows_after) / static_cast<double>(rows_before);
+    SIRIUS_LOG_DEBUG("[df_gate] gate={} decode-combined keep={} complete={} gen={} state={}",
+                     static_cast<void const*>(this),
+                     kept,
+                     complete,
+                     observed_filter_count,
+                     kept <= _keep_threshold ? "ACTIVE" : (complete ? "DISABLED" : "UNDECIDED"));
     if (kept <= _keep_threshold || complete) {
       _decided_filter_count.store(observed_filter_count, std::memory_order_relaxed);
       _state.store(kept > _keep_threshold ? state::DISABLED : state::ACTIVE,
@@ -1761,6 +1891,13 @@ void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
     _decided_filter_count.store(observed_filter_count, std::memory_order_relaxed);
     _state.store(kept > _keep_threshold ? state::DISABLED : state::ACTIVE,
                  std::memory_order_relaxed);
+    SIRIUS_LOG_DEBUG("[df_gate] gate={} endpoint-combined rows={}->{} keep={} gen={} state={}",
+                     static_cast<void const*>(this),
+                     rows_before,
+                     rows_after,
+                     kept,
+                     observed_filter_count,
+                     kept > _keep_threshold ? "DISABLED" : "ACTIVE");
   } catch (...) {
     // Failure to acquire optional decision state leaves its previous verdict intact.
   }
