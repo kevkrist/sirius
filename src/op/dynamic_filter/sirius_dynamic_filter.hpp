@@ -71,6 +71,10 @@ class sirius_dynamic_filter {
     return _estimated_selectivity;
   }
 
+  // PROTO(op2): whether the estimate comes from a build key with a uniqueness proof or declaration.
+  void set_estimate_reliable(bool value) noexcept { _estimate_reliable = value; }
+  [[nodiscard]] bool estimate_reliable() const noexcept { return _estimate_reliable; }
+
   [[nodiscard]] virtual sirius_dynamic_filter_kind kind() const = 0;
 
   [[nodiscard]] virtual bool is_available_on_device(int /*device_id*/) const noexcept
@@ -79,7 +83,8 @@ class sirius_dynamic_filter {
   }
 
  private:
-  bool _preserve_nulls = false;
+  bool _preserve_nulls    = false;
+  bool _estimate_reliable = false;
   std::optional<double> _estimated_selectivity;
 };
 

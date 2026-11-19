@@ -36,6 +36,7 @@
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
+#include <op/dynamic_filter/proto_op2.hpp>
 #include <op/scan/detail/read_retirement.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <telemetry/nvtx.hpp>
@@ -670,6 +671,12 @@ std::unique_ptr<application_program_state> prepare_state(
     for (auto const& step : program->membership) {
       double survival = 1.0;
       for (auto const& other : program->membership) {
+        // PROTO(op2): a stronger filter this batch's decode already applied has removed its rows
+        // from the batch, so the probe no longer covers them.
+        if (sirius::op::proto_op2::endpoint_apply() &&
+            contains(program->receipt.decode_attached, other.identity)) {
+          continue;
+        }
         if (other.estimated_selectivity && step.estimated_selectivity &&
             *other.estimated_selectivity < *step.estimated_selectivity) {
           survival *= *other.estimated_selectivity;

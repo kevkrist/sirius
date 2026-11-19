@@ -16,6 +16,8 @@
 
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 
+#include "op/dynamic_filter/proto_op2.hpp"
+
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/bloom_sizing.hpp"
@@ -683,6 +685,8 @@ struct dynamic_filter_publication_session::state {
             if (auto const selectivity = estimated_selectivity_of(
                   plan.admitted_keys()[built.admitted_key_index], key_rows)) {
               built.membership->set_estimated_selectivity(*selectivity);
+              built.membership->set_estimate_reliable(
+                plan.admitted_keys()[built.admitted_key_index].domain_gate_eligible());
             }
           }
         }
@@ -981,16 +985,68 @@ bool dynamic_filter_publication_session::begin(complete_build_inventory inventor
   };
   construction_plan planned;
   try {
+    // PROTO(op2): keys whose filters are not built. Dropping the key's bindings makes
+    // plan_construction pass over it.
+    auto key_bindings = binding_facts_of(plan);
+    auto const join   = operation.identity.operator_id;
+    for (std::size_t index = 0; index < plan.admitted_keys().size(); ++index) {
+      if (key_bindings[index].empty()) { continue; }
+      auto const& key = plan.admitted_keys()[index];
+      if (proto_op2::oracle_skip(join, key.planner_condition_index)) {
+        SIRIUS_LOG_DEBUG("[df_proto] skip join={} condition={} reason=oracle",
+                         join.value_or(0),
+                         key.planner_condition_index);
+        key_bindings[index].clear();
+        continue;
+      }
+      if (!proto_op2::shadow_skip()) { continue; }
+      auto const own = estimated_selectivity_of(key, inventory.total_rows());
+      if (!own || !key.domain_gate_eligible()) { continue; }
+      // Mirrors the endpoint's negligible-removed-share rule (dynamic_filter_merge.cpp) against
+      // the filters already on each target channel: skip only if every binding would skip it.
+      bool shadowed        = true;
+      std::size_t bound    = 0;
+      double weakest_cover = 0.0;
+      for (auto const& target : plan.probe_targets()) {
+        for (auto const& binding : target.key_bindings) {
+          if (binding.admitted_key_index != index) { continue; }
+          ++bound;
+          double survival = 1.0;
+          auto const snap = target.filter_set->snapshot();
+          for (auto const& [ordinal, filter] : snap.entries()) {
+            auto const other = filter->estimated_selectivity();
+            if (other && filter->estimate_reliable() && *other < *own) { survival *= *other; }
+          }
+          auto const removed = survival * (1.0 - *own);
+          weakest_cover      = std::max(weakest_cover, removed);
+          if (!(survival < 1.0 && removed < 0.10)) { shadowed = false; }
+        }
+      }
+      SIRIUS_LOG_DEBUG(
+        "[df_proto] shadow join={} condition={} rows={} own_est={} bindings={} "
+        "max_removed_share={} decision={}",
+        join.value_or(0),
+        key.planner_condition_index,
+        inventory.total_rows(),
+        *own,
+        bound,
+        weakest_cover,
+        shadowed && bound != 0 ? "skip" : "build");
+      if (shadowed && bound != 0) { key_bindings[index].clear(); }
+    }
+    auto const proto_bloom_keys = proto_op2::oracle_bloom_keys(join);
     planned = plan_construction(inventory.facts(),
                                 plan.admitted_keys(),
-                                binding_facts_of(plan),
+                                key_bindings,
                                 {.l2_bytes                  = device_l2_cache_bytes(replicas),
                                  .inlist_max_l2_fraction    = plan.inlist_max_l2_fraction(),
                                  .emit_zone_map_filters     = plan.emit_zone_map_filters(),
                                  .domain_coverage_threshold = plan.domain_coverage_threshold(),
                                  .max_bloom_bytes_per_gpu   = plan.max_bloom_bytes_per_gpu(),
                                  .bloom_only                = plan.policy().bloom_only,
-                                 .fixed_bloom_keys          = plan.policy().fixed_bloom_keys});
+                                 .fixed_bloom_keys          = proto_bloom_keys != 0
+                                                                ? proto_bloom_keys
+                                                                : plan.policy().fixed_bloom_keys});
     // An empty build publishes nothing, so no filter is planned for it, unless a cross-rank merge
     // waits on this process's part
     // (`dynamic_filter_publication_policy::publish_when_empty_or_drained`).

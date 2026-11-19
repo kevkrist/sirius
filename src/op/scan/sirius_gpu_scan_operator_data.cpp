@@ -27,7 +27,9 @@
 
 #include <data/sirius_converter_registry.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/proto_op2.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
+#include <op/scan/dynamic_filter_gate.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <pipeline/batch_lock_utils.hpp>
@@ -506,8 +508,22 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
   pushdown_filter_only_columns_dropped = outcome.filter_only_columns_dropped;
   pushdown_predicate_columns           = outcome.predicate_columns;
   pushdown_predicates_enforced         = outcome.predicates_enforced;
+  // PROTO(op2): a decode that gave compaction up because every join filter it carried was weak
+  // says nothing about the filters it did not carry. The gate stops attaching the weak ones, so
+  // the next decode carries a different set and decides again.
+  bool const weak_probes_only =
+    sirius::op::proto_op2::latch_fix() && outcome.membership_keep &&
+    !outcome.membership_keep->complete && !outcome.membership_keep->probes.empty() &&
+    std::ranges::all_of(outcome.membership_keep->probes, [](auto const& probe) {
+      return probe.rows_before != 0 &&
+             sirius::op::scan::dynamic_filter_gate::filter_skippable(
+               static_cast<double>(probe.rows_after) / static_cast<double>(probe.rows_before));
+    });
   if (pushdown_selection_unprofitable && outcome.selection_unprofitable) {
-    pushdown_selection_unprofitable->store(true, std::memory_order_relaxed);
+    SIRIUS_LOG_DEBUG("[df_gate] decode gave compaction up: latch={}", !weak_probes_only);
+    if (!weak_probes_only) {
+      pushdown_selection_unprofitable->store(true, std::memory_order_relaxed);
+    }
   }
   // The decode consumed the mask: clear it, since re-applying selects wrong rows and clearing
   // re-enables the zero-copy steal in prepare_for_processing.
