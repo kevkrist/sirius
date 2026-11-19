@@ -52,8 +52,10 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -208,6 +210,109 @@ TEST_CASE("dynamic-filter replicas require destination reservation admission",
     stream.sync();
     require_omitted(filter);
   }
+}
+
+// PROTOTYPE [xfer-PR] gate: with SIRIUS_PROTO_XFER_D2D on, a replica that cannot peer-copy from
+// the source GPU is relayed from a completed replica of its own island. Every GPU's mask must be
+// identical to the mask of the direct (switch off) replicas: for the exact kinds that is the exact
+// key set, for the Bloom filter it includes every false positive.
+TEST_CASE("PROTOTYPE xfer-d2d relayed replicas match direct replicas on every GPU",
+          "[dynamic_filter][mgpu][replica][xfer_relay][multi_gpu]")
+{
+  constexpr std::size_t device_count = 4;
+  if (!sirius::test::has_gpus(device_count)) { return; }
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager(device_count);
+  auto replica_spaces = get_replica_spaces(*memory_manager, device_count);
+  constexpr cudf::size_type probe_rows = 700000;
+  enum class kind { hash_in_list, small_in_list, bloom };
+  auto const relayed_before = sirius::op::detail::replica_relay::relayed_copies().load();
+  std::size_t compared = 0;
+  for (auto const root : {0, 3}) {
+    for (auto const which : {kind::hash_in_list, kind::small_in_list, kind::bloom}) {
+      std::vector<std::vector<std::uint8_t>> reference;  // Switch off, per GPU
+      for (auto const* mode : {"off", "exchange"}) {
+        REQUIRE(setenv("SIRIUS_PROTO_XFER_D2D", mode, 1) == 0);
+        auto const key_count = which == kind::small_in_list ? cudf::size_type{7}
+                                                            : cudf::size_type{200000};
+        std::unique_ptr<sirius::op::sirius_dynamic_filter> filter;
+        sirius::op::sirius_mask_applicable const* masks = nullptr;
+        {
+          rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{root}};
+          auto const& build_space =
+            replica_spaces[static_cast<std::size_t>(root)].get_gpu_space();
+          auto const stream = build_space.acquire_stream();
+          auto keys         = cudf::sequence(key_count,
+                                             cudf::numeric_scalar<std::int64_t>(0, true, stream),
+                                             cudf::numeric_scalar<std::int64_t>(3, true, stream),
+                                             stream,
+                                             build_space.get_default_allocator());
+          auto const mr = build_space.get_default_allocator();
+          if (which == kind::hash_in_list) {
+            auto made =
+              std::make_unique<sirius::op::sirius_dynamic_in_list_filter>(keys->view(), stream, mr);
+            stream.sync();
+            made->replicate_to_devices(replica_spaces);
+            masks  = made.get();
+            filter = std::move(made);
+          } else if (which == kind::small_in_list) {
+            auto made = std::make_unique<sirius::op::sirius_dynamic_small_in_list_filter>(
+              keys->view(), stream, mr);
+            stream.sync();
+            made->replicate_to_devices(replica_spaces);
+            masks  = made.get();
+            filter = std::move(made);
+          } else {
+            auto made =
+              std::make_unique<sirius::op::sirius_dynamic_bloom_filter>(keys->view(), stream, mr);
+            stream.sync();
+            made->replicate_to_devices(replica_spaces);
+            masks  = made.get();
+            filter = std::move(made);
+          }
+        }
+        for (int device_id = 0; device_id < static_cast<int>(device_count); ++device_id) {
+          rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{device_id}};
+          auto const& probe_space =
+            replica_spaces[static_cast<std::size_t>(device_id)].get_gpu_space();
+          auto const stream = probe_space.acquire_stream();
+          REQUIRE(filter->is_available_on_device(device_id));
+          auto probe = cudf::sequence(probe_rows,
+                                      cudf::numeric_scalar<std::int64_t>(0, true, stream),
+                                      cudf::numeric_scalar<std::int64_t>(1, true, stream),
+                                      stream,
+                                      probe_space.get_default_allocator());
+          auto mask  = masks->compute_mask(
+            probe->view(), device_id, stream, probe_space.get_default_allocator());
+          REQUIRE(mask != nullptr);
+          auto host = mask_to_host(mask->view(), stream);
+          std::size_t wrong = 0;
+          for (cudf::size_type row = 0; row < probe_rows; ++row) {
+            bool const member = row % 3 == 0 && row / 3 < key_count;
+            if (member || which != kind::bloom) {
+              wrong += (host[static_cast<std::size_t>(row)] != 0) != member;
+            }
+          }
+          REQUIRE(wrong == 0);
+          if (std::string_view{mode} == "off") {
+            reference.push_back(std::move(host));
+          } else {
+            REQUIRE(host == reference[static_cast<std::size_t>(device_id)]);
+            ++compared;
+          }
+          stream.sync();
+        }
+        rmm::cuda_set_device_raii const build_device{rmm::cuda_device_id{root}};
+        filter.reset();
+      }
+    }
+  }
+  unsetenv("SIRIUS_PROTO_XFER_D2D");
+  auto const relayed = sirius::op::detail::replica_relay::relayed_copies().load() - relayed_before;
+  WARN("xfer_relay: compared " << compared << " masks, relayed copies " << relayed);
+  REQUIRE(compared == 2 * 3 * device_count);
+  // Per (root, kind) with the switch on: on a machine with two peer-access pairs exactly one copy
+  // is relayed; with full or no peer access none is.
+  REQUIRE((relayed == 0 || relayed == 2 * 3));
 }
 
 TEST_CASE("IN-list peer copies fan out to three GPUs before publication",
