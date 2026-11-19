@@ -1,5 +1,5 @@
 diff --git a/src/cudf/representation_converter_builtins.cpp b/src/cudf/representation_converter_builtins.cpp
-index 731dab8..4035062 100644
+index 731dab8..1897ee5 100644
 --- a/src/cudf/representation_converter_builtins.cpp
 +++ b/src/cudf/representation_converter_builtins.cpp
 @@ -17,6 +17,9 @@
@@ -12,7 +12,7 @@ index 731dab8..4035062 100644
  #include <cucascade/cuda/event.hpp>
  #include <cucascade/cudf/builtin_converters.hpp>
  #include <cucascade/cudf/gpu_data_representation.hpp>
-@@ -557,6 +560,29 @@ int resolve_gpu_numa_node(int device_id) noexcept
+@@ -557,6 +560,55 @@ int resolve_gpu_numa_node(int device_id) noexcept
    }
  }
  
@@ -20,11 +20,14 @@ index 731dab8..4035062 100644
 +// the host-staged GPU-to-GPU copy. The staging blocks of every buffer stay alive in this
 +// thread-local list until convert_gpu_to_gpu has made its one table-level sync, so the whole table's
 +// copies are queued on the links at once instead of one buffer per sync.
-+bool proto_batch_staging() noexcept
++int proto_batch_staging() noexcept
 +{
-+  static bool const value = [] {
++  // 0 = off; 1 = no per-buffer sync (copies still interleave D2H, H2D per buffer on the stream);
++  // 2 = two phases: every buffer's device-to-host copy first, then every host-to-device copy in
++  //     one contiguous train (one wait on the target GPU's ingress queue for the whole table).
++  static int const value = [] {
 +    auto const* text = std::getenv("CUCASCADE_PROTO_BATCH_STAGING");
-+    return text != nullptr && std::atoi(text) != 0;
++    return text != nullptr ? std::atoi(text) : 0;
 +  }();
 +  return value;
 +}
@@ -35,19 +38,83 @@ index 731dab8..4035062 100644
 +  return blocks;
 +}
 +
++//! Mode 2: host-to-device halves not issued yet; each closure owns its staging blocks.
++std::vector<std::function<void(::cuda::stream_ref)>>& proto_deferred_h2d() noexcept
++{
++  thread_local std::vector<std::function<void(::cuda::stream_ref)>> pending;
++  return pending;
++}
++
++//! Issues every pending host-to-device half on @p stream; the blocks stay alive until the guard.
++void proto_flush_deferred_h2d(::cuda::stream_ref stream)
++{
++  auto& pending = proto_deferred_h2d();
++  for (auto& issue : pending) {
++    issue(stream);
++    proto_deferred_staging().push_back(
++      std::make_shared<std::function<void(::cuda::stream_ref)>>(std::move(issue)));
++  }
++  pending.clear();
++}
++
 +struct proto_deferred_staging_guard {
-+  ~proto_deferred_staging_guard() { proto_deferred_staging().clear(); }
++  ~proto_deferred_staging_guard()
++  {
++    proto_deferred_h2d().clear();
++    proto_deferred_staging().clear();
++  }
 +};
 +
  /**
   * @brief Copy @p size bytes from @p src_ptr
   * (on @p src_device) into a buffer.
-@@ -695,7 +721,13 @@ Buffer peer_copy_into_async(Buffer buf,
+@@ -670,6 +722,40 @@ Buffer peer_copy_into_async(Buffer buf,
+       }
+ 
+       // Pass 2: host-to-device, chunked across the same blocks.
++      if (proto_batch_staging() >= 2) {
++        // Two phases: the host-to-device half is issued by proto_flush_deferred_h2d().
++        auto holder = std::make_shared<std::decay_t<decltype(allocation)>>(std::move(allocation));
++        auto* const dst_ptr = reinterpret_cast<std::uint8_t*>(buf.data());
++        proto_deferred_h2d().push_back(
++          [holder, dst_ptr, size_in_bytes, block_sz, dst_device](::cuda::stream_ref issue_stream) {
++            {
++              rmm::cuda_set_device_raii dst_guard{rmm::cuda_device_id{dst_device}};
++              std::size_t block_index  = 0;
++              std::size_t block_offset = 0;
++              std::size_t dst_offset   = 0;
++              while (dst_offset < size_in_bytes) {
++                const std::size_t remaining  = size_in_bytes - dst_offset;
++                const std::size_t bytes_left = block_sz - block_offset;
++                const std::size_t to_copy    = std::min(remaining, bytes_left);
++                std::span<std::byte> block   = (*holder)->at(block_index);
++                CUCASCADE_CUDA_TRY(
++                  cudaMemcpyAsync(dst_ptr + dst_offset,
++                                  block.data() + block_offset,
++                                  to_copy,
++                                  cudaMemcpyHostToDevice,
++                                  issue_stream.get()));
++                dst_offset += to_copy;
++                block_offset += to_copy;
++                if (block_offset == block_sz) {
++                  ++block_index;
++                  block_offset = 0;
++                }
++              }
++            }
++          });
++        return buf;
++      }
++
+       {
+         rmm::cuda_set_device_raii dst_guard{rmm::cuda_device_id{dst_device}};
+         std::size_t block_index  = 0;
+@@ -695,7 +781,13 @@ Buffer peer_copy_into_async(Buffer buf,
          }
        }
  
 -      target_stream.sync();
-+      if (proto_batch_staging()) {
++      if (proto_batch_staging() == 1) {
 +        // Keep the staging blocks until the table-level sync in convert_gpu_to_gpu.
 +        proto_deferred_staging().push_back(
 +          std::make_shared<std::decay_t<decltype(allocation)>>(std::move(allocation)));
@@ -57,7 +124,15 @@ index 731dab8..4035062 100644
      } catch (...) {
        // best-effort drain before the blocks return to the pool; a second failure must not
        // replace the original exception or stay pending.
-@@ -913,6 +945,9 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
+@@ -768,6 +860,7 @@ std::unique_ptr<cudf::column> reconstruct_column_p2p_async(const cudf::column_vi
+       // from the target-side offsets buffer we just peer-copied; that's a same-device
+       // D→H read on the target stream and works reliably regardless of pool peer
+       // access semantics.
++      if (proto_batch_staging() >= 2) { proto_flush_deferred_h2d(stream); }
+       const cudf::column_view offsets_view = offsets_col->view();
+       const int last_idx                   = offsets_view.size() - 1;
+       int64_t chars_bytes                  = 0;
+@@ -913,6 +1006,9 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
    auto mr            = target_memory_space->get_default_allocator();
  
    std::unique_ptr<cudf::table> new_table{nullptr};
@@ -67,3 +142,11 @@ index 731dab8..4035062 100644
  
    try {
      // Order the peer copies below after the most recent writer of gpu_source. With an unknown
+@@ -931,6 +1027,7 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
+     }
+ 
+     new_table = std::make_unique<cudf::table>(std::move(target_columns));
++    if (proto_batch_staging() >= 2) { proto_flush_deferred_h2d(target_stream); }
+ 
+     // Sync for the source's lifetime, not for readers of the result (the writer event recorded
+     // below covers those). The peer reads on target_stream are not ordered with the source's
