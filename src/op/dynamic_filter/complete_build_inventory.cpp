@@ -31,6 +31,7 @@
 #include <cucascade/memory/disk_table.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -303,10 +304,15 @@ void build_arrival_ledger::close(construction_decline reason) noexcept
 std::size_t detail::accumulated_bloom_chunk_bytes(std::size_t raw_bytes) noexcept
 {
   auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
+  // PROTOTYPE (mb/lifecycle, H12): SIRIUS_PROTO_BLOOM_CHUNK_MIB overrides the largest chunk.
+  auto maximum = k_max_bloom_transfer_chunk_bytes;
+  if (auto const* text = std::getenv("SIRIUS_PROTO_BLOOM_CHUNK_MIB")) {
+    auto const mib = std::strtoull(text, nullptr, 10);
+    if (mib != 0) { maximum = static_cast<std::size_t>(mib) << 20; }
+  }
   return std::min(
-    rmm::align_up(
-      std::clamp(raw_bytes / 8, k_min_bloom_transfer_chunk_bytes, k_max_bloom_transfer_chunk_bytes),
-      alignment),
+    rmm::align_up(std::clamp(raw_bytes / 8, k_min_bloom_transfer_chunk_bytes, maximum),
+                  alignment),
     rmm::align_up(raw_bytes, alignment));
 }
 
