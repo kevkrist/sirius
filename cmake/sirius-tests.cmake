@@ -572,3 +572,45 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/bench/df_bloom_bench — prototype tooling: dynamic-filter Bloom insert /
+# probe microbenchmarks (production calls plus throwaway kernel variants)
+# -----------------------------------------------------------------------------
+add_executable(df_bloom_bench test/bench/df_bloom_bench.cu)
+
+target_include_directories(
+  df_bloom_bench PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+
+target_compile_options(
+  df_bloom_bench
+  PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>)
+target_compile_definitions(
+  df_bloom_bench PRIVATE CCCL_DISABLE_WARPSPEED_SCAN
+                         CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+
+target_link_libraries(
+  df_bloom_bench
+  sirius_core
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  cuco::cuco
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  cuCascade::cucascade_io
+  PkgConfig::LIBURING)
+sirius_link_duckdb_extensions(df_bloom_bench)
+
+target_link_options(df_bloom_bench PRIVATE "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  df_bloom_bench
+  PROPERTIES CXX_SCAN_FOR_MODULES OFF
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/bench")
