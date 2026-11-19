@@ -147,3 +147,18 @@ Reading:
 - One contributor per pair (mask 5): `star` = tip (the star through the root is still two serial bounces);
   `exchange` / `pipe` 2.3-2.4x.
 
+## 5. (b) TPC-H SF1000 ABBA timing, tip binary vs prototype with `SIRIUS_PROTO_XFER_D2D=pipe`
+
+INTERIM (replaced by the final table when the queue finishes): gates passed (section 7); first blocks, fresh process
+per query, 1 warm + 5 hot, first hot dropped, ABBA, n = 8 per arm:
+
+| q | tip med ms (n) [min-max] | proto med ms (n) [min-max] | delta ms | delta % | per-block deltas ms | results |
+|---|---|---|---|---|---|---|
+| 3 | 658.7 (8) [653-668] | 621.9 (8) [615-626] | -36.8 | -5.59 | -36.8 | identical |
+| 4 | 324.3 (8) [321-327] | 310.6 (8) [308-312] | -13.7 | -4.23 | -13.7 | identical |
+| 7 | 746.9 (8) [741-752] | 710.9 (8) [707-713] | -35.9 | -4.81 | -35.9 | identical |
+| 8 | 936.1 (8) [927-942] | 912.4 (8) [904-913] | -23.7 | -2.54 | -23.7 | identical |
+| 9 | 1420.5 (8) [1404-1438] | 1394.1 (8) [1365-1409] | -26.4 | -1.86 | -26.4 | identical |
+| 10 | 849.7 (8) [840-869] | 820.2 (8) [813-833] | -29.5 | -3.47 | -29.5 | identical |
+| 21 | 1442.0 (8) [1429-1454] | 1244.1 (8) [1227-1258] | -197.9 | -13.72 | -197.9 | identical |
+| sum | 6378 | 6014 | -363.9 | -5.71 | | |

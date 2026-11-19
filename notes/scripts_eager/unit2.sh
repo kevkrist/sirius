@@ -11,8 +11,9 @@
 #   bsk   bs + scan throttle 1          bf   f1 + batched staging
 #   bs2 / b02 / bs2k / bf2: as bs / b0 / bsk / bf with CUCASCADE_PROTO_BATCH_STAGING=2 (all D2H first, then one H2D train)
 #   f1    E2 eager 2, gate 2, admit 16 GiB (S6 shape)   f1k  f1 + scan throttle 2
-tag=$1; iters=$2; q=$3; shift 3
+tag=$1; iters=$2; qlist=$3; shift 3   # <q> may be a comma list: the same arms for each query, one hold
 B=/opt/dlami/nvme/dfperf/runs/eager/bin; R=/opt/dlami/nvme/dfperf; E2=$R/wt-eager2
+for q in ${qlist//,/ }; do
 for spec in "$@"; do
   arm=${spec%%:*}; n=${spec##*:}; label=${tag}_${arm}${n}
   case $arm in
@@ -40,4 +41,5 @@ for spec in "$@"; do
     bf2)  REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=2 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=2 SIRIUS_EAGER_GATE=2 SIRIUS_EAGER_ADMIT_GIB=16 $B/one_query.sh $label $q $iters ;;
     *) echo "unknown arm $arm"; exit 9 ;;
   esac
+done
 done
