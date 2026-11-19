@@ -6,7 +6,10 @@ Scripts `$R/runs/xfer_host/bin/`, raw output `$R/runs/xfer_host/`, Quent `$R/tel
 Every build and GPU process ran under `flock $R/machine.lock` (one queued command per hold, `bin/next.sh`).
 Config `/home/ubuntu/sirius/specific_config.yaml` untouched; the prototype is switched by environment variables only.
 
-STATUS: see section 9 for what ran and what did not. Sections 1-3 are design (code facts), 4+ are measurements.
+STATUS (2026-11-19, second session after the wipe): BUILT, gates pass, measured. Sections 1-2 are design (code facts, written
+before the first build; still accurate), 3+ are measurements of this session. Section 9 lists what ran and what did not.
+Commits on `proto/xfer-host`: `a57417f7` (mb/lifecycle cherry-pick), `336915e1` (design as recovered), `ff814aec` (compile fix +
+byte dump for the identity test), `e683d765` (exact-kind identity test). Pushed to the fork as `dfperf/proto/xfer-host` by backup.sh.
 
 ## 1. Scope and seam
 
@@ -105,20 +108,77 @@ A slot is reused only after its readers' events (uploads of chunk k-W for output
 - NUMA: this host is one NUMA node (MB_TRANSFER section 1), so placement of the staging blocks is not testable here.
   The slots come from `root->host_space` like today.
 
-## INTERIM RESULTS (2026-11-19 evening session; superseded by the final sections when written)
+## 3. Correctness gates
 
-- Built (1 compile fix: `drain` name lookup in `host_bounce_scope::impl::join`). Commit `ff814aec` on `proto/xfer-host`.
-- Identity gate `[xfer_proto]` G=4: 540 finishes, 2592 arrays byte-compared (memcmp of every array on every GPU against the
-  tip loop, plus checksums), all pass (`runs/xfer_host/out/check_g4.log`).
-- MB4P G=4 (finish ms/GiB, 5 reps): tip loop 61 / 104 / 186 (batches on 1 / 2 / 4 GPUs) -> fan-out 39-43, gpuor 45-55 /
-  95-100, hostor 46-55 / 45-58. hostor with 4 contributors: 3.25x (57 MiB) to 4.1x (1.4 GiB).
-- q21 ABBA (A1 U1 O1 O2 U2 A2, 8 hot each): tip 1438.6 -> auto 1230.0 ms = -208.5 ms (-14.5%); proto binary with the switch
-  off 1436.7 (-1.9 ms); results identical.
+| Gate | What | Result |
+|---|---|---|
+| Bloom bit identity, G=4 (`[xfer_proto]`, `out/check_g4.log`) | 5 array shapes (96 B .. 70 MiB, ragged tails, 2 keys) x 6 contribution sets (root only, non-root only, 2, 2 non-root, all, none) x 2 roots x 9 configs (gpuor w1/2/4, hostor w1/4, hostor w3 t1, hostor w8 t5, gpuor+forced fallback, hostor+forced fallback). Every array of every GPU downloaded and `memcmp`'d against the tip loop's (force-host) arrays, plus a position-dependent 64-bit checksum | 540 finishes, 2592 arrays, **all identical** |
+| Exact-kind identity, G=4 (`[xfer_proto_exact]`, `out/exact_g4.log`) | sessions (`publish_if_final`) over 12 / 1920 / 30720 / 199680 keys, 1-2 key columns, 1 / 6 / 8 / 64 batches, on GPU 0 or round-robin; every published IN-list probed on every GPU with the dense range [-8, max+8); replica switch 0 vs 1 vs 1 + forced HOST-allocation failure | 96 sessions, 576 masks (hash IN-list 42 cases, small IN-list 6), **identical and equal to the inserted key set**; proto paths ran: 144 staged sources, 144 stage-once hits, 40 batched gathers |
+| Query results | `result.txt` md5 of every process of every arm | identical for every query run (section 5) |
+| Fallback (pinned window refused) | `SIRIUS_PROTO_XFER_FAIL_HOST=1` inside both gates | tip loop / per-slice gather taken, arrays and masks identical |
+| Proto binary, switch off | arm O (q21, q3) | q21 -1.9 ms, q3 -7.5 ms vs tip binary (noise) |
+| Existing DF unit tests | section 8 | see there |
 
-- ABBA so far (8 hot per arm, tip vs `auto`): q3 665.7 -> 624.7 (-41.0, -6.2%), q7 745.6 -> 705.0 (-40.6, -5.5%),
-  q8 936.1 -> 910.3 (-25.8, -2.8%); switch off on the proto binary: q3 658.2 (-7.5), q21 -1.9. Results identical.
-- Exact-kind identity gate `[xfer_proto_exact]` G=4 (commit `e683d765`): 96 sessions, 576 exact masks (dense-range
-  membership on every GPU, replica switch 0 vs 1 vs 1 + forced HOST-allocation failure) identical and equal to the inserted
-  key set; proto paths exercised (144 staged sources, 144 stage-once hits, 40 batched gathers).
-- Queue (runs/xfer_host/queue.txt, bin/waiter.sh) still running: q10 q9 q4 q5, nsys q21 q3, q2 q6, MB sweeps, unit tests,
-  rest of the suite.
+Not covered by a gate: one-shot Bloom `replicate_to_devices` with the stage-once scope (only reached when a Bloom is built
+on one GPU outside the accumulation path; exercised by the unit tests of section 8, not byte-compared here).
+
+## 4. Lifecycle microbenchmark MB4P (builder-level `finish` wall, G=4, root GPU 0, 5 reps, median; min within 0.3%)
+
+Batches on 1 GPU = root only (S=0, fan-out); 2 = GPUs 0,1 (one source); 4 = all (S=3). `off` = tip loop.
+ms (ms per GiB of Bloom). Checksums of all 4 arrays agree with the tip loop in every row (`verified=1`).
+
+| Bloom | batches on | tip loop | gpuor w4 | hostor w4 t16 | best vs tip |
+|---|---|---|---|---|---|
+| 57 MiB | 1 | 3.43 (62) | 2.37 (42) fan-out | same | 1.45x |
+| 57 MiB | 2 | 5.79 (104) | 3.05 (55) | 3.08 (55) | 1.90x |
+| 57 MiB | 4 | 10.45 (188) | 5.59 (100) | **3.22 (58)** | 3.25x |
+| 174 MiB | 1 | 10.37 (61) | 6.79 (40) fan-out | same | 1.53x |
+| 174 MiB | 2 | 17.54 (103) | 8.28 (49) | 8.45 (50) | 2.12x |
+| 174 MiB | 4 | 31.59 (186) | 16.37 (96) | **8.21 (48)** | 3.85x |
+| 281 MiB | 1 | 16.75 (61) | 10.81 (39) fan-out | same | 1.55x |
+| 281 MiB | 2 | 28.42 (104) | 12.93 (47) | 13.27 (48) | 2.20x |
+| 281 MiB | 4 | 51.02 (186) | 26.33 (96) | **12.95 (47)** | 3.94x |
+| 1434 MiB | 1 | 85.30 (61) | 54.18 (39) fan-out | same | 1.57x |
+| 1434 MiB | 2 | 145.00 (104) | 62.40 (45) | 64.95 (46) | 2.32x |
+| 1434 MiB | 4 | 259.82 (186) | 133.35 (95) | **62.72 (45)** | 4.14x |
+
+- Tip reproduces MB4 / MB_TRANSFER exactly (61 / 104 / 186 ms/GiB).
+- `hostor` with every GPU contributing: 45-58 ms/GiB. That is at the link bound of this machine for any schedule that keeps
+  all legs on the host (each pair uplink carries 2 x B up and 2 x B down; duplex rate 41 GiB/s each way = 49 ms/GiB) and
+  **better than the best topology-aware schedule of the primitives bench** (`c2` 52-59, `pairhostor_pipe` 52-53 ms/GiB).
+- `gpuor` (star, OR on the root GPU) is 1.9x only: the root's port takes 3 x B in and B out. It ties `hostor` with one
+  source. `auto` = `hostor` with >= 2 sources, else `gpuor`; a single contributor is a pure fan-out (39-43 ms/GiB = the
+  uplink of the other pair carrying two uploads).
+- Pinned HOST held during one finish: fan-out 32 MiB, gpuor 64-128 MiB (+ 14-48 MiB device scratch on the root, the PEER
+  pipeline's amount), hostor 96-160 MiB and **no device scratch** (tip: 8 MiB pinned + 8 MiB scratch).
+- Host waits before the final one: 0 for fan-out and gpuor; hostor waits on events per chunk (it paces the CPU OR).
+
+(Sweeps: window / OR threads / chunk size / small arrays / G=2: section 7.)
+
+## 5. TPC-H SF1000, 4 GPUs: ABBA timing, tip binary (`$R/repo`) vs prototype with `SIRIUS_PROTO_XFER_HOST=auto`
+
+Fresh process per query, 6 iterations (1 warm + 5 hot, first hot dropped), arms interleaved A U U A / U A A U inside one lock
+hold per query (2 queries per hold later on). ms = median of the 8 kept hot iterations (2 processes x 4).
+
+PLACEHOLDER_ABBA
+
+## 6. nsys (q21, q3; 1 capture per arm, 1 warm + 2 hot; same-thread attribution, `runs/profile/bin/nsys_df.py`)
+
+| q | arm | query wall ms (2 hot) | `accum::finish` wall ms (sum of 2 publications) | largest finish ms | host waits in finish | ms inside waits | copies | GiB copied | CPU OR ms (n chunks) |
+|---|---|---|---|---|---|---|---|---|---|
+| 21 | tip | 1479, 1449 | 293.3, 308.1 | 266.8, 281.6 | 1932 | 274, 289 | 1920 | 14.91 | - |
+| 21 | auto | 1238, 1255 | 90.8, 74.2 | 81.1, 66.0 | 1522 | 45, 35 | 1536 | 11.93 | 25.4, 18.9 (192) |
+| 3 | tip | 669, 662 | 62.2, 62.4 | 58.0, 58.3 | 404 | 58 | 392 | 2.96 | - |
+| 3 | auto | 626, 622 | 22.0, 22.8 | 19.0, 19.8 | 290 | 12 | 320 | 2.41 | 5.6, 6.3 (36) |
+
+- Finish wall: q21 300 -> 82 ms (3.6x), q3 62 -> 22 ms (2.8x). The saving equals the query saving (q21 -208, q3 -41 ms).
+- Bytes: 10 x B -> 8 x B for S=3 (4 downloads + 4 uploads instead of 3 + 3 + 1 + 3); every byte still goes through the host.
+  CUPTI's per-kind split (HtoD / DtoH / PtoP) is not usable for these batch copies (it labels most as PtoP in both arms, as
+  noted in MB_TRANSFER section 8); the engine issues only host legs here, so "by transport" = 100% HOST in both arms.
+- Host waits: tip 1932 `cudaStreamSynchronize`, all blocking for one leg each (274-289 ms inside them). Proto: 1522 calls,
+  of which 1506 are `cudaEventSynchronize` of the hostor pacing (35-45 ms inside them: the host thread waits for a download
+  only when the links, not the CPU, are the limit) + 2 final waits (1 ms).
+- In the query the 1.39 GiB publication of q21 takes 66-81 ms (48-58 ms/GiB) against 62.7 ms in the microbench: the
+  query has other work on the links and CPUs.
+
+PLACEHOLDER_REST
