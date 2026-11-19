@@ -445,6 +445,8 @@ struct static_selectivity {
 [[nodiscard]] std::string describe_filter(sirius::op::sirius_dynamic_filter const& filter)
 {
   std::string out;
+  // Arguments of a disabled log line are still evaluated: keep them free at INFO.
+  if (!sirius::log::get_sink()->should_log(sirius::log::level::debug)) { return out; }
   if (auto const* small =
         dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(&filter)) {
     out = "small_in_list:" + std::to_string(small->size());
