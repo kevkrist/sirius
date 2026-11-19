@@ -104,3 +104,14 @@ A slot is reused only after its readers' events (uploads of chunk k-W for output
   leaked like the tip leaks `staging` / `scratch`.
 - NUMA: this host is one NUMA node (MB_TRANSFER section 1), so placement of the staging blocks is not testable here.
   The slots come from `root->host_space` like today.
+
+## INTERIM RESULTS (2026-11-19 evening session; superseded by the final sections when written)
+
+- Built (1 compile fix: `drain` name lookup in `host_bounce_scope::impl::join`). Commit `ff814aec` on `proto/xfer-host`.
+- Identity gate `[xfer_proto]` G=4: 540 finishes, 2592 arrays byte-compared (memcmp of every array on every GPU against the
+  tip loop, plus checksums), all pass (`runs/xfer_host/out/check_g4.log`).
+- MB4P G=4 (finish ms/GiB, 5 reps): tip loop 61 / 104 / 186 (batches on 1 / 2 / 4 GPUs) -> fan-out 39-43, gpuor 45-55 /
+  95-100, hostor 46-55 / 45-58. hostor with 4 contributors: 3.25x (57 MiB) to 4.1x (1.4 GiB).
+- q21 ABBA (A1 U1 O1 O2 U2 A2, 8 hot each): tip 1438.6 -> auto 1230.0 ms = -208.5 ms (-14.5%); proto binary with the switch
+  off 1436.7 (-1.9 ms); results identical.
+
