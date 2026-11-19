@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 
 namespace sirius::op {
 
@@ -40,10 +41,22 @@ static_assert(bloom_bits_per_block % bloom_target_bits_per_key == 0,
 /**
  * @brief Number of Bloom blocks for @p num_keys keys: at least one, and never overflowing.
  */
-[[nodiscard]] constexpr std::size_t bloom_blocks_for(std::size_t num_keys) noexcept
+/// PROTOTYPE (OP5): SIRIUS_PROTO_BLOOM_BPK=8|16|32 overrides the bits per key process-wide.
+[[nodiscard]] inline std::size_t proto_bloom_bits_per_key() noexcept
+{
+  static const std::size_t bits = [] {
+    char const* text = std::getenv("SIRIUS_PROTO_BLOOM_BPK");
+    auto const value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ULL;
+    return value == 8 || value == 16 || value == 32 ? static_cast<std::size_t>(value)
+                                                    : bloom_target_bits_per_key;
+  }();
+  return bits;
+}
+
+[[nodiscard]] inline std::size_t bloom_blocks_for(std::size_t num_keys) noexcept
 {
   return ::cuda::ceil_div(std::max<std::size_t>(num_keys, 1),
-                          bloom_bits_per_block / bloom_target_bits_per_key);
+                          bloom_bits_per_block / proto_bloom_bits_per_key());
 }
 
 }  // namespace sirius::op

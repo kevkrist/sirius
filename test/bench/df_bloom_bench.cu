@@ -43,6 +43,10 @@
 #include <cuco/bloom_filter_policy.cuh>
 #include <cuco/bloom_filter_ref.cuh>
 #include <cuco/hash_functions.cuh>
+#include <cuco/static_set.cuh>
+#include <cuda/dynamic_filter_fused_probe.cuh>
+#include <op/dynamic_filter/dynamic_filter_key_domain.hpp>
+#include <thrust/fill.h>
 #include <cuda/dynamic_filter_probe.cuh>
 #include <cuda/stream>
 #include <cuda_runtime_api.h>
@@ -846,6 +850,367 @@ int run_probe(arguments const& args)
   return 0;
 }
 
+// ---------------------------------------------------------------------------------------------
+// OP4: exact hash IN-list probe vs Bloom probe, production probe kernel (`run_membership_probe`
+// = cub::DeviceFor::Bulk over `membership_probe_functor`), production and prototype stores.
+// ---------------------------------------------------------------------------------------------
+
+// Dense-key model of TPC-H keys: universe [1, U]; index -> key is a bijection on the universe.
+struct dense_keys {
+  std::uint64_t universe;
+  std::uint64_t members;  // indices [0, members) are inserted
+  __host__ __device__ std::uint64_t key_of(std::uint64_t index) const
+  {
+    return (index * 1000003ULL) % universe + 1;
+  }
+};
+
+struct set_probe_spec {
+  dense_keys keys;
+  std::uint64_t base;
+  std::uint32_t hit_permille;
+  std::uint32_t prior_permille;  // rows the prior mask keeps
+  std::uint32_t run;             // consecutive probe rows sharing one key
+  bool ascending;                // clustered ascending keys (sorted fact-table column)
+  __host__ __device__ bool is_member(std::uint64_t row) const
+  {
+    auto const g = row / run;
+    return mix64((base + g) * 0x2545F4914F6CDD1DULL + 11) % 1000 < hit_permille;
+  }
+  __host__ __device__ bool prior(std::uint64_t row) const
+  {
+    return mix64((base + row) * 0x9E3779B97F4A7C15ULL + 5) % 1000 < prior_permille;
+  }
+  __host__ __device__ std::uint64_t operator()(std::uint64_t row) const
+  {
+    auto const g = row / run;
+    if (ascending) {
+      // Ascending raw key; membership is whatever the store says (counted by the exact reference).
+      return (base + g) % keys.universe + 1;
+    }
+    auto const r = mix64(base + g + 0x51ED);
+    return is_member(row) ? keys.key_of(r % keys.members)
+                          : keys.key_of(keys.members + r % (keys.universe - keys.members));
+  }
+};
+
+template <class Key, class Size, class Probing, int Bucket>
+using alt_set = cuco::static_set<Key,
+                                 cuco::extent<Size>,
+                                 ::cuda::thread_scope_device,
+                                 ::cuda::std::equal_to<Key>,
+                                 Probing,
+                                 op::detail::set_alloc<Key>,
+                                 cuco::storage<Bucket>>;
+template <class Key>
+using dh_scheme = cuco::double_hashing<1, cuco::default_hash_function<Key>>;
+template <class Key>
+using lp_scheme = cuco::linear_probing<1, cuco::default_hash_function<Key>>;
+
+template <class Set>
+std::unique_ptr<Set> make_alt_set(std::size_t capacity, rmm::device_async_resource_ref mr, ::cuda::stream_ref stream)
+{
+  using key_type  = typename Set::key_type;
+  using size_type = typename Set::size_type;
+  return std::unique_ptr<Set>(new Set{cuco::extent<size_type>{static_cast<size_type>(capacity)},
+                                      cuco::empty_key<key_type>{op::detail::set_sentinel<key_type>::value},
+                                      {},
+                                      {},
+                                      {},
+                                      {},
+                                      op::detail::set_alloc<key_type>{mr},
+                                      stream});
+}
+
+// Power-of-two open addressing, linear probing, one multiply hash: the cheapest exact lookup.
+template <class Key>
+struct pow2_lookup {
+  using key_type = Key;
+  Key const* slots;
+  std::uint32_t mask;
+  __device__ __forceinline__ static std::uint32_t hash(Key key) noexcept
+  {
+    auto x = static_cast<std::uint64_t>(key) * 0x9E3779B97F4A7C15ULL;
+    return static_cast<std::uint32_t>(x >> 32);
+  }
+  __device__ __forceinline__ bool operator()(Key key) const noexcept
+  {
+    constexpr Key empty = op::detail::set_sentinel<Key>::value;
+    if (key == empty) { return true; }
+    for (std::uint32_t i = hash(key) & mask;; i = (i + 1) & mask) {
+      Key const k = slots[i];
+      if (k == key) { return true; }
+      if (k == empty) { return false; }
+    }
+  }
+};
+
+template <class Key>
+struct pow2_inserter {
+  Key* slots;
+  std::uint32_t mask;
+  Key const* keys;
+  __device__ void operator()(std::int64_t r) const noexcept
+  {
+    constexpr Key empty = op::detail::set_sentinel<Key>::value;
+    Key const key       = keys[r];
+    for (std::uint32_t i = pow2_lookup<Key>::hash(key) & mask;; i = (i + 1) & mask) {
+      if constexpr (sizeof(Key) == 4) {
+        auto const old = atomicCAS(reinterpret_cast<unsigned int*>(slots + i),
+                                   static_cast<unsigned int>(empty),
+                                   static_cast<unsigned int>(key));
+        if (old == static_cast<unsigned int>(empty) || old == static_cast<unsigned int>(key)) { return; }
+      } else {
+        auto const old = atomicCAS(reinterpret_cast<unsigned long long*>(slots + i),
+                                   static_cast<unsigned long long>(empty),
+                                   static_cast<unsigned long long>(key));
+        if (old == static_cast<unsigned long long>(empty) || old == static_cast<unsigned long long>(key)) {
+          return;
+        }
+      }
+    }
+  }
+};
+
+template <class Key>
+void pow2_insert(Key* slots, std::uint32_t mask, Key const* keys, std::int64_t n, rmm::cuda_stream_view s)
+{
+  thrust::for_each_n(rmm::exec_policy_nosync(s),
+                     thrust::counting_iterator<std::int64_t>{0},
+                     n,
+                     pow2_inserter<Key>{slots, mask, keys});
+}
+
+// Bloom prefilter in front of an exact lookup.
+template <class First, class Second>
+struct and_lookup {
+  using key_type = typename Second::key_type;
+  First first;
+  Second second;
+  __device__ __forceinline__ bool operator()(key_type key) const noexcept { return first(key) && second(key); }
+};
+
+template <class Key, class Probe>
+int run_setprobe(arguments const& args)
+{
+  auto const members    = static_cast<std::uint64_t>(args.num("members", 400e3));
+  auto const universe   = static_cast<std::uint64_t>(args.num("universe", 200e6));
+  auto const probe_rows = static_cast<std::int64_t>(args.num("probe", 48e6));
+  auto const reps       = static_cast<int>(args.num("reps", 8));
+  auto const factor     = static_cast<std::size_t>(args.num("factor", 4));
+  auto const bpk        = args.num("bpk", 16);
+  auto const hit        = static_cast<std::uint32_t>(args.num("hit_permille", 2));
+  auto const prior      = static_cast<std::uint32_t>(args.num("prior_permille", 1000));
+  auto const run        = static_cast<std::uint32_t>(args.num("run", 1));
+  auto const ascending  = args.num("ascending", 0) != 0;
+  auto const variants   = args.str("variants", "prod,dh64,dh32,lp64,lp32,pow2,bloomprod,bloom,bloomset");
+  auto const label      = args.str("label", "");
+  dense_keys const keys{universe, members};
+
+  environment env{static_cast<std::size_t>(args.num("gpu_gib", 40)) << 30};
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
+  rmm::cuda_stream_view const task{env.task.value()};
+  auto const mr = env.gpu().get_default_allocator();
+  auto const key_type_id  = sizeof(Key) == 4 ? cudf::type_id::INT32 : cudf::type_id::INT64;
+  auto const probe_type_id = sizeof(Probe) == 4 ? cudf::type_id::INT32 : cudf::type_id::INT64;
+  auto const domain = *op::classify_membership_key(cudf::data_type{key_type_id});
+
+  // Build keys.
+  rmm::device_buffer build_data{members * sizeof(Key), task, env.raw};
+  auto* const build_keys = static_cast<Key*>(build_data.data());
+  thrust::for_each_n(rmm::exec_policy_nosync(task),
+                     thrust::counting_iterator<std::int64_t>{0},
+                     static_cast<std::int64_t>(members),
+                     [=] __device__(std::int64_t i) {
+                       build_keys[i] = static_cast<Key>(keys.key_of(static_cast<std::uint64_t>(i)));
+                     });
+  task.synchronize();
+  cudf::column_view const build{
+    cudf::data_type{key_type_id}, static_cast<cudf::size_type>(members), build_keys, nullptr, 0};
+
+  // Stores.
+  op::sirius_dynamic_in_list_filter prod_set{build, env.task_ref(), mr};
+  op::sirius_dynamic_bloom_filter prod_bloom{build, env.task_ref(), mr};
+  auto const capacity = std::max<std::size_t>(factor * members, 8);
+  auto dh64 = make_alt_set<alt_set<Key, std::size_t, dh_scheme<Key>, 4>>(capacity, mr, env.task_ref());
+  auto dh32 = make_alt_set<alt_set<Key, std::uint32_t, dh_scheme<Key>, 4>>(capacity, mr, env.task_ref());
+  auto lp64 = make_alt_set<alt_set<Key, std::size_t, lp_scheme<Key>, 4>>(capacity, mr, env.task_ref());
+  auto lp32 = make_alt_set<alt_set<Key, std::uint32_t, lp_scheme<Key>, 4>>(capacity, mr, env.task_ref());
+  dh64->insert_async(build_keys, build_keys + members, env.task_ref());
+  dh32->insert_async(build_keys, build_keys + members, env.task_ref());
+  lp64->insert_async(build_keys, build_keys + members, env.task_ref());
+  lp32->insert_async(build_keys, build_keys + members, env.task_ref());
+  std::uint32_t pow2_slots = 8;
+  while (pow2_slots < factor * members) { pow2_slots <<= 1; }
+  rmm::device_buffer pow2_data{std::size_t{pow2_slots} * sizeof(Key), task, env.raw};
+  auto* const pow2 = static_cast<Key*>(pow2_data.data());
+  thrust::fill_n(rmm::exec_policy_nosync(task), pow2, pow2_slots, op::detail::set_sentinel<Key>::value);
+  pow2_insert(pow2, pow2_slots - 1, build_keys, static_cast<std::int64_t>(members), task);
+  auto const bloom_blocks =
+    std::max<std::size_t>(1, static_cast<std::size_t>(static_cast<double>(members) * bpk / 256.0 + 0.999));
+  std::unique_ptr<op::detail::sirius_bloom<Key>> bloom{new op::detail::sirius_bloom<Key>{
+    cuco::extent<std::size_t>{bloom_blocks}, {}, {}, op::detail::bloom_alloc{mr}, env.task_ref()}};
+  bloom->add_async(build_keys, build_keys + members, env.task_ref());
+  task.synchronize();
+
+  rmm::device_buffer probe_data{static_cast<std::size_t>(probe_rows) * sizeof(Probe), task, env.raw};
+  auto* const probe_keys = static_cast<Probe*>(probe_data.data());
+  auto const words       = (probe_rows + 31) / 32;
+  rmm::device_buffer prior_data{static_cast<std::size_t>(words) * 4, task, env.raw};
+  auto* const prior_words = static_cast<std::uint32_t*>(prior_data.data());
+  rmm::device_buffer ref_data{static_cast<std::size_t>(probe_rows), task, env.raw};
+  auto* const reference = static_cast<bool*>(ref_data.data());
+
+  struct variant_result {
+    std::vector<double> ms;
+    std::uint64_t kept = 0, expected = 0, rows = 0, live = 0;
+  };
+  std::map<std::string, variant_result> results;
+  std::vector<std::string> order;
+  for (std::size_t pos = 0; pos <= variants.size();) {
+    auto const next = variants.find(',', pos);
+    order.push_back(variants.substr(pos, next == std::string::npos ? std::string::npos : next - pos));
+    if (next == std::string::npos) { break; }
+    pos = next + 1;
+  }
+
+  for (int rep = 0; rep < reps + 1; ++rep) {
+    set_probe_spec const spec{keys, static_cast<std::uint64_t>(rep) * static_cast<std::uint64_t>(probe_rows) + 977,
+                              hit, prior, run, ascending};
+    thrust::for_each_n(rmm::exec_policy_nosync(task),
+                       thrust::counting_iterator<std::int64_t>{0},
+                       probe_rows,
+                       [=] __device__(std::int64_t i) {
+                         probe_keys[i] = static_cast<Probe>(spec(static_cast<std::uint64_t>(i)));
+                       });
+    thrust::for_each_n(rmm::exec_policy_nosync(task),
+                       thrust::counting_iterator<std::int64_t>{0},
+                       words,
+                       [=] __device__(std::int64_t w) {
+                         std::uint32_t bits = 0;
+                         for (int b = 0; b < 32; ++b) {
+                           bits |= static_cast<std::uint32_t>(spec.prior(static_cast<std::uint64_t>(w) * 32 + b)) << b;
+                         }
+                         prior_words[w] = bits;
+                       });
+    task.synchronize();
+    cudf::column_view const probe{
+      cudf::data_type{probe_type_id}, static_cast<cudf::size_type>(probe_rows), probe_keys, nullptr, 0};
+    auto const* const prior_arg = prior >= 1000 ? nullptr : prior_words;
+    // Exact reference (the pow2 table, checked against the generator when not ascending).
+    std::uint64_t expected = 0;
+    {
+      auto const mask = op::detail::run_membership_probe<Key>(
+        domain, probe, prior_arg, env.task_ref(), mr, pow2_lookup<Key>{pow2, pow2_slots - 1});
+      task.synchronize();
+      check(cudaMemcpyAsync(reference, mask->view().template data<bool>(), static_cast<std::size_t>(probe_rows),
+                            cudaMemcpyDeviceToDevice, task.value()), "ref copy");
+      expected = static_cast<std::uint64_t>(
+        thrust::count(rmm::exec_policy(task), reference, reference + probe_rows, true));
+      if (!ascending) {
+        auto const generated = static_cast<std::uint64_t>(thrust::count_if(
+          rmm::exec_policy(task),
+          thrust::counting_iterator<std::int64_t>{0},
+          thrust::counting_iterator<std::int64_t>{probe_rows},
+          [=] __device__(std::int64_t i) {
+            return spec.is_member(static_cast<std::uint64_t>(i)) &&
+                   (prior >= 1000 || spec.prior(static_cast<std::uint64_t>(i)));
+          }));
+        if (generated != expected) { throw std::runtime_error("reference disagrees with generator"); }
+      }
+    }
+    auto const live = prior >= 1000 ? static_cast<std::uint64_t>(probe_rows)
+                                    : static_cast<std::uint64_t>(thrust::count_if(
+                                        rmm::exec_policy(task),
+                                        thrust::counting_iterator<std::int64_t>{0},
+                                        thrust::counting_iterator<std::int64_t>{probe_rows},
+                                        [=] __device__(std::int64_t i) {
+                                          return spec.prior(static_cast<std::uint64_t>(i));
+                                        }));
+    for (auto const& name : order) {
+      std::unique_ptr<cudf::column> mask;
+      task.synchronize();
+      auto const t0 = clk::now();
+      auto const go = [&](auto lookup) {
+        mask = op::detail::run_membership_probe<Key>(domain, probe, prior_arg, env.task_ref(), mr, lookup);
+      };
+      using op::detail::bloom_lookup;
+      using op::detail::set_lookup;
+      if (name == "prod") {
+        mask = prod_set.compute_mask(probe, prior_arg, 0, env.task_ref(), mr);
+      } else if (name == "bloomprod") {
+        mask = prod_bloom.compute_mask(probe, prior_arg, 0, env.task_ref(), mr);
+      } else if (name == "dh64") {
+        auto ref = dh64->ref(cuco::contains);
+        go(set_lookup<decltype(ref)>{ref});
+      } else if (name == "dh32") {
+        auto ref = dh32->ref(cuco::contains);
+        go(set_lookup<decltype(ref)>{ref});
+      } else if (name == "lp64") {
+        auto ref = lp64->ref(cuco::contains);
+        go(set_lookup<decltype(ref)>{ref});
+      } else if (name == "lp32") {
+        auto ref = lp32->ref(cuco::contains);
+        go(set_lookup<decltype(ref)>{ref});
+      } else if (name == "pow2") {
+        go(pow2_lookup<Key>{pow2, pow2_slots - 1});
+      } else if (name == "bloom") {
+        auto ref = bloom->ref();
+        go(bloom_lookup<decltype(ref)>{ref});
+      } else if (name == "bloomset") {
+        auto bref = bloom->ref();
+        auto sref = dh64->ref(cuco::contains);
+        go(and_lookup<bloom_lookup<decltype(bref)>, set_lookup<decltype(sref)>>{{bref}, {sref}});
+      } else if (name == "bloompow2") {
+        auto bref = bloom->ref();
+        go(and_lookup<bloom_lookup<decltype(bref)>, pow2_lookup<Key>>{{bref}, {pow2, pow2_slots - 1}});
+      } else {
+        throw std::runtime_error("unknown variant " + name);
+      }
+      task.synchronize();
+      auto const elapsed = ms_since(t0);
+      if (!mask) { throw std::runtime_error("probe declined: " + name); }
+      auto const* const got = mask->view().template data<bool>();
+      auto const kept = static_cast<std::uint64_t>(thrust::count(rmm::exec_policy(task), got, got + probe_rows, true));
+      auto const* const refp = reference;
+      auto const lost = static_cast<std::uint64_t>(thrust::count_if(
+        rmm::exec_policy(task),
+        thrust::counting_iterator<std::int64_t>{0},
+        thrust::counting_iterator<std::int64_t>{probe_rows},
+        [=] __device__(std::int64_t i) { return refp[i] && !got[i]; }));
+      if (lost != 0) { throw std::runtime_error("false negatives: " + name); }
+      bool const exact = name.rfind("bloom", 0) != 0 || name == "bloomset" || name == "bloompow2";
+      if (exact && kept != expected) { throw std::runtime_error("exact variant kept a non-member: " + name); }
+      if (rep == 0) { continue; }
+      auto& r = results[name];
+      r.ms.push_back(elapsed);
+      r.kept += kept;
+      r.expected += expected;
+      r.rows += static_cast<std::uint64_t>(probe_rows);
+      r.live += live;
+    }
+  }
+  for (auto const& name : order) {
+    auto const& r = results[name];
+    auto const st = summarize(r.ms);
+    std::printf(
+      "RES,setprobe,label=%s,variant=%s,key=%zu,probe_key=%zu,members=%llu,universe=%llu,factor=%zu,bpk=%.0f,"
+      "set_bytes=%zu,pow2_bytes=%zu,bloom_bytes=%zu,probe=%lld,hit_permille=%u,prior_permille=%u,run=%u,asc=%d,"
+      "reps=%d,ms_med=%.3f,ms_min=%.3f,ms_max=%.3f,Grows_s=%.1f,kept=%llu,expected=%llu,fp=%llu,"
+      "fpr_live=%.6f\n",
+      label.c_str(), name.c_str(), sizeof(Key) * 8, sizeof(Probe) * 8,
+      static_cast<unsigned long long>(members), static_cast<unsigned long long>(universe), factor, bpk,
+      prod_set.storage_bytes(), std::size_t{pow2_slots} * sizeof(Key), bloom_blocks * 32,
+      static_cast<long long>(probe_rows), hit, prior, run, ascending ? 1 : 0, reps, st.median, st.min, st.max,
+      static_cast<double>(probe_rows) / st.median / 1e6,
+      static_cast<unsigned long long>(r.kept), static_cast<unsigned long long>(r.expected),
+      static_cast<unsigned long long>(r.kept - r.expected),
+      r.live > r.expected ? static_cast<double>(r.kept - r.expected) / static_cast<double>(r.live - r.expected) : 0.0);
+  }
+  std::fflush(stdout);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -863,6 +1228,12 @@ int main(int argc, char** argv)
   try {
     auto const suite = args.str("suite", "insert");
     if (suite == "probe") { return run_probe(args); }
+    if (suite == "setprobe") {
+      bool const k32 = args.num("key", 32) == 32;
+      bool const p32 = args.num("probe_key", args.num("key", 32)) == 32;
+      if (k32) { return p32 ? run_setprobe<std::int32_t, std::int32_t>(args) : 2; }
+      return p32 ? run_setprobe<std::int64_t, std::int32_t>(args) : run_setprobe<std::int64_t, std::int64_t>(args);
+    }
     if (suite == "insert") {
       return args.num("key", 64) == 32 ? run_insert<std::int32_t>(args) : run_insert<std::int64_t>(args);
     }

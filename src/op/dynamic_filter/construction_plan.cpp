@@ -26,6 +26,7 @@
 #include <rmm/aligned.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -92,6 +93,23 @@ namespace {
      .supports_hash_in_list =
        !limits.bloom_only && sirius_dynamic_in_list_filter::supports(type, valid_rows),
      .supports_bloom = sirius_dynamic_bloom_filter::supports(type)});
+  // PROTOTYPE (OP4): SIRIUS_PROTO_BLOOM_RANGE=lo:hi publishes a Bloom instead of a hash IN-list
+  // for builds of lo..hi valid keys.
+  static const auto proto_range = [] {
+    std::pair<std::size_t, std::size_t> range{1, 0};
+    if (char const* text = std::getenv("SIRIUS_PROTO_BLOOM_RANGE")) {
+      std::string const value{text};
+      auto const colon = value.find(':');
+      if (colon != std::string::npos) {
+        range = {std::stoull(value.substr(0, colon)), std::stoull(value.substr(colon + 1))};
+      }
+    }
+    return range;
+  }();
+  if (kind == membership_filter_kind::hash_in_list && valid_rows >= proto_range.first &&
+      valid_rows <= proto_range.second && sirius_dynamic_bloom_filter::supports(type)) {
+    return bloom_for(valid_rows, limits);
+  }
   switch (kind) {
     case membership_filter_kind::small_in_list:
     case membership_filter_kind::hash_in_list:
