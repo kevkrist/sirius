@@ -100,3 +100,50 @@ The two prototypes split the finish along one line:
 - Replica copies compose by construction: `replica_relay` only changes *which source* a copy reads, the other
   agent's `host_bounce_scope` only changes *what the HOST route does*.
 
+## 4. (a) Lifecycle microbench MB4: Bloom finish at G=4, tip vs prototype
+
+`runs/xfer_d2d/bin/mb4.sh` -> `mb/mb4_g4.log`. Builder level (`try_create / enqueue_add / finish`), root = GPU 0, 1 key,
+default chunk clamp (8 MiB at these sizes), `finish()` wall time, median of 5 after 1 warm-up; `off` = the tip code
+path in the same binary. Min-max spread of the 5 repetitions <= 1.9% in every cell (last column = worst mode).
+
+| batches on | Bloom MiB | off ms (ms/GiB) | star ms (ms/GiB) | exchange ms (ms/GiB) | pipe ms (ms/GiB) | pipe vs off | spread max-min, worst mode |
+|---|---|---|---|---|---|---|---|
+| root only (GPU 0) | 57 | 3.42 (62) | 3.46 (62) | 3.46 (62) | 2.28 (41) | 1.50x | 1.1% |
+| root only (GPU 0) | 174 | 10.36 (61) | 10.41 (61) | 10.39 (61) | 6.76 (40) | 1.53x | 0.4% |
+| root only (GPU 0) | 281 | 16.73 (61) | 16.77 (61) | 16.75 (61) | 10.84 (40) | 1.54x | 0.6% |
+| root only (GPU 0) | 1434 | 85.29 (61) | 85.26 (61) | 85.09 (61) | 54.90 (39) | 1.55x | 0.3% |
+| pair 0-1 | 57 | 5.79 (104) | 3.68 (66) | 3.68 (66) | 2.47 (44) | 2.34x | 0.9% |
+| pair 0-1 | 174 | 17.52 (103) | 10.78 (63) | 10.75 (63) | 7.07 (42) | 2.48x | 0.3% |
+| pair 0-1 | 281 | 28.34 (103) | 17.26 (63) | 17.21 (63) | 11.23 (41) | 2.52x | 0.4% |
+| pair 0-1 | 1434 | 144.63 (103) | 86.94 (62) | 86.79 (62) | 56.48 (40) | 2.56x | 0.2% |
+| GPUs 0+2 (one per pair) | 57 | 5.79 (104) | 5.84 (105) | 3.67 (66) | 2.50 (45) | 2.31x | 0.9% |
+| GPUs 0+2 (one per pair) | 174 | 17.51 (103) | 17.69 (104) | 10.87 (64) | 7.41 (44) | 2.36x | 0.5% |
+| GPUs 0+2 (one per pair) | 281 | 28.35 (103) | 28.55 (104) | 17.50 (64) | 11.92 (43) | 2.38x | 0.5% |
+| GPUs 0+2 (one per pair) | 1434 | 144.56 (103) | 145.67 (104) | 88.77 (63) | 60.42 (43) | 2.39x | 0.1% |
+| all 4 | 57 | 10.46 (188) | 6.13 (110) | 3.93 (71) | 3.09 (56) | 3.38x | 1.9% |
+| all 4 | 174 | 31.58 (186) | 18.08 (106) | 11.28 (66) | 8.97 (53) | 3.52x | 0.7% |
+| all 4 | 281 | 51.02 (186) | 29.02 (106) | 18.02 (66) | 14.34 (52) | 3.56x | 0.4% |
+| all 4 | 1434 | 259.76 (185) | 146.71 (105) | 90.53 (65) | 72.59 (52) | 3.58x | 0.3% |
+| GPU 2 only (not the root) | 57 | 5.79 (104) | 3.52 (63) | 3.48 (62) | 2.26 (41) | 2.56x | 1.4% |
+| GPU 2 only (not the root) | 174 | 17.51 (103) | 10.58 (62) | 10.48 (62) | 6.75 (40) | 2.59x | 0.3% |
+| GPU 2 only (not the root) | 281 | 28.29 (103) | 17.05 (62) | 16.88 (62) | 10.85 (40) | 2.61x | 0.6% |
+| GPU 2 only (not the root) | 1434 | 144.62 (103) | 86.62 (62) | 85.87 (61) | 54.92 (39) | 2.63x | 0.2% |
+
+Reading:
+
+- **All four GPUs contributed (the shape of every large TPC-H Bloom: q21 1.4 GiB, q3 281 MiB, q8 174 MiB):
+  185-188 -> 52-56 ms/GiB, 3.4-3.6x.** `pipe` lands exactly on MB_TRANSFER's `c2` (52 ms/GiB, 55-59 at 57 MiB): the
+  engine prototype reproduces the standalone microbench. q21-size: 260 -> 73 ms; q3-size: 51 -> 14 ms.
+- Decomposition of that gain (1434 MiB): per-island P2P merge + fan-out with today's host loop between the leaders
+  (`star`) 260 -> 147 ms; both directions at once (`exchange`) -> 91 ms; event ordering instead of host waits
+  (`pipe`) -> 73 ms. So ~60% of the gain needs no change to the host staging code at all, ~30% comes from using
+  both uplinks at once, ~10% from removing the per-chunk host waits.
+- Batches on one pair (mask 3) or one GPU of the other pair (mask 4): 103 -> 40 ms/GiB (2.5-2.6x).
+- Root only (S=0; q3/q5/q8 57 MiB filters): 61 -> 39-41 ms/GiB (1.5x) with `pipe`; `star` / `exchange` = tip (one
+  bounce either way, P2P fan-out replaces two uploads but the root's port is the limit: it sends B to the host and B
+  to its partner). 39 = the same floor MB_TRANSFER section 4 found for every fan-out variant it tried. Untried
+  variant with every link at 1 x B (root -> host -> {partner, other leader}, other leader -> its partner by P2P):
+  modelled ~20-25 ms/GiB; worth <= 1 ms per 57 MiB filter, not built.
+- One contributor per pair (mask 5): `star` = tip (the star through the root is still two serial bounces);
+  `exchange` / `pipe` 2.3-2.4x.
+
