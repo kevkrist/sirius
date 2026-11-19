@@ -1,0 +1,107 @@
+Filters: [static_selection],[construction_plan],[published_filters],[key_outcome],[shadow]
+Randomness seeded to: 61964240
+Running: each binding reads its own Channel
+Running: an ordinal outside every batch's schema is a plan bug
+Running: every restorable carrier is a probe carrier of its recorded key
+Running: a session narrowed to no replica logs no key line
+Running: the removed share counts only strictly stronger estimates
+Running: a key line spells every field in a fixed order
+Running: only keys with a binding are planned and reported
+Running: a filter that is not statically selected is one the Negligible-Share Rule skips
+Running: a filter without a Replica on every GPU of the plan does not count
+Running: facts of a filter that is no concrete Membership Filter
+Running: the carrier rule picks each key's construction type
+Running: a key line spells unknown values and attempt reasons
+Running: post-unlock actions are move-only and log their lines once when dispatched
+Running: decode preference orders by kind and then by key count
+Running: an accumulated publication logs every bound key once
+Running: count-based IN-list support matches the column gates
+Running: the hash IN-list stops at the configured L2 fraction
+Running: the Negligible-Share Rule skips a filter that removes under a tenth of the batch
+Running: the domain gate judges only publishable keys
+Running: the join signature is FNV-1a over the join type and ordered conditions
+Running: a carrier that cannot restore skips only its key
+Running: zone maps follow the option, the key type, and NULL preservation
+Running: a key is shadowed only when every binding is dead
+Running: a whole-build membership filter no binding can read is logged as absent
+Running: join occurrences count earlier joins with the same signature
+Running: a whole-build session that never claims logs its key at finalization
+Running: an accumulation that ends without publishing logs why per key
+Running: a cross-rank merge counts no published filter
+Running: only a Proven Estimate lets a key be shadowed
+Running: a filter is statically selected unless the decode passes it over and its share is negligible
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+sirius_unittest is a Catch2 v3.16.1 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+a filter is statically selected unless the decode passes it over and its share
+is negligible
+  without Filtered Decode slots only the Negligible-Share Rule decides
+-------------------------------------------------------------------------------
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/operator/test_static_filter_selection.cpp:204
+...............................................................................
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/operator/test_static_filter_selection.cpp:207: FAILED:
+  CHECK( op::statically_selected(bloom(0.5), strong_in_list, 0) )
+with expansion:
+  false
+
+-------------------------------------------------------------------------------
+a filter is statically selected unless the decode passes it over and its share
+is negligible
+  a non-negligible filter is selected wherever it sorts
+-------------------------------------------------------------------------------
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/operator/test_static_filter_selection.cpp:215
+...............................................................................
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/operator/test_static_filter_selection.cpp:217: FAILED:
+  CHECK( op::statically_selected(bloom(0.5), strong_in_list, 1) )
+with expansion:
+  false
+
+Running: a whole-build attempt that ends early names the counter that ended it
+Running: a whole-build publication logs its key once, after terminal completion
+Running: types no membership filter supports plan only a zone map
+Running: the Consumer passes over the filter of a key the Construction Plan calls shadowed
+Running: an unknown null count plans a Bloom filter sized on every row
+Running: a shadowed key leaves the rest of the plan as it was
+Running: an all-null key plans the one-shot empty set
+Running: an admitted key estimates the kept share from its value domain
+Running: a key whose membership filter no Consumer would select is planned without it
+Running: a key no binding can read plans no membership
+Running: the Bloom cap applies to the sum of the keys' aligned arrays
+Running: only published Membership Filters with a Proven Estimate can shadow
+-------------------------------------------------------------------------------
+only published Membership Filters with a Proven Estimate can shadow
+  filters are reported in publication order with their proven estimates
+-------------------------------------------------------------------------------
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/operator/test_dynamic_filter_published_filters.cpp:170
+...............................................................................
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/operator/test_dynamic_filter_published_filters.cpp:178: FAILED:
+  CHECK( published[0].estimated_keep == 0.25 )
+with expansion:
+  {?} == 0.25
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/operator/test_dynamic_filter_published_filters.cpp:179: FAILED:
+  CHECK( published[0].estimate_proven )
+with expansion:
+  false
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/operator/test_dynamic_filter_published_filters.cpp:181: FAILED:
+  CHECK_FALSE( published[1].estimated_keep )
+with expansion:
+  !{?}
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/operator/test_dynamic_filter_published_filters.cpp:182: FAILED:
+  CHECK_FALSE( published[1].estimate_proven )
+with expansion:
+  !true
+
+Running: each key's membership kind equals the one-shot choice
+===============================================================================
+test cases:   43 |   41 passed | 2 failed
+assertions: 2318 | 2312 passed | 6 failed
+

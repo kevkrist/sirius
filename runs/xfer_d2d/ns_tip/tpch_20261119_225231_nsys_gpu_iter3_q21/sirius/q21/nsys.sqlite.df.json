@@ -1,0 +1,1594 @@
+[
+ {
+  "iter": 1,
+  "wall": 1447.52666,
+  "ranges": {
+   "dynfilter::stage::contribute": {
+    "wall": 0.106252,
+    "n_api": 16,
+    "api": {
+     "cudaStreamGetDevice": 2,
+     "cudaStreamWaitEvent": 4,
+     "cuKernelGetName": 2,
+     "cudaLaunchKernel": 2,
+     "cudaEventCreateWithFlags": 2,
+     "cudaEventRecord": 2,
+     "cudaEventDestroy": 2
+    },
+    "api_ms": {
+     "cudaStreamGetDevice": 0.000612,
+     "cudaStreamWaitEvent": 0.013565,
+     "cuKernelGetName": 0.000725,
+     "cudaLaunchKernel": 0.055029,
+     "cudaEventCreateWithFlags": 0.0021999999999999997,
+     "cudaEventRecord": 0.004641,
+     "cudaEventDestroy": 0.001949
+    },
+    "kern": {
+     "void cub::detail::for_each::static_kernel": 0.002368
+    },
+    "kern_n": {
+     "void cub::detail::for_each::static_kernel": 2
+    },
+    "mc": {},
+    "memset": [
+     0,
+     0,
+     0.0
+    ],
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "kern_union": 0.002368,
+    "host_copy_union": 0.0,
+    "other_copy_union": 0.0,
+    "n": 2,
+    "max_wall": 0.069201
+   },
+   "dynfilter::stage::gather": {
+    "wall": 0.191614,
+    "n_api": 52,
+    "api": {
+     "cudaStreamGetDevice": 4,
+     "cudaStreamWaitEvent": 10,
+     "cudaStreamSynchronize": 4,
+     "cudaMemcpyAsync": 8,
+     "cudaEventCreateWithFlags": 8,
+     "cudaEventRecord": 10,
+     "cudaEventDestroy": 8
+    },
+    "api_ms": {
+     "cudaStreamGetDevice": 0.00106,
+     "cudaStreamWaitEvent": 0.037631000000000005,
+     "cudaStreamSynchronize": 0.030125,
+     "cudaMemcpyAsync": 0.057359999999999994,
+     "cudaEventCreateWithFlags": 0.01226,
+     "cudaEventRecord": 0.014755999999999998,
+     "cudaEventDestroy": 0.005320999999999999
+    },
+    "kern": {},
+    "kern_n": {},
+    "mc": {
+     "DtoH": [
+      2,
+      8,
+      0.000992
+     ],
+     "PtoP": [
+      6,
+      24,
+      0.0025919999999999997
+     ]
+    },
+    "memset": [
+     0,
+     0,
+     0.0
+    ],
+    "sync_ms": 0.030125,
+    "n_sync": 4,
+    "kern_union": 0.0,
+    "host_copy_union": 0.000992,
+    "other_copy_union": 0.002592,
+    "n": 2,
+    "max_wall": 0.10034
+   },
+   "dynfilter::replicate_devices": {
+    "wall": 0.930352,
+    "n_api": 48,
+    "api": {
+     "cudaMallocFromPoolAsync": 6,
+     "cudaStreamGetDevice": 6,
+     "cudaMemPoolGetAccess": 6,
+     "cudaMemcpyPeerAsync": 2,
+     "cudaMemcpyAsync": 4,
+     "cudaStreamSynchronize": 14,
+     "cuKernelGetName": 3,
+     "cudaLaunchKernel": 3,
+     "cudaMemcpyBatchAsync": 4
+    },
+    "api_ms": {
+     "cudaMallocFromPoolAsync": 0.05473,
+     "cudaStreamGetDevice": 0.0020169999999999997,
+     "cudaMemPoolGetAccess": 0.002746,
+     "cudaMemcpyPeerAsync": 0.026097000000000002,
+     "cudaMemcpyAsync": 0.020042,
+     "cudaStreamSynchronize": 0.6469090000000001,
+     "cuKernelGetName": 0.00039500000000000006,
+     "cudaLaunchKernel": 0.029283,
+     "cudaMemcpyBatchAsync": 0.042053
+    },
+    "kern": {
+     "void cub::detail::for_each::static_kernel": 0.009536
+    },
+    "kern_n": {
+     "void cub::detail::for_each::static_kernel": 3
+    },
+    "mc": {
+     "PtoP": [
+      7,
+      25591756,
+      0.457374
+     ],
+     "DtoH": [
+      2,
+      8,
+      0.0009599999999999999
+     ],
+     "HtoD": [
+      1,
+      6397936,
+      0.116704
+     ]
+    },
+    "memset": [
+     0,
+     0,
+     0.0
+    ],
+    "sync_ms": 0.6469090000000001,
+    "n_sync": 14,
+    "kern_union": 0.009536,
+    "host_copy_union": 0.117664,
+    "other_copy_union": 0.457374,
+    "n": 4,
+    "max_wall": 0.773587
+   },
+   "dynfilter::accum::contribute": {
+    "wall": 0.304799,
+    "n_api": 72,
+    "api": {
+     "cudaStreamGetDevice": 9,
+     "cudaEventCreateWithFlags": 9,
+     "cudaStreamWaitEvent": 18,
+     "cuKernelGetName": 9,
+     "cudaLaunchKernel": 9,
+     "cudaEventRecord": 9,
+     "cudaEventDestroy": 9
+    },
+    "api_ms": {
+     "cudaStreamGetDevice": 0.003641,
+     "cudaEventCreateWithFlags": 0.011493999999999997,
+     "cudaStreamWaitEvent": 0.061889000000000007,
+     "cuKernelGetName": 0.0027319999999999996,
+     "cudaLaunchKernel": 0.121126,
+     "cudaEventRecord": 0.024352,
+     "cudaEventDestroy": 0.012158
+    },
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 129.23824000000002
+    },
+    "kern_n": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 9
+    },
+    "mc": {},
+    "memset": [
+     0,
+     0,
+     0.0
+    ],
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "kern_union": 129.23824000000002,
+    "host_copy_union": 0.0,
+    "other_copy_union": 0.0,
+    "n": 9,
+    "max_wall": 0.039775
+   },
+   "dynfilter::accum::finish": {
+    "wall": 307.29105,
+    "n_api": 5014,
+    "api": {
+     "cudaStreamGetDevice": 2,
+     "cudaMemPoolGetAccess": 4,
+     "cudaMallocFromPoolAsync": 2,
+     "cudaStreamSynchronize": 1932,
+     "cudaMemcpyBatchAsync": 1920,
+     "cuKernelGetName": 576,
+     "cudaLaunchKernel": 576,
+     "cudaFreeAsync": 2
+    },
+    "api_ms": {
+     "cudaStreamGetDevice": 0.000494,
+     "cudaMemPoolGetAccess": 0.0022649999999999997,
+     "cudaMallocFromPoolAsync": 0.007956999999999999,
+     "cudaStreamSynchronize": 288.60305799999963,
+     "cudaMemcpyBatchAsync": 13.012856,
+     "cuKernelGetName": 0.09742099999999985,
+     "cudaLaunchKernel": 2.5546049999999996,
+     "cudaFreeAsync": 0.006506
+    },
+    "kern": {
+     "sirius::op::": 2.8706069999999952
+    },
+    "kern_n": {
+     "sirius::op::": 576
+    },
+    "mc": {
+     "PtoP": [
+      1152,
+      9605663616,
+      225.81915199999986
+     ],
+     "HtoD": [
+      576,
+      4802831808,
+      87.14554799999989
+     ],
+     "DtoH": [
+      192,
+      1600943936,
+      28.01844299999998
+     ]
+    },
+    "memset": [
+     0,
+     0,
+     0.0
+    ],
+    "sync_ms": 288.60305799999963,
+    "n_sync": 1932,
+    "kern_union": 2.870607,
+    "host_copy_union": 115.163991,
+    "other_copy_union": 143.844823,
+    "n": 2,
+    "max_wall": 280.740237
+   },
+   "dynfilter::construction::begin": {
+    "wall": 0.8068850000000001,
+    "n_api": 96,
+    "api": {
+     "cudaStreamCreateWithFlags": 16,
+     "cudaMallocFromPoolAsync": 24,
+     "cudaMemsetAsync": 24,
+     "cudaEventCreateWithFlags": 16,
+     "cudaEventRecord": 16
+    },
+    "api_ms": {
+     "cudaStreamCreateWithFlags": 0.12178699999999999,
+     "cudaMallocFromPoolAsync": 0.19889099999999998,
+     "cudaMemsetAsync": 0.20020100000000002,
+     "cudaEventCreateWithFlags": 0.015225,
+     "cudaEventRecord": 0.036879999999999996
+    },
+    "kern": {},
+    "kern_n": {},
+    "mc": {},
+    "memset": [
+     24,
+     6410173664,
+     3.9496170000000004
+    ],
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "kern_union": 0.0,
+    "host_copy_union": 0.0,
+    "other_copy_union": 0.0,
+    "n": 4,
+    "max_wall": 0.226391
+   }
+  },
+  "sites": [
+   {
+    "task": "Pipeline 1: PARTITION (id=1)",
+    "task_wall": 0.33954,
+    "op": "partition",
+    "start": 6.024995,
+    "tid": 295124165487635,
+    "wall": 0.327762,
+    "df_wall": 0.282872,
+    "names": {
+     "stage::contribute": 1,
+     "stage::gather": 1,
+     "replicate_devices": 1
+    },
+    "contribute_wall": 0.037051,
+    "finish_wall": 0.245821,
+    "publishing": true,
+    "kern": {
+     "void cub::detail::for_each::static_kernel": 0.001
+    },
+    "kern_union": 0.00096,
+    "sync_ms": 0.068123,
+    "n_sync": 10,
+    "n_api": 58,
+    "host_copy_union": 0.001536,
+    "mc": {
+     "DtoH": [
+      3,
+      12,
+      0.0015359999999999998
+     ],
+     "PtoP": [
+      6,
+      24,
+      0.003104
+     ],
+     "DtoD": [
+      1,
+      4,
+      0.000416
+     ]
+    },
+    "contribute_kern": {
+     "void cub::detail::for_each::static_kernel": 0.00096
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": -0.00924,
+    "after_contribute_to_first_finish_ms": 0.003505,
+    "pre_finish_ms": 0.043464,
+    "post_finish_ms": 0.011162
+   },
+   {
+    "task": "Pipeline 10: PARTITION (id=11)",
+    "task_wall": 311.00324,
+    "op": "partition",
+    "start": 59.239889,
+    "tid": 295124165487635,
+    "wall": 310.986788,
+    "df_wall": 280.781219,
+    "names": {
+     "accum::contribute": 1,
+     "accum::finish": 1,
+     "replicate_devices": 1
+    },
+    "contribute_wall": 0.039775,
+    "finish_wall": 280.741444,
+    "publishing": true,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.72,
+     "void cudf::": 3.975,
+     "void cub::detail::scan::DeviceScanInitKernel": 0.001,
+     "void cub::detail::scan::DeviceScanKernel": 0.007,
+     "sirius::op::": 2.661
+    },
+    "kern_union": 31.364504,
+    "sync_ms": 293.52287599999977,
+    "n_sync": 1761,
+    "n_api": 4631,
+    "host_copy_union": 105.13963,
+    "mc": {
+     "PtoP": [
+      1051,
+      8769680704,
+      206.1968699999999
+     ],
+     "DtoH": [
+      176,
+      1461613456,
+      25.58120999999998
+     ],
+     "DtoD": [
+      4,
+      1174464960,
+      1.604183
+     ],
+     "HtoD": [
+      525,
+      4384840320,
+      79.55841999999988
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.720059
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 25.422789,
+    "after_contribute_to_first_finish_ms": 30.174253,
+    "pre_finish_ms": 30.216721,
+    "post_finish_ms": 0.013477
+   },
+   {
+    "task": "Pipeline 7: PARTITION (id=8)",
+    "task_wall": 1.061892,
+    "op": "partition",
+    "start": 26.450345,
+    "tid": 295124165487631,
+    "wall": 1.047156,
+    "df_wall": 0.943128,
+    "names": {
+     "stage::contribute": 1,
+     "stage::gather": 1,
+     "replicate_devices": 1
+    },
+    "contribute_wall": 0.069201,
+    "finish_wall": 0.873927,
+    "publishing": true,
+    "kern": {
+     "void cub::detail::for_each::static_kernel": 0.013,
+     "void cuco::detail::open_addressing_ns::insert_if_n": 0.012
+    },
+    "kern_union": 0.02512,
+    "sync_ms": 0.633612,
+    "n_sync": 10,
+    "n_api": 67,
+    "host_copy_union": 0.11712,
+    "mc": {
+     "DtoH": [
+      1,
+      4,
+      0.000416
+     ],
+     "PtoP": [
+      7,
+      25591756,
+      0.456862
+     ],
+     "HtoD": [
+      1,
+      6397936,
+      0.116704
+     ]
+    },
+    "contribute_kern": {
+     "void cub::detail::for_each::static_kernel": 0.001408
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": -0.013109,
+    "after_contribute_to_first_finish_ms": 0.003302,
+    "pre_finish_ms": 0.07558,
+    "post_finish_ms": 0.011859
+   },
+   {
+    "task": "Pipeline 22: PARTITION (id=27)",
+    "task_wall": 1.572878,
+    "op": "partition",
+    "start": 908.939727,
+    "tid": 295124165487631,
+    "wall": 0.03693,
+    "df_wall": 0.03261,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.03261,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.527
+    },
+    "kern_union": 1.527359,
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "n_api": 8,
+    "host_copy_union": 0.0,
+    "mc": {},
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.527359
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 1.519389,
+    "after_contribute_to_first_finish_ms": 0.002071
+   },
+   {
+    "task": "Pipeline 10: PARTITION (id=11)",
+    "task_wall": 61.659664,
+    "op": "partition",
+    "start": 59.208739,
+    "tid": 295124165487628,
+    "wall": 58.594705,
+    "df_wall": 0.039081,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.039081,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.731,
+     "void cudf::": 4.066,
+     "void cub::detail::scan::DeviceScanInitKernel": 0.001,
+     "void cub::detail::scan::DeviceScanKernel": 0.007
+    },
+    "kern_union": 28.804849,
+    "sync_ms": 58.210561,
+    "n_sync": 4,
+    "n_api": 69,
+    "host_copy_union": 0.0008,
+    "mc": {
+     "PtoP": [
+      1,
+      64,
+      0.001536
+     ],
+     "DtoH": [
+      1,
+      16,
+      0.0008
+     ],
+     "DtoD": [
+      4,
+      1174353920,
+      2.068215
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.730721
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 49.621823,
+    "after_contribute_to_first_finish_ms": 58.552798
+   },
+   {
+    "task": "Pipeline 10: PARTITION (id=11)",
+    "task_wall": 61.624232,
+    "op": "partition",
+    "start": 59.216894,
+    "tid": 295124165487626,
+    "wall": 56.199286,
+    "df_wall": 0.036616,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.036616,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.198,
+     "void cudf::": 3.979,
+     "void cub::detail::scan::DeviceScanInitKernel": 0.008,
+     "void cub::detail::scan::DeviceScanKernel": 0.011
+    },
+    "kern_union": 28.195284,
+    "sync_ms": 55.780421000000004,
+    "n_sync": 4,
+    "n_api": 69,
+    "host_copy_union": 0.001824,
+    "mc": {
+     "PtoP": [
+      1,
+      64,
+      0.007744
+     ],
+     "DtoH": [
+      1,
+      16,
+      0.001824
+     ],
+     "DtoD": [
+      4,
+      1148761328,
+      3.204563
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.197507
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 24.984687,
+    "after_contribute_to_first_finish_ms": 56.158511
+   },
+   {
+    "task": "Pipeline 22: PARTITION (id=27)",
+    "task_wall": 1.568378,
+    "op": "partition",
+    "start": 908.915019,
+    "tid": 295124165487643,
+    "wall": 0.031952,
+    "df_wall": 0.02728,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.02728,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.533
+    },
+    "kern_union": 1.532666,
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "n_api": 8,
+    "host_copy_union": 0.0,
+    "mc": {},
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.532666
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 1.526074,
+    "after_contribute_to_first_finish_ms": 0.001989
+   },
+   {
+    "task": "Pipeline 10: PARTITION (id=11)",
+    "task_wall": 31.7054,
+    "op": "partition",
+    "start": 59.236428,
+    "tid": 295124165487632,
+    "wall": 30.203176,
+    "df_wall": 0.029453,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.029453,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.717,
+     "void cudf::": 3.971,
+     "void cub::detail::scan::DeviceScanInitKernel": 0.001,
+     "void cub::detail::scan::DeviceScanKernel": 0.007
+    },
+    "kern_union": 28.695983,
+    "sync_ms": 29.760143000000003,
+    "n_sync": 4,
+    "n_api": 69,
+    "host_copy_union": 0.001152,
+    "mc": {
+     "PtoP": [
+      1,
+      64,
+      0.00032
+     ],
+     "DtoH": [
+      1,
+      16,
+      0.001152
+     ],
+     "DtoD": [
+      4,
+      1174451992,
+      1.603039
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.716626
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 25.46935,
+    "after_contribute_to_first_finish_ms": 30.171185
+   },
+   {
+    "task": "Pipeline 22: PARTITION (id=27)",
+    "task_wall": 1.558564,
+    "op": "partition",
+    "start": 908.941437,
+    "tid": 295124165487627,
+    "wall": 0.033372,
+    "df_wall": 0.028631,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.028631,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.522
+    },
+    "kern_union": 1.522234,
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "n_api": 8,
+    "host_copy_union": 0.0,
+    "mc": {},
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.522234
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 1.515148,
+    "after_contribute_to_first_finish_ms": 0.002205
+   },
+   {
+    "task": "Pipeline 22: PARTITION (id=27)",
+    "task_wall": 26.627592,
+    "op": "partition",
+    "start": 908.936183,
+    "tid": 295124165487638,
+    "wall": 26.61569,
+    "df_wall": 26.58737,
+    "names": {
+     "accum::contribute": 1,
+     "accum::finish": 1,
+     "replicate_devices": 1
+    },
+    "contribute_wall": 0.035546,
+    "finish_wall": 26.551824,
+    "publishing": true,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.528,
+     "sirius::op::": 0.209
+    },
+    "kern_union": 1.73759,
+    "sync_ms": 24.816171000000004,
+    "n_sync": 177,
+    "n_api": 462,
+    "host_copy_union": 10.025481,
+    "mc": {
+     "PtoP": [
+      102,
+      835982976,
+      19.622601999999997
+     ],
+     "HtoD": [
+      51,
+      417991488,
+      7.587128000000004
+     ],
+     "DtoH": [
+      17,
+      139330496,
+      2.438353
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.52812
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 1.518387,
+    "after_contribute_to_first_finish_ms": 0.003888,
+    "pre_finish_ms": 0.042856,
+    "post_finish_ms": 0.012871
+   },
+   {
+    "task": "Pipeline 10: PARTITION (id=11)",
+    "task_wall": 31.770044,
+    "op": "partition",
+    "start": 59.217502,
+    "tid": 295124165487640,
+    "wall": 30.246334,
+    "df_wall": 0.035807,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.035807,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.763,
+     "void cudf::": 3.976,
+     "void cub::detail::scan::DeviceScanInitKernel": 0.001,
+     "void cub::detail::scan::DeviceScanKernel": 0.007
+    },
+    "kern_union": 28.747638,
+    "sync_ms": 29.758668,
+    "n_sync": 4,
+    "n_api": 69,
+    "host_copy_union": 0.001568,
+    "mc": {
+     "HtoD": [
+      1,
+      64,
+      0.00032
+     ],
+     "DtoH": [
+      1,
+      16,
+      0.001248
+     ],
+     "DtoD": [
+      4,
+      1174421488,
+      1.600826
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.762948
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 25.444769,
+    "after_contribute_to_first_finish_ms": 30.199804
+   }
+  ],
+  "df_top_wall": 309.630952,
+  "df_top_union": 309.454394,
+  "marks": {
+   "dynfilter::accum::final_commit": 4,
+   "dynfilter::accum::visible": 4
+  },
+  "partition_execute_all_ms": 743.407575,
+  "partition_execute_n": 102
+ },
+ {
+  "iter": 2,
+  "wall": 1452.216062,
+  "ranges": {
+   "dynfilter::construction::begin": {
+    "wall": 0.687046,
+    "n_api": 96,
+    "api": {
+     "cudaStreamCreateWithFlags": 16,
+     "cudaMallocFromPoolAsync": 24,
+     "cudaMemsetAsync": 24,
+     "cudaEventCreateWithFlags": 16,
+     "cudaEventRecord": 16
+    },
+    "api_ms": {
+     "cudaStreamCreateWithFlags": 0.10252900000000001,
+     "cudaMallocFromPoolAsync": 0.18132500000000001,
+     "cudaMemsetAsync": 0.179735,
+     "cudaEventCreateWithFlags": 0.013297,
+     "cudaEventRecord": 0.033124999999999995
+    },
+    "kern": {},
+    "kern_n": {},
+    "mc": {},
+    "memset": [
+     24,
+     6410173664,
+     3.9607859999999997
+    ],
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "kern_union": 0.0,
+    "host_copy_union": 0.0,
+    "other_copy_union": 0.0,
+    "n": 4,
+    "max_wall": 0.2022
+   },
+   "dynfilter::accum::contribute": {
+    "wall": 0.30356299999999997,
+    "n_api": 72,
+    "api": {
+     "cudaStreamGetDevice": 9,
+     "cudaEventCreateWithFlags": 9,
+     "cudaStreamWaitEvent": 18,
+     "cuKernelGetName": 9,
+     "cudaLaunchKernel": 9,
+     "cudaEventRecord": 9,
+     "cudaEventDestroy": 9
+    },
+    "api_ms": {
+     "cudaStreamGetDevice": 0.003709,
+     "cudaEventCreateWithFlags": 0.011099,
+     "cudaStreamWaitEvent": 0.065844,
+     "cuKernelGetName": 0.0025909999999999996,
+     "cudaLaunchKernel": 0.11614100000000001,
+     "cudaEventRecord": 0.024635999999999998,
+     "cudaEventDestroy": 0.010568
+    },
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 129.21629199999998
+    },
+    "kern_n": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 9
+    },
+    "mc": {},
+    "memset": [
+     0,
+     0,
+     0.0
+    ],
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "kern_union": 129.21629199999998,
+    "host_copy_union": 0.0,
+    "other_copy_union": 0.0,
+    "n": 9,
+    "max_wall": 0.042059
+   },
+   "dynfilter::accum::finish": {
+    "wall": 308.02465,
+    "n_api": 5014,
+    "api": {
+     "cudaStreamGetDevice": 2,
+     "cudaMemPoolGetAccess": 4,
+     "cudaMallocFromPoolAsync": 2,
+     "cudaStreamSynchronize": 1932,
+     "cudaMemcpyBatchAsync": 1920,
+     "cuKernelGetName": 576,
+     "cudaLaunchKernel": 576,
+     "cudaFreeAsync": 2
+    },
+    "api_ms": {
+     "cudaStreamGetDevice": 0.000523,
+     "cudaMemPoolGetAccess": 0.00202,
+     "cudaMallocFromPoolAsync": 0.006052,
+     "cudaStreamSynchronize": 289.19109599999945,
+     "cudaMemcpyBatchAsync": 13.073348000000022,
+     "cuKernelGetName": 0.10505300000000019,
+     "cudaLaunchKernel": 2.534592,
+     "cudaFreeAsync": 0.006815
+    },
+    "kern": {
+     "sirius::op::": 2.8627729999999993
+    },
+    "kern_n": {
+     "sirius::op::": 576
+    },
+    "mc": {
+     "PtoP": [
+      1502,
+      12528890496,
+      254.11669699999985
+     ],
+     "DtoH": [
+      192,
+      1600943936,
+      28.072138999999986
+     ],
+     "HtoD": [
+      226,
+      1879604928,
+      58.84528999999999
+     ]
+    },
+    "memset": [
+     0,
+     0,
+     0.0
+    ],
+    "sync_ms": 289.19109599999945,
+    "n_sync": 1932,
+    "kern_union": 2.8627730000000002,
+    "host_copy_union": 86.917429,
+    "other_copy_union": 220.354425,
+    "n": 2,
+    "max_wall": 281.564883
+   },
+   "dynfilter::replicate_devices": {
+    "wall": 0.918654,
+    "n_api": 48,
+    "api": {
+     "cudaMallocFromPoolAsync": 6,
+     "cuKernelGetName": 3,
+     "cudaLaunchKernel": 3,
+     "cudaStreamGetDevice": 6,
+     "cudaMemPoolGetAccess": 6,
+     "cudaMemcpyBatchAsync": 4,
+     "cudaStreamSynchronize": 14,
+     "cudaMemcpyPeerAsync": 2,
+     "cudaMemcpyAsync": 4
+    },
+    "api_ms": {
+     "cudaMallocFromPoolAsync": 0.037489999999999996,
+     "cuKernelGetName": 0.000604,
+     "cudaLaunchKernel": 0.026660999999999997,
+     "cudaStreamGetDevice": 0.0018759999999999998,
+     "cudaMemPoolGetAccess": 0.002616,
+     "cudaMemcpyBatchAsync": 0.039713,
+     "cudaStreamSynchronize": 0.6626839999999999,
+     "cudaMemcpyPeerAsync": 0.025255,
+     "cudaMemcpyAsync": 0.019589000000000002
+    },
+    "kern": {
+     "void cub::detail::for_each::static_kernel": 0.007776000000000001
+    },
+    "kern_n": {
+     "void cub::detail::for_each::static_kernel": 3
+    },
+    "mc": {
+     "PtoP": [
+      8,
+      25591760,
+      0.45660599999999996
+     ],
+     "HtoD": [
+      2,
+      6397940,
+      0.116799
+     ]
+    },
+    "memset": [
+     0,
+     0,
+     0.0
+    ],
+    "sync_ms": 0.6626839999999999,
+    "n_sync": 14,
+    "kern_union": 0.007776,
+    "host_copy_union": 0.116799,
+    "other_copy_union": 0.456606,
+    "n": 4,
+    "max_wall": 0.776197
+   },
+   "dynfilter::stage::contribute": {
+    "wall": 0.093107,
+    "n_api": 16,
+    "api": {
+     "cudaStreamGetDevice": 2,
+     "cudaStreamWaitEvent": 4,
+     "cuKernelGetName": 2,
+     "cudaLaunchKernel": 2,
+     "cudaEventCreateWithFlags": 2,
+     "cudaEventRecord": 2,
+     "cudaEventDestroy": 2
+    },
+    "api_ms": {
+     "cudaStreamGetDevice": 0.000574,
+     "cudaStreamWaitEvent": 0.012429,
+     "cuKernelGetName": 0.000509,
+     "cudaLaunchKernel": 0.050342,
+     "cudaEventCreateWithFlags": 0.0019890000000000003,
+     "cudaEventRecord": 0.0039499999999999995,
+     "cudaEventDestroy": 0.001778
+    },
+    "kern": {
+     "void cub::detail::for_each::static_kernel": 0.002368
+    },
+    "kern_n": {
+     "void cub::detail::for_each::static_kernel": 2
+    },
+    "mc": {},
+    "memset": [
+     0,
+     0,
+     0.0
+    ],
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "kern_union": 0.002368,
+    "host_copy_union": 0.0,
+    "other_copy_union": 0.0,
+    "n": 2,
+    "max_wall": 0.058965
+   },
+   "dynfilter::stage::gather": {
+    "wall": 0.187234,
+    "n_api": 52,
+    "api": {
+     "cudaStreamGetDevice": 4,
+     "cudaStreamWaitEvent": 10,
+     "cudaStreamSynchronize": 4,
+     "cudaMemcpyAsync": 8,
+     "cudaEventCreateWithFlags": 8,
+     "cudaEventRecord": 10,
+     "cudaEventDestroy": 8
+    },
+    "api_ms": {
+     "cudaStreamGetDevice": 0.00104,
+     "cudaStreamWaitEvent": 0.034286,
+     "cudaStreamSynchronize": 0.028732999999999998,
+     "cudaMemcpyAsync": 0.066939,
+     "cudaEventCreateWithFlags": 0.004137,
+     "cudaEventRecord": 0.013493,
+     "cudaEventDestroy": 0.005196000000000001
+    },
+    "kern": {},
+    "kern_n": {},
+    "mc": {
+     "DtoH": [
+      2,
+      8,
+      0.0015359999999999998
+     ],
+     "PtoP": [
+      6,
+      24,
+      0.00384
+     ]
+    },
+    "memset": [
+     0,
+     0,
+     0.0
+    ],
+    "sync_ms": 0.028732999999999998,
+    "n_sync": 4,
+    "kern_union": 0.0,
+    "host_copy_union": 0.0015359999999999998,
+    "other_copy_union": 0.0038399999999999997,
+    "n": 2,
+    "max_wall": 0.100902
+   }
+  },
+  "sites": [
+   {
+    "task": "Pipeline 10: PARTITION (id=11)",
+    "task_wall": 31.62384,
+    "op": "partition",
+    "start": 58.779559,
+    "tid": 295124165487636,
+    "wall": 30.12064,
+    "df_wall": 0.042059,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.042059,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.694,
+     "void cudf::": 3.976,
+     "void cub::detail::scan::DeviceScanInitKernel": 0.001,
+     "void cub::detail::scan::DeviceScanKernel": 0.007
+    },
+    "kern_union": 28.678853,
+    "sync_ms": 29.644446,
+    "n_sync": 4,
+    "n_api": 69,
+    "host_copy_union": 0.000768,
+    "mc": {
+     "PtoP": [
+      1,
+      64,
+      0.00032
+     ],
+     "DtoH": [
+      1,
+      16,
+      0.000768
+     ],
+     "DtoD": [
+      4,
+      1174421488,
+      1.601783
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.694139
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 25.383971,
+    "after_contribute_to_first_finish_ms": 30.067048
+   },
+   {
+    "task": "Pipeline 22: PARTITION (id=27)",
+    "task_wall": 1.571974,
+    "op": "partition",
+    "start": 912.547339,
+    "tid": 295124165487636,
+    "wall": 0.040734,
+    "df_wall": 0.033601,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.033601,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.529
+    },
+    "kern_union": 1.528536,
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "n_api": 8,
+    "host_copy_union": 0.0,
+    "mc": {},
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.528536
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 1.519635,
+    "after_contribute_to_first_finish_ms": 0.002066
+   },
+   {
+    "task": "Pipeline 10: PARTITION (id=11)",
+    "task_wall": 311.766475,
+    "op": "partition",
+    "start": 58.800162,
+    "tid": 295124165487628,
+    "wall": 311.749969,
+    "df_wall": 281.598624,
+    "names": {
+     "accum::contribute": 1,
+     "accum::finish": 1,
+     "replicate_devices": 1
+    },
+    "contribute_wall": 0.032429,
+    "finish_wall": 281.566195,
+    "publishing": true,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.689,
+     "void cudf::": 3.976,
+     "void cub::detail::scan::DeviceScanInitKernel": 0.001,
+     "void cub::detail::scan::DeviceScanKernel": 0.007,
+     "sirius::op::": 2.652
+    },
+    "kern_union": 31.324678,
+    "sync_ms": 294.1884719999997,
+    "n_sync": 1761,
+    "n_api": 4631,
+    "host_copy_union": 76.89555,
+    "mc": {
+     "PtoP": [
+      1401,
+      11692907584,
+      234.53096899999989
+     ],
+     "DtoH": [
+      176,
+      1461613456,
+      25.634965999999988
+     ],
+     "DtoD": [
+      4,
+      1174451992,
+      1.59721
+     ],
+     "HtoD": [
+      175,
+      1461613440,
+      51.26058399999999
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.688705
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 25.433478,
+    "after_contribute_to_first_finish_ms": 30.117987,
+    "pre_finish_ms": 30.15275,
+    "post_finish_ms": 0.014797
+   },
+   {
+    "task": "Pipeline 10: PARTITION (id=11)",
+    "task_wall": 61.608777,
+    "op": "partition",
+    "start": 58.779255,
+    "tid": 295124165487641,
+    "wall": 58.57108,
+    "df_wall": 0.035618,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.035618,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.245,
+     "void cudf::": 3.991,
+     "void cub::detail::scan::DeviceScanInitKernel": 0.009,
+     "void cub::detail::scan::DeviceScanKernel": 0.01
+    },
+    "kern_union": 28.255095,
+    "sync_ms": 58.159144,
+    "n_sync": 4,
+    "n_api": 69,
+    "host_copy_union": 0.005216,
+    "mc": {
+     "HtoD": [
+      1,
+      64,
+      0.004416
+     ],
+     "DtoH": [
+      1,
+      16,
+      0.0008
+     ],
+     "DtoD": [
+      4,
+      1148761328,
+      2.795126
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.245318
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 24.923051,
+    "after_contribute_to_first_finish_ms": 58.531365
+   },
+   {
+    "task": "Pipeline 7: PARTITION (id=8)",
+    "task_wall": 1.032282,
+    "op": "partition",
+    "start": 26.167143,
+    "tid": 295124165487626,
+    "wall": 1.018401,
+    "df_wall": 0.921494,
+    "names": {
+     "stage::contribute": 1,
+     "stage::gather": 1,
+     "replicate_devices": 1
+    },
+    "contribute_wall": 0.058965,
+    "finish_wall": 0.862529,
+    "publishing": true,
+    "kern": {
+     "void cub::detail::for_each::static_kernel": 0.012,
+     "void cuco::detail::open_addressing_ns::insert_if_n": 0.011
+    },
+    "kern_union": 0.023072,
+    "sync_ms": 0.6544789999999999,
+    "n_sync": 10,
+    "n_api": 67,
+    "host_copy_union": 0.116863,
+    "mc": {
+     "DtoH": [
+      1,
+      4,
+      0.000416
+     ],
+     "PtoP": [
+      7,
+      25591756,
+      0.45538999999999996
+     ],
+     "HtoD": [
+      1,
+      6397936,
+      0.116447
+     ]
+    },
+    "contribute_kern": {
+     "void cub::detail::for_each::static_kernel": 0.001408
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": -0.008043,
+    "after_contribute_to_first_finish_ms": 0.003156,
+    "pre_finish_ms": 0.065035,
+    "post_finish_ms": 0.01182
+   },
+   {
+    "task": "Pipeline 10: PARTITION (id=11)",
+    "task_wall": 61.59206,
+    "op": "partition",
+    "start": 58.777381,
+    "tid": 295124165487643,
+    "wall": 56.226015,
+    "df_wall": 0.036654,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.036654,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.793,
+     "void cudf::": 4.032,
+     "void cub::detail::scan::DeviceScanInitKernel": 0.001,
+     "void cub::detail::scan::DeviceScanKernel": 0.007
+    },
+    "kern_union": 28.833139,
+    "sync_ms": 55.853466,
+    "n_sync": 4,
+    "n_api": 69,
+    "host_copy_union": 0.003168,
+    "mc": {
+     "HtoD": [
+      1,
+      64,
+      0.0024
+     ],
+     "DtoH": [
+      1,
+      16,
+      0.000768
+     ],
+     "DtoD": [
+      4,
+      1174353920,
+      3.194516
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.792739
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 49.624797,
+    "after_contribute_to_first_finish_ms": 56.186137
+   },
+   {
+    "task": "Pipeline 22: PARTITION (id=27)",
+    "task_wall": 1.567891,
+    "op": "partition",
+    "start": 912.529957,
+    "tid": 295124165487643,
+    "wall": 0.033383,
+    "df_wall": 0.028106,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.028106,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.529
+    },
+    "kern_union": 1.529083,
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "n_api": 8,
+    "host_copy_union": 0.0,
+    "mc": {},
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.529083
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 1.52317,
+    "after_contribute_to_first_finish_ms": 0.002359
+   },
+   {
+    "task": "Pipeline 1: PARTITION (id=1)",
+    "task_wall": 0.337456,
+    "op": "partition",
+    "start": 5.752683,
+    "tid": 295124165487632,
+    "wall": 0.324964,
+    "df_wall": 0.275402,
+    "names": {
+     "stage::contribute": 1,
+     "stage::gather": 1,
+     "replicate_devices": 1
+    },
+    "contribute_wall": 0.034142,
+    "finish_wall": 0.24126,
+    "publishing": true,
+    "kern": {
+     "void cub::detail::for_each::static_kernel": 0.001
+    },
+    "kern_union": 0.00096,
+    "sync_ms": 0.06209999999999999,
+    "n_sync": 10,
+    "n_api": 58,
+    "host_copy_union": 0.001472,
+    "mc": {
+     "DtoH": [
+      1,
+      4,
+      0.00112
+     ],
+     "PtoP": [
+      7,
+      28,
+      0.005056000000000001
+     ],
+     "DtoD": [
+      1,
+      4,
+      0.000416
+     ],
+     "HtoD": [
+      1,
+      4,
+      0.000352
+     ]
+    },
+    "contribute_kern": {
+     "void cub::detail::for_each::static_kernel": 0.00096
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": -0.008326,
+    "after_contribute_to_first_finish_ms": 0.003168,
+    "pre_finish_ms": 0.039863,
+    "post_finish_ms": 0.011734
+   },
+   {
+    "task": "Pipeline 10: PARTITION (id=11)",
+    "task_wall": 31.636856,
+    "op": "partition",
+    "start": 58.786447,
+    "tid": 295124165487632,
+    "wall": 30.129094,
+    "df_wall": 0.032955,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.032955,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.684,
+     "void cudf::": 3.973,
+     "void cub::detail::scan::DeviceScanInitKernel": 0.001,
+     "void cub::detail::scan::DeviceScanKernel": 0.007
+    },
+    "kern_union": 28.665328,
+    "sync_ms": 29.695549,
+    "n_sync": 4,
+    "n_api": 69,
+    "host_copy_union": 0.001152,
+    "mc": {
+     "PtoP": [
+      1,
+      64,
+      0.00032
+     ],
+     "DtoH": [
+      1,
+      16,
+      0.001152
+     ],
+     "DtoD": [
+      4,
+      1174464960,
+      1.598943
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 24.684242
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 25.415811,
+    "after_contribute_to_first_finish_ms": 30.093801
+   },
+   {
+    "task": "Pipeline 22: PARTITION (id=27)",
+    "task_wall": 1.569727,
+    "op": "partition",
+    "start": 912.548949,
+    "tid": 295124165487632,
+    "wall": 0.037597,
+    "df_wall": 0.032235,
+    "names": {
+     "accum::contribute": 1
+    },
+    "contribute_wall": 0.032235,
+    "finish_wall": 0.0,
+    "publishing": false,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.528
+    },
+    "kern_union": 1.528223,
+    "sync_ms": 0.0,
+    "n_sync": 0,
+    "n_api": 8,
+    "host_copy_union": 0.0,
+    "mc": {},
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.528223
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 1.520331,
+    "after_contribute_to_first_finish_ms": 0.002258
+   },
+   {
+    "task": "Pipeline 22: PARTITION (id=27)",
+    "task_wall": 26.5382,
+    "op": "partition",
+    "start": 912.548446,
+    "tid": 295124165487627,
+    "wall": 26.526415,
+    "df_wall": 26.49046,
+    "names": {
+     "accum::contribute": 1,
+     "accum::finish": 1,
+     "replicate_devices": 1
+    },
+    "contribute_wall": 0.029906,
+    "finish_wall": 26.460554,
+    "publishing": true,
+    "kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.525,
+     "sirius::op::": 0.211
+    },
+    "kern_union": 1.735963,
+    "sync_ms": 24.74335700000002,
+    "n_sync": 177,
+    "n_api": 462,
+    "host_copy_union": 10.022647,
+    "mc": {
+     "PtoP": [
+      102,
+      835982976,
+      19.586048
+     ],
+     "HtoD": [
+      51,
+      417991488,
+      7.584706000000005
+     ],
+     "DtoH": [
+      17,
+      139330496,
+      2.4379410000000004
+     ]
+    },
+    "contribute_kern": {
+     "void cuco::detail::bloom_filter_ns::add_if_n": 1.525307
+    },
+    "contribute_n_api": 8,
+    "contrib_kernels_end_after_contribute_return_ms": 1.518136,
+    "after_contribute_to_first_finish_ms": 0.003636,
+    "pre_finish_ms": 0.045086,
+    "post_finish_ms": 0.011984
+   }
+  ],
+  "df_top_wall": 310.214254,
+  "df_top_union": 310.022032,
+  "marks": {
+   "dynfilter::accum::final_commit": 4,
+   "dynfilter::accum::visible": 4
+  },
+  "partition_execute_all_ms": 594.879007,
+  "partition_execute_n": 102
+ }
+]

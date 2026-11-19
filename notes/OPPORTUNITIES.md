@@ -12,6 +12,11 @@
   on top of S5 - not part of #2569/#2570. Ledger buckets: #2569 (S5B1), #2570 (S5B2), S6 PR (eager probe), transfer PR.
 - Consequence: OP1 (finish off the critical path, hidden in the CONCAT slack) and "local replicas after CONCAT" are demoted:
   they consume / sit behind the slack that eager scans reclaim.
+- (2026-11-19) Transfer PR direction: user prefers IN PRINCIPLE "D2D inside P2P pairs + host hop between pairs" (proto/xfer-d2d,
+  mode pipe) over the all-host CPU-OR scheme, even where the latter ties on this machine. Treat D2D-in-pairs as the lead design;
+  the pipelined host bounce is the cross-pair leg / no-P2P fallback.
+- (2026-11-19) Instance auto-stops. Checkpoint incrementally to fork kevkrist/sirius (branches dfperf/*, notes branch dfperf/notes,
+  issues allowed). A fresh session must be able to resume from dfperf/notes:RESUME.md alone.
 
 # OPPORTUNITIES: measured, verified opportunity list for the DF stack (#2569 -> #2570), TPC-H SF1000, 4 GPUs
 
