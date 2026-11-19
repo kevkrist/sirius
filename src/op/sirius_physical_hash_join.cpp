@@ -2165,8 +2165,18 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             batch_telemetry());
 }
 
+void sirius_physical_hash_join::on_input_batch_pushed(std::string_view port_id,
+                                                      ::cucascade::data_batch& /*batch*/)
+{
+  // PROTOTYPE (OP1A): the single join point. A build deposit is what lets the probe side be
+  // demanded (every slot needs its build batch before `wait_for_probe`), so no consumer scan is
+  // created before the join's filters are visible.
+  if (port_id == "build") { _dynamic_filter_session.await_publication(); }
+}
+
 void sirius_physical_hash_join::on_finalize_operator()
 {
+  _dynamic_filter_session.join_continuation();
   _dynamic_filter_session.finalize_input();
   std::scoped_lock lg(op_state_mutex);
 

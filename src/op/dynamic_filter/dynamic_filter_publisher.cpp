@@ -48,10 +48,13 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <concepts>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -61,6 +64,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -710,6 +715,7 @@ struct dynamic_filter_publication_session::state {
       std::optional<std::chrono::steady_clock::duration> latency;
       auto const counts = fan_out(plan, producers, per_key, pushed_bindings, [&] {
         latency = std::chrono::steady_clock::now() - final_commit;
+        visible_epoch_ns.store(proto_epoch_ns(), std::memory_order_relaxed);
         nvtx3::mark_in<nvtx_domain>("dynfilter::accum::visible");
       });
       sirius::log::log_noexcept([&] {
@@ -811,6 +817,30 @@ struct dynamic_filter_publication_session::state {
   bool sealed        = false;
   bool input_closed  = false;
   bool cancelled     = false;
+
+  // PROTOTYPE (OP1A): asynchronous publication continuation.
+  // `continuation_in_flight` is guarded by `mutex`; awaiters wait on `continuation_done`.
+  std::condition_variable continuation_done;
+  bool continuation_in_flight = false;
+  std::exception_ptr continuation_error;  ///< A fatal continuation failure, rethrown by an awaiter
+  std::mutex continuation_join_mutex;     ///< Serializes joins of `continuation`
+  std::thread continuation;
+  std::atomic<std::int64_t> visible_epoch_ns{0};
+
+  /// Epoch nanoseconds on the clock Quent stamps its events with.
+  [[nodiscard]] static std::int64_t proto_epoch_ns() noexcept
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+  }
+
+  /// Joins the continuation thread, if one was started. Never called from the continuation.
+  void join_continuation() noexcept
+  {
+    std::scoped_lock join_lock(continuation_join_mutex);
+    if (continuation.joinable()) { continuation.join(); }
+  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -863,7 +893,11 @@ dynamic_filter_publication_session::dynamic_filter_publication_session(
 {
 }
 
-dynamic_filter_publication_session::~dynamic_filter_publication_session() { cancel(); }
+dynamic_filter_publication_session::~dynamic_filter_publication_session()
+{
+  cancel();
+  _state->join_continuation();
+}
 
 dynamic_filter_publish_plan const& dynamic_filter_publication_session::plan() const noexcept
 {
@@ -1184,6 +1218,198 @@ void dynamic_filter_publication_session::publish_if_final(
     active.claimed = true;
   }
   operation.publish(task_space, stream);
+}
+
+//===----------------------------------------------------------------------===//
+// PROTOTYPE (OP1A): asynchronous publication continuation
+//===----------------------------------------------------------------------===//
+namespace {
+
+/// Streams for publication continuations: one free list per GPU, never destroyed, because a filter
+/// built on a continuation's stream frees in that stream's order long after the continuation ends.
+class continuation_streams {
+ public:
+  [[nodiscard]] static cudaStream_t acquire(int device)
+  {
+    auto& self = instance();
+    {
+      std::scoped_lock lock(self._mutex);
+      auto& free = self._free[device];
+      if (!free.empty()) {
+        auto const stream = free.back();
+        free.pop_back();
+        return stream;
+      }
+    }
+    cudaStream_t stream{};
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+      (void)cudaGetLastError();
+      throw std::runtime_error("[dynamic_filter continuation] cudaStreamCreateWithFlags failed");
+    }
+    return stream;
+  }
+
+  static void release(int device, cudaStream_t stream) noexcept
+  {
+    try {
+      auto& self = instance();
+      std::scoped_lock lock(self._mutex);
+      self._free[device].push_back(stream);
+    } catch (...) {
+    }
+  }
+
+ private:
+  static continuation_streams& instance()
+  {
+    static auto* self = new continuation_streams;  // leaked on purpose: outlives the CUDA context
+    return *self;
+  }
+  std::mutex _mutex;
+  std::unordered_map<int, std::vector<cudaStream_t>> _free;
+};
+
+/// `SIRIUS_DF_ASYNC_PUBLISH=0` restores the synchronous publication on the Publishing Task.
+[[nodiscard]] bool async_publication_enabled() noexcept
+{
+  static bool const enabled = [] {
+    auto const* value = std::getenv("SIRIUS_DF_ASYNC_PUBLISH");
+    return value == nullptr || std::string_view{value} != "0";
+  }();
+  return enabled;
+}
+
+}  // namespace
+
+void dynamic_filter_publication_session::publish_if_final_async(
+  std::uint64_t original_id,
+  cucascade::memory::memory_space const& task_space,
+  ::cuda::stream_ref stream)
+{
+  if (!async_publication_enabled()) {
+    publish_if_final(original_id, task_space, stream);
+    return;
+  }
+  auto& operation = *_state;
+  bool claimed    = false;
+  {
+    std::scoped_lock lock(operation.mutex);
+    if (operation.pending_publication == original_id && !operation.accumulation_result &&
+        !operation.continuation_in_flight) {
+      operation.pending_publication.reset();
+      ++operation.active_operations;
+      operation.continuation_in_flight = true;
+      claimed                          = true;
+    }
+  }
+  if (!claimed) {
+    operation.settle().dispatch();
+    return;
+  }
+  auto const handoff_ns = state::proto_epoch_ns();
+  auto const body       = [&operation, space = &task_space, handoff_ns]() noexcept {
+    auto const start_ns = state::proto_epoch_ns();
+    std::exception_ptr error;
+    {
+      // Settles the session (PUBLISHING -> TERMINAL) before any awaiter is released.
+      state::active_operation active{operation};
+      active.claimed = true;
+      try {
+        auto const device = space->get_device_id();
+        rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device}};
+        auto const continuation_stream = continuation_streams::acquire(device);
+        try {
+          operation.publish(*space, ::cuda::stream_ref{continuation_stream});
+        } catch (...) {
+          (void)cudaStreamSynchronize(continuation_stream);
+          (void)cudaGetLastError();
+          continuation_streams::release(device, continuation_stream);
+          throw;
+        }
+        continuation_streams::release(device, continuation_stream);
+      } catch (...) {
+        error = std::current_exception();
+      }
+    }
+    auto const end_ns = state::proto_epoch_ns();
+    std::optional<std::size_t> join;
+    {
+      std::scoped_lock lock(operation.mutex);
+      join                             = operation.identity.operator_id;
+      operation.continuation_error     = error;
+      operation.continuation_in_flight = false;
+    }
+    operation.continuation_done.notify_all();
+    sirius::log::log_noexcept([&] {
+      SIRIUS_LOG_INFO(
+        "[df_async] continuation join={} root_gpu={} handoff_epoch_ns={} start_delay_us={:.1f} "
+        "run_ms={:.3f} visible_epoch_ns={} end_epoch_ns={} failed={}",
+        join ? static_cast<long long>(*join) : -1LL,
+        space->get_device_id(),
+        handoff_ns,
+        static_cast<double>(start_ns - handoff_ns) / 1e3,
+        static_cast<double>(end_ns - start_ns) / 1e6,
+        operation.visible_epoch_ns.load(std::memory_order_relaxed),
+        end_ns,
+        error ? 1 : 0);
+    });
+  };
+  try {
+    std::scoped_lock join_lock(operation.continuation_join_mutex);
+    operation.continuation = std::thread{body};
+  } catch (std::system_error const&) {
+    // No thread: publish here, as the synchronous path does. The claim is already taken.
+    {
+      std::scoped_lock lock(operation.mutex);
+      operation.continuation_in_flight = false;
+    }
+    state::active_operation active{operation};
+    active.claimed = true;
+    operation.publish(task_space, stream);
+    operation.continuation_done.notify_all();
+  }
+}
+
+void dynamic_filter_publication_session::await_publication()
+{
+  auto& operation = *_state;
+  std::exception_ptr error;
+  std::optional<std::size_t> join;
+  double waited_ms = -1.0;
+  {
+    std::unique_lock lock(operation.mutex);
+    if (operation.continuation_in_flight) {
+      auto const begin = std::chrono::steady_clock::now();
+      operation.continuation_done.wait(lock, [&] { return !operation.continuation_in_flight; });
+      waited_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    }
+    error = std::exchange(operation.continuation_error, nullptr);
+    join  = operation.identity.operator_id;
+  }
+  if (waited_ms >= 0.0) {
+    sirius::log::log_noexcept([&] {
+      SIRIUS_LOG_INFO("[df_async] await join={} waited_ms={:.3f} released_epoch_ns={}",
+                      join ? static_cast<long long>(*join) : -1LL,
+                      waited_ms,
+                      state::proto_epoch_ns());
+    });
+  }
+  if (error) {
+    operation.join_continuation();
+    std::rethrow_exception(error);
+  }
+}
+
+bool dynamic_filter_publication_session::publication_in_flight() const noexcept
+{
+  std::scoped_lock lock(_state->mutex);
+  return _state->continuation_in_flight;
+}
+
+void dynamic_filter_publication_session::join_continuation() noexcept
+{
+  _state->join_continuation();
 }
 
 namespace {

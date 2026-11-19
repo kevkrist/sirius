@@ -54,14 +54,15 @@ void hash_join_partition_observer::after_transform(uint64_t id,
                                                    cucascade::memory::memory_space& space,
                                                    ::cuda::stream_ref stream)
 {
-  _join.dynamic_filter_session().publish_if_final(id, space, stream);
+  // PROTOTYPE (OP1A): the finish chain runs on a continuation; the join awaits it at the build push.
+  _join.dynamic_filter_session().publish_if_final_async(id, space, stream);
 }
 
 void hash_join_partition_observer::finalize_input()
 {
   auto& session = _join.dynamic_filter_session();
   session.finalize_input();
-  D_ASSERT(!session.plan().enabled() || session.terminal());
+  D_ASSERT(!session.plan().enabled() || session.terminal() || session.publication_in_flight());
 }
 
 std::size_t hash_join_partition_observer::task_scratch_bytes() const noexcept

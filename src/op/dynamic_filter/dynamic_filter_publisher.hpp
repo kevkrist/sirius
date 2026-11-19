@@ -139,6 +139,31 @@ class dynamic_filter_publication_session final {
                         ::cuda::stream_ref stream);
 
   /**
+   * @brief PROTOTYPE (OP1A): as `publish_if_final`, but the claimed publication runs on a
+   * continuation thread with its own stream on `task_space`'s GPU, and this call returns at once.
+   *
+   * Every consumer-activating deposit must call `await_publication` first: consumers never wait, so
+   * a filter that becomes visible after its consumer started is lost. `stream` is used only when
+   * no thread can be started and the publication runs synchronously. `SIRIUS_DF_ASYNC_PUBLISH=0`
+   * makes this call `publish_if_final`.
+   */
+  void publish_if_final_async(std::uint64_t original_id,
+                              cucascade::memory::memory_space const& task_space,
+                              ::cuda::stream_ref stream);
+
+  /**
+   * @brief PROTOTYPE (OP1A): blocks while a publication continuation runs; rethrows its fatal
+   * failure once. Returns at once when none is in flight.
+   */
+  void await_publication();
+
+  /// PROTOTYPE (OP1A): whether a publication continuation is running.
+  [[nodiscard]] bool publication_in_flight() const noexcept;
+
+  /// PROTOTYPE (OP1A): joins the continuation thread, if any; never throws.
+  void join_continuation() noexcept;
+
+  /**
    * @brief Ends a collecting attempt whose task input cannot identify one certified batch.
    *
    * COLLECTING only: the attempt ends with `accumulations_skipped_inventory` and settles; otherwise
