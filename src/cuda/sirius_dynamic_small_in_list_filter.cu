@@ -268,6 +268,7 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
   pending.reserve(spaces.size());
   _store->replicas.reserve(_store->replicas.size() + spaces.size());
   detail::replica_fanout_failures failures;
+  detail::replica_relay relay;  // PROTOTYPE [xfer-PR]
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
@@ -291,13 +292,15 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
 
       auto replica = std::make_unique<needle_store::needle_replica>(
         device_id, rmm::device_buffer{bytes, stream, reservation->allocator()});
-      detail::enqueue_replica_copy(replica->needles.data(),
-                                   rmm::cuda_device_id{device_id},
-                                   source->needles.data(),
-                                   source_space,
-                                   bytes,
-                                   stream,
-                                   target.get_host_staging_space());
+      auto const origin = relay.pick({source->needles.data(), &source_space}, device_id);
+      auto const route  = detail::enqueue_replica_copy(replica->needles.data(),
+                                                       rmm::cuda_device_id{device_id},
+                                                       origin.data,
+                                                       *origin.space,
+                                                       bytes,
+                                                       stream,
+                                                       target.get_host_staging_space());
+      relay.offer(route, replica->needles.data(), target_space);
       pending.emplace_back(std::move(replica), std::move(stream_lease));
     } catch (...) {
       if (failures.skip_if_recoverable(

@@ -55,6 +55,7 @@
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -587,11 +588,12 @@ TEST_CASE("bench dynamic filter Bloom finish (MB4)", "[!benchmark][dynamic_filte
         setenv("SIRIUS_PROTO_BLOOM_CHUNK_MIB", std::to_string(chunk).c_str(), 1);
       }
       for (auto const megabytes : env_list("SIRIUS_BENCH_DF_MB", {1, 16, 256, 1024, 3072})) {
-        // Sources: 1 = only the root GPU contributed; `gpus` = every GPU contributed.
-        for (auto const sources : std::vector<std::size_t>{1, gpus}) {
-          if (sources == 1 && gpus == 1 && megabytes != 1) {
-            // Kept: the single-GPU case has one source by construction.
-          }
+        // Mask: bit d set = GPU d contributed. Default: only the root, and every GPU.
+        for (auto const mask : env_list("SIRIUS_BENCH_DF_MASKS", {1, (1ull << gpus) - 1})) {
+          auto const sources = static_cast<std::size_t>(std::popcount(mask));
+          if ((mask >> gpus) != 0) { continue; }
+        for (auto const& xfer : env_names("SIRIUS_BENCH_DF_XFER", {""})) {
+          if (!xfer.empty()) { setenv("SIRIUS_PROTO_XFER_D2D", xfer.c_str(), 1); }
           auto const blocks = (megabytes << 20) / op::bloom_bytes_per_block;
           samples finish;
           int transport = -1;
@@ -599,7 +601,8 @@ TEST_CASE("bench dynamic filter Bloom finish (MB4)", "[!benchmark][dynamic_filte
             auto made = builder::try_create(
               {{0, cudf::data_type{cudf::type_id::INT64}, blocks}}, spaces);
             REQUIRE(made);
-            for (std::size_t device = 0; device < sources; ++device) {
+            for (std::size_t device = 0; device < gpus; ++device) {
+              if (((mask >> device) & 1) == 0) { continue; }
               auto source = batches[device]->to_read_only();
               rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
               REQUIRE(made->enqueue_add(sirius::get_cudf_table_view(source),
@@ -624,22 +627,132 @@ TEST_CASE("bench dynamic filter Bloom finish (MB4)", "[!benchmark][dynamic_filte
             sync_devices(gpus);
           }
           std::printf(
-            "ROW,MB4,gpus=%zu,sources=%zu,mb=%llu,chunk_mib=%llu,transport=%s,finish_us=%.1f,"
-            "finish_min=%.1f\n",
+            "ROW,MB4,gpus=%zu,sources=%zu,mask=%llu,xfer=%s,mb=%llu,chunk_mib=%llu,transport=%s,"
+            "finish_us=%.1f,finish_min=%.1f,finish_max=%.1f\n",
             gpus,
             sources,
+            static_cast<unsigned long long>(mask),
+            xfer.empty() ? "env" : xfer.c_str(),
             static_cast<unsigned long long>(megabytes),
             static_cast<unsigned long long>(chunk == 0 ? 8 : chunk),
             transport == 0 ? "PEER" : "HOST",
             finish.median(),
-            finish.minimum());
+            finish.minimum(),
+            finish.values.empty() ? 0.0 : *std::ranges::max_element(finish.values));
           std::fflush(stdout);
+        }
           if (gpus == 1) { break; }
         }
       }
     }
     unsetenv("SIRIUS_PROTO_BLOOM_CHUNK_MIB");
   }
+}
+
+/**
+ * PROTOTYPE gate for SIRIUS_PROTO_XFER_D2D: for every transport mode, every contribution mask and
+ * two root GPUs, every replica of every GPU must equal the OR of the partials taken before
+ * `finish`. The partials are identical across modes, so the replicas are bit-identical to the
+ * tip's (mode "off").
+ */
+TEST_CASE("gate dynamic filter Bloom finish identity (MBID)", "[!benchmark][dynamic_filter][mbid]")
+{
+  using builder = op::detail::accumulated_bloom_builder;
+  auto const gpus = usable_gpus(env_list("SIRIUS_BENCH_DF_GPUS", {4}).front());
+  REQUIRE(gpus >= 2);
+  acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{8} << 30});
+  std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), gpus};
+  auto const rows = static_cast<cudf::size_type>(env_list("SIRIUS_BENCH_DF_ROWS", {300000}).front());
+  std::vector<acc::batch_ptr> batches;
+  for (std::size_t device = 0; device < gpus; ++device) {
+    batches.push_back(make_keys(
+      fixture, static_cast<int>(device), static_cast<std::int64_t>(device + 1) * 10000019, rows, 2));
+  }
+  std::size_t cases = 0;
+  std::size_t bad   = 0;
+  // Two keys of different sizes exercise the per-key chunking and the chunk parity.
+  for (auto const megabytes : env_list("SIRIUS_BENCH_DF_MB", {1, 3, 20, 57})) {
+    auto const blocks = (megabytes << 20) / op::bloom_bytes_per_block;
+    for (std::uint64_t mask = 0; mask < (1ull << gpus); ++mask) {
+      for (auto const root : std::vector<int>{0, static_cast<int>(gpus) - 1}) {
+        std::vector<std::vector<std::byte>> reference;  // Mode "off", per key x GPU
+        for (auto const& xfer : env_names("SIRIUS_BENCH_DF_XFER", {"off", "star", "exchange"})) {
+          setenv("SIRIUS_PROTO_XFER_D2D", xfer.c_str(), 1);
+          auto made = builder::try_create({{0, cudf::data_type{cudf::type_id::INT64}, blocks},
+                                           {1, cudf::data_type{cudf::type_id::INT64}, blocks / 3 + 1}},
+                                          spaces);
+          REQUIRE(made);
+          for (std::size_t device = 0; device < gpus; ++device) {
+            if (((mask >> device) & 1) == 0) { continue; }
+            auto source = batches[device]->to_read_only();
+            rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+            REQUIRE(made->enqueue_add(sirius::get_cudf_table_view(source),
+                                      rmm::cuda_device_id{static_cast<int>(device)},
+                                      fixture.task_stream(static_cast<int>(device))));
+            fixture.task_stream(static_cast<int>(device)).sync();
+          }
+          sync_devices(gpus);
+          std::vector<std::vector<std::byte>> expected(2);
+          for (std::size_t key = 0; key < 2; ++key) {
+            for (std::size_t device = 0; device < gpus; ++device) {
+              auto partial = made->inspect_partial(key, rmm::cuda_device_id{static_cast<int>(device)});
+              REQUIRE(partial);
+              if (expected[key].empty()) { expected[key].assign(partial->bytes.size(), std::byte{0}); }
+              for (std::size_t index = 0; index < partial->bytes.size(); ++index) {
+                expected[key][index] |= partial->bytes[index];
+              }
+            }
+          }
+          std::size_t mismatched = 0;
+          std::size_t set_bytes  = 0;
+          {
+            rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root}};
+            auto published = made->finish(rmm::cuda_device_id{root},
+                                          fixture.publication_stream(root),
+                                          fixture.gpu(root).get_default_allocator());
+            REQUIRE(published);
+            for (std::size_t key = 0; key < 2; ++key) {
+              for (auto const byte : expected[key]) {
+                set_bytes += byte != std::byte{0};
+              }
+              for (std::size_t device = 0; device < gpus; ++device) {
+                auto replica = builder::inspect_replica(
+                  *published->filters[key], rmm::cuda_device_id{static_cast<int>(device)});
+                REQUIRE(replica);
+                bool const same = replica->bytes == expected[key];
+                mismatched += !same;
+                if (xfer == "off") {
+                  reference.push_back(std::move(replica->bytes));
+                } else if (!reference.empty()) {
+                  mismatched += reference[key * gpus + device] != replica->bytes;
+                }
+              }
+            }
+          }
+          sync_devices(gpus);
+          made.reset();
+          sync_devices(gpus);
+          ++cases;
+          bad += mismatched != 0;
+          if (mismatched != 0 || mask == (1ull << gpus) - 1) {
+            std::printf("ROW,MBID,gpus=%zu,mb=%llu,mask=%llu,root=%d,xfer=%s,set_bytes=%zu,"
+                        "mismatched_replicas=%zu\n",
+                        gpus,
+                        static_cast<unsigned long long>(megabytes),
+                        static_cast<unsigned long long>(mask),
+                        root,
+                        xfer.c_str(),
+                        set_bytes,
+                        mismatched);
+            std::fflush(stdout);
+          }
+        }
+      }
+    }
+  }
+  unsetenv("SIRIUS_PROTO_XFER_D2D");
+  std::printf("ROW,MBID_SUMMARY,cases=%zu,bad=%zu\n", cases, bad);
+  CHECK(bad == 0);
 }
 
 TEST_CASE("bench dynamic filter exact slices at finish (MB4x)",

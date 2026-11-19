@@ -58,6 +58,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -66,6 +67,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -758,6 +760,7 @@ struct accumulated_bloom_builder::impl {
   std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> filters;
 
   class chunk_pipeline;
+  class island_reduce;  // PROTOTYPE [xfer-PR]
 };
 
 /**
@@ -961,6 +964,491 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
   std::vector<cuda_event> _source_ready;    // Per source: its inserts are complete
   std::vector<cuda_event> _target_done;     // Per target: its egress landed
   std::size_t _sequence = 0;                // Global chunk index over (key, offset)
+};
+
+//===----------------------------------------------------------------------===//
+// PROTOTYPE [xfer-PR]: topology-aware reduce, switched by SIRIUS_PROTO_XFER_D2D
+//===----------------------------------------------------------------------===//
+namespace {
+
+/**
+ * @brief Prototype switch: unset / "0" / "off" keep the all-or-nothing transport choice of the tip.
+ *
+ * "star": peer copies inside every island, today's HOST loop between the island leaders only.
+ * "1" / "exchange": the same, and with two islands the leaders exchange both ways at once.
+ */
+enum class proto_xfer_mode { off, star, exchange };
+
+[[nodiscard]] proto_xfer_mode proto_xfer() noexcept
+{
+  auto const* text = std::getenv("SIRIUS_PROTO_XFER_D2D");
+  if (text == nullptr || *text == '\0') { return proto_xfer_mode::off; }
+  std::string_view const value{text};
+  if (value == "0" || value == "off") { return proto_xfer_mode::off; }
+  if (value == "star") { return proto_xfer_mode::star; }
+  return proto_xfer_mode::exchange;
+}
+
+}  // namespace
+
+/**
+ * @brief Reduces and replicates one publication over the peer-access topology of its GPUs.
+ *
+ * The GPUs are partitioned into islands: sets whose pools grant each other access. Per chunk:
+ *  (A) merge: every contributing non-leader GPU of an island is peer-copied into its leader's
+ *      scratch and ORed into the leader's array (asynchronous, enqueued one chunk ahead);
+ *  (B) cross: the leaders make their chunks equal to the union through HOST staging: the only
+ *      legs that leave an island (`cross_star` / `cross_exchange`: the seam for a better bounce);
+ *  (C) fan-out: every leader peer-copies its chunk to the other GPUs of its island
+ *      (asynchronous, behind the leader's `settled` event).
+ * One island (full peer access) and all-singleton islands (no peer access) are left to the
+ * existing transports.
+ */
+class accumulated_bloom_builder::impl::island_reduce final {
+ public:
+  using window_type = cucascade::memory::fixed_multiple_blocks_allocation;
+
+  struct island {
+    partial* leader{};
+    std::vector<partial*> sources;  // Contributing GPUs other than the leader
+    std::vector<partial*> members;  // Every GPU other than the leader
+    bool contributed{};             // The leader or a source received a contribution
+    std::unique_ptr<rmm::cuda_stream> ingress;    // Leader GPU: peer copies into `merge_scratch`
+    std::unique_ptr<rmm::cuda_stream> xfer;       // Leader GPU: every cross-island leg
+    std::unique_ptr<rmm::device_buffer> scratch;  // Leaders other than the root
+    std::byte* merge_scratch{};                   // Two parities of `sources.size()` slots
+    std::byte* cross_scratch{};                   // One slot: a chunk arriving from another island
+    std::optional<cuda_event> ingress_done[2];
+    std::optional<cuda_event> merged[2];
+    std::optional<cuda_event> settled;       // The leader's chunk equals the union
+    std::optional<cuda_event> leader_ready;  // The leader's inserts are complete
+    std::vector<cuda_event> source_ready;
+    window_type window;
+  };
+
+  struct chunk {
+    std::size_t key;
+    std::size_t offset;
+    std::size_t bytes;
+  };
+
+  /**
+   * @brief Partitions the partials into islands, the root's first; nullopt when the existing
+   * transports already fit (one island, or no two GPUs with mutual access).
+   */
+  [[nodiscard]] static std::optional<std::vector<island>> plan(impl const& owner, partial& root)
+  {
+    auto const count = owner.partials.size();
+    if (count < 3) { return std::nullopt; }
+    std::vector<partial*> order{&root};
+    for (auto const& entry : owner.partials) {
+      if (entry.get() != &root) { order.push_back(entry.get()); }
+    }
+    std::vector<char> mutual(count * count, 0);
+    for (std::size_t left = 0; left < count; ++left) {
+      for (std::size_t right = left + 1; right < count; ++right) {
+        bool const both =
+          sirius::memory::try_grant_pool_access(*order[left]->space, order[right]->device_id) &&
+          sirius::memory::try_grant_pool_access(*order[right]->space, order[left]->device_id);
+        mutual[left * count + right] = mutual[right * count + left] = both;
+      }
+    }
+    std::vector<char> taken(count, 0);
+    std::vector<island> islands;
+    for (std::size_t seed = 0; seed < count; ++seed) {
+      if (taken[seed]) { continue; }
+      std::vector<std::size_t> group{seed};
+      taken[seed] = 1;
+      for (std::size_t other = seed + 1; other < count; ++other) {
+        if (taken[other]) { continue; }
+        if (std::ranges::all_of(
+              group, [&](auto member) { return mutual[member * count + other] != 0; })) {
+          group.push_back(other);
+          taken[other] = 1;
+        }
+      }
+      // The root leads its island; elsewhere a contributing GPU leads, saving its merge leg.
+      auto lead = group.front();
+      if (seed != 0) {
+        for (auto const member : group) {
+          if (order[member]->contributed.load(std::memory_order_relaxed)) {
+            lead = member;
+            break;
+          }
+        }
+      }
+      auto& made  = islands.emplace_back();
+      made.leader = order[lead];
+      made.contributed = made.leader->contributed.load(std::memory_order_relaxed);
+      for (auto const member : group) {
+        if (member == lead) { continue; }
+        made.members.push_back(order[member]);
+        if (order[member]->contributed.load(std::memory_order_relaxed)) {
+          made.sources.push_back(order[member]);
+          made.contributed = true;
+        }
+      }
+    }
+    if (islands.size() == 1 || islands.size() == count) { return std::nullopt; }
+    return islands;
+  }
+
+  island_reduce(impl const& owner, std::vector<island> islands, proto_xfer_mode mode)
+    : _owner{owner},
+      _islands{std::move(islands)},
+      _slot{owner.max_chunk_bytes()},
+      _exchange{mode == proto_xfer_mode::exchange && _islands.size() == 2}
+  {
+    for (std::size_t key = 0; key < owner.keys.size(); ++key) {
+      auto const& shape = owner.shapes[key];
+      for (std::size_t offset = 0; offset < shape.raw_bytes; offset += shape.chunk_bytes) {
+        _chunks.push_back({key, offset, std::min(shape.chunk_bytes, shape.raw_bytes - offset)});
+      }
+    }
+    _contributing = static_cast<std::size_t>(
+      std::ranges::count_if(_islands, [](auto const& entry) { return entry.contributed; }));
+  }
+
+  ~island_reduce() noexcept
+  {
+    // Every stream this object owns is drained before its scratch and HOST windows are released.
+    for (auto& entry : _islands) {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
+      if (entry.ingress) { (void)cudaStreamSynchronize(entry.ingress->value()); }
+      if (entry.xfer) { (void)cudaStreamSynchronize(entry.xfer->value()); }
+      (void)cudaStreamSynchronize(entry.leader->stream->value());
+      entry.scratch.reset();
+      entry.window.reset();
+      entry.ingress.reset();
+      entry.xfer.reset();
+    }
+    (void)cudaGetLastError();
+  }
+
+  island_reduce(island_reduce const&)            = delete;
+  island_reduce& operator=(island_reduce const&) = delete;
+
+  /// Device scratch the root needs, in bytes.
+  [[nodiscard]] std::size_t root_scratch_bytes() const noexcept
+  {
+    return (parities() * _islands.front().sources.size() + 1) * _slot;
+  }
+
+  [[nodiscard]] std::size_t host_bytes() const noexcept { return _host_bytes; }
+  [[nodiscard]] std::size_t remote_scratch_bytes() const noexcept { return _remote_scratch; }
+  [[nodiscard]] bool exchanges() const noexcept { return _exchange; }
+  [[nodiscard]] std::size_t island_count() const noexcept { return _islands.size(); }
+
+  /**
+   * @brief Creates streams and events and takes every allocation; enqueues no copy.
+   *
+   * @param root_scratch The root's scratch of `root_scratch_bytes()`
+   * @return False when a leader's scratch reservation was refused: the caller falls back
+   */
+  [[nodiscard]] bool prepare(std::byte* root_scratch)
+  {
+    auto* host =
+      _islands.front().leader->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+    if (host == nullptr || host->get_block_size() == 0) {
+      throw accumulation_invariant_error{"accumulated publication requires fixed HOST blocks"};
+    }
+    for (std::size_t index = 0; index < _islands.size(); ++index) {
+      auto& entry = _islands[index];
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
+      entry.xfer = std::make_unique<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking);
+      entry.settled.emplace();
+      entry.leader_ready.emplace();
+      auto const merge_bytes = parities() * entry.sources.size() * _slot;
+      if (!entry.sources.empty()) {
+        entry.ingress = std::make_unique<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking);
+        for (std::size_t parity = 0; parity < 2; ++parity) {
+          entry.ingress_done[parity].emplace();
+          entry.merged[parity].emplace();
+        }
+        for (auto* source : entry.sources) {
+          entry.source_ready.push_back(make_event_on(source->device_id));
+        }
+      }
+      if (index == 0) {
+        entry.merge_scratch = root_scratch;
+        entry.cross_scratch = root_scratch + merge_bytes;
+      } else if (auto const bytes = merge_bytes + (_exchange ? _slot : 0); bytes != 0) {
+        ::cuda::stream_ref const stream{entry.xfer->value()};
+        auto lease = scoped_replica_reservation::try_acquire(
+          *entry.leader->space, tracked_replica_allocation_bytes(bytes), stream);
+        if (!lease) { return false; }
+        entry.scratch = std::make_unique<rmm::device_buffer>(bytes, stream, lease->allocator());
+        entry.merge_scratch = static_cast<std::byte*>(entry.scratch->data());
+        entry.cross_scratch = entry.merge_scratch + merge_bytes;
+        _remote_scratch += tracked_replica_allocation_bytes(bytes);
+      }
+      if (index == 0 || _exchange) {
+        entry.window = host->allocate_multiple_blocks(_slot);
+        if (entry.window->size_bytes() < _slot) {
+          throw accumulation_invariant_error{
+            "accumulated publication HOST window is smaller than a chunk"};
+        }
+        _host_bytes += entry.window->size_bytes();
+      }
+    }
+    _copies.reserve(_slot / host->get_block_size() + 1);
+    return true;
+  }
+
+  /**
+   * @brief Enqueues the whole publication and waits for it on the host.
+   */
+  void run()
+  {
+    // Without any contribution every array is still zero on every GPU: nothing moves.
+    for (auto& entry : _islands) {
+      if (_contributing == 0) { break; }
+      for (std::size_t index = 0; index < entry.sources.size(); ++index) {
+        auto const* source = entry.sources[index];
+        {
+          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{source->device_id}};
+          check_cuda(cudaEventRecord(entry.source_ready[index].get(), source->stream->value()),
+                     "cudaEventRecord(island source ready)");
+        }
+        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
+        check_cuda(
+          cudaStreamWaitEvent(entry.ingress->value(), entry.source_ready[index].get(), 0),
+          "cudaStreamWaitEvent(island source ready)");
+      }
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
+      check_cuda(cudaEventRecord(entry.leader_ready->get(), entry.leader->stream->value()),
+                 "cudaEventRecord(island leader ready)");
+      check_cuda(cudaStreamWaitEvent(entry.xfer->value(), entry.leader_ready->get(), 0),
+                 "cudaStreamWaitEvent(island leader ready)");
+    }
+    if (_contributing != 0) { enqueue_merge(0); }
+    for (std::size_t sequence = 0; _contributing != 0 && sequence < _chunks.size(); ++sequence) {
+      // One chunk of lookahead: its peer ingress overlaps this chunk's HOST legs.
+      if (sequence + 1 < _chunks.size()) { enqueue_merge(sequence + 1); }
+      auto const parity = sequence % 2;
+      for (auto& entry : _islands) {
+        if (entry.sources.empty()) { continue; }
+        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
+        check_cuda(cudaStreamWaitEvent(entry.xfer->value(), entry.merged[parity]->get(), 0),
+                   "cudaStreamWaitEvent(island merged)");
+      }
+      if (_exchange) {
+        cross_exchange(_chunks[sequence]);
+      } else {
+        cross_star(_chunks[sequence]);
+      }
+      enqueue_fan_out(_chunks[sequence]);
+    }
+    for (auto& entry : _islands) {
+      if (entry.ingress) {
+        check_cuda(cudaStreamSynchronize(entry.ingress->value()),
+                   "cudaStreamSynchronize(island ingress)");
+      }
+      check_cuda(cudaStreamSynchronize(entry.xfer->value()), "cudaStreamSynchronize(island xfer)");
+    }
+    for (auto const& entry : _owner.partials) {
+      check_cuda(cudaStreamSynchronize(entry->stream->value()),
+                 "cudaStreamSynchronize(island publication)");
+    }
+  }
+
+ private:
+  [[nodiscard]] std::size_t parities() const noexcept
+  {
+    return std::min<std::size_t>(2, _chunks.size());
+  }
+
+  [[nodiscard]] static std::byte* chunk_of(partial const& owner, chunk const& piece) noexcept
+  {
+    return static_cast<std::byte*>(owner.arrays[piece.key]->data()) + piece.offset;
+  }
+
+  /// (A) Peer ingress of chunk `sequence` into every leader's scratch and its OR into the leader.
+  void enqueue_merge(std::size_t sequence)
+  {
+    auto const& piece = _chunks[sequence];
+    auto const parity = sequence % 2;
+    for (auto& entry : _islands) {
+      if (entry.sources.empty()) { continue; }
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
+      auto const ingress = entry.ingress->value();
+      if (sequence >= 2) {
+        // The merge of chunk (sequence - 2) read this parity's slots.
+        check_cuda(cudaStreamWaitEvent(ingress, entry.merged[parity]->get(), 0),
+                   "cudaStreamWaitEvent(island scratch reuse)");
+      }
+      auto* const slots = entry.merge_scratch + parity * entry.sources.size() * _slot;
+      for (std::size_t index = 0; index < entry.sources.size(); ++index) {
+        auto const* source = entry.sources[index];
+        check_cuda(cudaMemcpyPeerAsync(slots + index * _slot,
+                                       entry.leader->device_id,
+                                       chunk_of(*source, piece),
+                                       source->device_id,
+                                       piece.bytes,
+                                       ingress),
+                   "cudaMemcpyPeerAsync(island ingress)");
+      }
+      check_cuda(cudaEventRecord(entry.ingress_done[parity]->get(), ingress),
+                 "cudaEventRecord(island ingress)");
+      auto const leader_stream = entry.leader->stream->value();
+      check_cuda(cudaStreamWaitEvent(leader_stream, entry.ingress_done[parity]->get(), 0),
+                 "cudaStreamWaitEvent(island ingress)");
+      enqueue_or_chunk(
+        chunk_of(*entry.leader, piece), slots, _slot, entry.sources.size(), piece.bytes,
+        leader_stream);
+      check_cuda(cudaEventRecord(entry.merged[parity]->get(), leader_stream),
+                 "cudaEventRecord(island merged)");
+    }
+  }
+
+  /// One HOST-staged leg on the island's cross stream: device -> window or window -> device.
+  void submit(island& entry, window_type& window, std::byte* device_bytes, std::size_t bytes,
+              bool to_host)
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
+    _copies.clear();
+    std::size_t offset = 0;
+    for (std::size_t index = 0; offset < bytes; ++index) {
+      auto block       = window->at(index);
+      auto const count = std::min(block.size(), bytes - offset);
+      if (to_host) {
+        _copies.add(block.data(), device_bytes + offset, count);
+      } else {
+        _copies.add(device_bytes + offset, block.data(), count);
+      }
+      offset += count;
+    }
+    check_cuda(_copies.enqueue(::cuda::stream_ref{entry.xfer->value()}),
+               "device_copy_batch::enqueue(island staging)");
+    ++_host_legs;
+  }
+
+  static void wait(island const& entry)
+  {
+    check_cuda(cudaStreamSynchronize(entry.xfer->value()),
+               "cudaStreamSynchronize(island staging)");
+  }
+
+  void enqueue_cross_or(island& entry, chunk const& piece)
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
+    enqueue_or_chunk(
+      chunk_of(*entry.leader, piece), entry.cross_scratch, _slot, 1, piece.bytes,
+      entry.xfer->value());
+  }
+
+  void record_settled(island& entry)
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
+    check_cuda(cudaEventRecord(entry.settled->get(), entry.xfer->value()),
+               "cudaEventRecord(island final)");
+  }
+
+  /**
+   * @brief (B) Today's HOST loop over the leaders: contributing leaders into the root, the root
+   * out to the leaders. SEAM: a pipelined or CPU-OR bounce replaces this body.
+   */
+  void cross_star(chunk const& piece)
+  {
+    auto& root    = _islands.front();
+    auto& window  = root.window;
+    bool uploads  = false;
+    for (std::size_t index = 1; index < _islands.size(); ++index) {
+      auto& entry = _islands[index];
+      if (!entry.contributed) { continue; }
+      submit(entry, window, chunk_of(*entry.leader, piece), piece.bytes, true);
+      wait(entry);
+      submit(root, window, root.cross_scratch, piece.bytes, false);
+      wait(root);
+      enqueue_cross_or(root, piece);
+    }
+    // A leader that is the only contributor already holds the union.
+    auto const needs = [&](island const& entry) { return !(entry.contributed && _contributing == 1); };
+    for (std::size_t index = 1; index < _islands.size(); ++index) {
+      uploads = uploads || needs(_islands[index]);
+    }
+    if (uploads) {
+      submit(root, window, chunk_of(*root.leader, piece), piece.bytes, true);
+      wait(root);
+      for (std::size_t index = 1; index < _islands.size(); ++index) {
+        if (needs(_islands[index])) {
+          submit(_islands[index], window, chunk_of(*_islands[index].leader, piece), piece.bytes,
+                 false);
+        }
+      }
+      for (std::size_t index = 1; index < _islands.size(); ++index) {
+        wait(_islands[index]);
+      }
+    }
+    for (auto& entry : _islands) {
+      record_settled(entry);
+    }
+  }
+
+  /**
+   * @brief (B) Two islands: both leaders download at once, then both upload at once and OR.
+   * SEAM: a pipelined bounce replaces this body.
+   */
+  void cross_exchange(chunk const& piece)
+  {
+    auto& left        = _islands[0];
+    auto& right       = _islands[1];
+    auto* left_chunk  = chunk_of(*left.leader, piece);
+    auto* right_chunk = chunk_of(*right.leader, piece);
+    if (left.contributed && right.contributed) {
+      submit(left, left.window, left_chunk, piece.bytes, true);
+      submit(right, right.window, right_chunk, piece.bytes, true);
+      wait(left);
+      wait(right);
+      submit(left, right.window, left.cross_scratch, piece.bytes, false);
+      enqueue_cross_or(left, piece);
+      submit(right, left.window, right.cross_scratch, piece.bytes, false);
+      enqueue_cross_or(right, piece);
+      record_settled(left);
+      record_settled(right);
+      wait(left);
+      wait(right);
+      return;
+    }
+    auto& from = left.contributed ? left : right;
+    auto& to   = left.contributed ? right : left;
+    submit(from, from.window, chunk_of(*from.leader, piece), piece.bytes, true);
+    record_settled(from);
+    wait(from);
+    submit(to, from.window, chunk_of(*to.leader, piece), piece.bytes, false);
+    record_settled(to);
+    wait(to);
+  }
+
+  /// (C) Peer copy of the leader's final chunk to every other GPU of its island.
+  void enqueue_fan_out(chunk const& piece)
+  {
+    for (auto& entry : _islands) {
+      for (auto* member : entry.members) {
+        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{member->device_id}};
+        check_cuda(cudaStreamWaitEvent(member->stream->value(), entry.settled->get(), 0),
+                   "cudaStreamWaitEvent(island final)");
+        check_cuda(cudaMemcpyPeerAsync(chunk_of(*member, piece),
+                                       member->device_id,
+                                       chunk_of(*entry.leader, piece),
+                                       entry.leader->device_id,
+                                       piece.bytes,
+                                       member->stream->value()),
+                   "cudaMemcpyPeerAsync(island fan-out)");
+      }
+    }
+  }
+
+  impl const& _owner;
+  std::vector<island> _islands;  // The root's island first
+  std::size_t _slot;             // Bytes of one slot: the largest chunk of any key
+  bool _exchange;
+  std::vector<chunk> _chunks;
+  std::size_t _contributing = 0;  // Islands with a contribution
+  std::size_t _host_bytes   = 0;
+  std::size_t _remote_scratch = 0;
+  std::size_t _host_legs      = 0;
+  sirius::cuda::device_copy_batch _copies;
 };
 
 //===----------------------------------------------------------------------===//
@@ -1186,6 +1674,8 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
   sirius::cuda::device_copy_batch copies;
   bool prepared  = false;
   auto transport = publication_transport::HOST_STAGED;
+  char const* island_route   = nullptr;  // PROTOTYPE [xfer-PR]
+  std::size_t island_scratch = 0;
   try {
     auto const execute = [&] {
       bool direct = !force_host && !sirius::memory::find_pair_without_pool_access(spaces);
@@ -1201,6 +1691,35 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
           }
         }
       };
+      // PROTOTYPE [xfer-PR]: per-island transport instead of the all-or-nothing choice.
+      if (auto const mode = force_host ? proto_xfer_mode::off : proto_xfer();
+          mode != proto_xfer_mode::off) {
+        if (auto islands = impl::island_reduce::plan(*_impl, *root)) {
+          impl::island_reduce reduce{*_impl, std::move(*islands), mode};
+          bool ready = false;
+          try {
+            allocate_scratch(reduce.root_scratch_bytes());
+            // As below: the root's task stream owns scratch allocation.
+            check_cuda(cudaStreamSynchronize(stream.get()),
+                       "cudaStreamSynchronize(island allocation)");
+            ready = reduce.prepare(static_cast<std::byte*>(scratch->data()));
+          } catch (rmm::out_of_memory const&) {
+            check_cuda(cudaStreamSynchronize(stream.get()),
+                       "cudaStreamSynchronize(island preparation)");
+          }
+          if (ready) {
+            if (observation) { observation->host_staging_bytes = reduce.host_bytes(); }
+            prepared = true;
+            island_route = reduce.exchanges() ? "island peer copies + HOST exchange"
+                                              : "island peer copies + HOST star";
+            island_scratch = reduce.remote_scratch_bytes();
+            reduce.run();
+            return;
+          }
+          scratch.reset();
+          if (observation) { *observation = {}; }
+        }
+      }
       if (direct) {
         auto const scratch_bytes =
           multiply(multiply(std::min<std::size_t>(2, all_chunks), sources.size()), chunk_slot);
@@ -1345,13 +1864,16 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
   SIRIUS_LOG_DEBUG(
     "[accumulated_bloom_builder::finish] root GPU {} reduced and replicated {} key(s), {} bytes in "
     "all, "
-    "through {}: {} contributing source(s), {} target(s).",
+    "through {}: {} contributing source(s), {} target(s), {} scratch byte(s) on other leaders.",
     root->device_id,
     _impl->keys.size(),
     all_bytes,
-    transport == publication_transport::PEER_COPY ? "peer copies" : "HOST staging",
+    island_route != nullptr                       ? island_route
+    : transport == publication_transport::PEER_COPY ? "peer copies"
+                                                    : "HOST staging",
     sources.size(),
-    targets.size());
+    targets.size(),
+    island_scratch);
   make_filters(root->device_id);
   return publication{{_impl->filters}, transport};
 }

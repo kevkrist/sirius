@@ -28,9 +28,11 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
 #include <memory/device_transfer.hpp>
+#include <memory/pool_peer_access.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
 
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #include <string_view>
@@ -59,6 +61,34 @@ replica_transfer_route enqueue_replica_copy(
                                              sirius::memory::source_already_complete{},
                                              &host_staging_space,
                                              policy);
+}
+
+replica_relay::replica_relay()
+{
+  auto const* text = std::getenv("SIRIUS_PROTO_XFER_D2D");
+  std::string_view const value{text == nullptr ? "" : text};
+  _enabled = !(value.empty() || value == "0" || value == "off");
+}
+
+replica_relay::origin replica_relay::pick(origin original, int destination_device) const
+{
+  if (!_enabled || _relays.empty() ||
+      sirius::memory::try_grant_pool_access(*original.space, destination_device)) {
+    return original;
+  }
+  for (auto const& relay : _relays) {
+    if (sirius::memory::try_grant_pool_access(*relay.space, destination_device)) { return relay; }
+  }
+  return original;
+}
+
+void replica_relay::offer(replica_transfer_route route,
+                          void const* data,
+                          cucascade::memory::memory_space const& space)
+{
+  if (_enabled && route == replica_transfer_route::host_staging) {
+    _relays.push_back({data, &space});
+  }
 }
 
 bool replica_fanout_failures::skip_if_recoverable(std::string_view filter_name,
