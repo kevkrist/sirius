@@ -744,6 +744,7 @@ struct copy_load {
         std::unique_ptr<rmm::device_buffer> input;
         std::unique_ptr<rmm::device_buffer> output;
         std::unique_ptr<rmm::cuda_stream> stream;
+        std::unique_ptr<rmm::cuda_stream> target_stream;  // outlives `output`, which frees on it
         {
           rmm::cuda_set_device_raii guard{rmm::cuda_device_id{from}};
           stream = std::make_unique<rmm::cuda_stream>();
@@ -754,11 +755,11 @@ struct copy_load {
         }
         {
           rmm::cuda_set_device_raii guard{rmm::cuda_device_id{to}};
-          rmm::cuda_stream local;
-          output = std::make_unique<rmm::device_buffer>(
-            chunk, local.view(), fixture.gpu(to).get_default_allocator());
-          (void)cudaMemsetAsync(output->data(), 0, chunk, local.value());
-          (void)cudaStreamSynchronize(local.value());
+          target_stream = std::make_unique<rmm::cuda_stream>();
+          output        = std::make_unique<rmm::device_buffer>(
+            chunk, target_stream->view(), fixture.gpu(to).get_default_allocator());
+          (void)cudaMemsetAsync(output->data(), 0, chunk, target_stream->value());
+          (void)cudaStreamSynchronize(target_stream->value());
         }
         rmm::cuda_set_device_raii guard{rmm::cuda_device_id{from}};
         while (!stop.load(std::memory_order_relaxed)) {
@@ -782,7 +783,10 @@ struct copy_load {
         {
           rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{to}};
           output.reset();
+          (void)cudaStreamSynchronize(target_stream->value());
+          target_stream.reset();
         }
+        (void)cudaStreamSynchronize(stream->value());
         stream.reset();
       });
     }
