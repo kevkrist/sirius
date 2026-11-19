@@ -22,6 +22,7 @@
 
 #include <cuda/stream>
 
+#include <atomic>
 #include <cstddef>
 #include <exception>
 #include <string_view>
@@ -84,6 +85,9 @@ class replica_relay final {
    * destination or no relay does, else the first relay whose pool grants it.
    */
   [[nodiscard]] origin pick(origin original, int destination_device) const;
+
+  /// Process-wide count of copies that read a relay instead of the original (tests).
+  [[nodiscard]] static std::atomic<std::size_t>& relayed_copies() noexcept;
 
   /// Offers a replica that was copied through @p route as a relay.
   void offer(replica_transfer_route route,

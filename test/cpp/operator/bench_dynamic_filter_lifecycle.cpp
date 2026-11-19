@@ -676,7 +676,7 @@ TEST_CASE("gate dynamic filter Bloom finish identity (MBID)", "[!benchmark][dyna
     for (std::uint64_t mask = 0; mask < (1ull << gpus); ++mask) {
       for (auto const root : std::vector<int>{0, static_cast<int>(gpus) - 1}) {
         std::vector<std::vector<std::byte>> reference;  // Mode "off", per key x GPU
-        for (auto const& xfer : env_names("SIRIUS_BENCH_DF_XFER", {"off", "star", "exchange"})) {
+        for (auto const& xfer : env_names("SIRIUS_BENCH_DF_XFER", {"off", "star", "exchange", "pipe"})) {
           setenv("SIRIUS_PROTO_XFER_D2D", xfer.c_str(), 1);
           auto made = builder::try_create({{0, cudf::data_type{cudf::type_id::INT64}, blocks},
                                            {1, cudf::data_type{cudf::type_id::INT64}, blocks / 3 + 1}},

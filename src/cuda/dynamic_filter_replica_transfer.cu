@@ -31,6 +31,7 @@
 #include <memory/pool_peer_access.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <exception>
@@ -77,9 +78,18 @@ replica_relay::origin replica_relay::pick(origin original, int destination_devic
     return original;
   }
   for (auto const& relay : _relays) {
-    if (sirius::memory::try_grant_pool_access(*relay.space, destination_device)) { return relay; }
+    if (sirius::memory::try_grant_pool_access(*relay.space, destination_device)) {
+      relayed_copies().fetch_add(1, std::memory_order_relaxed);
+      return relay;
+    }
   }
   return original;
+}
+
+std::atomic<std::size_t>& replica_relay::relayed_copies() noexcept
+{
+  static std::atomic<std::size_t> count{0};
+  return count;
 }
 
 void replica_relay::offer(replica_transfer_route route,
