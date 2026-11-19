@@ -1,0 +1,69 @@
+diff --git a/src/cudf/representation_converter_builtins.cpp b/src/cudf/representation_converter_builtins.cpp
+index 731dab8..4035062 100644
+--- a/src/cudf/representation_converter_builtins.cpp
++++ b/src/cudf/representation_converter_builtins.cpp
+@@ -17,6 +17,9 @@
+ 
+ #include "cudf_compat.hpp"
+ 
++#include <type_traits>
++#include <memory>
++#include <cstdlib>
+ #include <cucascade/cuda/event.hpp>
+ #include <cucascade/cudf/builtin_converters.hpp>
+ #include <cucascade/cudf/gpu_data_representation.hpp>
+@@ -557,6 +560,29 @@ int resolve_gpu_numa_node(int device_id) noexcept
+   }
+ }
+ 
++// PROTOTYPE (dfperf, transfer PR): CUCASCADE_PROTO_BATCH_STAGING=1 drops the per-buffer stream sync of
++// the host-staged GPU-to-GPU copy. The staging blocks of every buffer stay alive in this
++// thread-local list until convert_gpu_to_gpu has made its one table-level sync, so the whole table's
++// copies are queued on the links at once instead of one buffer per sync.
++bool proto_batch_staging() noexcept
++{
++  static bool const value = [] {
++    auto const* text = std::getenv("CUCASCADE_PROTO_BATCH_STAGING");
++    return text != nullptr && std::atoi(text) != 0;
++  }();
++  return value;
++}
++
++std::vector<std::shared_ptr<void>>& proto_deferred_staging() noexcept
++{
++  thread_local std::vector<std::shared_ptr<void>> blocks;
++  return blocks;
++}
++
++struct proto_deferred_staging_guard {
++  ~proto_deferred_staging_guard() { proto_deferred_staging().clear(); }
++};
++
+ /**
+  * @brief Copy @p size bytes from @p src_ptr
+  * (on @p src_device) into a buffer.
+@@ -695,7 +721,13 @@ Buffer peer_copy_into_async(Buffer buf,
+         }
+       }
+ 
+-      target_stream.sync();
++      if (proto_batch_staging()) {
++        // Keep the staging blocks until the table-level sync in convert_gpu_to_gpu.
++        proto_deferred_staging().push_back(
++          std::make_shared<std::decay_t<decltype(allocation)>>(std::move(allocation)));
++      } else {
++        target_stream.sync();
++      }
+     } catch (...) {
+       // best-effort drain before the blocks return to the pool; a second failure must not
+       // replace the original exception or stay pending.
+@@ -913,6 +945,9 @@ std::unique_ptr<idata_representation> convert_gpu_to_gpu(
+   auto mr            = target_memory_space->get_default_allocator();
+ 
+   std::unique_ptr<cudf::table> new_table{nullptr};
++  // Declared before the try: destroyed after the table-level sync on both the normal and the
++  // error path.
++  proto_deferred_staging_guard staging_guard;
+ 
+   try {
+     // Order the peer copies below after the most recent writer of gpu_source. With an unknown
