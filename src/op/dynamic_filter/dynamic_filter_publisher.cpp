@@ -17,6 +17,7 @@
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 
 #include "log/logging.hpp"
+#include "memory/runtime_stream_pool.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/dynamic_filter/build_filter_construction.hpp"
@@ -48,10 +49,12 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -624,7 +627,9 @@ struct dynamic_filter_publication_session::state {
    *
    * Runs on the Publishing Task.
    */
-  void publish(cucascade::memory::memory_space const& task_space, ::cuda::stream_ref stream)
+  void publish(cucascade::memory::memory_space const& task_space,
+               ::cuda::stream_ref stream,
+               bool local = false)
   {
     try {
       {
@@ -636,14 +641,15 @@ struct dynamic_filter_publication_session::state {
         throw detail::accumulation_invariant_error{"publication task space must be a GPU space"};
       }
       auto constructed = construction->finish(
-        {.space = task_space, .stream = stream, .scratch = task_space.get_default_allocator()});
+        {.space = task_space, .stream = stream, .scratch = task_space.get_default_allocator()},
+        local);
       if (!constructed) {
         skip_locked(attempt_counters::skipped_admission);
         return;
       }
       bool const host_staged =
-        constructed->transport ==
-        detail::accumulated_bloom_builder::publication_transport::HOST_STAGED;
+        !local && constructed->transport ==
+                    detail::accumulated_bloom_builder::publication_transport::HOST_STAGED;
       auto const& planned = construction->plan().keys;
       std::vector<key_filters> per_key(plan.admitted_keys().size());
       {
@@ -716,7 +722,7 @@ struct dynamic_filter_publication_session::state {
         SIRIUS_LOG_INFO(
           "[dynamic_filter_publication_session] constructed filters published{}: {} filter(s) "
           "pushed to {} target(s), {:.1f} ms after the final contribution.",
-          host_staged ? " (Bloom through HOST staging)" : "",
+          local ? " (PROTO local replicas)" : host_staged ? " (Bloom through HOST staging)" : "",
           counts.pushed,
           counts.active_targets,
           latency ? std::chrono::duration<double, std::milli>(*latency).count() : 0.0);
@@ -800,6 +806,12 @@ struct dynamic_filter_publication_session::state {
   // The ID of the batch whose contribution completed the inventory, while its task's publication is
   // owed and has not run.
   std::optional<std::uint64_t> pending_publication;
+  // PROTO(sgb): local-replica mode for Bloom-only broadcast builds.
+  std::atomic<std::size_t> broadcast_slots{0};
+  std::optional<bool> local_mode;  ///< Decided by the first contribution, under the mutex
+  bool local_await = false;        ///< Inventory claimed; waiting for each GPU's whole build
+  std::vector<int> local_devices;  ///< GPUs whose replica is complete or being completed
+  std::size_t local_done = 0;
   std::vector<dynamic_filter_key_line> key_lines;  ///< One per admitted key with a binding, moved
                                                    ///< out when the session becomes terminal
   dynamic_filter_join_identity identity;
@@ -1103,6 +1115,7 @@ void dynamic_filter_publication_session::contribute(std::uint64_t original_id,
     auto const* space = source.get_memory_space();
     std::optional<cudf::table_view> view;
     std::optional<build_filter_construction::contribution_ticket> ticket;
+    bool local = false;
     {
       std::scoped_lock lock(operation.mutex);
       if (!operation.inventory) { return; }
@@ -1144,18 +1157,34 @@ void dynamic_filter_publication_session::contribute(std::uint64_t original_id,
       }
       ++operation.active_operations;
       active.claimed = true;
+      if (!operation.local_mode) {
+        static bool const enabled = [] {
+          auto const* value = std::getenv("SIRIUS_PROTO_SGB");
+          return value != nullptr && value[0] == '1';
+        }();
+        auto const slots     = operation.broadcast_slots.load(std::memory_order_relaxed);
+        operation.local_mode = enabled && slots != 0 && operation.construction->bloom_only() &&
+                               slots == operation.plan.replica_spaces().size();
+      }
+      local = *operation.local_mode;
     }
-    if (!operation.construction->contribute(
-          *ticket, *view, stream, space->get_default_allocator())) {
+    // PROTO(sgb): in local-replica mode the task only claims its batch; each GPU inserts the whole
+    // build when its broadcast slot's delivery lands (contribute_replica).
+    if (!local && !operation.construction->contribute(
+                    *ticket, *view, stream, space->get_default_allocator())) {
       operation.skip_locked(attempt_counters::skipped_admission);
       return;
     }
     std::scoped_lock lock(operation.mutex);
     if (++operation.outcome.accumulation_completed_contributions == operation.claimed.size() &&
         !operation.accumulation_result) {
-      operation.current             = state::phase::PUBLISHING;
-      operation.pending_publication = original_id;
-      operation.final_commit        = std::chrono::steady_clock::now();
+      operation.current = state::phase::PUBLISHING;
+      if (local) {
+        operation.local_await = true;
+      } else {
+        operation.pending_publication = original_id;
+      }
+      operation.final_commit = std::chrono::steady_clock::now();
       nvtx3::mark_in<nvtx_domain>("dynfilter::accum::final_commit");
     }
   } catch (...) {
@@ -1184,6 +1213,74 @@ void dynamic_filter_publication_session::publish_if_final(
     active.claimed = true;
   }
   operation.publish(task_space, stream);
+}
+
+void dynamic_filter_publication_session::note_broadcast_slots(std::size_t slots) noexcept
+{
+  _state->broadcast_slots.store(slots, std::memory_order_relaxed);
+}
+
+bool dynamic_filter_publication_session::awaits_replicas() const noexcept
+{
+  std::scoped_lock lock(_state->mutex);
+  return _state->local_await && !_state->accumulation_result;
+}
+
+void dynamic_filter_publication_session::contribute_replica(
+  cucascade::read_only_data_batch const& source)
+{
+  auto& operation = *_state;
+  state::active_operation active{operation};
+  try {
+    auto const* gpu   = dynamic_cast<cucascade::gpu_table_representation const*>(source.get_data());
+    auto const* space = source.get_memory_space();
+    int device        = -1;
+    {
+      std::scoped_lock lock(operation.mutex);
+      if (!operation.local_await || operation.accumulation_result || !operation.inventory) {
+        return;
+      }
+      // A broadcast slot delivers its whole build as one GPU batch; anything else ends the attempt.
+      if (gpu == nullptr || space == nullptr ||
+          space->get_tier() != cucascade::memory::Tier::GPU ||
+          static_cast<std::size_t>(gpu->get_table_view().num_rows()) !=
+            operation.inventory->total_rows()) {
+        operation.end_attempt(completion::SKIPPED, attempt_counters::skipped_inventory);
+        return;
+      }
+      device = space->get_device_id();
+      if (std::ranges::find(operation.local_devices, device) != operation.local_devices.end()) {
+        return;
+      }
+      operation.local_devices.push_back(device);
+      ++operation.active_operations;
+      active.claimed = true;
+    }
+    rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{device}};
+    if (!operation.construction->contribute_local(gpu->get_table_view(),
+                                                  rmm::cuda_device_id{device})) {
+      operation.skip_locked(attempt_counters::skipped_admission);
+      return;
+    }
+    {
+      std::scoped_lock lock(operation.mutex);
+      if (++operation.local_done != operation.plan.replica_spaces().size() ||
+          operation.accumulation_result) {
+        return;
+      }
+      operation.local_await = false;
+    }
+    auto stream_lease = sirius::memory::runtime_stream_pool::acquire(*space);
+    operation.publish(*space, stream_lease.get(), /*local=*/true);
+  } catch (...) {
+    auto const error = std::current_exception();
+    auto const kind  = classify_failure(error);
+    {
+      std::scoped_lock lock(operation.mutex);
+      operation.end_attempt_on_failure(kind);
+    }
+    if (!recoverable(kind)) { std::rethrow_exception(error); }
+  }
 }
 
 namespace {

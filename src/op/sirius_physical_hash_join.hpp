@@ -310,6 +310,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// follow the global three-valued rule. Idempotent, so OOM retries are harmless.
   void observe_partitioned_build_batch(cucascade::read_only_data_batch const& batch);
 
+  /// PROTO(sgb): a broadcast slot's whole build completes that GPU's Bloom replica before deposit.
+  void push_data_batch_partitioned(std::string_view port_id,
+                                   std::shared_ptr<cucascade::data_batch> batch,
+                                   std::size_t partition_idx) override;
+
   /// @brief Records that the build PARTITION carries this join's observer, so a hash-partitioned
   /// MARK build is known to be observed (see observe_partitioned_build_batch).
   void note_build_observer_attached() noexcept

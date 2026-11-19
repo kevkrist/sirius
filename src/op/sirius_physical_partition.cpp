@@ -159,6 +159,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     // Contribute to the dynamic filters before the routed output is built.
     std::optional<std::uint64_t> forward_publication_id;
     if (_input_observer) {
+      if (routing->mode == partition_mode::broadcast) {
+        _input_observer->note_broadcast_slots(routing->placement->num_partitions());
+      }
       forward_publication_id = _input_observer->before_transform(input, input_batch_ro, stream);
     }
     std::vector<std::size_t> destinations;

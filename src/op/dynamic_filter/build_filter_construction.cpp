@@ -302,8 +302,19 @@ bool build_filter_construction::contribute(contribution_ticket const& ticket,
   return accepted;
 }
 
+bool build_filter_construction::bloom_only() const noexcept
+{
+  return _impl->bloom && !_impl->stager && !_impl->bounds;
+}
+
+bool build_filter_construction::contribute_local(cudf::table_view const& input,
+                                                 rmm::cuda_device_id device)
+{
+  return _impl->bloom && _impl->bloom->enqueue_add_local(input, device);
+}
+
 std::optional<build_filter_construction::constructed_filters> build_filter_construction::finish(
-  publication_root const& root)
+  publication_root const& root, bool local)
 {
   rmm::cuda_device_id const device{root.space.get_device_id()};
   int current = -1;
@@ -326,7 +337,8 @@ std::optional<build_filter_construction::constructed_filters> build_filter_const
   if (_impl->bounds) { merged = _impl->bounds->finish(root.stream, root.scratch); }
   std::optional<detail::accumulated_bloom_builder::publication> blooms;
   if (_impl->bloom) {
-    blooms = _impl->bloom->finish(device, root.stream, root.scratch);
+    blooms = local ? _impl->bloom->finish_local(device)
+                   : _impl->bloom->finish(device, root.stream, root.scratch);
     if (!blooms) { return std::nullopt; }
     result.transport = blooms->transport;
   }

@@ -146,6 +146,15 @@ class dynamic_filter_publication_session final {
    */
   void decline_task_input() noexcept;
 
+  /// PROTO(sgb): the build PARTITION forwards every batch to @p slots broadcast slots.
+  void note_broadcast_slots(std::size_t slots) noexcept;
+
+  /// PROTO(sgb): one broadcast slot's whole build arrived on its GPU: insert it into that GPU's
+  /// replica, and publish once every replica GPU has done so. No-op outside local-replica mode.
+  void contribute_replica(cucascade::read_only_data_batch const& source);
+  /// PROTO(sgb): whether `contribute_replica` could still do something.
+  [[nodiscard]] bool awaits_replicas() const noexcept;
+
   /**
    * @brief Most GPU bytes one Construction Site task may allocate for this session, beyond the
    * storage leased when Construction begins.

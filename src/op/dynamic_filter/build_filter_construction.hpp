@@ -203,7 +203,14 @@ class build_filter_construction final {
    * @return The filters, or nullopt when the Bloom publication workspace is refused or the root GPU
    * holds no storage
    */
-  [[nodiscard]] std::optional<constructed_filters> finish(publication_root const& root);
+  [[nodiscard]] std::optional<constructed_filters> finish(publication_root const& root,
+                                                           bool local = false);
+
+  /// PROTO(sgb): true iff only Bloom filters are constructed (no exact keys, no bounds).
+  [[nodiscard]] bool bloom_only() const noexcept;
+
+  /// PROTO(sgb): inserts the whole build @p input, resident on @p device, into that GPU's replica.
+  [[nodiscard]] bool contribute_local(cudf::table_view const& input, rmm::cuda_device_id device);
 
   /**
    * @brief Bytes one task may take from its allocator: Contribution temporaries for the largest

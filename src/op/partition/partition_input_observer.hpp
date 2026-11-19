@@ -42,6 +42,8 @@ class partition_input_observer {
                                cucascade::memory::memory_space& space,
                                ::cuda::stream_ref stream)                         = 0;
   virtual void finalize_input()                                                   = 0;
+  /// PROTO(sgb): the observed input forwards every batch to @p slots broadcast slots.
+  virtual void note_broadcast_slots(std::size_t /*slots*/) {}
   /**
    * @brief Bytes a task of the observed input may take from its allocator beyond its input and
    * output; 0 when the observer builds nothing.

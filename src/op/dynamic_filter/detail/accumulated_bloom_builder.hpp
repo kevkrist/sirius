@@ -228,6 +228,14 @@ class accumulated_bloom_builder final {
                                  rmm::cuda_device_id device,
                                  ::cuda::stream_ref stream);
 
+  /// PROTO(sgb): inserts every key of @p input (a whole build resident on @p device) into that
+  /// GPU's own array on the partial's stream and waits for it. Returns false without a partial.
+  [[nodiscard]] bool enqueue_add_local(cudf::table_view const& input, rmm::cuda_device_id device);
+
+  /// PROTO(sgb): publication when every replica GPU inserted the whole build itself: no merge, no
+  /// cross-GPU copy.
+  [[nodiscard]] std::optional<publication> finish_local(rmm::cuda_device_id root);
+
   /**
    * @brief How `finish` moved partials and the union between GPUs.
    */

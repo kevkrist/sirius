@@ -64,6 +64,11 @@ void hash_join_partition_observer::finalize_input()
   D_ASSERT(!session.plan().enabled() || session.terminal());
 }
 
+void hash_join_partition_observer::note_broadcast_slots(std::size_t slots)
+{
+  _join.dynamic_filter_session().note_broadcast_slots(slots);
+}
+
 std::size_t hash_join_partition_observer::task_scratch_bytes() const noexcept
 {
   return _join.dynamic_filter_session().task_scratch_bound();

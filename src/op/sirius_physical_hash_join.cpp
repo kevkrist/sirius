@@ -1556,6 +1556,17 @@ sirius_physical_hash_join::mark_null_state sirius_physical_hash_join::resolve_ma
   return {local_build_has_null, local_build_empty};
 }
 
+void sirius_physical_hash_join::push_data_batch_partitioned(
+  std::string_view port_id, std::shared_ptr<cucascade::data_batch> batch, std::size_t partition_idx)
+{
+  if (port_id == "build" && batch && _dynamic_filter_session.awaits_replicas()) {
+    auto pinned = batch->to_read_only();
+    _dynamic_filter_session.contribute_replica(pinned);
+  }
+  sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
+    port_id, std::move(batch), partition_idx);
+}
+
 void sirius_physical_hash_join::observe_partitioned_build_batch(
   cucascade::read_only_data_batch const& batch)
 {

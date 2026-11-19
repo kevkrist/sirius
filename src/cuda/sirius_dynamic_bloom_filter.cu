@@ -1119,6 +1119,67 @@ bool accumulated_bloom_builder::enqueue_add(cudf::table_view const& input,
   return true;
 }
 
+bool accumulated_bloom_builder::enqueue_add_local(cudf::table_view const& input,
+                                                  rmm::cuda_device_id device)
+{
+  nvtx_scoped_range range{"dynfilter::accum::contribute_local"};
+  check_cuda(cudaGetLastError(), "pending CUDA error before local accumulated contribution");
+  auto* target = _impl->find(device.value());
+  if (target == nullptr) { return false; }
+  rmm::cuda_set_device_raii guard{device};
+  auto const stream = target->stream_ref();
+  std::array const joined{stream};
+  try {
+    join_on_failure(joined, [&] {
+      for (std::size_t index = 0; index < _impl->keys.size(); ++index) {
+        auto const& domain = _impl->domains[index];
+        detail::dispatch_key_rep(domain.rep, [&](auto key_tag) {
+          add_accumulated_keys<decltype(key_tag)>(*target->arrays[index],
+                                                  _impl->shapes[index].blocks,
+                                                  domain,
+                                                  input.column(_impl->keys[index].ordinal),
+                                                  stream);
+        });
+      }
+      // The input is only pinned by the caller: retire the inserts before returning.
+      check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(local contribution)");
+    });
+  } catch (unjoined_gpu_work const&) {
+    _impl->leak_storage.store(true);
+    throw;
+  }
+  target->contributed.store(true, std::memory_order_relaxed);
+  return true;
+}
+
+std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder::finish_local(
+  rmm::cuda_device_id root_device)
+{
+  nvtx_scoped_range range{"dynfilter::accum::finish_local"};
+  auto* root = _impl->find(root_device.value());
+  if (root == nullptr) { return std::nullopt; }
+  std::size_t all_bytes = 0;
+  for (auto const& shape : _impl->shapes) {
+    all_bytes += shape.raw_bytes;
+  }
+  for (auto const& entry : _impl->partials) {
+    if (!entry->contributed.load(std::memory_order_relaxed)) {
+      throw accumulation_invariant_error{"local publication with an incomplete replica"};
+    }
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry->device_id}};
+    check_cuda(cudaStreamSynchronize(entry->stream->value()),
+               "cudaStreamSynchronize(local publication)");
+  }
+  SIRIUS_LOG_DEBUG(
+    "[accumulated_bloom_builder::finish] PROTO local replicas: {} key(s), {} bytes in all, built "
+    "on each of {} GPU(s); no cross-GPU copy.",
+    _impl->keys.size(),
+    all_bytes,
+    _impl->partials.size());
+  make_filters(root->device_id);
+  return publication{{_impl->filters}, publication_transport::PEER_COPY};
+}
+
 std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder::finish(
   rmm::cuda_device_id root_device,
   ::cuda::stream_ref stream,
