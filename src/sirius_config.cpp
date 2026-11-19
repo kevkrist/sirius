@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -801,6 +802,11 @@ struct topology {
     } else {
       long long n = 0;
       r.optional("num_gpus", n);
+      // PROTO OP1B (measurement only): run on the first N GPUs without editing the config, to
+      // measure on the P2P pair 0-1.
+      if (auto const* override_gpus = std::getenv("SIRIUS_PROTO_NUM_GPUS")) {
+        n = std::atoll(override_gpus);
+      }
       if (n < 0) { throw std::runtime_error("topology.num_gpus must be non-negative"); }
       opt.num_gpus_or_gpu_ids = static_cast<size_t>(n);
     }
