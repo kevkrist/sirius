@@ -115,3 +115,10 @@ A slot is reused only after its readers' events (uploads of chunk k-W for output
 - q21 ABBA (A1 U1 O1 O2 U2 A2, 8 hot each): tip 1438.6 -> auto 1230.0 ms = -208.5 ms (-14.5%); proto binary with the switch
   off 1436.7 (-1.9 ms); results identical.
 
+- ABBA so far (8 hot per arm, tip vs `auto`): q3 665.7 -> 624.7 (-41.0, -6.2%), q7 745.6 -> 705.0 (-40.6, -5.5%),
+  q8 936.1 -> 910.3 (-25.8, -2.8%); switch off on the proto binary: q3 658.2 (-7.5), q21 -1.9. Results identical.
+- Exact-kind identity gate `[xfer_proto_exact]` G=4 (commit `e683d765`): 96 sessions, 576 exact masks (dense-range
+  membership on every GPU, replica switch 0 vs 1 vs 1 + forced HOST-allocation failure) identical and equal to the inserted
+  key set; proto paths exercised (144 staged sources, 144 stage-once hits, 40 batched gathers).
+- Queue (runs/xfer_host/queue.txt, bin/waiter.sh) still running: q10 q9 q4 q5, nsys q21 q3, q2 q6, MB sweeps, unit tests,
+  rest of the suite.
