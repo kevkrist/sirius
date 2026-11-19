@@ -68,6 +68,13 @@ void hash_join_partition_observer::run_claimed_publication(cucascade::memory::me
   _join.dynamic_filter_session().run_claimed_publication(space, stream);
 }
 
+void hash_join_partition_observer::publication_finished()
+{
+  // PROTO eager option 2: the build is already deposited (the build CONCAT may be running); the
+  // filters are visible now, so the probe side may start.
+  _join.activate_probe_after_build_partition(nullptr);
+}
+
 void hash_join_partition_observer::finalize_input()
 {
   auto& session = _join.dynamic_filter_session();

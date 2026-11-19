@@ -951,12 +951,9 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
     bool const has_plan   = session.plan().enabled();
     bool const terminal   = session.terminal();
     if (mode == 1 && !has_plan) { return; }
-    if (has_plan && !terminal) {
-      SIRIUS_LOG_ERROR("[eager] join {}: session NOT terminal at build PARTITION finalize; "
-                       "probe not activated early",
-                       get_operator_id());
-      return;
-    }
+    // Option 2 (deferred publication, SIRIUS_DF_DEFER_PUBLISH != 0): the PARTITION finalize can run
+    // while the publication is still in flight; the Publishing Task calls again when it is done.
+    if (has_plan && !terminal) { return; }
     auto* probe_port = get_port("default");
     if (!probe_port || !probe_port->src_pipeline) { return; }
     auto const pipeline = get_pipeline();
@@ -966,9 +963,10 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
     auto* probe_head = &probe_port->src_pipeline->get_operators()[0].get();
     if (concat_first != 0 && build_concat != nullptr) { creator->schedule(build_concat); }
     creator->schedule(probe_head);
-    SIRIUS_LOG_INFO("[eager] join {} probe activated at build PARTITION finalize (filter_plan={}, "
-                    "session_terminal={}, concat_first={})",
+    SIRIUS_LOG_INFO("[eager] join {} probe activated {} (filter_plan={}, session_terminal={}, "
+                    "concat_first={})",
                     get_operator_id(),
+                    build_concat != nullptr ? "at build PARTITION finalize" : "after deferred publication",
                     has_plan,
                     terminal,
                     concat_first);

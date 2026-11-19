@@ -48,6 +48,8 @@ class partition_input_observer {
                                        ::cuda::stream_ref /*stream*/)
   {
   }
+  // PROTO eager option 2: called by the Publishing Task right after its deferred publication ran.
+  virtual void publication_finished() {}
   virtual void finalize_input()                                                   = 0;
   /**
    * @brief Bytes a task of the observed input may take from its allocator beyond its input and

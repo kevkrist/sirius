@@ -311,6 +311,7 @@ void sirius_physical_partition::after_sink(operator_data const& output_data,
       throw;
     }
     _input_observer->run_claimed_publication(*deferred.space, stream);
+    _input_observer->publication_finished();
   } else if (deferred.complete_early_always) {
     // Not the Publishing Task: only its own insert kernels are left, which the task's final
     // stream sync retires before its input is released.
