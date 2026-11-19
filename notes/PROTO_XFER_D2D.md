@@ -162,3 +162,54 @@ per query, 1 warm + 5 hot, first hot dropped, ABBA, n = 8 per arm:
 | 10 | 849.7 (8) [840-869] | 820.2 (8) [813-833] | -29.5 | -3.47 | -29.5 | identical |
 | 21 | 1442.0 (8) [1429-1454] | 1244.1 (8) [1227-1258] | -197.9 | -13.72 | -197.9 | identical |
 | sum | 6378 | 6014 | -363.9 | -5.71 | | |
+
+## 6. (a, continued) Small Blooms (fixed cost), exact kinds, full-P2P pair
+
+### 6.1 Fixed cost: small Blooms at G=4 (`mb/mb4_small.log`, median of 9)
+
+| batches on | Bloom MiB | off ms (ms/GiB) | star ms (ms/GiB) | exchange ms (ms/GiB) | pipe ms (ms/GiB) | pipe vs off | spread max-min, worst mode |
+|---|---|---|---|---|---|---|---|
+| root only (GPU 0) | 1 | 0.08 (85) | 0.13 (128) | 0.12 (127) | 0.15 (159) | 0.53x | 14.8% |
+| root only (GPU 0) | 4 | 0.27 (70) | 0.33 (84) | 0.32 (82) | 0.27 (69) | 1.01x | 30.0% |
+| root only (GPU 0) | 16 | 1.07 (68) | 1.14 (73) | 1.14 (73) | 0.74 (47) | 1.45x | 13.2% |
+| root only (GPU 0) | 32 | 1.98 (64) | 2.04 (65) | 2.04 (65) | 1.35 (43) | 1.47x | 6.6% |
+| all 4 | 1 | 0.27 (279) | 0.27 (272) | 0.21 (218) | 0.23 (236) | 1.18x | 16.4% |
+| all 4 | 4 | 0.87 (223) | 0.62 (160) | 0.46 (117) | 0.38 (97) | 2.30x | 14.1% |
+| all 4 | 16 | 3.38 (216) | 2.09 (134) | 1.42 (91) | 1.03 (66) | 3.28x | 4.1% |
+| all 4 | 32 | 6.13 (196) | 3.67 (118) | 2.38 (76) | 1.83 (59) | 3.35x | 4.4% |
+
+- The island reduce has a fixed cost of about 0.05-0.07 ms per finish (3 streams + 6-10 events per island, 2-4 pinned
+  windows, one reservation + scratch allocation on the other leader). Root-only 1 MiB: 0.08 -> 0.15 ms (slower);
+  break-even at 4 MiB; all-four case wins from 1 MiB up. Production: pool the streams (`runtime_stream_pool`), or keep
+  the tip loop below ~4 MiB when at most one GPU contributed.
+- Repetition spread at these sizes is 4-30% (sub-millisecond calls); the medians are stable to ~10 us.
+
+### 6.2 Exact kinds (session level, `[mb4x]` exact slices and `[mb5]` small builds, G=4, 1 key, median of 7)
+
+`publish_us` = `publish_if_final` wall (gather + filter construction + replica fan-out); `shot_repl_us` = one-shot
+filter `replicate_to_devices` (source GPU 0, 3 targets). Switch off -> `pipe` (relay on); off run twice (run-to-run
+difference <= 2%).
+
+| Case (kind chosen by `auto`) | publish us: off -> on | one-shot replicate us: off -> on |
+|---|---|---|
+| 12 rows, 1 batch (small IN-list) | 165 -> 162 | 73 -> 60 |
+| 1000 rows, 1 batch (small / hash IN-list) | 273 -> 254 | 115 -> 107 |
+| 100k rows, 1 batch on GPU 0 (hash IN-list) | 654 -> 568 (-13%) | 429 -> 351 (-18%) |
+| 100k rows, 16 batches spread over 4 GPUs | 892 -> 758 (-15%) | 429 -> 354 |
+| 100k rows, 128 batches spread | 2129 -> 1988 (-7%) | 431 -> 346 |
+| 10M rows on GPU 0 (accumulated Bloom, 19 MiB, S=0) | 1286 -> 1037 (-19%) | 1949 -> 1564 (-20%, one-shot Bloom relay) |
+| 10M rows, 16 batches spread (Bloom, S=3) | 4067 -> 1344 (3.0x) | 1963 -> 1591 |
+
+- MB4x (exact slices, 512 / 32768 rows in 1 / 64 / 512 batches): publish -10 to -50 us with the switch on
+  (`exchange` run: 200 -> 181, 457 -> 431, 498 -> 449 us); the spread 512-slice cases stay at 5.3-5.8 ms
+  (5365 -> 5296 us): the gather is unchanged, its cost is the per-slice synced bounce from the two cross-pair GPUs.
+- The relay saves one of the two whole-payload host bounces of an exact / one-shot replica fan-out: -18..-20% of
+  `replicate_to_devices`, tens of microseconds to 0.4 ms per filter. Not a suite item (as MB_TRANSFER predicted).
+- Side finding: mode `exchange` (not `pipe`) made the 19 MiB S=0 session publish 0.2 ms slower (1291 -> 1500 us):
+  2.4 MiB chunks, two host waits per chunk plus the fixed cost. `pipe` does not have this.
+
+### 6.3 Full-P2P sanity: G=2 on the P2P pair 0-1 (`mb/mb4_g2.log`)
+
+281 MiB: off 5.57 / 6.42 ms (S=0 / S=1), `pipe` 5.58 / 6.41 ms; 1434 MiB: off 28.37 / 31.85, `pipe` 28.36 / 31.84.
+Identical: with one island `plan()` declines and the tip PEER pipeline runs.
+
