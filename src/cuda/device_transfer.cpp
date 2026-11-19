@@ -150,11 +150,11 @@ struct host_bounce_scope::impl {
   {
     auto failed = cudaSuccess;
     for (auto const& entry : sources) {
-      auto const status = drain(entry->get(), rmm::cuda_device_id{entry->device});
+      auto const status = memory::drain(entry->get(), rmm::cuda_device_id{entry->device});
       if (failed == cudaSuccess) { failed = status; }
     }
     for (auto const& [device, stream] : destinations) {
-      auto const status = drain(::cuda::stream_ref{stream}, rmm::cuda_device_id{device});
+      auto const status = memory::drain(::cuda::stream_ref{stream}, rmm::cuda_device_id{device});
       if (failed == cudaSuccess) { failed = status; }
     }
     return failed;

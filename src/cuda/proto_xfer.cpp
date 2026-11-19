@@ -263,6 +263,8 @@ bool fail_host_allocation() noexcept { return env("SIRIUS_PROTO_XFER_FAIL_HOST")
 
 bool checksum_enabled() noexcept { return env("SIRIUS_PROTO_XFER_CHECKSUM") == "1"; }
 
+bool dump_enabled() noexcept { return env("SIRIUS_PROTO_XFER_DUMP") == "1"; }
+
 void host_or(std::span<std::byte* const> out,
              std::span<std::span<std::byte* const> const> inputs,
              std::size_t block_bytes,

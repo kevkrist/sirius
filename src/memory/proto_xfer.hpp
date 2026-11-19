@@ -27,6 +27,7 @@
 //                                (default: on iff SIRIUS_PROTO_XFER_HOST is on)
 //   SIRIUS_PROTO_XFER_FAIL_HOST  1 = pretend the pinned HOST window cannot be allocated
 //   SIRIUS_PROTO_XFER_CHECKSUM   1 = checksum every replica array after a Bloom finish
+//   SIRIUS_PROTO_XFER_DUMP       1 = also copy every replica array to the host (byte compare)
 
 #include <atomic>
 #include <cstddef>
@@ -44,6 +45,7 @@ enum class bloom_mode : std::uint8_t { off, gpuor, hostor, automatic };
 [[nodiscard]] bool replica_enabled() noexcept;
 [[nodiscard]] bool fail_host_allocation() noexcept;
 [[nodiscard]] bool checksum_enabled() noexcept;
+[[nodiscard]] bool dump_enabled() noexcept;
 
 /**
  * @brief ORs `inputs.size()` arrays held in equally sized HOST blocks into @p out, in parallel.
@@ -67,6 +69,8 @@ struct finish_observation {
   std::size_t device_scratch_bytes{0};
   std::size_t host_waits{0};
   std::vector<std::uint64_t> checksums;  ///< Per partial, per key; with SIRIUS_PROTO_XFER_CHECKSUM
+  /// Per partial, per key: the array's bytes; with SIRIUS_PROTO_XFER_DUMP (tests only)
+  std::vector<std::vector<std::byte>> arrays;
 };
 
 void set_last_finish(finish_observation observation);

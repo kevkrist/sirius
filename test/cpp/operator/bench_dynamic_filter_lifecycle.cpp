@@ -60,6 +60,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <span>
@@ -820,7 +821,8 @@ void clear_proto_env()
                            "SIRIUS_PROTO_XFER_WINDOW",
                            "SIRIUS_PROTO_XFER_OR_THREADS",
                            "SIRIUS_PROTO_XFER_FAIL_HOST",
-                           "SIRIUS_PROTO_XFER_CHECKSUM"}) {
+                           "SIRIUS_PROTO_XFER_CHECKSUM",
+                           "SIRIUS_PROTO_XFER_DUMP"}) {
     unsetenv(name);
   }
 }
@@ -861,7 +863,8 @@ TEST_CASE("proto xfer host: every schedule leaves the tip loop's Bloom arrays on
   }
   contributions.push_back(everyone);
   contributions.push_back({});
-  std::size_t checked = 0;
+  std::size_t checked  = 0;
+  std::size_t compared = 0;
   for (auto const& bytes : shapes) {
     std::vector<std::size_t> blocks;
     for (auto const size : bytes) {
@@ -871,10 +874,12 @@ TEST_CASE("proto xfer host: every schedule leaves the tip loop's Bloom arrays on
       for (auto const root : {0, static_cast<int>(gpus) - 1}) {
         clear_proto_env();
         setenv("SIRIUS_PROTO_XFER_CHECKSUM", "1", 1);
+        setenv("SIRIUS_PROTO_XFER_DUMP", "1", 1);
         auto const tip =
           run_proto_finish(fixture, spaces, blocks, batches, contributing, root, true);
         REQUIRE(tip.seen.schedule == -1);
         auto const expected = agreed_checksums(tip.seen, gpus, blocks.size());
+        REQUIRE(tip.seen.arrays.size() == gpus * blocks.size());
         if (!contributing.empty()) { REQUIRE(expected.front() != 0); }
         for (auto const& config : configs) {
           config.apply();
@@ -882,6 +887,16 @@ TEST_CASE("proto xfer host: every schedule leaves the tip loop's Bloom arrays on
           auto const got =
             run_proto_finish(fixture, spaces, blocks, batches, contributing, root, true);
           REQUIRE(agreed_checksums(got.seen, gpus, blocks.size()) == expected);
+          // Bit identity with the tip loop, array by array, on every GPU.
+          REQUIRE(got.seen.arrays.size() == tip.seen.arrays.size());
+          for (std::size_t index = 0; index < got.seen.arrays.size(); ++index) {
+            REQUIRE(got.seen.arrays[index].size() == tip.seen.arrays[index].size());
+            bool const same = std::memcmp(got.seen.arrays[index].data(),
+                                          tip.seen.arrays[index].data(),
+                                          got.seen.arrays[index].size()) == 0;
+            REQUIRE(same);
+            ++compared;
+          }
           if (config.fail_host) {
             REQUIRE(got.seen.fell_back);
             REQUIRE(got.seen.schedule == -1);
@@ -903,7 +918,10 @@ TEST_CASE("proto xfer host: every schedule leaves the tip loop's Bloom arrays on
     }
   }
   clear_proto_env();
-  std::printf("ROW,XFERCHECK,gpus=%zu,finishes_checked=%zu\n", gpus, checked);
+  std::printf("ROW,XFERCHECK,gpus=%zu,finishes_checked=%zu,arrays_byte_compared=%zu\n",
+              gpus,
+              checked,
+              compared);
   std::fflush(stdout);
 }
 

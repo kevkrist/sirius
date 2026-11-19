@@ -277,6 +277,7 @@ std::optional<exact_key_stager::gathered> exact_key_stager::gather(rmm::cuda_dev
   std::fill(words.begin(), words.end(), std::uint32_t{0});
   // PROTOTYPE [xfer-PR]: pinned HOST blocks of the batched gather; alive until the final wait.
   std::vector<cucascade::memory::fixed_multiple_blocks_allocation> proto_stagings;
+  std::vector<cuda_event> proto_staged_events;
   bool const proto_gather = sirius::memory::proto_xfer::replica_enabled();
   try {
     join_on_failure(joined, [&] {
@@ -338,7 +339,8 @@ std::optional<exact_key_stager::gathered> exact_key_stager::gather(rmm::cuda_dev
               rmm::cuda_set_device_raii guard{rmm::cuda_device_id{source.device_id}};
               check_cuda(download.enqueue(source.stream_ref()),
                          "device_copy_batch::enqueue(staging gather download)");
-              cuda_event staged;
+              // Created on the source GPU; kept until the final wait.
+              auto& staged = proto_staged_events.emplace_back();
               check_cuda(cudaEventRecord(staged.get(), source.stream->value()),
                          "cudaEventRecord(staging gather download)");
               check_cuda(cudaStreamWaitEvent(stream.get(), staged.get(), 0),

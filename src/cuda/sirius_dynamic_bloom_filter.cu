@@ -1880,6 +1880,14 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
                                    proto_word_checksum{words},
                                    std::uint64_t{0},
                                    thrust::plus<std::uint64_t>{}));
+        if (sirius::memory::proto_xfer::dump_enabled()) {
+          auto& bytes = proto_seen.arrays.emplace_back(shapes[key_index].raw_bytes);
+          check_cuda(cudaMemcpy(bytes.data(),
+                                entry->arrays[key_index]->data(),
+                                bytes.size(),
+                                cudaMemcpyDeviceToHost),
+                     "cudaMemcpy(proto dump)");
+        }
       }
     }
   }
