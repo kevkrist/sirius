@@ -183,7 +183,48 @@ PLACEHOLDER_ABBA
 
 ## 7. Sweeps (MB4P)
 
-PLACEHOLDER_SWEEPS
+### 7.1 Window (HOST slots per array) and CPU OR threads, 4 contributors (ms/GiB; `out/mb4p_g4_w.log`)
+
+| Bloom | tip | gpuor w1 / w2 / w4 / w8 | hostor t16: w1 / w2 / w4 / w8 | hostor w4: t4 / t8 / t16 / t32 | hostor w2 t8 |
+|---|---|---|---|---|---|
+| 57 MiB | 188 | 123 / 103 / 101 / 96 | 77 / 58 / 58 / 60 | 68 / 54 / 58 / 60 | 54 |
+| 281 MiB | 186 | 118 / 97 / 96 / 95 | 74 / 49 / 47 / 47 | 58 / 45 / 47 / 49 | 45 |
+| 1434 MiB | 186 | 117 / 96 / 95 / 95 | 75 / 47 / 45 / 45 | 56 / 43 / 45 / 47 | 43 |
+
+- Two slots are enough (double buffering); 4 or 8 add nothing. W=2 hostor holds 80 MiB pinned (4 contributors), W=1 40 MiB.
+- 8 OR threads are the best point (43-54 ms/GiB), 4 cost 20-25%, 32 are worse than 8. Defaults used in TPC-H: W=4, 16 threads.
+- Even the smallest configuration (W=1, 4 threads, 40 MiB pinned) is 2x the tip loop.
+
+### 7.2 Small arrays and 3 contributors (`out/mb4p_g4_small.log`, `out/mb4p_g4_s3.log`; ms)
+
+| Bloom | batches on 1: tip / proto | on 2: tip / gpuor / hostor | on 4: tip / gpuor / hostor |
+|---|---|---|---|
+| 1 MiB | 0.08 / **0.12** | 0.15 / 0.18 / 0.17 | 0.27 / 0.24 / 0.22 |
+| 4 MiB | 0.27 / 0.27 | 0.48 / 0.38 / 0.37 | 0.87 / 0.58 / 0.52 |
+| 16 MiB | 1.07 / 0.71 | 1.86 / 0.99 / 0.97 | 3.38 / 1.68 / 1.26 |
+
+3 contributors (GPUs 0-2): 57 / 281 / 1434 MiB: tip 8.11 / 39.6 / 201.7 ms (144-146 ms/GiB), gpuor 4.35 / 20.8 / 105.9 (76-78),
+hostor 3.15 / 13.2 / 64.7 (46-56).
+- Fixed cost of a pipeline (streams + events): about 40 us. Break-even with the tip loop at 4 MiB with one contributor,
+  below 1 MiB with four. A product version keeps the tip loop under a few MiB.
+
+### 7.3 Exact-kind builds (session `publish_if_final`, G=4, us; replica switch off -> on; `out/mb4x_g4_r{0,1}.log`, `out/mb2_g4_r{0,1}.log`)
+
+| Case (hash IN-list) | 1 key | 2 keys |
+|---|---|---|
+| all batches on GPU 0 (replica fan-out only), 12 cases | 190-508 -> 169-466 (0.95-1.15x) | 639-826 -> 716-784 (0.88-1.10x) |
+| round-robin, 64 batches (512 / 32768 rows) | 1001 -> 508, 1206 -> 564 (2.0-2.1x) | 1913 -> 936, 2180 -> 981 (2.0-2.2x) |
+| round-robin, 512 batches | 5409 -> 1202, 5798 -> 1187 (4.5-4.9x) | 10601 -> 2332, 11508 -> 2385 (4.6-4.8x) |
+| MB2 round-robin 1 / 8 / 64 batches, 1000 rows | 190 -> 173, 377 -> 281, 1280 -> 567 | 815 -> 728, 986 -> 845, 2555 -> 1049 |
+
+- The batched gather removes the per-slice `D2H, sync, H2D, sync`: up to 4.9x for many small slices spread over GPUs.
+- The stage-once replica fan-out is worth 5-15% of a sub-millisecond publish; three single-batch cases were 5-12% slower
+  (within the spread of these 5-rep medians; not re-run). On the suite the exact kinds are < 5 ms per query in total.
+- Bloom rows of MB2 are unchanged (0.98-1.00x): the Bloom switch was off in this run.
+
+### 7.4 Larger chunks and G=2
+
+PLACEHOLDER_CHUNK_G2
 
 ## 8. Existing DF unit tests on the prototype binary
 
