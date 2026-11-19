@@ -20,6 +20,12 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
+#include <cstdlib>
+#include <string_view>
+
 namespace sirius::op {
 
 hash_join_partition_observer::hash_join_partition_observer(sirius_physical_hash_join& join,
@@ -47,7 +53,20 @@ std::optional<uint64_t> hash_join_partition_observer::before_transform(
   cucascade::read_only_data_batch const& batch,
   ::cuda::stream_ref stream)
 {
-  return _certifier.contribute(input, batch, stream);
+  auto const id = _certifier.contribute(input, batch, stream);
+  // PROTOTYPE (OP1A, variant "early"): hand the publication to its continuation right after the
+  // final contribution, before the hash path's scatter, so the scatter overlaps it too.
+  static bool const early = [] {
+    auto const* value = std::getenv("SIRIUS_DF_ASYNC_EARLY");
+    return value != nullptr && std::string_view{value} == "1";
+  }();
+  if (early && id) {
+    if (auto const* space = batch.get_memory_space();
+        space != nullptr && space->get_tier() == cucascade::memory::Tier::GPU) {
+      _join.dynamic_filter_session().publish_if_final_async(*id, *space, stream);
+    }
+  }
+  return id;
 }
 
 void hash_join_partition_observer::after_transform(uint64_t id,
