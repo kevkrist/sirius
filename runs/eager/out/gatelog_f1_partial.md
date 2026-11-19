@@ -1,0 +1,34 @@
+| q | join | lines | activated | held | plan | relevant ch | relevant pending (max) | started scans | with channel | started pending (max) | min GPU avail GiB | when |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 3 | 8 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 85.3 | finalize |
+| 3 | 15 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 84.6 | finalize |
+| 5 | 10 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 85.3 | finalize |
+| 5 | 18 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 85.3 | finalize |
+| 5 | 25 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 84.8 | finalize |
+| 5 | 32 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 84.9 | finalize |
+| 5 | 35 | 6 | 6 | 0 | false | 0 | 0 | 1 | 0 | 0 | 85.4 | finalize |
+| 7 | 9 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 85.5 | finalize |
+| 7 | 21 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 85.3 | finalize |
+| 7 | 28 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 85.4 | finalize |
+| 7 | 35 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 84.0 | finalize |
+| 7 | 38 | 6 | 6 | 0 | true | 1 | 1 | 1 | 0 | 0 | 85.3 | finalize |
+| 8 | 6 | 6 | 6 | 0 | false | 0 | 0 | 1 | 0 | 0 | 85.5 | finalize |
+| 8 | 19 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 85.4 | finalize |
+| 8 | 27 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 85.4 | finalize |
+| 8 | 34 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 85.0 | finalize |
+| 8 | 41 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 84.6 | finalize |
+| 8 | 44 | 6 | 6 | 0 | true | 1 | 1 | 1 | 0 | 0 | 85.4 | finalize |
+| 8 | 47 | 6 | 6 | 0 | false | 0 | 0 | 1 | 0 | 0 | 85.3 | finalize |
+| 9 | 9 | 6 | 6 | 0 | false | 0 | 0 | 1 | 0 | 0 | 74.9 | finalize |
+| 9 | 19 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 74.7 | finalize |
+| 9 | 22 | 6 | 6 | 0 | false | 0 | 0 | 1 | 0 | 0 | 74.9 | finalize |
+| 9 | 29 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 81.5 | finalize |
+| 9 | 32 | 6 | 6 | 0 | false | 0 | 0 | 1 | 0 | 0 | 80.6 | finalize |
+| 16 | 11 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 84.9 | finalize |
+| 21 | 7 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 85.5 | finalize |
+| 21 | 18 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 81.9 | finalize |
+| 21 | 21 | 6 | 6 | 0 | true | 1 | 1 | 1 | 0 | 0 | 85.5 | finalize |
+| 21 | 33 | 6 | 6 | 0 | true | 1 | 0 | 1 | 1 | 0 | 83.3 | finalize |
+| 21 | 42 | 6 | 6 | 0 | false | 0 | 0 | 0 | 0 | 0 | 82.9 | finalize |
+
+joins 30, with relevant pending 3, with started-scan channel pending 0, held lines 0
