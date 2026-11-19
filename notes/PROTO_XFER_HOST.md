@@ -160,7 +160,50 @@ ms (ms per GiB of Bloom). Checksums of all 4 arrays agree with the tip loop in e
 Fresh process per query, 6 iterations (1 warm + 5 hot, first hot dropped), arms interleaved A U U A / U A A U inside one lock
 hold per query (2 queries per hold later on). ms = median of the 8 kept hot iterations (2 processes x 4).
 
-PLACEHOLDER_ABBA
+| q | A med ms (n) [min-max] | U med (n) [min-max] | U-A ms (%) | results |
+|---|---|---|---|---|
+| 1 | 471.0 (4) [469-486] | 466.0 (4) [463-473] | -4.9 (-1.04%) | identical |
+| 2 | 149.7 (8) [146-151] | 146.7 (8) [146-150] | -3.0 (-1.99%) | identical |
+| 3 | 665.7 (8) [658-741] | 624.7 (8) [620-702] | -41.0 (-6.16%) | identical |
+| 4 | 325.2 (8) [322-413] | 311.0 (8) [307-312] | -14.2 (-4.37%) | identical |
+| 5 | 692.1 (8) [679-713] | 680.0 (8) [668-700] | -12.1 (-1.75%) | identical |
+| 6 | 380.1 (8) [379-386] | 380.3 (8) [379-384] | +0.2 (+0.04%) | identical |
+| 7 | 745.6 (8) [738-750] | 705.0 (8) [700-713] | -40.6 (-5.45%) | identical |
+| 8 | 936.1 (8) [926-938] | 910.3 (8) [904-913] | -25.8 (-2.75%) | identical |
+| 9 | 1408.8 (8) [1391-1431] | 1396.0 (8) [1371-1408] | -12.8 (-0.91%) | identical |
+| 10 | 853.2 (8) [834-872] | 820.2 (8) [810-828] | -33.0 (-3.87%) | identical |
+| 11 | 170.4 (8) [167-185] | 173.5 (8) [166-180] | +3.1 (+1.84%) | DIFF ['158ff8f5', '2279edd7', '9133e283', 'c1b3c281'] |
+| 12 | 703.7 (8) [701-707] | 694.2 (8) [691-696] | -9.6 (-1.36%) | identical |
+| 13 | 1288.5 (4) [1274-1321] | 1294.3 (4) [1283-1308] | +5.8 (+0.45%) | identical |
+| 14 | 692.5 (4) [678-706] | 686.9 (4) [676-697] | -5.6 (-0.81%) | identical |
+| 15 | 527.0 (4) [527-529] | 527.1 (4) [527-527] | +0.0 (+0.01%) | identical |
+| 16 | 312.4 (8) [302-318] | 308.1 (8) [298-313] | -4.2 (-1.36%) | identical |
+| 17 | 498.6 (4) [488-507] | 497.8 (4) [489-505] | -0.8 (-0.17%) | identical |
+| 18 | 1087.1 (4) [1068-1098] | 1082.5 (4) [1081-1092] | -4.6 (-0.42%) | identical |
+| 19 | 880.0 (4) [878-894] | 882.0 (4) [878-889] | +2.0 (+0.23%) | identical |
+| 20 | 715.7 (8) [701-735] | 712.5 (8) [699-734] | -3.2 (-0.45%) | identical |
+| 21 | 1438.6 (8) [1429-1459] | 1230.0 (8) [1210-1245] | -208.5 (-14.50%) | identical |
+| 22 | 338.5 (8) [338-339] | 333.7 (8) [333-335] | -4.8 (-1.42%) | identical |
+| sum | 15280 | 14863 | -417.5 (-2.73%) | |
+
+n = 8: full ABBA (2 processes per arm); n = 4: one A/U pair (queries without a HOST-staged Bloom; lock contention, section 9).
+Reference totals of the campaign: base 15225, tip 15372 ms (this session's tip: 15280 ms).
+
+- **Suite: 15280 -> 14863 ms = -417.5 ms (-2.73%).** Queries with a HOST-staged Bloom finish (q3 4 5 7 8 9 10 12 16 21 22):
+  -407 ms. The stack's own regression against the base (+147 ms) is more than paid back.
+- Per query the saving tracks the finish time removed: q21 -208.5 (-14.5%), q3 -41.0 (-6.2%), q7 -40.6 (-5.5%),
+  q10 -33.0 (-3.9%), q8 -25.8 (-2.8%), q4 -14.2 (-4.4%), q9 -12.8 (-0.9%), q5 -12.1 (-1.8%), q12 -9.6 (-1.4%),
+  q22 -4.8, q16 -4.2. PROFILE_SUITE put 600 ms of HOST-staged finish in the suite; about 70% of it is gone.
+- Controls: q6 +0.2 ms, q2 -3.0 ms (q2 has 4.7 ms of HOST-staged replica copies at tip), q15 0.0, q17 -0.8, q19 +2.0,
+  q13 +5.8 (n=4, range 1274-1321 at tip: noise). No query is slower beyond noise (+-3% / +-10 ms).
+- Proto binary with the switch off (arm O, 8 hot): q21 1436.7 (-1.9 ms vs tip), q3 658.2 (-7.5 ms; tip arm had one 741 ms
+  outlier). The switch-off path is the tip's.
+- Results: `result.txt` md5 identical across all processes of both arms for 21 queries. q11: the four processes (2 tip, 2
+  proto) give four different md5s and one identical sorted content (936989 rows): the tie order of q11's ORDER BY differs
+  between any two runs, tip against tip included. Not a prototype effect.
+- Variance: per-arm min-max in the table; steady-state spread 2-25 ms. First hot iteration dropped as per protocol.
+- The extension binary was relinked once between q7/q8 and q10 (test-only source change; md5 changed, library sources
+  identical): q21 q3 q7 q8 ran on the first link, the rest on the second.
 
 ## 6. nsys (q21, q3; 1 capture per arm, 1 warm + 2 hot; same-thread attribution, `runs/profile/bin/nsys_df.py`)
 
@@ -250,7 +293,7 @@ The 4 failures under `auto` all pin the tip loop's workspace, none compares filt
 ## 9. What ran / what did not
 
 Ran (all under `flock $R/machine.lock`, one queued job per hold, `runs/xfer_host/queue.log`): build (2 holds), `[xfer_proto]`
-G=4, MB4P short + sweeps, ABBA on PLACEHOLDER_NQ queries, nsys q21 + q3 (2 arms), `[xfer_proto_exact]` G=4, DF unit tests
+G=4, MB4P short + sweeps, ABBA on 22 queries, nsys q21 + q3 (2 arms), `[xfer_proto_exact]` G=4, DF unit tests
 (arms: PLACEHOLDER_UT_ARMS), MB4x / MB2 exact-kind microbench.
 Not run / unverified:
 - `gpuor`-only and `hostor`-only arms in TPC-H (only `auto`); `SIRIUS_PROTO_XFER_REPLICA` alone in TPC-H.
@@ -268,7 +311,7 @@ Not run / unverified:
 - **Full P2P (every pair has pool access).** `finish_impl` takes the PEER `chunk_pipeline` before the prototype is
   consulted, and `enqueue_device_copy` takes the peer route: the prototype code is not reached. Zero gain, zero loss
   (PLACEHOLDER_G2PEER). The 20 ms/GiB per target of MB4 stays.
-- **This machine (P2P inside pairs only).** Measured: finish 186 -> 45-58 ms/GiB with all GPUs contributing, -PLACEHOLDER_SUITE
+- **This machine (P2P inside pairs only).** Measured: finish 186 -> 45-58 ms/GiB with all GPUs contributing, -417 ms (-2.7%)
   on the suite. It is already at the uplink bound for host-only legs; what the per-pair D2D prototype can still add is the
   difference between 2 x B and B on each pair uplink (bound 38 ms/GiB instead of 49; `c2` measured 52 in the primitives
   bench, i.e. no better than hostor as built here).
