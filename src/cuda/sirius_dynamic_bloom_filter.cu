@@ -104,20 +104,24 @@ void copy_filter_storage(Filter const& source,
                          rmm::cuda_device_id destination_device,
                          ::cuda::stream_ref stream,
                          cucascade::memory::memory_space const& host_staging_space,
-                         std::size_t& bytes)
+                         std::size_t& bytes,
+                         detail::replica_relay& relay,  // PROTOTYPE [xfer-PR]
+                         cucascade::memory::memory_space const& destination_space)
 {
   auto const source_blocks = source.block_extent();
   if (destination.block_extent() != source_blocks) {
     throw std::runtime_error("destination Bloom block extent changed during replication");
   }
   bytes = source_blocks * Filter::words_per_block * sizeof(typename Filter::word_type);
-  detail::enqueue_replica_copy(destination.data(),
-                               destination_device,
-                               source.data(),
-                               source_space,
-                               bytes,
-                               stream,
-                               host_staging_space);
+  auto const origin = relay.pick({source.data(), &source_space}, destination_device.value());
+  auto const route  = detail::enqueue_replica_copy(destination.data(),
+                                                   destination_device,
+                                                   origin.data,
+                                                   *origin.space,
+                                                   bytes,
+                                                   stream,
+                                                   host_staging_space);
+  relay.offer(route, destination.data(), destination_space);
 }
 
 template <class Filter>
@@ -570,6 +574,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
   pending.reserve(spaces.size());
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
   detail::replica_fanout_failures failures;
+  detail::replica_relay relay;  // PROTOTYPE [xfer-PR]
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
@@ -606,7 +611,9 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
                               rmm::cuda_device_id{device_id},
                               stream,
                               target.get_host_staging_space(),
-                              bytes);
+                              bytes,
+                              relay,
+                              target_space);
           return result;
         },
         source->bloom);
