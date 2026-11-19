@@ -29,6 +29,7 @@
 #include "cudf/transform.hpp"
 #include "cudf/types.hpp"
 #include "cudf/utilities/memory_resource.hpp"
+#include "creator/task_creator.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/exception.hpp"
 #include "expression/ast/node.hpp"
@@ -60,6 +61,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <format>
 #include <limits>
 #include <optional>
@@ -926,6 +928,56 @@ void sirius_physical_hash_join::reclaim_build_only_slots_if_probe_complete(bool 
     discard_build_partition(*build_port->repo, partition);
     _partition_build_states[partition].build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED,
                                                          std::memory_order_release);
+  }
+}
+
+namespace {
+int eager_env(char const* name, int fallback)
+{
+  auto const* value = std::getenv(name);
+  return value ? std::atoi(value) : fallback;
+}
+}  // namespace
+
+void sirius_physical_hash_join::activate_probe_after_build_partition(
+  sirius_physical_operator* build_concat) noexcept
+{
+  try {
+    static int const mode         = eager_env("SIRIUS_EAGER_PROBE", 0);
+    static int const concat_first = eager_env("SIRIUS_EAGER_CONCAT_FIRST", 1);
+    if (mode == 0) { return; }
+    if (_join_mode != HASH_JOIN_MODE::BUILD_PROBE || join_type == duckdb::JoinType::MARK ||
+        is_right_family()) {
+      return;
+    }
+    auto const& session   = _dynamic_filter_session;
+    bool const has_plan   = session.plan().enabled();
+    bool const terminal   = session.terminal();
+    if (mode == 1 && !has_plan) { return; }
+    if (has_plan && !terminal) {
+      SIRIUS_LOG_ERROR("[eager] join {}: session NOT terminal at build PARTITION finalize; "
+                       "probe not activated early",
+                       get_operator_id());
+      return;
+    }
+    auto* probe_port = get_port("default");
+    if (!probe_port || !probe_port->src_pipeline) { return; }
+    auto const pipeline = get_pipeline();
+    auto* const creator = pipeline ? pipeline->get_task_creator() : nullptr;
+    if (!creator) { return; }
+    if (_eager_probe_activated.exchange(true, std::memory_order_acq_rel)) { return; }
+    auto* probe_head = &probe_port->src_pipeline->get_operators()[0].get();
+    if (concat_first != 0 && build_concat != nullptr) { creator->schedule(build_concat); }
+    creator->schedule(probe_head);
+    SIRIUS_LOG_INFO("[eager] join {} probe activated at build PARTITION finalize (filter_plan={}, "
+                    "session_terminal={}, concat_first={})",
+                    get_operator_id(),
+                    has_plan,
+                    terminal,
+                    concat_first);
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_ERROR("[eager] join {}: early probe activation failed: {}", get_operator_id(), e.what());
+  } catch (...) {
   }
 }
 

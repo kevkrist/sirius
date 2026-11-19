@@ -63,6 +63,12 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
   probe.set_input_barrier(probe_drives ? MemoryBarrierType::FULL : MemoryBarrierType::PARTIAL);
   build.set_input_observer(std::make_unique<hash_join_partition_observer>(join, build));
   join.note_build_observer_attached();
+  // PROTOTYPE (eager probe): release the probe side when the build PARTITION has finished. The
+  // listener runs after the observer's finalize_input(), so the join's session is terminal.
+  if (!probe_drives) {
+    build.add_finalize_listener(
+      [&join, build_concat] { join.activate_probe_after_build_partition(build_concat); });
+  }
   partition_exchange::bind(
     {&build, &probe},
     probe_drives ? 1 : 0,
