@@ -37,6 +37,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
@@ -64,6 +65,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -709,6 +711,127 @@ TEST_CASE("bench dynamic filter bounds against rows (MB7)", "[!benchmark][dynami
     for (auto const& kind : std::vector<std::string>{"bloom", "bloomzone"}) {
       session_case const subject{.kind = kind, .keys = 1, .gpus = 1, .batches = 1, .rows = rows};
       print("MB7", subject, run_session(fixture, subject));
+    }
+  }
+}
+
+// PROTO(sgb) MB8: tip shape (each source GPU inserts its share, root merges and replicates) against
+// local replicas (every GPU inserts the whole build, no cross-GPU copy). One thread per GPU.
+TEST_CASE("bench dynamic filter local replicas (MB8)", "[!benchmark][dynamic_filter][mb8]")
+{
+  trace_flush const flush;
+  using builder = op::detail::accumulated_bloom_builder;
+  for (auto const wanted : env_list("SIRIUS_BENCH_DF_GPUS", {2, 4})) {
+    auto const gpus = usable_gpus(wanted);
+    if (gpus != wanted) { continue; }
+    acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{40} << 30});
+    std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), gpus};
+    for (auto const megabytes : env_list("SIRIUS_BENCH_DF_MB", {57, 174, 281, 1434})) {
+      auto const blocks = (megabytes << 20) / op::bloom_bytes_per_block;
+      auto const rows   = static_cast<cudf::size_type>(blocks * 16);
+      std::vector<acc::batch_ptr> whole;
+      for (std::size_t device = 0; device < gpus; ++device) {
+        whole.push_back(make_keys(fixture, static_cast<int>(device), 0, rows, 1));
+      }
+      std::vector<std::size_t> placements{1, 2, gpus};
+      placements.erase(std::unique(placements.begin(), placements.end()), placements.end());
+      for (auto const sources : placements) {
+        samples tip_insert, tip_finish, tip_total, local_total;
+        int transport = -1;
+        for (std::size_t rep = 0; rep <= reps(); ++rep) {
+          {
+            auto made =
+              builder::try_create({{0, cudf::data_type{cudf::type_id::INT64}, blocks}}, spaces);
+            REQUIRE(made);
+            sync_devices(gpus);
+            auto const start = clock_type::now();
+            std::vector<std::thread> workers;
+            for (std::size_t device = 0; device < sources; ++device) {
+              workers.emplace_back([&, device] {
+                rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+                auto source      = whole[device]->to_read_only();
+                auto const share = rows / static_cast<cudf::size_type>(sources);
+                auto const first = share * static_cast<cudf::size_type>(device);
+                auto const last  = device + 1 == sources ? rows : first + share;
+                auto const part =
+                  cudf::slice(sirius::get_cudf_table_view(source), {first, last}).front();
+                (void)made->enqueue_add(part,
+                                        rmm::cuda_device_id{static_cast<int>(device)},
+                                        fixture.task_stream(static_cast<int>(device)));
+                fixture.task_stream(static_cast<int>(device)).sync();
+              });
+            }
+            for (auto& worker : workers) {
+              worker.join();
+            }
+            auto const inserted = clock_type::now();
+            {
+              rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
+              auto published = made->finish(rmm::cuda_device_id{0},
+                                            fixture.publication_stream(0),
+                                            fixture.gpu(0).get_default_allocator());
+              REQUIRE(published);
+              transport = static_cast<int>(published->transport);
+            }
+            auto const done = clock_type::now();
+            if (rep != 0) {
+              tip_insert.add(us_between(start, inserted));
+              tip_finish.add(us_between(inserted, done));
+              tip_total.add(us_between(start, done));
+            }
+            sync_devices(gpus);
+            made.reset();
+            sync_devices(gpus);
+          }
+          {
+            auto made =
+              builder::try_create({{0, cudf::data_type{cudf::type_id::INT64}, blocks}}, spaces);
+            REQUIRE(made);
+            sync_devices(gpus);
+            auto const start = clock_type::now();
+            std::vector<std::thread> workers;
+            for (std::size_t device = 0; device < gpus; ++device) {
+              workers.emplace_back([&, device] {
+                rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+                auto source = whole[device]->to_read_only();
+                (void)made->enqueue_add_local(sirius::get_cudf_table_view(source),
+                                              rmm::cuda_device_id{static_cast<int>(device)});
+              });
+            }
+            for (auto& worker : workers) {
+              worker.join();
+            }
+            {
+              rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
+              auto published = made->finish_local(rmm::cuda_device_id{0});
+              REQUIRE(published);
+            }
+            auto const done = clock_type::now();
+            if (rep != 0) { local_total.add(us_between(start, done)); }
+            sync_devices(gpus);
+            made.reset();
+            sync_devices(gpus);
+          }
+        }
+        std::printf(
+          "ROW,MB8,gpus=%zu,sources=%zu,mb=%llu,rows=%d,transport=%s,tip_insert_us=%.0f,"
+          "tip_finish_us=%.0f,tip_total_us=%.0f,tip_total_min=%.0f,local_total_us=%.0f,"
+          "local_total_min=%.0f\n",
+          gpus,
+          sources,
+          static_cast<unsigned long long>(megabytes),
+          rows,
+          transport == 0 ? "PEER" : "HOST",
+          tip_insert.median(),
+          tip_finish.median(),
+          tip_total.median(),
+          tip_total.minimum(),
+          local_total.median(),
+          local_total.minimum());
+        std::fflush(stdout);
+      }
+      whole.clear();
+      sync_devices(gpus);
     }
   }
 }

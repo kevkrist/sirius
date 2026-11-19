@@ -232,10 +232,6 @@ class accumulated_bloom_builder final {
   /// GPU's own array on the partial's stream and waits for it. Returns false without a partial.
   [[nodiscard]] bool enqueue_add_local(cudf::table_view const& input, rmm::cuda_device_id device);
 
-  /// PROTO(sgb): publication when every replica GPU inserted the whole build itself: no merge, no
-  /// cross-GPU copy.
-  [[nodiscard]] std::optional<publication> finish_local(rmm::cuda_device_id root);
-
   /**
    * @brief How `finish` moved partials and the union between GPUs.
    */
@@ -277,6 +273,10 @@ class accumulated_bloom_builder final {
   [[nodiscard]] std::optional<publication> finish(rmm::cuda_device_id root,
                                                   ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref scratch_mr);
+
+  /// PROTO(sgb): publication when every replica GPU inserted the whole build itself: no merge, no
+  /// cross-GPU copy.
+  [[nodiscard]] std::optional<publication> finish_local(rmm::cuda_device_id root);
 
   /**
    * @brief True iff releasing this builder's storage now credits no allocation tracker.
