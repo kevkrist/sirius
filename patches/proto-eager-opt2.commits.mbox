@@ -1,0 +1,490 @@
+From 797f03f2684b5d3295a938420ebde18235ddc12d Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-42-26.ec2.internal>
+Date: Thu, 19 Nov 2026 19:21:32 +0000
+Subject: [PATCH 1/3] recovered prototype: proto(eager): activate the probe
+ side at build PARTITION finalize
+
+Throwaway prototype. A finalize listener on the build PARTITION nominates the
+join's probe producer (and the build CONCAT) as soon as the PARTITION pipeline
+has finished, i.e. when the join's dynamic-filter session is terminal, instead
+of waiting for the build CONCAT to deliver.
+
+Switch SIRIUS_EAGER_PROBE: 0/unset = off, 1 = joins with an enabled filter
+plan, 2 = every BUILD_PROBE join. SIRIUS_EAGER_CONCAT_FIRST (default 1).
+
+Recovered by replaying the original agent transcript (original commit 092a0e3a).
+---
+ .../partition/consumer_partition_policy.cpp   |  6 +++
+ src/op/sirius_physical_hash_join.cpp          | 52 +++++++++++++++++++
+ src/op/sirius_physical_hash_join.hpp          |  9 ++++
+ 3 files changed, 67 insertions(+)
+
+diff --git a/src/op/partition/consumer_partition_policy.cpp b/src/op/partition/consumer_partition_policy.cpp
+index 38a466d1..f8fea38e 100644
+--- a/src/op/partition/consumer_partition_policy.cpp
++++ b/src/op/partition/consumer_partition_policy.cpp
+@@ -63,6 +63,12 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
+   probe.set_input_barrier(probe_drives ? MemoryBarrierType::FULL : MemoryBarrierType::PARTIAL);
+   build.set_input_observer(std::make_unique<hash_join_partition_observer>(join, build));
+   join.note_build_observer_attached();
++  // PROTOTYPE (eager probe): release the probe side when the build PARTITION has finished. The
++  // listener runs after the observer's finalize_input(), so the join's session is terminal.
++  if (!probe_drives) {
++    build.add_finalize_listener(
++      [&join, build_concat] { join.activate_probe_after_build_partition(build_concat); });
++  }
+   partition_exchange::bind(
+     {&build, &probe},
+     probe_drives ? 1 : 0,
+diff --git a/src/op/sirius_physical_hash_join.cpp b/src/op/sirius_physical_hash_join.cpp
+index 5f582089..306bd4d6 100644
+--- a/src/op/sirius_physical_hash_join.cpp
++++ b/src/op/sirius_physical_hash_join.cpp
+@@ -29,6 +29,7 @@
+ #include "cudf/transform.hpp"
+ #include "cudf/types.hpp"
+ #include "cudf/utilities/memory_resource.hpp"
++#include "creator/task_creator.hpp"
+ #include "data/data_batch_utils.hpp"
+ #include "duckdb/common/exception.hpp"
+ #include "expression/ast/node.hpp"
+@@ -57,6 +58,7 @@
+ #include <cassert>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <format>
+ #include <limits>
+ #include <optional>
+@@ -926,6 +928,56 @@ void sirius_physical_hash_join::reclaim_build_only_slots_if_probe_complete(bool
+   }
+ }
+ 
++namespace {
++int eager_env(char const* name, int fallback)
++{
++  auto const* value = std::getenv(name);
++  return value ? std::atoi(value) : fallback;
++}
++}  // namespace
++
++void sirius_physical_hash_join::activate_probe_after_build_partition(
++  sirius_physical_operator* build_concat) noexcept
++{
++  try {
++    static int const mode         = eager_env("SIRIUS_EAGER_PROBE", 0);
++    static int const concat_first = eager_env("SIRIUS_EAGER_CONCAT_FIRST", 1);
++    if (mode == 0) { return; }
++    if (_join_mode != HASH_JOIN_MODE::BUILD_PROBE || join_type == duckdb::JoinType::MARK ||
++        is_right_family()) {
++      return;
++    }
++    auto const& session   = _dynamic_filter_session;
++    bool const has_plan   = session.plan().enabled();
++    bool const terminal   = session.terminal();
++    if (mode == 1 && !has_plan) { return; }
++    if (has_plan && !terminal) {
++      SIRIUS_LOG_ERROR("[eager] join {}: session NOT terminal at build PARTITION finalize; "
++                       "probe not activated early",
++                       get_operator_id());
++      return;
++    }
++    auto* probe_port = get_port("default");
++    if (!probe_port || !probe_port->src_pipeline) { return; }
++    auto const pipeline = get_pipeline();
++    auto* const creator = pipeline ? pipeline->get_task_creator() : nullptr;
++    if (!creator) { return; }
++    if (_eager_probe_activated.exchange(true, std::memory_order_acq_rel)) { return; }
++    auto* probe_head = &probe_port->src_pipeline->get_operators()[0].get();
++    if (concat_first != 0 && build_concat != nullptr) { creator->schedule(build_concat); }
++    creator->schedule(probe_head);
++    SIRIUS_LOG_INFO("[eager] join {} probe activated at build PARTITION finalize (filter_plan={}, "
++                    "session_terminal={}, concat_first={})",
++                    get_operator_id(),
++                    has_plan,
++                    terminal,
++                    concat_first);
++  } catch (std::exception const& e) {
++    SIRIUS_LOG_ERROR("[eager] join {}: early probe activation failed: {}", get_operator_id(), e.what());
++  } catch (...) {
++  }
++}
++
+ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
+ {
+   std::unique_lock<std::mutex> lg(op_state_mutex);
+diff --git a/src/op/sirius_physical_hash_join.hpp b/src/op/sirius_physical_hash_join.hpp
+index e78981e8..b7328135 100644
+--- a/src/op/sirius_physical_hash_join.hpp
++++ b/src/op/sirius_physical_hash_join.hpp
+@@ -317,6 +317,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
+     _build_observer_attached.store(true, std::memory_order_release);
+   }
+ 
++  /// @brief PROTOTYPE (eager probe). Called from the build PARTITION's finalize listener: the
++  /// build layout is complete and this join's dynamic-filter session is terminal, so every filter
++  /// this join will ever publish is visible. Nominates the probe producer (and the build CONCAT)
++  /// right away instead of waiting for the build CONCAT to deliver. One shot; never throws.
++  /// Switch SIRIUS_EAGER_PROBE: 0/unset = off, 1 = joins with an enabled filter plan, 2 = every
++  /// BUILD_PROBE join. SIRIUS_EAGER_CONCAT_FIRST (default 1): nominate the build CONCAT first.
++  void activate_probe_after_build_partition(sirius_physical_operator* build_concat) noexcept;
++
+   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
+   [[nodiscard]] bool is_build_probe_mode();
+ 
+@@ -429,6 +437,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
+   std::atomic<bool> _partitioned_build_has_rows{false};
+   std::atomic<bool> _partitioned_build_has_null{false};
+   std::atomic<bool> _build_observer_attached{false};
++  std::atomic<bool> _eager_probe_activated{false};
+ 
+   /// Global build facts a MARK probe needs: whether a build key is NULL, and whether marks are
+   /// definite (all-null-safe keys, or a globally empty build).
+-- 
+2.43.0
+
+
+From 2ba03d9ddd93be61f7700dc3225c319d1c947019 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-42-26.ec2.internal>
+Date: Thu, 19 Nov 2026 19:22:11 +0000
+Subject: [PATCH 2/3] recovered prototype: proto(eager): option 2, activate the
+ probe side when the deferred publication finishes
+
+Recovered by replaying the original agent transcript (original commit 0cd75dcb).
+---
+ .../hash_join_partition_observer.cpp               |  7 +++++++
+ .../hash_join_partition_observer.hpp               |  1 +
+ src/op/partition/partition_input_observer.hpp      |  2 ++
+ src/op/sirius_physical_hash_join.cpp               | 14 ++++++--------
+ src/op/sirius_physical_partition.cpp               |  1 +
+ 5 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/src/op/dynamic_filter/hash_join_partition_observer.cpp b/src/op/dynamic_filter/hash_join_partition_observer.cpp
+index a8548e5e..2ffa7be1 100644
+--- a/src/op/dynamic_filter/hash_join_partition_observer.cpp
++++ b/src/op/dynamic_filter/hash_join_partition_observer.cpp
+@@ -68,6 +68,13 @@ void hash_join_partition_observer::run_claimed_publication(cucascade::memory::me
+   _join.dynamic_filter_session().run_claimed_publication(space, stream);
+ }
+ 
++void hash_join_partition_observer::publication_finished()
++{
++  // PROTO eager option 2: the build is already deposited (the build CONCAT may be running); the
++  // filters are visible now, so the probe side may start.
++  _join.activate_probe_after_build_partition(nullptr);
++}
++
+ void hash_join_partition_observer::finalize_input()
+ {
+   auto& session = _join.dynamic_filter_session();
+diff --git a/src/op/dynamic_filter/hash_join_partition_observer.hpp b/src/op/dynamic_filter/hash_join_partition_observer.hpp
+index 6937d583..2555d0c8 100644
+--- a/src/op/dynamic_filter/hash_join_partition_observer.hpp
++++ b/src/op/dynamic_filter/hash_join_partition_observer.hpp
+@@ -39,6 +39,7 @@ class hash_join_partition_observer final : public partition_input_observer {
+   [[nodiscard]] bool claim_publication(uint64_t id) override;
+   void run_claimed_publication(cucascade::memory::memory_space& space,
+                                ::cuda::stream_ref stream) override;
++  void publication_finished() override;
+   void finalize_input() override;
+   [[nodiscard]] std::size_t task_scratch_bytes() const noexcept override;
+ 
+diff --git a/src/op/partition/partition_input_observer.hpp b/src/op/partition/partition_input_observer.hpp
+index fe9e6f4d..65c9f353 100644
+--- a/src/op/partition/partition_input_observer.hpp
++++ b/src/op/partition/partition_input_observer.hpp
+@@ -48,6 +48,8 @@ class partition_input_observer {
+                                        ::cuda::stream_ref /*stream*/)
+   {
+   }
++  // PROTO eager option 2: called by the Publishing Task right after its deferred publication ran.
++  virtual void publication_finished() {}
+   virtual void finalize_input()                                                   = 0;
+   /**
+    * @brief Bytes a task of the observed input may take from its allocator beyond its input and
+diff --git a/src/op/sirius_physical_hash_join.cpp b/src/op/sirius_physical_hash_join.cpp
+index 306bd4d6..d9535ad6 100644
+--- a/src/op/sirius_physical_hash_join.cpp
++++ b/src/op/sirius_physical_hash_join.cpp
+@@ -951,12 +951,9 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
+     bool const has_plan   = session.plan().enabled();
+     bool const terminal   = session.terminal();
+     if (mode == 1 && !has_plan) { return; }
+-    if (has_plan && !terminal) {
+-      SIRIUS_LOG_ERROR("[eager] join {}: session NOT terminal at build PARTITION finalize; "
+-                       "probe not activated early",
+-                       get_operator_id());
+-      return;
+-    }
++    // Option 2 (deferred publication, SIRIUS_DF_DEFER_PUBLISH != 0): the PARTITION finalize can run
++    // while the publication is still in flight; the Publishing Task calls again when it is done.
++    if (has_plan && !terminal) { return; }
+     auto* probe_port = get_port("default");
+     if (!probe_port || !probe_port->src_pipeline) { return; }
+     auto const pipeline = get_pipeline();
+@@ -966,9 +963,10 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
+     auto* probe_head = &probe_port->src_pipeline->get_operators()[0].get();
+     if (concat_first != 0 && build_concat != nullptr) { creator->schedule(build_concat); }
+     creator->schedule(probe_head);
+-    SIRIUS_LOG_INFO("[eager] join {} probe activated at build PARTITION finalize (filter_plan={}, "
+-                    "session_terminal={}, concat_first={})",
++    SIRIUS_LOG_INFO("[eager] join {} probe activated {} (filter_plan={}, session_terminal={}, "
++                    "concat_first={})",
+                     get_operator_id(),
++                    build_concat != nullptr ? "at build PARTITION finalize" : "after deferred publication",
+                     has_plan,
+                     terminal,
+                     concat_first);
+diff --git a/src/op/sirius_physical_partition.cpp b/src/op/sirius_physical_partition.cpp
+index 8129170c..eab621ca 100644
+--- a/src/op/sirius_physical_partition.cpp
++++ b/src/op/sirius_physical_partition.cpp
+@@ -311,6 +311,7 @@ void sirius_physical_partition::after_sink(operator_data const& output_data,
+       throw;
+     }
+     _input_observer->run_claimed_publication(*deferred.space, stream);
++    _input_observer->publication_finished();
+   } else if (deferred.complete_early_always) {
+     // Not the Publishing Task: only its own insert kernels are left, which the task's final
+     // stream sync retires before its input is released.
+-- 
+2.43.0
+
+
+From eb221343da2835f096af4ab1702a2a53c1966dc1 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-42-26.ec2.internal>
+Date: Thu, 19 Nov 2026 19:22:11 +0000
+Subject: [PATCH 3/3] recovered prototype: proto(eager): optional scan throttle
+ while an overlapped build move is pending (SIRIUS_EAGER_SCAN_THROTTLE)
+
+Recovered by replaying the original agent transcript (original commit 2abda103).
+---
+ src/op/eager_probe_throttle.hpp               | 107 ++++++++++++++++++
+ .../partition/consumer_partition_policy.cpp   |   3 +
+ src/op/sirius_physical_hash_join.cpp          |  10 ++
+ src/op/sirius_physical_hash_join.hpp          |   3 +
+ src/pipeline/gpu_pipeline_task.cpp            |  10 ++
+ 5 files changed, 133 insertions(+)
+ create mode 100644 src/op/eager_probe_throttle.hpp
+
+diff --git a/src/op/eager_probe_throttle.hpp b/src/op/eager_probe_throttle.hpp
+new file mode 100644
+index 00000000..ec82863d
+--- /dev/null
++++ b/src/op/eager_probe_throttle.hpp
+@@ -0,0 +1,107 @@
++/*
++ * PROTOTYPE (eager probe): optional throttle of scan tasks while an eagerly overlapped build
++ * CONCAT is still moving the build across GPUs. Header-only, process-global, measurement only.
++ *
++ * SIRIUS_EAGER_SCAN_THROTTLE = K (> 0): while at least one eagerly activated join still waits for
++ * its build CONCAT pipeline, at most K tasks of scan-sourced pipelines run their Preparing phase
++ * (host-to-GPU copy / decode) per GPU. 0 or unset = off.
++ */
++#pragma once
++
++#include <array>
++#include <condition_variable>
++#include <cstdlib>
++#include <mutex>
++
++namespace sirius::op::eager_throttle {
++
++struct state_t {
++  std::mutex mutex;
++  std::condition_variable cv;
++  int pending_build_moves = 0;
++  std::array<int, 16> running{};
++};
++
++inline state_t& state()
++{
++  static state_t instance;
++  return instance;
++}
++
++inline int limit()
++{
++  static int const value = [] {
++    auto const* text = std::getenv("SIRIUS_EAGER_SCAN_THROTTLE");
++    return text ? std::atoi(text) : 0;
++  }();
++  return value;
++}
++
++//! Per-join move state, guarded by state().mutex: 0 = none, 1 = counted, 2 = ended.
++inline void build_move_begin(int& join_state)
++{
++  if (limit() <= 0) { return; }
++  auto& s = state();
++  std::lock_guard<std::mutex> guard(s.mutex);
++  if (join_state == 0) {
++    join_state = 1;
++    ++s.pending_build_moves;
++  }
++}
++
++inline void build_move_end(int& join_state)
++{
++  if (limit() <= 0) { return; }
++  auto& s = state();
++  {
++    std::lock_guard<std::mutex> guard(s.mutex);
++    if (join_state == 1) { --s.pending_build_moves; }
++    join_state = 2;
++  }
++  s.cv.notify_all();
++}
++
++//! Blocks while the device already runs `limit()` throttled scan tasks and a build move is
++//! pending. Returns true when a slot was taken (release it with scan_release).
++inline bool scan_acquire(int device)
++{
++  if (limit() <= 0 || device < 0 || device >= 16) { return false; }
++  auto& s = state();
++  std::unique_lock<std::mutex> guard(s.mutex);
++  if (s.pending_build_moves <= 0) { return false; }
++  s.cv.wait(guard, [&] {
++    return s.pending_build_moves <= 0 || s.running[static_cast<std::size_t>(device)] < limit();
++  });
++  if (s.pending_build_moves <= 0) { return false; }
++  ++s.running[static_cast<std::size_t>(device)];
++  return true;
++}
++
++inline void scan_release(int device)
++{
++  auto& s = state();
++  {
++    std::lock_guard<std::mutex> guard(s.mutex);
++    --s.running[static_cast<std::size_t>(device)];
++  }
++  s.cv.notify_all();
++}
++
++//! Releases a taken slot at scope exit or on reset().
++struct scan_slot {
++  int device = -1;
++  scan_slot() = default;
++  explicit scan_slot(int dev) : device(scan_acquire(dev) ? dev : -1) {}
++  scan_slot(scan_slot const&)            = delete;
++  scan_slot& operator=(scan_slot const&) = delete;
++  void reset() noexcept
++  {
++    if (device >= 0) {
++      scan_release(device);
++      device = -1;
++    }
++  }
++  ~scan_slot() { reset(); }
++};
++
++}  // namespace sirius::op::eager_throttle
+diff --git a/src/op/partition/consumer_partition_policy.cpp b/src/op/partition/consumer_partition_policy.cpp
+index f8fea38e..e999f550 100644
+--- a/src/op/partition/consumer_partition_policy.cpp
++++ b/src/op/partition/consumer_partition_policy.cpp
+@@ -68,6 +68,9 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
+   if (!probe_drives) {
+     build.add_finalize_listener(
+       [&join, build_concat] { join.activate_probe_after_build_partition(build_concat); });
++    if (build_concat != nullptr) {
++      build_concat->add_finalize_listener([&join] { join.eager_build_move_finished(); });
++    }
+   }
+   partition_exchange::bind(
+     {&build, &probe},
+diff --git a/src/op/sirius_physical_hash_join.cpp b/src/op/sirius_physical_hash_join.cpp
+index d9535ad6..35cda42e 100644
+--- a/src/op/sirius_physical_hash_join.cpp
++++ b/src/op/sirius_physical_hash_join.cpp
+@@ -40,6 +40,7 @@
+ #include "log/logging.hpp"
+ #include "memory/size_arithmetic.hpp"
+ #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
++#include "op/eager_probe_throttle.hpp"
+ #include "op/key_preparation.hpp"
+ #include "op/sirius_physical_nested_loop_join.hpp"
+ #include "pipeline/sirius_meta_pipeline.hpp"
+@@ -961,6 +962,7 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
+     if (!creator) { return; }
+     if (_eager_probe_activated.exchange(true, std::memory_order_acq_rel)) { return; }
+     auto* probe_head = &probe_port->src_pipeline->get_operators()[0].get();
++    eager_throttle::build_move_begin(_eager_move_state);
+     if (concat_first != 0 && build_concat != nullptr) { creator->schedule(build_concat); }
+     creator->schedule(probe_head);
+     SIRIUS_LOG_INFO("[eager] join {} probe activated {} (filter_plan={}, session_terminal={}, "
+@@ -976,6 +978,14 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
+   }
+ }
+ 
++void sirius_physical_hash_join::eager_build_move_finished() noexcept
++{
++  try {
++    eager_throttle::build_move_end(_eager_move_state);
++  } catch (...) {
++  }
++}
++
+ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
+ {
+   std::unique_lock<std::mutex> lg(op_state_mutex);
+diff --git a/src/op/sirius_physical_hash_join.hpp b/src/op/sirius_physical_hash_join.hpp
+index b7328135..e87191d4 100644
+--- a/src/op/sirius_physical_hash_join.hpp
++++ b/src/op/sirius_physical_hash_join.hpp
+@@ -324,6 +324,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
+   /// Switch SIRIUS_EAGER_PROBE: 0/unset = off, 1 = joins with an enabled filter plan, 2 = every
+   /// BUILD_PROBE join. SIRIUS_EAGER_CONCAT_FIRST (default 1): nominate the build CONCAT first.
+   void activate_probe_after_build_partition(sirius_physical_operator* build_concat) noexcept;
++  /// @brief PROTOTYPE (eager probe): the build CONCAT pipeline has finished (scan throttle ends).
++  void eager_build_move_finished() noexcept;
+ 
+   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
+   [[nodiscard]] bool is_build_probe_mode();
+@@ -438,6 +440,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
+   std::atomic<bool> _partitioned_build_has_null{false};
+   std::atomic<bool> _build_observer_attached{false};
+   std::atomic<bool> _eager_probe_activated{false};
++  int _eager_move_state{0};  // guarded by eager_throttle::state().mutex
+ 
+   /// Global build facts a MARK probe needs: whether a build key is NULL, and whether marks are
+   /// definite (all-null-safe keys, or a globally empty build).
+diff --git a/src/pipeline/gpu_pipeline_task.cpp b/src/pipeline/gpu_pipeline_task.cpp
+index ed3a1af8..83cd288d 100644
+--- a/src/pipeline/gpu_pipeline_task.cpp
++++ b/src/pipeline/gpu_pipeline_task.cpp
+@@ -23,6 +23,7 @@
+ #include "log/logging.hpp"
+ #include "memory/defragmenter_oom_policy.hpp"
+ #include "memory/size_arithmetic.hpp"
++#include "op/eager_probe_throttle.hpp"
+ #include "op/scan/sirius_gpu_scan_operator.hpp"
+ #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+ #include "creator/task_creator.hpp"
+@@ -749,6 +750,14 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
+                                  ->get_memory_handle(requested_memory_space->get_id());
+     if (memory_handle) { _reservation_memory_resource_id = memory_handle->get().id().raw(); }
+   }
++  // PROTOTYPE (eager probe): optionally hold back scan tasks while an overlapped build move runs.
++  op::eager_throttle::scan_slot eager_scan_slot;
++  if (op::eager_throttle::limit() > 0 && source_op && requested_memory_space != nullptr) {
++    eager_scan_slot.device =
++      op::eager_throttle::scan_acquire(requested_memory_space->get_device_id())
++        ? requested_memory_space->get_device_id()
++        : -1;
++  }
+   telemetry_fsm().preparing(
+     {.origin_tier     = local_state._input_data->get_origin_tiers(),
+      .target_tier     = "GPU",
+@@ -763,6 +772,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
+     // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
+     // is accurate.
+     stream.sync();
++    eager_scan_slot.reset();
+   } catch (const rmm::out_of_memory& oom) {
+     auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
+     std::optional<std::size_t> retry_requested_bytes;
+-- 
+2.43.0
+

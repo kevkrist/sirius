@@ -1,0 +1,1866 @@
+diff --git a/bench/transfer/build.sh b/bench/transfer/build.sh
+new file mode 100755
+index 00000000..60998984
+--- /dev/null
++++ b/bench/transfer/build.sh
+@@ -0,0 +1,32 @@
++#!/bin/bash
++# Builds the standalone transfer microbenchmark with the toolchain of the reference pixi env
++# (read-only use of $R/repo/.pixi). Run under: flock $R/machine.lock bench/transfer/build.sh
++R=${R:-/opt/dlami/nvme/dfperf}
++E=$R/repo/.pixi/envs/default
++SRC=$(cd "$(dirname "$0")" && pwd)
++OUT=${OUT:-$R/runs/mb_xfer/bin}
++export PATH=$E/bin:$PATH TMPDIR=$R/tmp
++mkdir -p "$OUT" "$TMPDIR"
++CXX=$E/bin/x86_64-conda-linux-gnu-c++
++CUDA_INC=$E/targets/x86_64-linux/include
++DEFS="-DCCCL_DISABLE_PDL -DCCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE -DFMT_SHARED -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB"
++INC="-I$E/include/rapids -isystem $E/include -I$CUDA_INC -isystem $CUDA_INC/cccl"
++set -x
++$E/bin/nvcc -ccbin $CXX -O3 -std=c++20 \
++  "--generate-code=arch=compute_90a,code=[sm_90a]" "--generate-code=arch=compute_100f,code=[sm_100f]" \
++  "--generate-code=arch=compute_120f,code=[sm_120f]" \
++  -I$CUDA_INC -c $SRC/xfer_kernels.cu -o $OUT/xfer_kernels.o || exit 1
++build_main() {
++  $CXX $1 $DEFS $INC -O3 -DNDEBUG -std=gnu++20 -fopenmp -mavx512f -mavx512bw -Wall -Wno-unknown-pragmas \
++    -c $SRC/xfer_bench.cpp -o $OUT/xfer_bench.o &&
++  $CXX $OUT/xfer_bench.o $OUT/xfer_kernels.o -o $OUT/xfer_bench -fopenmp \
++    -L$E/lib -L$E/targets/x86_64-linux/lib $2 -lcudart -ldl -lpthread \
++    -Wl,-rpath,$E/lib -Wl,-rpath,$E/targets/x86_64-linux/lib
++}
++if build_main -DUSE_RMM "-lrmm -lrapids_logger"; then
++  echo "BUILD_OK rmm=1"
++elif build_main "" ""; then
++  echo "BUILD_OK rmm=0 (RMM build failed; pool created with the same properties through raw CUDA)"
++else
++  echo "BUILD_FAILED"; exit 1
++fi
+diff --git a/bench/transfer/run_all.sh b/bench/transfer/run_all.sh
+new file mode 100755
+index 00000000..b236204b
+--- /dev/null
++++ b/bench/transfer/run_all.sh
+@@ -0,0 +1,35 @@
++#!/bin/bash
++# One locked pass: build, smoke, main run, no-peer run, probe run, nsys capture.
++R=/opt/dlami/nvme/dfperf; M=$R/runs/mb_xfer; B=$M/bin/xfer_bench
++export TMPDIR=$R/tmp
++cd $M
++PHASES=${PHASES:-build,smoke,main,nopeer,probe,nsys}
++has() { [[ ",$PHASES," == *",$1,"* ]] && [ ! -f out/.ok_$1 ]; }
++ok() { touch out/.ok_$1; }
++if has build; then
++  $R/wt-mb-xfer/bench/transfer/build.sh > out/build.log 2>&1 || { echo "build failed"; grep -E 'error|Error' out/build.log | head -40; exit 10; }
++  tail -1 out/build.log; ok build
++fi
++if has smoke; then
++  timeout 600 $B tests=leg,pair,fan,hostor,conc,df,cont sizes=8 dfsizes=16 fansizes=1,8 bmax=64 reps=1 > out/smoke.log 2> out/smoke.err
++  rc=$?; echo "smoke rc=$rc lines=$(wc -l < out/smoke.log)"
++  [ $rc -ne 0 ] && { tail -5 out/smoke.err; tail -3 out/smoke.log; exit 11; }
++  bad=$(grep -E '^R\|(fan|df|cont)\|' out/smoke.log | grep -v -E 'peerapi|ERR=' | grep 'mism=' | grep -c -v 'mism=0|')
++  echo "smoke mismatching engineered schedules: $bad"
++  [ "$bad" -ne 0 ] && { grep -E '^R\|(fan|df|cont)\|' out/smoke.log | grep -v -E 'peerapi|ERR=' | grep 'mism=' | grep -v 'mism=0|' | cut -c1-200 | head -20; exit 12; }
++  ok smoke
++fi
++if has main; then
++  /usr/bin/time -v -o out/main.time timeout 2400 $B reps=${REPS:-5} ${MAINARGS:-} > out/${MAINLOG:-main}.log 2> out/main.err; rc=$?; echo "main rc=$rc lines=$(wc -l < out/${MAINLOG:-main}.log)"; [ $rc -eq 0 ] && ok main
++fi
++if has nopeer; then
++  timeout 900 $B nopeer=1 tests=pair pairmethods=peer reps=5 > out/nopeer.log 2> out/nopeer.err; rc=$?; echo "nopeer rc=$rc"; [ $rc -eq 0 ] && ok nopeer
++fi
++if has probe; then
++  timeout 900 $B probe=1 tests=pair pairmethods=peer sizes=64,1434 reps=3 > out/probe.log 2> out/probe.err; rc=$?; echo "probe rc=$rc"; [ $rc -eq 0 ] && ok probe
++fi
++if has nsys; then
++  mkdir -p nsys
++  timeout 900 nsys profile --trace=cuda,nvtx --sample=none --cudabacktrace=none --cpuctxsw=none --force-overwrite=true --export=sqlite \
++    -o $M/nsys/df281 $B tests=df dfsizes=281 reps=2 bmax=512 > out/nsys.log 2> out/nsys.err; rc=$?; echo "nsys rc=$rc"; [ $rc -eq 0 ] && ok nsys
++fi
+diff --git a/bench/transfer/run_cont2.sh b/bench/transfer/run_cont2.sh
+new file mode 100755
+index 00000000..c469828f
+--- /dev/null
++++ b/bench/transfer/run_cont2.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++# Follow-up pass: rebuild, then leg-size robustness under background copies (tests=cont2).
++R=/opt/dlami/nvme/dfperf; M=$R/runs/mb_xfer; B=$M/bin/xfer_bench
++export TMPDIR=$R/tmp
++cd $M
++[ -f out/.ok_cont2 ] && exit 0
++$R/wt-mb-xfer/bench/transfer/build.sh > out/build2.log 2>&1 || { echo "build failed"; grep -E 'error' out/build2.log | head -30; exit 10; }
++tail -1 out/build2.log
++timeout 1500 $B tests=cont2 dfsizes=281,1434 reps=3 > out/cont2.log 2> out/cont2.err; rc=$?
++echo "cont2 rc=$rc lines=$(wc -l < out/cont2.log)"; [ $rc -eq 0 ] && touch out/.ok_cont2
+diff --git a/bench/transfer/tab.py b/bench/transfer/tab.py
+new file mode 100644
+index 00000000..5f26f3f8
+--- /dev/null
++++ b/bench/transfer/tab.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""Tables from xfer_bench "R|test|name...|key=value|..." lines.
++
++usage: tab.py LOG leg|pair|fan|hostor|conc|df|cont [substring filter ...]
++"""
++import statistics
++import sys
++from collections import defaultdict
++
++
++def parse(path):
++    rows = []
++    for line in open(path):
++        if not line.startswith("R|"):
++            continue
++        parts = line.rstrip("\n").split("|")
++        row = {"test": parts[1], "tags": [], "kv": {}}
++        for p in parts[2:]:
++            if "=" in p and not p.startswith("p2p:") and ":" not in p.split("=")[0]:
++                k, v = p.split("=", 1)
++                row["kv"][k] = v
++            else:
++                row["tags"].append(p)
++        rows.append(row)
++    return rows
++
++
++def f(row, key, default=float("nan")):
++    try:
++        return float(row["kv"][key])
++    except (KeyError, ValueError):
++        return default
++
++
++def name(row, skip=()):
++    keys = [k for k in row["kv"] if k not in (
++        "bytes", "med_ms", "min_ms", "max_ms", "gibps", "ms_per_gib", "submit_ms", "mism", "reps",
++        "legs", "agg_gibps", "leg_gibps", "ERR") and k not in skip]
++    return " ".join(row["tags"] + [f"{k}={row['kv'][k]}" for k in keys])
++
++
++def leg(rows):
++    # GiB/s per (kind, n): median over the 4 GPUs, with range.
++    acc = defaultdict(list)
++    for r in rows:
++        nm = " ".join(t for t in r["tags"] if not t.startswith("g")) + " " + " ".join(
++            f"{k}={r['kv'][k]}" for k in ("host", "dev", "chunk", "blk") if k in r["kv"])
++        acc[(nm, int(r["kv"]["n"]))].append(f(r, "gibps"))
++    sizes = sorted({k[1] for k in acc})
++    print("| leg | " + " | ".join(f"{s} MiB" for s in sizes) + " |")
++    print("|---|" + "---|" * len(sizes))
++    for nm in dict.fromkeys(k[0] for k in acc):
++        cells = []
++        for s in sizes:
++            v = acc.get((nm, s))
++            cells.append(f"{statistics.median(v):.1f} ({min(v):.1f}-{max(v):.1f})" if v else "-")
++        print(f"| {nm} | " + " | ".join(cells) + " |")
++
++
++def pair(rows):
++    acc = defaultdict(list)
++    bad = defaultdict(int)
++    sub = defaultdict(list)
++    for r in rows:
++        nm = name(r, skip=("p2p", "n"))
++        nm = " ".join(t for t in nm.split(" ") if ">" not in t)
++        key = (nm, "P2P pairs" if r["kv"].get("p2p") == "1" else "cross pairs", int(r["kv"]["n"]))
++        if "ERR" in r["kv"]:
++            bad[key] += 1
++            continue
++        acc[key].append(f(r, "gibps"))
++        sub[key].append(f(r, "submit_ms"))
++        if r["kv"].get("mism", "0") != "0":
++            bad[key] += 1
++    sizes = sorted({k[2] for k in list(acc) + list(bad)})
++    for cls in ("P2P pairs", "cross pairs"):
++        print(f"\n**{cls}** GiB/s, median over ordered pairs (min-max) [pairs]; '!' = wrong bytes or error\n")
++        print("| method | " + " | ".join(f"{s} MiB" for s in sizes) + " |")
++        print("|---|" + "---|" * len(sizes))
++        for nm in dict.fromkeys(k[0] for k in list(acc) + list(bad)):
++            cells = []
++            for s in sizes:
++                v = acc.get((nm, cls, s))
++                b = bad.get((nm, cls, s), 0)
++                if v:
++                    cells.append(f"{statistics.median(v):.1f} ({min(v):.1f}-{max(v):.1f}) [{len(v)}]" +
++                                 (f" !{b}" if b else ""))
++                else:
++                    cells.append(f"!{b}" if b else "-")
++            if any(c != "-" for c in cells):
++                print(f"| {nm} | " + " | ".join(cells) + " |")
++
++
++def listing(rows, cols):
++    print("| config | " + " | ".join(cols) + " |")
++    print("|---|" + "---|" * len(cols))
++    for r in rows:
++        if "ERR" in r["kv"]:
++            print(f"| {name(r)} | ERR {r['kv']['ERR']} |")
++            continue
++        print(f"| {name(r)} | " + " | ".join(r["kv"].get(c, "-") for c in cols) + " |")
++
++
++def df(rows):
++    # one row per schedule, columns per B: ms (ms/GiB)
++    acc = {}
++    sizes = []
++    for r in rows:
++        b = int(r["kv"]["B"])
++        if b not in sizes:
++            sizes.append(b)
++        nm = name(r, skip=("B",))
++        if "ERR" in r["kv"]:
++            acc[(nm, b)] = "ERR"
++        else:
++            flag = "" if r["kv"].get("mism", "0") == "0" else " !WRONG"
++            acc[(nm, b)] = (f"{f(r, 'med_ms'):.1f} [{f(r, 'min_ms'):.1f}-{f(r, 'max_ms'):.1f}] "
++                            f"({f(r, 'ms_per_gib'):.0f}){flag}")
++    print("| schedule | " + " | ".join(f"B={s} MiB: ms [min-max] (ms/GiB)" for s in sizes) + " |")
++    print("|---|" + "---|" * len(sizes))
++    for nm in dict.fromkeys(k[0] for k in acc):
++        print(f"| {nm} | " + " | ".join(acc.get((nm, s), "-") for s in sizes) + " |")
++
++
++def main():
++    path, what = sys.argv[1], sys.argv[2]
++    filters = sys.argv[3:]
++    allrows = parse(path)
++    if what == "df":
++        rows = [r for r in allrows if r["test"] == "df" and "bg" not in r["kv"]]
++    elif what == "cont":
++        rows = [r for r in allrows if r["test"] == "cont" or (r["test"] == "df" and "bg" in r["kv"])]
++    else:
++        rows = [r for r in allrows if r["test"] == what]
++    if filters:
++        rows = [r for r in rows if all(x in "|".join(r["tags"] + [f"{k}={v}" for k, v in r["kv"].items()])
++                                       for x in filters)]
++    if what == "leg":
++        leg(rows)
++    elif what == "pair":
++        pair(rows)
++    elif what in ("df",):
++        df(rows)
++    elif what == "conc":
++        listing(rows, ["med_ms", "agg_gibps", "leg_gibps"])
++    elif what == "cont":
++        legs = [r for r in rows if "legs" in r["kv"]]
++        df([r for r in rows if "legs" not in r["kv"]])
++        if legs:
++            listing(legs, ["med_ms", "agg_gibps", "leg_gibps"])
++    else:
++        listing(rows, ["med_ms", "min_ms", "max_ms", "gibps", "ms_per_gib", "submit_ms", "mism"])
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/bench/transfer/xfer_bench.cpp b/bench/transfer/xfer_bench.cpp
+new file mode 100644
+index 00000000..1b56e67a
+--- /dev/null
++++ b/bench/transfer/xfer_bench.cpp
+@@ -0,0 +1,1493 @@
++// Transfer-primitive microbenchmark for the dynamic-filter finish chain (prototype tooling).
++//
++// Standalone: raw CUDA + (optionally) rmm::mr::cuda_async_memory_resource for the device pools,
++// no engine code. Measures, on the visible GPUs:
++//   topo   peer matrix / P2P attributes
++//   leg    D2H and H2D link rates per device (pinned / registered / THP / pageable host memory)
++//   pair   every ordered GPU pair: cudaMemcpyPeerAsync, host staging synced per leg (today's
++//          engine shape), pipelined host staging
++//   fan    one root to three targets (replica copies)
++//   hostor multi-threaded AVX-512 OR on the host
++//   conc   several legs at once (aggregate throughput)
++//   df     the Bloom finish shape end to end: G = 4, every GPU holds a partial, all GPUs end with
++//          the OR of all partials. Today's star with serial synced legs vs alternative schedules
++//   cont   df + legs while an unrelated heavy cross-GPU copy runs
++//
++// Output: one "R|test|name|key=value|..." line per configuration (parsed by tab.py).
++// GiB = 2^30 bytes everywhere.
++
++#include <cuda_runtime.h>
++
++#include <immintrin.h>
++#include <omp.h>
++#include <sys/mman.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <functional>
++#include <initializer_list>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++#ifdef USE_RMM
++#include <rmm/mr/cuda_async_memory_resource.hpp>
++#endif
++
++#if __has_include(<nvtx3/nvToolsExt.h>)
++#include <nvtx3/nvToolsExt.h>
++#define NVTX_PUSH(name) nvtxRangePushA(name)
++#define NVTX_POP()      nvtxRangePop()
++#else
++#define NVTX_PUSH(name) (void)0
++#define NVTX_POP()      (void)0
++#endif
++
++cudaError_t launch_fill(void* p, size_t bytes, unsigned mask, uint64_t salt, cudaStream_t stream);
++cudaError_t launch_verify(void const* p,
++                          size_t bytes,
++                          unsigned mask,
++                          uint64_t salt,
++                          unsigned long long* mismatches,
++                          cudaStream_t stream);
++cudaError_t launch_or(void* dst, void const* src, size_t bytes, cudaStream_t stream);
++
++#define CK(call)                                                                              \
++  do {                                                                                        \
++    cudaError_t const ck_e = (call);                                                          \
++    if (ck_e != cudaSuccess) {                                                                \
++      std::fprintf(stderr, "CUDA error %s (%d) at %s:%d: %s\n", cudaGetErrorName(ck_e),       \
++                   static_cast<int>(ck_e), __FILE__, __LINE__, #call);                        \
++      std::fflush(stdout);                                                                    \
++      std::exit(2);                                                                           \
++    }                                                                                         \
++  } while (0)
++
++namespace {
++
++constexpr size_t MiB = 1ull << 20;
++using ev_t           = cudaEvent_t;
++
++enum stream_id { TX = 0, RX, KS, RX2, KS2, TX2, AUX, AUX2, NST };
++enum buffer_id { PART = 0, SCR, BG, RPART, RSCR, NBUF };
++
++struct device {
++  cudaStream_t st[NST]{};
++  cudaMemPool_t pool{};
++  std::vector<ev_t> events;
++  size_t next_event{0};
++  void* buf[NBUF]{};
++  unsigned long long* counter{};
++};
++
++int G = 4;
++size_t BMAX = 1434 * MiB;  // largest payload
++size_t HSZ  = 0;           // size of every device / host buffer (>= BMAX, room for chunk slots)
++device dv[4];
++char* hb[6]{};         // cudaHostAlloc(Portable) buffers
++char* hreg  = nullptr; // mmap + populate + cudaHostRegister (the engine's host-pool recipe), 4K pages
++char* hthp  = nullptr; // same with transparent huge pages
++char* hpage = nullptr; // pageable
++bool can[4][4]{};
++bool g_nopeer = false;
++bool g_probe  = false;
++int g_reps    = 5;
++uint64_t g_salt = 1;
++size_t g_bgleg   = 0;  // bytes per leg of the background copies (contention tests)
++cudaError_t g_err = cudaSuccess;
++
++#ifdef USE_RMM
++std::vector<std::unique_ptr<rmm::mr::cuda_async_memory_resource>> g_mrs;
++#endif
++
++double now_ms()
++{
++  return std::chrono::duration<double, std::milli>(
++           std::chrono::steady_clock::now().time_since_epoch())
++    .count();
++}
++
++bool soft(cudaError_t e)
++{
++  if (e != cudaSuccess) {
++    if (g_err == cudaSuccess) { g_err = e; }
++    (void)cudaGetLastError();
++    return false;
++  }
++  return true;
++}
++
++char* P(int g) { return static_cast<char*>(dv[g].buf[PART]); }
++char* S(int g) { return static_cast<char*>(dv[g].buf[SCR]); }
++char* B_(int g, int b) { return static_cast<char*>(dv[g].buf[b]); }
++
++ev_t new_event(int g)
++{
++  auto& d = dv[g];
++  if (d.next_event == d.events.size()) {
++    for (int i = 0; i < 1024; ++i) {
++      ev_t e{};
++      CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
++      d.events.push_back(e);
++    }
++  }
++  return d.events[d.next_event++];
++}
++
++struct deps {
++  ev_t e[12]{};
++  int n{0};
++  deps() = default;
++  deps(std::initializer_list<ev_t> list)
++  {
++    for (auto x : list) { add(x); }
++  }
++  void add(ev_t x)
++  {
++    if (x != nullptr) { e[n++] = x; }
++  }
++  void add(deps const& o)
++  {
++    for (int i = 0; i < o.n; ++i) { add(o.e[i]); }
++  }
++};
++
++void wait_deps(cudaStream_t s, deps const& d)
++{
++  for (int i = 0; i < d.n; ++i) { CK(cudaStreamWaitEvent(s, d.e[i], 0)); }
++}
++
++ev_t record(int g, cudaStream_t s)
++{
++  ev_t const e = new_event(g);
++  CK(cudaEventRecord(e, s));
++  return e;
++}
++
++// Every op: runs on a stream of the named device, after `d`, and returns its completion event.
++ev_t op_d2h(int g, int si, void* host, void const* dev, size_t n, deps const& d = {})
++{
++  CK(cudaSetDevice(g));
++  auto const s = dv[g].st[si];
++  wait_deps(s, d);
++  CK(cudaMemcpyAsync(host, dev, n, cudaMemcpyDeviceToHost, s));
++  return record(g, s);
++}
++
++ev_t op_h2d(int g, int si, void* dev, void const* host, size_t n, deps const& d = {})
++{
++  CK(cudaSetDevice(g));
++  auto const s = dv[g].st[si];
++  wait_deps(s, d);
++  CK(cudaMemcpyAsync(dev, host, n, cudaMemcpyHostToDevice, s));
++  return record(g, s);
++}
++
++// cudaMemcpyPeerAsync on a stream of the destination device.
++ev_t op_p2p(int dst, int si, void* dp, int src, void const* sp, size_t n, deps const& d = {})
++{
++  CK(cudaSetDevice(dst));
++  auto const s = dv[dst].st[si];
++  wait_deps(s, d);
++  if (!soft(cudaMemcpyPeerAsync(dp, dst, sp, src, n, s))) { return nullptr; }
++  return record(dst, s);
++}
++
++ev_t op_or(int g, int si, void* dp, void const* sp, size_t n, deps const& d = {})
++{
++  CK(cudaSetDevice(g));
++  auto const s = dv[g].st[si];
++  wait_deps(s, d);
++  CK(launch_or(dp, sp, n, s));
++  return record(g, s);
++}
++
++enum transport { PEERAPI, BOUNCE };
++
++// One edge src -> dst. BOUNCE: D2H into `hslot` on the source's stream, then H2D on the
++// destination's stream; `*hfree` carries the slot's last reader so the slot can be reused.
++ev_t xfer(transport m,
++          int dst,
++          int dsi,
++          void* dp,
++          int src,
++          int ssi,
++          void const* sp,
++          size_t n,
++          deps const& src_deps,
++          deps const& dst_deps,
++          char* hslot,
++          ev_t* hfree)
++{
++  if (m == PEERAPI) {
++    deps d = src_deps;
++    d.add(dst_deps);
++    return op_p2p(dst, dsi, dp, src, sp, n, d);
++  }
++  deps d1 = src_deps;
++  d1.add(*hfree);
++  ev_t const e1 = op_d2h(src, ssi, hslot, sp, n, d1);
++  deps d2       = dst_deps;
++  d2.add(e1);
++  ev_t const e2 = op_h2d(dst, dsi, dp, hslot, n, d2);
++  *hfree        = e2;
++  return e2;
++}
++
++void sync_stream(int g, int si)
++{
++  CK(cudaSetDevice(g));
++  CK(cudaStreamSynchronize(dv[g].st[si]));
++}
++
++void sync_streams()
++{
++  for (int g = 0; g < G; ++g) {
++    CK(cudaSetDevice(g));
++    // AUX2 belongs to the background-load threads of the contention test.
++    for (int i = 0; i < AUX2; ++i) { CK(cudaStreamSynchronize(dv[g].st[i])); }
++  }
++}
++
++void sync_all()
++{
++  for (int g = 0; g < G; ++g) {
++    CK(cudaSetDevice(g));
++    CK(cudaDeviceSynchronize());
++  }
++}
++
++void fill(int g, void* p, size_t n, unsigned mask, uint64_t salt)
++{
++  CK(cudaSetDevice(g));
++  CK(launch_fill(p, n, mask, salt, dv[g].st[KS]));
++}
++
++unsigned long long verify(int g, void const* p, size_t n, unsigned mask, uint64_t salt)
++{
++  CK(cudaSetDevice(g));
++  auto const s = dv[g].st[KS];
++  CK(cudaMemsetAsync(dv[g].counter, 0, sizeof(unsigned long long), s));
++  CK(launch_verify(p, n, mask, salt, dv[g].counter, s));
++  CK(cudaStreamSynchronize(s));
++  unsigned long long v = 0;
++  CK(cudaMemcpy(&v, dv[g].counter, sizeof(v), cudaMemcpyDeviceToHost));
++  return v;
++}
++
++struct result_t {
++  double med{0}, mn{0}, mx{0}, sub{0};
++  unsigned long long mism{0};
++  int reps{0};
++  cudaError_t err{cudaSuccess};
++};
++
++double median(std::vector<double> v)
++{
++  if (v.empty()) { return 0; }
++  std::sort(v.begin(), v.end());
++  size_t const n = v.size();
++  return (n % 2 != 0) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
++}
++
++// reps + 1 runs, the first is a warm-up. `run` returns the time until every call was submitted
++// (ms) or a negative number. `ver` runs after the warm-up and after the last rep.
++result_t measure(char const* name,
++             int reps,
++             std::function<void(int)> const& prep,
++             std::function<double()> const& run,
++             std::function<unsigned long long()> const& ver)
++{
++  result_t st;
++  std::vector<double> t, s;
++  for (int r = 0; r <= reps; ++r) {
++    for (int g = 0; g < G; ++g) { dv[g].next_event = 0; }
++    prep(r);
++    sync_all();
++    NVTX_PUSH(name);
++    double const t0  = now_ms();
++    double const sub = run();
++    double const el  = now_ms() - t0;
++    NVTX_POP();
++    if (g_err != cudaSuccess) {
++      st.err = g_err;
++      g_err  = cudaSuccess;
++      for (int g = 0; g < G; ++g) {
++        (void)cudaSetDevice(g);
++        (void)cudaDeviceSynchronize();
++        (void)cudaGetLastError();
++      }
++      return st;
++    }
++    if (r == 0 || r == reps) { st.mism += ver(); }
++    if (r > 0) {
++      t.push_back(el);
++      s.push_back(sub);
++    }
++  }
++  st.med  = median(t);
++  st.mn   = *std::min_element(t.begin(), t.end());
++  st.mx   = *std::max_element(t.begin(), t.end());
++  st.sub  = median(s);
++  st.reps = reps;
++  return st;
++}
++
++void report(char const* test, std::string const& name, size_t bytes, result_t const& st)
++{
++  if (st.err != cudaSuccess) {
++    std::printf("R|%s|%s|bytes=%zu|ERR=%s\n", test, name.c_str(), bytes, cudaGetErrorName(st.err));
++  } else {
++    double const gib = static_cast<double>(bytes) / static_cast<double>(1ull << 30);
++    std::printf(
++      "R|%s|%s|bytes=%zu|med_ms=%.3f|min_ms=%.3f|max_ms=%.3f|gibps=%.2f|ms_per_gib=%.2f|"
++      "submit_ms=%.3f|mism=%llu|reps=%d\n",
++      test, name.c_str(), bytes, st.med, st.mn, st.mx, gib / (st.med / 1000.0), st.med / gib,
++      st.sub, st.mism, st.reps);
++  }
++  std::fflush(stdout);
++}
++
++std::string mib(size_t n) { return std::to_string(n / MiB); }
++
++// ---- host copies the way the engine's staging does: 1 MiB blocks through the batch API ----
++void copy_host(cudaStream_t s, char* dev, char* host, size_t n, bool to_host, bool blocks)
++{
++  if (!blocks) {
++    if (to_host) {
++      CK(cudaMemcpyAsync(host, dev, n, cudaMemcpyDeviceToHost, s));
++    } else {
++      CK(cudaMemcpyAsync(dev, host, n, cudaMemcpyHostToDevice, s));
++    }
++    return;
++  }
++  static thread_local std::vector<void*> d;
++  static thread_local std::vector<void const*> sr;
++  static thread_local std::vector<size_t> sz;
++  d.clear();
++  sr.clear();
++  sz.clear();
++  for (size_t off = 0; off < n; off += MiB) {
++    size_t const m = std::min(MiB, n - off);
++    d.push_back(to_host ? host + off : dev + off);
++    sr.push_back(to_host ? dev + off : host + off);
++    sz.push_back(m);
++  }
++  if (d.size() == 1) {
++    CK(cudaMemcpyAsync(d[0], sr[0], sz[0], to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice,
++                       s));
++    return;
++  }
++  cudaMemcpyAttributes at{};
++  at.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
++  at.flags          = cudaMemcpyFlagDefault;
++  size_t idx        = 0;
++  CK(cudaMemcpyBatchAsync(d.data(), sr.data(), sz.data(), d.size(), &at, &idx, 1, s));
++}
++
++// ---- host OR ----
++void host_or(char* out, char* const* in, int nin, size_t n, int nt)
++{
++  constexpr size_t blk = 1 << 16;
++  long const nblk      = static_cast<long>((n + blk - 1) / blk);
++  bool const aligned   = (reinterpret_cast<uintptr_t>(out) % 64) == 0;
++#pragma omp parallel for num_threads(nt) schedule(static)
++  for (long b = 0; b < nblk; ++b) {
++    size_t const lo = static_cast<size_t>(b) * blk;
++    size_t const hi = std::min(n, lo + blk);
++    size_t i        = lo;
++    for (; i + 64 <= hi; i += 64) {
++      __m512i v = _mm512_loadu_si512(in[0] + i);
++      for (int k = 1; k < nin; ++k) { v = _mm512_or_si512(v, _mm512_loadu_si512(in[k] + i)); }
++      if (aligned) {
++        _mm512_stream_si512(reinterpret_cast<__m512i*>(out + i), v);
++      } else {
++        _mm512_storeu_si512(out + i, v);
++      }
++    }
++    for (; i < hi; ++i) {
++      char v = in[0][i];
++      for (int k = 1; k < nin; ++k) { v = static_cast<char>(v | in[k][i]); }
++      out[i] = v;
++    }
++    _mm_sfence();
++  }
++}
++
++// =============================== setup ===============================
++
++char* map_host(size_t bytes, bool huge)
++{
++  size_t const align = 2 * MiB;
++  char* raw          = static_cast<char*>(
++    mmap(nullptr, bytes + align, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
++  if (raw == MAP_FAILED) {
++    std::perror("mmap");
++    std::exit(3);
++  }
++  char* p = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(raw) + align - 1) / align * align);
++  if (huge) { (void)madvise(p, bytes, MADV_HUGEPAGE); }
++#ifdef MADV_POPULATE_WRITE
++  if (madvise(p, bytes, MADV_POPULATE_WRITE) != 0) { std::memset(p, 1, bytes); }
++#else
++  std::memset(p, 1, bytes);
++#endif
++  return p;
++}
++
++void setup()
++{
++  int count = 0;
++  CK(cudaGetDeviceCount(&count));
++  G = std::min(4, count);
++#ifdef USE_RMM
++  int const with_rmm = 1;
++#else
++  int const with_rmm = 0;
++#endif
++  std::printf("I|devices=%d|cudart=%d|rmm=%d|nopeer=%d|probe=%d|bmax_mib=%zu|buf_mib=%zu\n", count,
++              CUDART_VERSION, with_rmm, g_nopeer ? 1 : 0, g_probe ? 1 : 0, BMAX / MiB, HSZ / MiB);
++  for (int g = 0; g < G; ++g) {
++    CK(cudaSetDevice(g));
++    CK(cudaFree(nullptr));
++    cudaDeviceProp prop{};
++    CK(cudaGetDeviceProperties(&prop, g));
++    std::printf("I|dev=%d|name=%s|pci=%04x:%02x:%02x|sm=%d.%d\n", g, prop.name, prop.pciDomainID,
++                prop.pciBusID, prop.pciDeviceID, prop.major, prop.minor);
++    for (auto& s : dv[g].st) { CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking)); }
++#ifdef USE_RMM
++    g_mrs.push_back(std::make_unique<rmm::mr::cuda_async_memory_resource>());
++    dv[g].pool = g_mrs.back()->pool_handle();
++#else
++    // Same properties as the pool owned by rmm::mr::cuda_async_memory_resource.
++    cudaMemPoolProps props{};
++    props.allocType     = cudaMemAllocationTypePinned;
++    props.handleTypes   = cudaMemHandleTypeNone;
++    props.location.type = cudaMemLocationTypeDevice;
++    props.location.id   = g;
++    CK(cudaMemPoolCreate(&dv[g].pool, &props));
++    uint64_t threshold = UINT64_MAX;
++    CK(cudaMemPoolSetAttribute(dv[g].pool, cudaMemPoolAttrReleaseThreshold, &threshold));
++#endif
++  }
++  for (int a = 0; a < G; ++a) {
++    for (int b = 0; b < G; ++b) {
++      if (a == b) { continue; }
++      int v = 0, rank = -1, access = -1, nvlink = -1;
++      CK(cudaDeviceCanAccessPeer(&v, a, b));
++      can[a][b] = v != 0;
++      (void)soft(cudaDeviceGetP2PAttribute(&rank, cudaDevP2PAttrPerformanceRank, a, b));
++      (void)soft(cudaDeviceGetP2PAttribute(&access, cudaDevP2PAttrAccessSupported, a, b));
++      (void)soft(cudaDeviceGetP2PAttribute(&nvlink, cudaDevP2PAttrNativeAtomicSupported, a, b));
++      g_err = cudaSuccess;
++      std::printf("I|peer|%d>%d|can_access=%d|perf_rank=%d|access_supported=%d|native_atomic=%d\n", a, b,
++                  v, rank, access, nvlink);
++    }
++  }
++  if (!g_nopeer) {
++    for (int a = 0; a < G; ++a) {
++      for (int b = 0; b < G; ++b) {
++        if (a == b || (!can[a][b] && !g_probe)) { continue; }
++        CK(cudaSetDevice(a));
++        cudaError_t const e1 = cudaDeviceEnablePeerAccess(b, 0);
++        (void)cudaGetLastError();
++        // Owner pool `a` grants device `b` access (what the engine's grant does).
++        cudaMemAccessDesc desc{};
++        desc.location.type   = cudaMemLocationTypeDevice;
++        desc.location.id     = b;
++        desc.flags           = cudaMemAccessFlagsProtReadWrite;
++        cudaError_t const e2 = cudaMemPoolSetAccess(dv[a].pool, &desc, 1);
++        (void)cudaGetLastError();
++        std::printf("I|grant|ctx=%d|peer=%d|can=%d|EnablePeerAccess=%s|MemPoolSetAccess=%s\n", a, b,
++                    can[a][b] ? 1 : 0, cudaGetErrorName(e1), cudaGetErrorName(e2));
++      }
++    }
++  }
++  for (int g = 0; g < G; ++g) {
++    CK(cudaSetDevice(g));
++    for (int b : {PART, SCR, BG}) {
++      CK(cudaMallocFromPoolAsync(&dv[g].buf[b], HSZ, dv[g].pool, dv[g].st[KS]));
++    }
++    CK(cudaStreamSynchronize(dv[g].st[KS]));
++    CK(cudaMalloc(&dv[g].buf[RPART], HSZ));
++    CK(cudaMalloc(&dv[g].buf[RSCR], HSZ));
++    void* c = nullptr;
++    CK(cudaMalloc(&c, sizeof(unsigned long long)));
++    dv[g].counter = static_cast<unsigned long long*>(c);
++    for (int b = 0; b < NBUF; ++b) { CK(launch_fill(dv[g].buf[b], HSZ, 1u << g, 7, dv[g].st[KS])); }
++    (void)new_event(g);
++    dv[g].next_event = 0;
++  }
++  sync_all();
++  CK(cudaSetDevice(0));
++  for (auto& h : hb) {
++    void* p = nullptr;
++    CK(cudaHostAlloc(&p, HSZ, cudaHostAllocPortable));
++    h = static_cast<char*>(p);
++    std::memset(h, 1, HSZ);
++  }
++  hreg = map_host(HSZ, false);
++  CK(cudaHostRegister(hreg, HSZ, cudaHostRegisterPortable | cudaHostRegisterMapped));
++  hthp = map_host(HSZ, true);
++  CK(cudaHostRegister(hthp, HSZ, cudaHostRegisterPortable | cudaHostRegisterMapped));
++  hpage = map_host(HSZ, false);
++  // Warm the OpenMP pool.
++#pragma omp parallel
++  {
++    volatile int x = omp_get_thread_num();
++    (void)x;
++  }
++  std::printf("I|setup_done|omp_max_threads=%d\n", omp_get_max_threads());
++  std::fflush(stdout);
++}
++
++// =============================== leg ===============================
++
++void test_leg(std::vector<size_t> const& sizes)
++{
++  auto const noprep = [](int) {};
++  auto const nover  = []() -> unsigned long long { return 0; };
++  for (int g = 0; g < G; ++g) {
++    for (size_t n : sizes) {
++      auto whole = [&](char const* nm, bool to_host, char* h, int buf) {
++        result_t st = measure(nm, g_reps, noprep, [&]() -> double {
++          CK(cudaSetDevice(g));
++          auto const s = dv[g].st[to_host ? TX : RX];
++          double const t0 = now_ms();
++          copy_host(s, B_(g, buf), h, n, to_host, false);
++          double const sub = now_ms() - t0;
++          CK(cudaStreamSynchronize(s));
++          return sub;
++        }, nover);
++        report("leg", "g" + std::to_string(g) + "|" + nm + "|n=" + mib(n), n, st);
++      };
++      whole("d2h|host=pinned|dev=pool", true, hb[0], PART);
++      whole("h2d|host=pinned|dev=pool", false, hb[0], SCR);
++      whole("d2h|host=pinned|dev=raw", true, hb[0], RPART);
++      whole("h2d|host=pinned|dev=raw", false, hb[0], RSCR);
++      whole("d2h|host=registered4k|dev=pool", true, hreg, PART);
++      whole("h2d|host=registered4k|dev=pool", false, hreg, SCR);
++      whole("d2h|host=registeredthp|dev=pool", true, hthp, PART);
++      whole("h2d|host=registeredthp|dev=pool", false, hthp, SCR);
++      whole("d2h|host=pageable|dev=pool", true, hpage, PART);
++      whole("h2d|host=pageable|dev=pool", false, hpage, SCR);
++      auto chunked = [&](char const* nm, bool to_host, size_t chunk, bool blocks) {
++        result_t st = measure(nm, g_reps, noprep, [&]() -> double {
++          CK(cudaSetDevice(g));
++          auto const s = dv[g].st[to_host ? TX : RX];
++          char* const h = blocks ? hreg : hb[0];
++          for (size_t off = 0; off < n; off += chunk) {
++            size_t const m = std::min(chunk, n - off);
++            copy_host(s, B_(g, to_host ? PART : SCR) + off, h, m, to_host, blocks);
++            CK(cudaStreamSynchronize(s));
++          }
++          return -1;
++        }, nover);
++        report("leg", "g" + std::to_string(g) + "|" + nm + "|n=" + mib(n), n, st);
++      };
++      if (n >= 8 * MiB) {
++        chunked("d2h_sync|chunk=8|blk=contig", true, 8 * MiB, false);
++        chunked("h2d_sync|chunk=8|blk=contig", false, 8 * MiB, false);
++        chunked("d2h_sync|chunk=8|blk=1m_batch", true, 8 * MiB, true);
++        chunked("h2d_sync|chunk=8|blk=1m_batch", false, 8 * MiB, true);
++        chunked("d2h_sync|chunk=2|blk=contig", true, 2 * MiB, false);
++        chunked("h2d_sync|chunk=2|blk=contig", false, 2 * MiB, false);
++      }
++    }
++  }
++}
++
++// =============================== pair ===============================
++
++double run_stage_pipe(int a, int b, size_t n, size_t chunk, int K, char* h)
++{
++  ev_t hfree[8]{};
++  double const t0 = now_ms();
++  size_t i        = 0;
++  for (size_t off = 0; off < n; off += chunk, ++i) {
++    size_t const m = std::min(chunk, n - off);
++    int const j    = static_cast<int>(i % static_cast<size_t>(K));
++    ev_t const e1  = op_d2h(a, TX, h + j * chunk, P(a) + off, m, {hfree[j]});
++    hfree[j]       = op_h2d(b, RX, S(b) + off, h + j * chunk, m, {e1});
++  }
++  double const sub = now_ms() - t0;
++  sync_stream(a, TX);
++  sync_stream(b, RX);
++  return sub;
++}
++
++void test_pair(std::vector<size_t> const& sizes, bool all_methods)
++{
++  for (int a = 0; a < G; ++a) {
++    for (int b = 0; b < G; ++b) {
++      if (a == b) { continue; }
++      bool const sec =
++        (a == 0 && b == 1) || (a == 0 && b == 2) || (a == 2 && b == 0) || (a == 1 && b == 3);
++      for (size_t n : sizes) {
++        uint64_t salt = 0;
++        int sbuf = PART, dbuf = SCR;
++        auto const prep = [&](int r) {
++          if (r == 0) {
++            salt = ++g_salt;
++            fill(a, B_(a, sbuf), n, 1u << a, salt);
++            fill(b, B_(b, dbuf), n, 0, salt);
++          }
++        };
++        auto const ver = [&]() -> unsigned long long {
++          return verify(b, B_(b, dbuf), n, 1u << a, salt);
++        };
++        std::string const pre = std::to_string(a) + ">" + std::to_string(b) + "|p2p=" +
++                                ((can[a][b] && !g_nopeer) ? "1" : "0") + "|n=" + mib(n) + "|";
++        auto go = [&](std::string const& nm, std::function<double()> const& fn) {
++          result_t st = measure(nm.c_str(), g_reps, prep, fn, ver);
++          report("pair", pre + nm, n, st);
++        };
++        auto peer = [&](bool on_src) -> double {
++          int const d = on_src ? a : b;
++          CK(cudaSetDevice(d));
++          auto const s    = dv[d].st[RX];
++          double const t0 = now_ms();
++          (void)soft(cudaMemcpyPeerAsync(B_(b, dbuf), b, B_(a, sbuf), a, n, s));
++          double const sub = now_ms() - t0;
++          (void)soft(cudaStreamSynchronize(s));
++          return sub;
++        };
++        go("peerasync|alloc=pool|stream=dst", [&] { return peer(false); });
++        sbuf = RPART;
++        dbuf = RSCR;
++        go("peerasync|alloc=raw|stream=dst", [&] { return peer(false); });
++        sbuf = PART;
++        dbuf = SCR;
++        go("memcpyasync_d2d|alloc=pool|stream=dst", [&]() -> double {
++          CK(cudaSetDevice(b));
++          auto const s    = dv[b].st[RX];
++          double const t0 = now_ms();
++          (void)soft(cudaMemcpyAsync(S(b), P(a), n, cudaMemcpyDeviceToDevice, s));
++          double const sub = now_ms() - t0;
++          (void)soft(cudaStreamSynchronize(s));
++          return sub;
++        });
++        if (sec || g_nopeer || g_probe) {
++          go("peerasync|alloc=pool|stream=src", [&] { return peer(true); });
++        }
++        if (!all_methods) { continue; }
++        auto stage_sync = [&](size_t chunk, bool blocks, char* h) -> double {
++          for (size_t off = 0; off < n; off += chunk) {
++            size_t const m = std::min(chunk, n - off);
++            CK(cudaSetDevice(a));
++            copy_host(dv[a].st[TX], P(a) + off, h, m, true, blocks);
++            CK(cudaStreamSynchronize(dv[a].st[TX]));
++            CK(cudaSetDevice(b));
++            copy_host(dv[b].st[RX], S(b) + off, h, m, false, blocks);
++            CK(cudaStreamSynchronize(dv[b].st[RX]));
++          }
++          return -1;
++        };
++        go("stage_sync|chunk=8|blk=1m_batch", [&] { return stage_sync(8 * MiB, true, hreg); });
++        go("stage_sync|chunk=8|blk=contig", [&] { return stage_sync(8 * MiB, false, hb[0]); });
++        go("stage_sync|chunk=2|blk=contig", [&] { return stage_sync(2 * MiB, false, hb[0]); });
++        go("stage_pipe|chunk=8|slots=2|host=pinned",
++           [&] { return run_stage_pipe(a, b, n, 8 * MiB, 2, hb[0]); });
++        go("stage_pipe|chunk=32|slots=2|host=pinned",
++           [&] { return run_stage_pipe(a, b, n, 32 * MiB, 2, hb[0]); });
++        go("stage_pipe|chunk=whole|slots=1|host=pinned",
++           [&] { return run_stage_pipe(a, b, n, n, 1, hb[0]); });
++        if (!sec) { continue; }
++        go("stage_pipe|chunk=2|slots=2|host=pinned",
++           [&] { return run_stage_pipe(a, b, n, 2 * MiB, 2, hb[0]); });
++        go("stage_pipe|chunk=16|slots=2|host=pinned",
++           [&] { return run_stage_pipe(a, b, n, 16 * MiB, 2, hb[0]); });
++        go("stage_pipe|chunk=64|slots=2|host=pinned",
++           [&] { return run_stage_pipe(a, b, n, 64 * MiB, 2, hb[0]); });
++        go("stage_pipe|chunk=8|slots=4|host=pinned",
++           [&] { return run_stage_pipe(a, b, n, 8 * MiB, 4, hb[0]); });
++        go("stage_pipe|chunk=32|slots=4|host=pinned",
++           [&] { return run_stage_pipe(a, b, n, 32 * MiB, 4, hb[0]); });
++        go("stage_pipe|chunk=32|slots=2|host=registered4k",
++           [&] { return run_stage_pipe(a, b, n, 32 * MiB, 2, hreg); });
++        go("stage_pipe|chunk=32|slots=2|host=registeredthp",
++           [&] { return run_stage_pipe(a, b, n, 32 * MiB, 2, hthp); });
++        go("stage_pipe|chunk=whole|slots=1|host=registered4k",
++           [&] { return run_stage_pipe(a, b, n, n, 1, hreg); });
++        auto pageable = [&](size_t chunk) -> double {
++          for (size_t off = 0; off < n; off += chunk) {
++            size_t const m = std::min(chunk, n - off);
++            CK(cudaSetDevice(a));
++            CK(cudaMemcpyAsync(hpage, P(a) + off, m, cudaMemcpyDeviceToHost, dv[a].st[TX]));
++            CK(cudaStreamSynchronize(dv[a].st[TX]));
++            CK(cudaSetDevice(b));
++            CK(cudaMemcpyAsync(S(b) + off, hpage, m, cudaMemcpyHostToDevice, dv[b].st[RX]));
++            CK(cudaStreamSynchronize(dv[b].st[RX]));
++          }
++          return -1;
++        };
++        go("stage_sync|chunk=whole|host=pageable", [&] { return pageable(n); });
++        go("stage_sync|chunk=8|host=pageable", [&] { return pageable(8 * MiB); });
++      }
++    }
++  }
++}
++
++// =============================== fan-out ===============================
++
++void test_fan(std::vector<size_t> const& sizes)
++{
++  for (size_t n : sizes) {
++    uint64_t salt   = 0;
++    auto const prep = [&](int) {
++      salt = ++g_salt;
++      fill(0, P(0), n, 1u, salt);
++      for (int t = 1; t < G; ++t) { fill(t, S(t), n, 0, salt); }
++    };
++    auto const ver = [&]() -> unsigned long long {
++      unsigned long long m = 0;
++      for (int t = 1; t < G; ++t) { m += verify(t, S(t), n, 1u, salt); }
++      return m;
++    };
++    auto go = [&](std::string const& nm, std::function<double()> const& fn) {
++      result_t st = measure(nm.c_str(), g_reps, prep, fn, ver);
++      report("fan", "n=" + mib(n) + "|" + nm, n, st);
++    };
++    // Today's replica copy (src/cuda/device_transfer.cpp host path): per target, whole payload
++    // D2H in 1 MiB blocks, sync, H2D, sync.
++    go("today_serial_per_target", [&]() -> double {
++      for (int t = 1; t < G; ++t) {
++        CK(cudaSetDevice(0));
++        copy_host(dv[0].st[KS], P(0), hreg, n, true, true);
++        CK(cudaStreamSynchronize(dv[0].st[KS]));
++        CK(cudaSetDevice(t));
++        copy_host(dv[t].st[KS], S(t), hreg, n, false, true);
++        CK(cudaStreamSynchronize(dv[t].st[KS]));
++      }
++      return -1;
++    });
++    // mode 0: staged once, three uploads; 1: P2P to the partner + staged once for the other pair;
++    // 2: P2P to the partner, staged once to GPU 2, relay 2 -> 3 by P2P.
++    auto fan = [&](size_t chunk, int K, int mode) -> double {
++      ev_t hf[4][3]{};
++      double const t0 = now_ms();
++      size_t i        = 0;
++      for (size_t off = 0; off < n; off += chunk, ++i) {
++        size_t const m = std::min(chunk, n - off);
++        int const j    = static_cast<int>(i % static_cast<size_t>(K));
++        char* const hs = hb[0] + j * chunk;
++        ev_t const e1  = op_d2h(0, TX, hs, P(0) + off, m, {hf[j][0], hf[j][1], hf[j][2]});
++        if (mode == 0) {
++          hf[j][0] = op_h2d(1, RX, S(1) + off, hs, m, {e1});
++        } else {
++          op_p2p(1, RX, S(1) + off, 0, P(0) + off, m);
++        }
++        hf[j][1] = op_h2d(2, RX, S(2) + off, hs, m, {e1});
++        if (mode == 2) {
++          op_p2p(3, RX, S(3) + off, 2, S(2) + off, m, {hf[j][1]});
++        } else {
++          hf[j][2] = op_h2d(3, RX, S(3) + off, hs, m, {e1});
++        }
++      }
++      double const sub = now_ms() - t0;
++      sync_streams();
++      return sub;
++    };
++    go("staged_once|chunk=whole", [&] { return fan(n, 1, 0); });
++    go("staged_once|chunk=32", [&] { return fan(32 * MiB, 2, 0); });
++    go("p2p_partner+staged_once|chunk=whole", [&] { return fan(n, 1, 1); });
++    go("p2p_partner+staged_once|chunk=32", [&] { return fan(32 * MiB, 2, 1); });
++    go("p2p_partner+staged_one+p2p_relay|chunk=32", [&] { return fan(32 * MiB, 2, 2); });
++    go("peerapi_all_targets|chunk=whole", [&]() -> double {
++      double const t0 = now_ms();
++      for (int t = 1; t < G; ++t) { op_p2p(t, RX, S(t), 0, P(0), n); }
++      double const sub = now_ms() - t0;
++      sync_streams();
++      return sub;
++    });
++  }
++}
++
++// =============================== host OR ===============================
++
++void test_hostor(std::vector<size_t> const& sizes)
++{
++  for (size_t n : sizes) {
++    for (int nin : {2, 4}) {
++      for (int nt : {1, 2, 4, 8, 16, 32, 48}) {
++        std::vector<double> t;
++        char* in[4] = {hb[0], hb[1], hb[2], hb[3]};
++        for (int r = 0; r <= g_reps; ++r) {
++          double const t0 = now_ms();
++          host_or(hb[4], in, nin, n, nt);
++          double const el = now_ms() - t0;
++          if (r > 0) { t.push_back(el); }
++        }
++        result_t st;
++        st.med  = median(t);
++        st.mn   = *std::min_element(t.begin(), t.end());
++        st.mx   = *std::max_element(t.begin(), t.end());
++        st.sub  = -1;
++        st.reps = g_reps;
++        report("hostor",
++               "n=" + mib(n) + "|inputs=" + std::to_string(nin) + "|threads=" + std::to_string(nt),
++               n, st);
++      }
++    }
++  }
++}
++
++// =============================== concurrency ===============================
++
++struct leg {
++  char kind;  // D: d2h a -> hb[h]; H: h2d hb[h] -> b; P: peer API a -> b; B: pipelined bounce a -> b
++  int a, b, h;
++  int sbuf, dbuf;
++};
++
++void run_legs(char const* test, std::string const& name, std::vector<leg> const& legs, size_t n)
++{
++  int const L = static_cast<int>(legs.size());
++  std::vector<std::vector<double>> tl(static_cast<size_t>(L));
++  std::vector<double> tot;
++  for (int r = 0; r <= g_reps; ++r) {
++    for (int g = 0; g < G; ++g) { dv[g].next_event = 0; }
++    sync_all();
++    int sc[4] = {0, 0, 0, 0};
++    std::vector<ev_t> ev(static_cast<size_t>(L));
++    std::vector<int> evdev(static_cast<size_t>(L));
++    double const t0 = now_ms();
++    for (int l = 0; l < L; ++l) {
++      leg const& x = legs[static_cast<size_t>(l)];
++      switch (x.kind) {
++        case 'D':
++          ev[l]    = op_d2h(x.a, sc[x.a]++, hb[x.h], B_(x.a, x.sbuf), n);
++          evdev[l] = x.a;
++          break;
++        case 'H':
++          ev[l]    = op_h2d(x.b, sc[x.b]++, B_(x.b, x.dbuf), hb[x.h], n);
++          evdev[l] = x.b;
++          break;
++        case 'P':
++          ev[l]    = op_p2p(x.b, sc[x.b]++, B_(x.b, x.dbuf), x.a, B_(x.a, x.sbuf), n);
++          evdev[l] = x.b;
++          break;
++        default: {
++          int const sa = sc[x.a]++, sb = sc[x.b]++;
++          size_t const chunk = 32 * MiB;
++          ev_t hfree[2]{};
++          ev_t last = nullptr;
++          size_t i  = 0;
++          for (size_t off = 0; off < n; off += chunk, ++i) {
++            size_t const m = std::min(chunk, n - off);
++            int const j    = static_cast<int>(i % 2);
++            ev_t const e1 =
++              op_d2h(x.a, sa, hb[x.h] + j * chunk, B_(x.a, x.sbuf) + off, m, {hfree[j]});
++            hfree[j] = op_h2d(x.b, sb, B_(x.b, x.dbuf) + off, hb[x.h] + j * chunk, m, {e1});
++            last     = hfree[j];
++          }
++          ev[l]    = last;
++          evdev[l] = x.b;
++        }
++      }
++    }
++    if (g_err != cudaSuccess) {
++      std::printf("R|%s|%s|bytes=%zu|ERR=%s\n", test, name.c_str(), n, cudaGetErrorName(g_err));
++      g_err = cudaSuccess;
++      sync_all();
++      return;
++    }
++    std::vector<double> te(static_cast<size_t>(L), -1.0);
++    int done = 0;
++    while (done < L) {
++      for (int l = 0; l < L; ++l) {
++        if (te[l] >= 0) { continue; }
++        CK(cudaSetDevice(evdev[l]));
++        cudaError_t const q = cudaEventQuery(ev[l]);
++        if (q == cudaSuccess) {
++          te[l] = now_ms() - t0;
++          ++done;
++        } else if (q != cudaErrorNotReady) {
++          CK(q);
++        }
++      }
++    }
++    if (r > 0) {
++      for (int l = 0; l < L; ++l) { tl[l].push_back(te[l]); }
++      tot.push_back(*std::max_element(te.begin(), te.end()));
++    }
++  }
++  double const gib = static_cast<double>(n) / static_cast<double>(1ull << 30);
++  double const med = median(tot);
++  std::string per;
++  for (int l = 0; l < L; ++l) {
++    leg const& x = legs[static_cast<size_t>(l)];
++    char tmp[64];
++    char lab[16];
++    if (x.kind == 'D') {
++      std::snprintf(lab, sizeof lab, "D%d", x.a);
++    } else if (x.kind == 'H') {
++      std::snprintf(lab, sizeof lab, "H%d", x.b);
++    } else {
++      std::snprintf(lab, sizeof lab, "%c%d%d", x.kind, x.a, x.b);
++    }
++    std::snprintf(tmp, sizeof tmp, "%s%s=%.1f", l != 0 ? "," : "", lab,
++                  gib / (median(tl[l]) / 1000.0));
++    per += tmp;
++  }
++  std::printf("R|%s|%s|bytes=%zu|legs=%d|med_ms=%.3f|min_ms=%.3f|max_ms=%.3f|agg_gibps=%.2f|"
++              "leg_gibps=%s|reps=%d\n",
++              test, name.c_str(), n, L, med, *std::min_element(tot.begin(), tot.end()),
++              *std::max_element(tot.begin(), tot.end()), gib * L / (med / 1000.0), per.c_str(),
++              g_reps);
++  std::fflush(stdout);
++}
++
++leg D(int a, int h) { return {'D', a, -1, h, PART, SCR}; }
++leg H(int b, int h) { return {'H', -1, b, h, PART, SCR}; }
++leg Pp(int a, int b, int dbuf = SCR) { return {'P', a, b, -1, PART, dbuf}; }
++leg Bb(int a, int b, int h, int dbuf = SCR) { return {'B', a, b, h, PART, dbuf}; }
++
++void test_conc(std::vector<size_t> const& sizes)
++{
++  for (size_t n : sizes) {
++    std::string const p = "n=" + mib(n) + "|";
++    auto go = [&](char const* nm, std::vector<leg> const& l) { run_legs("conc", p + nm, l, n); };
++    go("d2h:0", {D(0, 0)});
++    go("d2h:0,1", {D(0, 0), D(1, 1)});
++    go("d2h:0,2", {D(0, 0), D(2, 2)});
++    go("d2h:0,1,2", {D(0, 0), D(1, 1), D(2, 2)});
++    go("d2h:1,2,3", {D(1, 1), D(2, 2), D(3, 3)});
++    go("d2h:0,1,2,3", {D(0, 0), D(1, 1), D(2, 2), D(3, 3)});
++    go("h2d_onebuf:0", {H(0, 4)});
++    go("h2d_onebuf:0,1", {H(0, 4), H(1, 4)});
++    go("h2d_onebuf:0,2", {H(0, 4), H(2, 4)});
++    go("h2d_onebuf:1,2,3", {H(1, 4), H(2, 4), H(3, 4)});
++    go("h2d_onebuf:0,1,2,3", {H(0, 4), H(1, 4), H(2, 4), H(3, 4)});
++    go("h2d_sepbuf:1,2,3", {H(1, 1), H(2, 2), H(3, 3)});
++    go("h2d_sepbuf:0,1,2,3", {H(0, 0), H(1, 1), H(2, 2), H(3, 3)});
++    go("duplex:d2h0+h2d0", {D(0, 0), H(0, 4)});
++    go("duplex:d2h0+h2d2", {D(0, 0), H(2, 4)});
++    go("duplex:d2h0,1+h2d2,3", {D(0, 0), D(1, 1), H(2, 4), H(3, 4)});
++    go("duplex:d2h0-3+h2d0-3",
++       {D(0, 0), D(1, 1), D(2, 2), D(3, 3), H(0, 4), H(1, 4), H(2, 4), H(3, 4)});
++    go("p2p:01", {Pp(0, 1)});
++    go("p2p:23", {Pp(2, 3)});
++    go("p2p:01+23", {Pp(0, 1), Pp(2, 3)});
++    go("p2p:01+10", {Pp(0, 1), Pp(1, 0)});
++    go("p2p:01+10+23+32", {Pp(0, 1), Pp(1, 0), Pp(2, 3), Pp(3, 2)});
++    go("p2p:01x2_same_dir", {Pp(0, 1), Pp(0, 1, BG)});
++    go("p2p:01+d2h0", {Pp(0, 1), D(0, 0)});
++    go("p2p:01+h2d1", {Pp(0, 1), {'H', -1, 1, 4, PART, BG}});
++    go("p2p:01+h2d0", {Pp(0, 1), H(0, 4)});
++    go("p2p:01+d2h1", {Pp(0, 1), D(1, 1)});
++    go("p2p:01+d2h2+h2d3", {Pp(0, 1), D(2, 2), H(3, 4)});
++    go("peerapi_cross:02", {Pp(0, 2)});
++    go("peerapi_cross:02+13", {Pp(0, 2), Pp(1, 3)});
++    go("peerapi_cross:02+20", {Pp(0, 2), Pp(2, 0)});
++    go("peerapi_cross:02+p2p01", {Pp(0, 2), Pp(0, 1)});
++    go("peerapi_cross:02+12", {Pp(0, 2), Pp(1, 2, BG)});
++    go("bounce:02", {Bb(0, 2, 0)});
++    go("bounce:02+13", {Bb(0, 2, 0), Bb(1, 3, 1)});
++    go("bounce:02+20", {Bb(0, 2, 0), Bb(2, 0, 2)});
++    go("bounce:02+p2p01", {Bb(0, 2, 0), Pp(0, 1)});
++    go("bounce:02+13+20+31", {Bb(0, 2, 0), Bb(1, 3, 1), Bb(2, 0, 2), Bb(3, 1, 3)});
++    go("bounce:02+03", {Bb(0, 2, 0), Bb(0, 3, 1)});
++    go("bounce:02+12", {Bb(0, 2, 0), Bb(1, 2, 1, BG)});
++  }
++}
++
++// =============================== DF shape ===============================
++
++// Today (engine HOST_STAGED loop, sirius_dynamic_bloom_filter.cu): star through root 0, one
++// staging window per chunk, a host sync after every leg.
++double sched_today(size_t B, bool blocks, size_t chunk_override)
++{
++  size_t const chunk =
++    chunk_override != 0 ? chunk_override : std::clamp<size_t>(B / 8, 2 * MiB, 8 * MiB);
++  char* const stage = blocks ? hreg : hb[4];
++  for (size_t off = 0; off < B; off += chunk) {
++    size_t const n = std::min(chunk, B - off);
++    for (int s = 1; s < G; ++s) {
++      CK(cudaSetDevice(s));
++      copy_host(dv[s].st[KS], P(s) + off, stage, n, true, blocks);
++      CK(cudaStreamSynchronize(dv[s].st[KS]));
++      CK(cudaSetDevice(0));
++      copy_host(dv[0].st[KS], S(0), stage, n, false, blocks);
++      CK(cudaStreamSynchronize(dv[0].st[KS]));
++      CK(launch_or(P(0) + off, S(0), n, dv[0].st[KS]));
++    }
++    CK(cudaSetDevice(0));
++    copy_host(dv[0].st[KS], P(0) + off, stage, n, true, blocks);
++    CK(cudaStreamSynchronize(dv[0].st[KS]));
++    for (int t = 1; t < G; ++t) {
++      CK(cudaSetDevice(t));
++      copy_host(dv[t].st[KS], P(t) + off, stage, n, false, blocks);
++    }
++    for (int t = 1; t < G; ++t) {
++      CK(cudaSetDevice(t));
++      CK(cudaStreamSynchronize(dv[t].st[KS]));
++    }
++  }
++  sync_streams();
++  return -1;
++}
++
++// The engine's PEER_COPY pipeline (chunk_pipeline): star through root 0, cudaMemcpyPeerAsync on
++// every leg, two scratch slots per source, event-chained, one final wait. With Gn == 4 on this
++// machine the cross-pair legs are staged by the driver.
++double sched_star_peer(int Gn, size_t B, size_t chunk, int K)
++{
++  ev_t fr[3][4]{};
++  double const t0 = now_ms();
++  size_t i        = 0;
++  for (size_t off = 0; off < B; off += chunk, ++i) {
++    size_t const n = std::min(chunk, B - off);
++    int const j    = static_cast<int>(i % static_cast<size_t>(K));
++    ev_t last      = nullptr;
++    for (int s = 1; s < Gn; ++s) {
++      char* const slot = S(0) + (static_cast<size_t>(s - 1) * K + j) * chunk;
++      ev_t const e     = op_p2p(0, RX, slot, s, P(s) + off, n, {fr[s - 1][j]});
++      last             = op_or(0, KS, P(0) + off, slot, n, {e});
++      fr[s - 1][j]     = last;
++    }
++    for (int t = 1; t < Gn; ++t) { op_p2p(t, RX, P(t) + off, 0, P(0) + off, n, {last}); }
++  }
++  double const sub = now_ms() - t0;
++  sync_streams();
++  return sub;
++}
++
++// Same star, explicit host bounce on every leg, pipelined (no P2P anywhere, OR on the root GPU).
++double sched_star_pipe(size_t B, size_t chunk, int K)
++{
++  static const int rxs[3] = {RX, RX2, AUX};
++  ev_t inf[3][4]{}, sf[3][4]{}, rf[4][3]{};
++  double const t0 = now_ms();
++  size_t i        = 0;
++  for (size_t off = 0; off < B; off += chunk, ++i) {
++    size_t const n = std::min(chunk, B - off);
++    int const j    = static_cast<int>(i % static_cast<size_t>(K));
++    ev_t last      = nullptr;
++    for (int s = 1; s < G; ++s) {
++      int const si     = s - 1;
++      char* const hs   = hb[s] + j * chunk;
++      char* const slot = S(0) + (static_cast<size_t>(si) * K + j) * chunk;
++      ev_t const e1    = op_d2h(s, TX, hs, P(s) + off, n, {inf[si][j]});
++      ev_t const e2    = op_h2d(0, rxs[si], slot, hs, n, {e1, sf[si][j]});
++      inf[si][j]       = e2;
++      last             = op_or(0, KS, P(0) + off, slot, n, {e2});
++      sf[si][j]        = last;
++    }
++    char* const hr = hb[0] + j * chunk;
++    ev_t const er  = op_d2h(0, TX, hr, P(0) + off, n, {last, rf[j][0], rf[j][1], rf[j][2]});
++    for (int t = 1; t < G; ++t) { rf[j][t - 1] = op_h2d(t, RX, P(t) + off, hr, n, {er}); }
++  }
++  double const sub = now_ms() - t0;
++  sync_streams();
++  return sub;
++}
++
++// Hypercube all-reduce: round 1 exchanges inside the pairs (g <-> g^1), round 2 across the pairs
++// (g <-> g^2). Every GPU ORs what it receives into its own array; nobody is a root.
++double sched_hyper(int Gn, size_t B, size_t chunk, int K, transport r1, transport r2)
++{
++  ev_t af[4][4]{}, bf[4][4]{}, h1[4][4]{}, h2[4][4]{};
++  double const t0 = now_ms();
++  size_t i        = 0;
++  for (size_t off = 0; off < B; off += chunk, ++i) {
++    size_t const n = std::min(chunk, B - off);
++    int const j    = static_cast<int>(i % static_cast<size_t>(K));
++    ev_t in1[4]{}, or1[4]{}, in2[4]{};
++    for (int g = 0; g < Gn; ++g) {
++      int const p = g ^ 1;
++      in1[g] = xfer(r1, g, RX, S(g) + j * chunk, p, TX, P(p) + off, n, {}, {af[g][j]},
++                    hb[g] + j * chunk, &h1[g][j]);
++    }
++    for (int g = 0; g < Gn; ++g) {
++      or1[g]   = op_or(g, KS, P(g) + off, S(g) + j * chunk, n, {in1[g], in1[g ^ 1]});
++      af[g][j] = or1[g];
++    }
++    if (Gn == 4) {
++      for (int g = 0; g < Gn; ++g) {
++        int const p = g ^ 2;
++        in2[g] = xfer(r2, g, RX2, S(g) + static_cast<size_t>(K + j) * chunk, p, TX2, P(p) + off, n,
++                      {or1[p]}, {bf[g][j]}, hb[g] + static_cast<size_t>(K + j) * chunk, &h2[g][j]);
++      }
++      for (int g = 0; g < Gn; ++g) {
++        bf[g][j] = op_or(g, KS2, P(g) + off, S(g) + static_cast<size_t>(K + j) * chunk, n,
++                         {in2[g], in2[g ^ 2], or1[g]});
++      }
++    }
++  }
++  double const sub = now_ms() - t0;
++  sync_streams();
++  return sub;
++}
++
++// Pair-local P2P merge (1 -> 0, 3 -> 2), symmetric cross-pair exchange 0 <-> 2 (bounce or peer
++// API), then P2P fan-out 0 -> 1 and 2 -> 3.
++double sched_c2(size_t B, size_t chunk, int K, transport r2)
++{
++  ev_t af[4][4]{}, bf[4][4]{}, hf[4][4]{};
++  double const t0 = now_ms();
++  size_t i        = 0;
++  for (size_t off = 0; off < B; off += chunk, ++i) {
++    size_t const n = std::min(chunk, B - off);
++    int const j    = static_cast<int>(i % static_cast<size_t>(K));
++    ev_t or1[4]{}, in2[4]{}, or2[4]{};
++    for (int r : {0, 2}) {
++      char* const slot = S(r) + j * chunk;
++      ev_t const e     = op_p2p(r, RX, slot, r + 1, P(r + 1) + off, n, {af[r][j]});
++      or1[r]           = op_or(r, KS, P(r) + off, slot, n, {e});
++      af[r][j]         = or1[r];
++    }
++    for (int r : {0, 2}) {
++      int const p = r ^ 2;
++      in2[r] = xfer(r2, r, RX2, S(r) + static_cast<size_t>(K + j) * chunk, p, TX, P(p) + off, n,
++                    {or1[p]}, {bf[r][j]}, hb[r] + j * chunk, &hf[r][j]);
++    }
++    for (int r : {0, 2}) {
++      or2[r]   = op_or(r, KS2, P(r) + off, S(r) + static_cast<size_t>(K + j) * chunk, n,
++                       {in2[r], in2[r ^ 2], or1[r]});
++      bf[r][j] = or2[r];
++    }
++    for (int r : {0, 2}) { op_p2p(r + 1, RX, P(r + 1) + off, r, P(r) + off, n, {or2[r]}); }
++  }
++  double const sub = now_ms() - t0;
++  sync_streams();
++  return sub;
++}
++
++// The schedule as literally proposed: pair-local P2P merge, ONE cross-pair bounce 2 -> 0, then
++// fan-out 0 -> 1 by P2P and 0 -> host once -> 2, and 2 -> 3 by P2P (relay) or host -> 3.
++double sched_c1(size_t B, size_t chunk, int K, bool relay)
++{
++  ev_t af[4][4]{}, bf[4]{}, hf2[4]{}, f2[4]{}, f3[4]{};
++  double const t0 = now_ms();
++  size_t i        = 0;
++  for (size_t off = 0; off < B; off += chunk, ++i) {
++    size_t const n = std::min(chunk, B - off);
++    int const j    = static_cast<int>(i % static_cast<size_t>(K));
++    ev_t or1[4]{};
++    for (int r : {0, 2}) {
++      char* const slot = S(r) + j * chunk;
++      ev_t const e     = op_p2p(r, RX, slot, r + 1, P(r + 1) + off, n, {af[r][j]});
++      or1[r]           = op_or(r, KS, P(r) + off, slot, n, {e});
++      af[r][j]         = or1[r];
++    }
++    char* const slot2 = S(0) + static_cast<size_t>(K + j) * chunk;
++    ev_t const eb = xfer(BOUNCE, 0, RX2, slot2, 2, TX, P(2) + off, n, {or1[2]}, {bf[j]},
++                         hb[2] + j * chunk, &hf2[j]);
++    ev_t const ef = op_or(0, KS2, P(0) + off, slot2, n, {eb, or1[0]});
++    bf[j]         = ef;
++    op_p2p(1, RX, P(1) + off, 0, P(0) + off, n, {ef});
++    char* const hs = hb[0] + j * chunk;
++    ev_t const eF  = op_d2h(0, TX, hs, P(0) + off, n, {ef, f2[j], f3[j]});
++    ev_t const e2  = op_h2d(2, RX2, P(2) + off, hs, n, {eF});
++    f2[j]          = e2;
++    if (relay) {
++      op_p2p(3, RX2, P(3) + off, 2, P(2) + off, n, {e2});
++    } else {
++      f3[j] = op_h2d(3, RX2, P(3) + off, hs, n, {eF});
++    }
++  }
++  double const sub = now_ms() - t0;
++  sync_streams();
++  return sub;
++}
++
++// Host OR, three synced phases: all D2H in parallel, OR on the CPU, all H2D in parallel.
++double sched_hostor_3phase(size_t B, int nt)
++{
++  for (int g = 0; g < G; ++g) { op_d2h(g, TX, hb[g], P(g), B); }
++  for (int g = 0; g < G; ++g) { sync_stream(g, TX); }
++  char* in[4] = {hb[0], hb[1], hb[2], hb[3]};
++  host_or(hb[4], in, G, B, nt);
++  for (int g = 0; g < G; ++g) { op_h2d(g, RX, P(g), hb[4], B); }
++  for (int g = 0; g < G; ++g) { sync_stream(g, RX); }
++  return -1;
++}
++
++// Host OR, pipelined per chunk: every D2H is queued up front; the host waits for chunk i from
++// all GPUs, ORs it, and queues its four uploads while later chunks are still downloading.
++double sched_hostor_pipe(size_t B, size_t chunk, int nt)
++{
++  size_t const nch = (B + chunk - 1) / chunk;
++  std::vector<ev_t> ev(static_cast<size_t>(G) * nch);
++  double const t0 = now_ms();
++  for (int g = 0; g < G; ++g) {
++    for (size_t i = 0; i < nch; ++i) {
++      size_t const off = i * chunk;
++      ev[static_cast<size_t>(g) * nch + i] =
++        op_d2h(g, TX, hb[g] + off, P(g) + off, std::min(chunk, B - off));
++    }
++  }
++  double const sub = now_ms() - t0;
++  for (size_t i = 0; i < nch; ++i) {
++    size_t const off = i * chunk;
++    size_t const n   = std::min(chunk, B - off);
++    char* in[4];
++    for (int g = 0; g < G; ++g) {
++      CK(cudaSetDevice(g));
++      CK(cudaEventSynchronize(ev[static_cast<size_t>(g) * nch + i]));
++      in[g] = hb[g] + off;
++    }
++    host_or(hb[4] + off, in, G, n, nt);
++    for (int g = 0; g < G; ++g) { op_h2d(g, RX, P(g) + off, hb[4] + off, n); }
++  }
++  for (int g = 0; g < G; ++g) { sync_stream(g, RX); }
++  return sub;
++}
++
++// Pair-local P2P merge on the GPUs, then host OR of the two pair results, uploads to all four.
++double sched_pairhostor_pipe(size_t B, size_t chunk, int K, int nt)
++{
++  size_t const nch = (B + chunk - 1) / chunk;
++  std::vector<ev_t> ev(2 * nch);
++  ev_t af[4][4]{};
++  double const t0 = now_ms();
++  for (size_t i = 0; i < nch; ++i) {
++    size_t const off = i * chunk;
++    size_t const n   = std::min(chunk, B - off);
++    int const j      = static_cast<int>(i % static_cast<size_t>(K));
++    for (int r : {0, 2}) {
++      char* const slot = S(r) + j * chunk;
++      ev_t const e     = op_p2p(r, RX, slot, r + 1, P(r + 1) + off, n, {af[r][j]});
++      ev_t const o     = op_or(r, KS, P(r) + off, slot, n, {e});
++      af[r][j]         = o;
++      ev[static_cast<size_t>(r / 2) * nch + i] = op_d2h(r, TX, hb[r] + off, P(r) + off, n, {o});
++    }
++  }
++  double const sub = now_ms() - t0;
++  for (size_t i = 0; i < nch; ++i) {
++    size_t const off = i * chunk;
++    size_t const n   = std::min(chunk, B - off);
++    char* in[2];
++    for (int r : {0, 2}) {
++      CK(cudaSetDevice(r));
++      CK(cudaEventSynchronize(ev[static_cast<size_t>(r / 2) * nch + i]));
++      in[r / 2] = hb[r] + off;
++    }
++    host_or(hb[4] + off, in, 2, n, nt);
++    for (int g = 0; g < G; ++g) { op_h2d(g, RX2, P(g) + off, hb[4] + off, n); }
++  }
++  sync_streams();
++  return sub;
++}
++
++void run_df(size_t B, std::string const& sfx, int mode)
++{
++  uint64_t salt   = 0;
++  auto const prep = [&](int) {
++    salt = ++g_salt;
++    for (int g = 0; g < G; ++g) { fill(g, P(g), B, 1u << g, salt); }
++  };
++  auto const ver4 = [&]() -> unsigned long long {
++    unsigned long long m = 0;
++    for (int g = 0; g < G; ++g) { m += verify(g, P(g), B, 0xFu, salt); }
++    return m;
++  };
++  auto const ver2 = [&]() -> unsigned long long {
++    return verify(0, P(0), B, 0x3u, salt) + verify(1, P(1), B, 0x3u, salt);
++  };
++  auto go = [&](std::string const& nm, std::function<double()> const& fn, bool pair = false) {
++    result_t st = measure(nm.c_str(), g_reps, prep, fn,
++                      pair ? std::function<unsigned long long()>(ver2)
++                           : std::function<unsigned long long()>(ver4));
++    report("df", "B=" + mib(B) + "|" + nm + sfx, B, st);
++  };
++  size_t const c8 = 8 * MiB, c32 = 32 * MiB, c64 = 64 * MiB, c256 = 256 * MiB;
++  if (mode == 2) {  // leg-size / robustness set for the contention follow-up
++    if (B <= 300 * MiB) { go("today|blk=1m_batch", [&] { return sched_today(B, true, 0); }); }
++    go("c2|r2=bounce|chunk=32", [&] { return sched_c2(B, c32, 2, BOUNCE); });
++    go("c2|r2=bounce|chunk=256", [&] { return sched_c2(B, c256, 2, BOUNCE); });
++    go("c2|r2=bounce|chunk=whole", [&] { return sched_c2(B, B, 1, BOUNCE); });
++    go("c1|fan=relay|chunk=whole", [&] { return sched_c1(B, B, 1, true); });
++    go("hostor_pipe|chunk=32|threads=16", [&] { return sched_hostor_pipe(B, c32, 16); });
++    go("hostor_pipe|chunk=256|threads=16", [&] { return sched_hostor_pipe(B, c256, 16); });
++    go("hostor_3phase|threads=16", [&] { return sched_hostor_3phase(B, 16); });
++    go("pairhostor_pipe|chunk=32|threads=16", [&] { return sched_pairhostor_pipe(B, c32, 2, 16); });
++    go("pairhostor_pipe|chunk=whole|threads=16",
++       [&] { return sched_pairhostor_pipe(B, B, 1, 16); });
++    return;
++  }
++  go("today|blk=1m_batch", [&] { return sched_today(B, true, 0); });
++  go("hyper|r1=p2p|r2=bounce|chunk=32", [&] { return sched_hyper(4, B, c32, 2, PEERAPI, BOUNCE); });
++  go("c2|r2=bounce|chunk=32", [&] { return sched_c2(B, c32, 2, BOUNCE); });
++  go("hostor_pipe|chunk=32|threads=16", [&] { return sched_hostor_pipe(B, c32, 16); });
++  go("star_peerapi|chunk=8", [&] { return sched_star_peer(4, B, c8, 2); });
++  if (mode == 1) { return; }
++  go("today|blk=contig", [&] { return sched_today(B, false, 0); });
++  go("today|blk=contig|chunk=64", [&] { return sched_today(B, false, c64); });
++  go("star_peerapi|chunk=32", [&] { return sched_star_peer(4, B, c32, 2); });
++  go("star_pipe|chunk=8", [&] { return sched_star_pipe(B, c8, 2); });
++  go("star_pipe|chunk=32", [&] { return sched_star_pipe(B, c32, 2); });
++  go("c1|fan=relay|chunk=32", [&] { return sched_c1(B, c32, 2, true); });
++  go("c1|fan=host3|chunk=32", [&] { return sched_c1(B, c32, 2, false); });
++  go("c2|r2=bounce|chunk=8", [&] { return sched_c2(B, c8, 2, BOUNCE); });
++  go("c2|r2=bounce|chunk=64", [&] { return sched_c2(B, c64, 2, BOUNCE); });
++  go("c2|r2=peerapi|chunk=32", [&] { return sched_c2(B, c32, 2, PEERAPI); });
++  go("hyper|r1=p2p|r2=bounce|chunk=8", [&] { return sched_hyper(4, B, c8, 2, PEERAPI, BOUNCE); });
++  go("hyper|r1=p2p|r2=bounce|chunk=64", [&] { return sched_hyper(4, B, c64, 2, PEERAPI, BOUNCE); });
++  go("hyper|r1=p2p|r2=peerapi|chunk=32",
++     [&] { return sched_hyper(4, B, c32, 2, PEERAPI, PEERAPI); });
++  go("hyper|r1=bounce|r2=bounce|chunk=32",
++     [&] { return sched_hyper(4, B, c32, 2, BOUNCE, BOUNCE); });
++  go("hostor_3phase|threads=16", [&] { return sched_hostor_3phase(B, 16); });
++  go("hostor_pipe|chunk=8|threads=16", [&] { return sched_hostor_pipe(B, c8, 16); });
++  go("hostor_pipe|chunk=64|threads=16", [&] { return sched_hostor_pipe(B, c64, 16); });
++  go("hostor_pipe|chunk=32|threads=4", [&] { return sched_hostor_pipe(B, c32, 4); });
++  go("hostor_pipe|chunk=32|threads=8", [&] { return sched_hostor_pipe(B, c32, 8); });
++  go("hostor_pipe|chunk=32|threads=32", [&] { return sched_hostor_pipe(B, c32, 32); });
++  go("pairhostor_pipe|chunk=32|threads=16", [&] { return sched_pairhostor_pipe(B, c32, 2, 16); });
++  // G = 2 references on the P2P pair (0, 1): the engine's PEER pipeline and a duplex exchange.
++  go("pair01_star_peer|chunk=8", [&] { return sched_star_peer(2, B, c8, 2); }, true);
++  go("pair01_star_peer|chunk=32", [&] { return sched_star_peer(2, B, c32, 2); }, true);
++  go("pair01_exchange|chunk=8", [&] { return sched_hyper(2, B, c8, 2, PEERAPI, PEERAPI); }, true);
++  go("pair01_exchange|chunk=32", [&] { return sched_hyper(2, B, c32, 2, PEERAPI, PEERAPI); },
++     true);
++  go("pair01_exchange_bounce|chunk=32",
++     [&] { return sched_hyper(2, B, c32, 2, BOUNCE, BOUNCE); }, true);
++}
++
++// =============================== contention ===============================
++
++void test_cont(std::vector<size_t> const& dfsizes, int dfmode, bool legs,
++               std::vector<int> const& modes)
++{
++  for (int mode : modes) {
++    std::atomic<bool> stop{false};
++    std::atomic<uint64_t> bytes_p2p{0}, bytes_host{0};
++    std::vector<std::thread> th;
++    if ((mode & 1) != 0) {  // P2P 0 -> 1, whole buffers, back to back
++      th.emplace_back([&] {
++        while (!stop.load()) {
++          CK(cudaSetDevice(1));
++          CK(cudaMemcpyPeerAsync(dv[1].buf[BG], 1, dv[0].buf[BG], 0, g_bgleg, dv[1].st[AUX2]));
++          CK(cudaStreamSynchronize(dv[1].st[AUX2]));
++          bytes_p2p += g_bgleg;
++        }
++      });
++    }
++    if ((mode & 2) != 0) {  // host-staged 0 -> 2: whole D2H, then whole H2D (cuCascade's shape)
++      th.emplace_back([&] {
++        while (!stop.load()) {
++          CK(cudaSetDevice(0));
++          CK(cudaMemcpyAsync(hb[5], dv[0].buf[RPART], g_bgleg, cudaMemcpyDeviceToHost,
++                             dv[0].st[AUX2]));
++          CK(cudaStreamSynchronize(dv[0].st[AUX2]));
++          CK(cudaSetDevice(2));
++          CK(cudaMemcpyAsync(dv[2].buf[BG], hb[5], g_bgleg, cudaMemcpyHostToDevice,
++                             dv[2].st[AUX2]));
++          CK(cudaStreamSynchronize(dv[2].st[AUX2]));
++          bytes_host += g_bgleg;
++        }
++      });
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    double const t0       = now_ms();
++    std::string const sfx = std::string("|bg=") + (mode == 0   ? "none"
++                                                   : mode == 1 ? "p2p01"
++                                                   : mode == 2 ? "host02"
++                                                               : "p2p01+host02") +
++                            "|bgleg=" + mib(g_bgleg);
++    for (size_t B : dfsizes) { run_df(B, sfx, dfmode); }
++    size_t const n = BMAX;
++    if (legs) {
++    run_legs("cont", "n=" + mib(n) + "|p2p:01" + sfx, {Pp(0, 1)}, n);
++    run_legs("cont", "n=" + mib(n) + "|p2p:23" + sfx, {Pp(2, 3)}, n);
++    run_legs("cont", "n=" + mib(n) + "|bounce:02" + sfx, {Bb(0, 2, 0)}, n);
++    run_legs("cont", "n=" + mib(n) + "|bounce:13" + sfx, {Bb(1, 3, 1)}, n);
++    }
++    double const el = (now_ms() - t0) / 1000.0;
++    stop.store(true);
++    for (auto& t : th) { t.join(); }
++    std::printf("I|cont|%s|bg_p2p_gibps=%.2f|bg_host_gibps=%.2f\n", sfx.c_str() + 1,
++                static_cast<double>(bytes_p2p.load()) / static_cast<double>(1ull << 30) / el,
++                static_cast<double>(bytes_host.load()) / static_cast<double>(1ull << 30) / el);
++    std::fflush(stdout);
++    sync_all();
++  }
++}
++
++std::vector<size_t> parse_sizes(std::string const& s)
++{
++  std::vector<size_t> out;
++  size_t pos = 0;
++  while (pos < s.size()) {
++    size_t const end = s.find(',', pos);
++    std::string const tok = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
++    if (!tok.empty()) { out.push_back(static_cast<size_t>(std::stoull(tok)) * MiB); }
++    if (end == std::string::npos) { break; }
++    pos = end + 1;
++  }
++  return out;
++}
++
++bool has(std::string const& tests, char const* t)
++{
++  return ("," + tests + ",").find(std::string(",") + t + ",") != std::string::npos;
++}
++
++}  // namespace
++
++int main(int argc, char** argv)
++{
++  std::string tests = "leg,pair,fan,hostor,conc,df,cont";
++  std::vector<size_t> sizes   = parse_sizes("8,64,256,1434");
++  std::vector<size_t> dfsizes = parse_sizes("57,281,1434");
++  std::vector<size_t> fansizes = parse_sizes("1,16,281,1434");
++  bool pair_all = true;
++  for (int i = 1; i < argc; ++i) {
++    std::string const a = argv[i];
++    size_t const eq     = a.find('=');
++    if (eq == std::string::npos) { continue; }
++    std::string const k = a.substr(0, eq), v = a.substr(eq + 1);
++    if (k == "tests") {
++      tests = v;
++    } else if (k == "sizes") {
++      sizes = parse_sizes(v);
++    } else if (k == "dfsizes") {
++      dfsizes = parse_sizes(v);
++    } else if (k == "fansizes") {
++      fansizes = parse_sizes(v);
++    } else if (k == "reps") {
++      g_reps = std::max(1, std::atoi(v.c_str()));
++    } else if (k == "bmax") {
++      BMAX = static_cast<size_t>(std::stoull(v)) * MiB;
++    } else if (k == "bgleg") {
++      g_bgleg = static_cast<size_t>(std::stoull(v)) * MiB;
++    } else if (k == "nopeer") {
++      g_nopeer = v != "0";
++    } else if (k == "probe") {
++      g_probe = v != "0";
++    } else if (k == "pairmethods") {
++      pair_all = v != "peer";
++    }
++  }
++  HSZ = std::max(2 * BMAX, 512 * MiB);  // room for whole-array scratch slots
++  if (g_bgleg == 0) { g_bgleg = BMAX; }
++  setup();
++  if (G < 4) {
++    std::fprintf(stderr, "needs 4 GPUs\n");
++    return 1;
++  }
++  if (has(tests, "leg")) { test_leg(sizes); }
++  if (has(tests, "pair")) { test_pair(sizes, pair_all); }
++  if (has(tests, "fan")) { test_fan(fansizes); }
++  if (has(tests, "hostor")) { test_hostor({32 * MiB, std::min(BMAX, 1434 * MiB)}); }
++  if (has(tests, "conc")) { test_conc({std::min<size_t>(256 * MiB, BMAX), BMAX}); }
++  if (has(tests, "df")) {
++    for (size_t B : dfsizes) { run_df(B, "", 0); }
++  }
++  if (has(tests, "cont")) { test_cont(dfsizes, 1, true, {0, 1, 2, 3}); }
++  if (has(tests, "cont2")) {
++    test_cont(dfsizes, 2, false, {0, 2, 3});
++    g_bgleg = 64 * MiB;
++    test_cont(dfsizes, 2, false, {2, 3});
++  }
++  std::printf("I|done\n");
++  return 0;
++}
+diff --git a/bench/transfer/xfer_kernels.cu b/bench/transfer/xfer_kernels.cu
+new file mode 100644
+index 00000000..b88fbfee
+--- /dev/null
++++ b/bench/transfer/xfer_kernels.cu
+@@ -0,0 +1,104 @@
++// Kernels for the transfer-primitive microbenchmark (prototype tooling, not engine code).
++#include <cuda_runtime.h>
++
++#include <cstddef>
++#include <cstdint>
++
++namespace {
++
++__device__ __forceinline__ uint64_t mix(uint64_t x)
++{
++  x += 0x9E3779B97F4A7C15ull;
++  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
++  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
++  return x ^ (x >> 31);
++}
++
++// Word i of the "partial" owned by every device in `mask`, OR-ed together.
++__device__ __forceinline__ uint64_t pattern(uint64_t i, unsigned mask, uint64_t salt)
++{
++  uint64_t v = 0;
++  for (unsigned g = 0; g < 4; ++g) {
++    if ((mask >> g) & 1u) {
++      uint64_t a = mix(i * 4 + g + salt * 0x100000001B3ull);
++      v |= a & mix(a ^ 0x5555555555555555ull);
++    }
++  }
++  return v;
++}
++
++__global__ void k_fill(uint64_t* p, size_t n, unsigned mask, uint64_t salt)
++{
++  size_t const stride = static_cast<size_t>(gridDim.x) * blockDim.x;
++  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
++    p[i] = pattern(i, mask, salt);
++  }
++}
++
++__global__ void k_verify(uint64_t const* p,
++                         size_t n,
++                         unsigned mask,
++                         uint64_t salt,
++                         unsigned long long* mismatches)
++{
++  size_t const stride = static_cast<size_t>(gridDim.x) * blockDim.x;
++  unsigned long long bad = 0;
++  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
++    bad += (p[i] != pattern(i, mask, salt)) ? 1ull : 0ull;
++  }
++  if (bad != 0) { atomicAdd(mismatches, bad); }
++}
++
++// Same shape as the engine's or_bloom_chunk: 16-byte loads/stores, 256 threads, <= 4096 blocks.
++__global__ void k_or(uint4* dst, uint4 const* src, size_t n)
++{
++  size_t const stride = static_cast<size_t>(gridDim.x) * blockDim.x;
++  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
++    uint4 a       = dst[i];
++    uint4 const b = src[i];
++    a.x |= b.x;
++    a.y |= b.y;
++    a.z |= b.z;
++    a.w |= b.w;
++    dst[i] = a;
++  }
++}
++
++unsigned grid_for(size_t n)
++{
++  size_t const blocks = (n + 255) / 256;
++  return static_cast<unsigned>(blocks < 1 ? 1 : (blocks > 4096 ? 4096 : blocks));
++}
++
++}  // namespace
++
++// All launchers run on the caller's current device.
++cudaError_t launch_fill(void* p, size_t bytes, unsigned mask, uint64_t salt, cudaStream_t stream)
++{
++  size_t const n = bytes / 8;
++  if (n == 0) { return cudaSuccess; }
++  k_fill<<<grid_for(n), 256, 0, stream>>>(static_cast<uint64_t*>(p), n, mask, salt);
++  return cudaGetLastError();
++}
++
++cudaError_t launch_verify(void const* p,
++                          size_t bytes,
++                          unsigned mask,
++                          uint64_t salt,
++                          unsigned long long* mismatches,
++                          cudaStream_t stream)
++{
++  size_t const n = bytes / 8;
++  if (n == 0) { return cudaSuccess; }
++  k_verify<<<grid_for(n), 256, 0, stream>>>(
++    static_cast<uint64_t const*>(p), n, mask, salt, mismatches);
++  return cudaGetLastError();
++}
++
++cudaError_t launch_or(void* dst, void const* src, size_t bytes, cudaStream_t stream)
++{
++  size_t const n = bytes / 16;
++  if (n == 0) { return cudaSuccess; }
++  k_or<<<grid_for(n), 256, 0, stream>>>(static_cast<uint4*>(dst), static_cast<uint4 const*>(src), n);
++  return cudaGetLastError();
++}

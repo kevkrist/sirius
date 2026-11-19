@@ -1,0 +1,606 @@
+From 8a18c918bcf5474042a8b0bf892db205593d1fcf Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-42-26.ec2.internal>
+Date: Thu, 19 Nov 2026 19:25:46 +0000
+Subject: [PATCH 1/3] recovered prototype: proto(op2): DEBUG logging of
+ consumer gate state per filter (decode + endpoint)
+
+---
+ src/op/scan/dynamic_filter_merge.cpp          | 139 +++++++++++++++++-
+ src/op/scan/sirius_gpu_scan_operator_data.cpp |  20 ++-
+ 2 files changed, 157 insertions(+), 2 deletions(-)
+
+diff --git a/src/op/scan/dynamic_filter_merge.cpp b/src/op/scan/dynamic_filter_merge.cpp
+index 9097702f..6b45159a 100644
+--- a/src/op/scan/dynamic_filter_merge.cpp
++++ b/src/op/scan/dynamic_filter_merge.cpp
+@@ -53,6 +53,7 @@
+ #include <optional>
+ #include <span>
+ #include <stdexcept>
++#include <string>
+ #include <thread>
+ #include <type_traits>
+ #include <utility>
+@@ -439,6 +440,32 @@ struct static_selectivity {
+   return {};
+ }
+ 
++/// PROTO(op2) diagnostic: one-token description of a filter for the gate-state DEBUG lines.
++[[nodiscard]] std::string describe_filter(sirius::op::sirius_dynamic_filter const& filter)
++{
++  std::string out;
++  if (auto const* small =
++        dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(&filter)) {
++    out = "small_in_list:" + std::to_string(small->size());
++  } else if (auto const* set =
++               dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(&filter)) {
++    out = "hash_in_list:" + std::to_string(set->size());
++  } else if (auto const* bloom =
++               dynamic_cast<sirius::op::sirius_dynamic_bloom_filter const*>(&filter)) {
++    out = "bloom:" + std::to_string(bloom->storage_bytes());
++  } else {
++    out = "other";
++  }
++  out += "@" + std::to_string(reinterpret_cast<std::uintptr_t>(&filter) & 0xffffff);
++  if (auto const est = filter.estimated_selectivity()) { out += " est=" + std::to_string(*est); }
++  return out;
++}
++
++[[nodiscard]] std::string keep_text(std::optional<double> const& keep)
++{
++  return keep ? std::to_string(*keep) : std::string{"?"};
++}
++
+ struct candidate {
+   applied_entry identity;
+   cudf::size_type column_index;
+@@ -532,6 +559,17 @@ std::unique_ptr<application_program_state> prepare_state(
+   if (input.source.num_rows() == 0 || input.source.num_columns() == 0) { return nullptr; }
+   gate_selection selection{};
+   auto candidates = capture_candidates(snapshot, gate, input.bindings, selection);
++  SIRIUS_LOG_DEBUG(
++    "[df_gate] endpoint ch={} gen={} rows={} candidates={} applicable={} needs_combined={} "
++    "decode_trains={} history_known={}",
++    static_cast<void const*>(endpoint.get()),
++    snapshot.generation(),
++    input.source.num_rows(),
++    candidates.size(),
++    selection.applicable,
++    selection.needs_combined_sample,
++    selection.decode_trains,
++    history_known);
+   if (!selection.applicable) { return nullptr; }
+   auto program              = std::make_unique<application_program_state>();
+   program->snapshot         = std::move(snapshot);
+@@ -559,6 +597,19 @@ std::unique_ptr<application_program_state> prepare_state(
+     if (covered_by(program->receipt.applied) ||
+         !current.identity.filter->is_available_on_device(program->device_id) ||
+         !accepts_carrier(*current.identity.filter, program->types[current.column_index])) {
++      SIRIUS_LOG_DEBUG(
++        "[df_gate] endpoint ch={} gen={} rows={} filter=[{}] ord={} col={} decision=skip reason={}",
++        static_cast<void const*>(endpoint.get()),
++        program->snapshot.generation(),
++        program->rows,
++        describe_filter(*current.identity.filter),
++        current.identity.output_ordinal,
++        current.column_index,
++        covered_by(program->receipt.applied)
++          ? "already_applied"
++          : (!current.identity.filter->is_available_on_device(program->device_id)
++               ? "no_replica_on_device"
++               : "carrier_type"));
+       continue;
+     }
+     auto const* mask =
+@@ -577,7 +628,19 @@ std::unique_ptr<application_program_state> prepare_state(
+       if (!representative || in_normal_order(*alias, *representative)) { representative = alias; }
+       represented.push_back(alias->identity);
+     }
+-    if (!representative) { continue; }
++    if (!representative) {
++      SIRIUS_LOG_DEBUG(
++        "[df_gate] endpoint ch={} gen={} rows={} filter=[{}] ord={} col={} decision=skip "
++        "reason=measured_weak keep={}",
++        static_cast<void const*>(endpoint.get()),
++        program->snapshot.generation(),
++        program->rows,
++        describe_filter(*current.identity.filter),
++        current.identity.output_ordinal,
++        current.column_index,
++        keep_text(current.expected_keep));
++      continue;
++    }
+     selected_step step{
+       .identity      = representative->identity,
+       .column_index  = current.column_index,
+@@ -615,8 +678,28 @@ std::unique_ptr<application_program_state> prepare_state(
+       if (step.estimated_selectivity && survival < 1.0 &&
+           survival * (1.0 - *step.estimated_selectivity) < k_negligible_removed_share) {
+         program->sample_combined = false;
++        SIRIUS_LOG_DEBUG(
++          "[df_gate] endpoint ch={} gen={} rows={} filter=[{}] ord={} decision=skip "
++          "reason=negligible_removed_share survival={}",
++          static_cast<void const*>(endpoint.get()),
++          program->snapshot.generation(),
++          program->rows,
++          describe_filter(*step.identity.filter),
++          step.identity.output_ordinal,
++          survival);
+         continue;
+       }
++      SIRIUS_LOG_DEBUG(
++        "[df_gate] endpoint ch={} gen={} rows={} filter=[{}] ord={} decision=apply keep={} "
++        "sample={} decode_attached={}",
++        static_cast<void const*>(endpoint.get()),
++        program->snapshot.generation(),
++        program->rows,
++        describe_filter(*step.identity.filter),
++        step.identity.output_ordinal,
++        keep_text(step.expected_keep),
++        step.sample,
++        contains(program->receipt.decode_attached, step.identity));
+       kept.push_back(step);
+     }
+     program->membership = std::move(kept);
+@@ -1296,9 +1379,29 @@ decode_selection dynamic_filter_consumer::select_for_decode(std::span<binding co
+   decode_selection result{_channel, snapshot.generation(), {}};
+   // An undecided gate lets the decode apply the filters and measure them; waiting for a clean
+   // endpoint sample instead would leave every batch decoded before that sample unfiltered.
++  SIRIUS_LOG_DEBUG(
++    "[df_gate] decode ch={} gen={} bound={} applicable={} needs_combined={} decode_trains={}",
++    static_cast<void const*>(_channel.get()),
++    snapshot.generation(),
++    candidates.size(),
++    selection.applicable,
++    selection.needs_combined_sample,
++    selection.decode_trains);
+   if (!selection.applicable || (selection.needs_combined_sample && !selection.decode_trains)) {
+     return result;
+   }
++  for (auto const& current : candidates) {
++    auto const weak =
++      current.expected_keep && skip_measured_filter(*current.expected_keep, std::nullopt);
++    SIRIUS_LOG_DEBUG("[df_gate] decode ch={} gen={} filter=[{}] ord={} col={} keep={} decision={}",
++                     static_cast<void const*>(_channel.get()),
++                     snapshot.generation(),
++                     describe_filter(*current.identity.filter),
++                     current.identity.output_ordinal,
++                     current.column_index,
++                     keep_text(current.expected_keep),
++                     weak ? "skip_measured_weak" : "attach");
++  }
+   auto const bound_entries = candidates.size();
+   for (auto& current : candidates) {
+     current.prior = static_selectivity_of(*current.identity.filter);
+@@ -1335,6 +1438,13 @@ void dynamic_filter_consumer::record_decode_keep_ratio(std::size_t rows_before,
+                                                        std::size_t generation,
+                                                        bool complete) noexcept
+ {
++  SIRIUS_LOG_DEBUG("[df_gate] decode-combined ch={} gen={} rows={}->{} keep={} complete={}",
++                   static_cast<void const*>(_channel.get()),
++                   generation,
++                   rows_before,
++                   rows_after,
++                   rows_before ? static_cast<double>(rows_after) / rows_before : 0.0,
++                   complete);
+   _gate.record_decode_keep_ratio(rows_before, rows_after, generation, complete);
+ }
+ 
+@@ -1343,6 +1453,14 @@ void dynamic_filter_consumer::record_decode_filter_keep_ratio(applied_entry cons
+                                                               std::size_t rows_after,
+                                                               std::size_t generation) noexcept
+ {
++  SIRIUS_LOG_DEBUG("[df_gate] decode-probe ch={} gen={} filter=[{}] ord={} rows={}->{} keep={}",
++                   static_cast<void const*>(_channel.get()),
++                   generation,
++                   describe_filter(*filter.filter),
++                   filter.output_ordinal,
++                   rows_before,
++                   rows_after,
++                   rows_before ? static_cast<double>(rows_after) / rows_before : 0.0);
+   if (rows_before == 0 || rows_after > rows_before) { return; }
+   _gate.record_filter_keep_ratio({filter.filter.get(), filter.output_ordinal},
+                                  static_cast<double>(rows_after) / static_cast<double>(rows_before),
+@@ -1691,6 +1809,12 @@ void dynamic_filter_gate::record_filter_keep_ratio(bound_filter_key filter,
+       return;
+     }
+     _filter_keep_ratios.insert_or_assign(filter, filter_measurement{kept, observed_filter_count});
++    SIRIUS_LOG_DEBUG("[df_gate] gate={} marginal filter@{} ord={} keep={} gen={}",
++                     static_cast<void const*>(this),
++                     reinterpret_cast<std::uintptr_t>(filter.filter) & 0xffffff,
++                     filter.output_ordinal,
++                     kept,
++                     observed_filter_count);
+   } catch (...) {
+     // Optional hints cannot invalidate an already constructed output.
+   }
+@@ -1731,6 +1855,12 @@ void dynamic_filter_gate::record_decode_keep_ratio(std::size_t rows_before,
+     std::scoped_lock decision_lock(_decision_mu);
+     if (_state.load(std::memory_order_relaxed) != state::UNKNOWN) { return; }
+     auto const kept = static_cast<double>(rows_after) / static_cast<double>(rows_before);
++    SIRIUS_LOG_DEBUG("[df_gate] gate={} decode-combined keep={} complete={} gen={} state={}",
++                     static_cast<void const*>(this),
++                     kept,
++                     complete,
++                     observed_filter_count,
++                     kept <= _keep_threshold ? "ACTIVE" : (complete ? "DISABLED" : "UNDECIDED"));
+     if (kept <= _keep_threshold || complete) {
+       _decided_filter_count.store(observed_filter_count, std::memory_order_relaxed);
+       _state.store(kept > _keep_threshold ? state::DISABLED : state::ACTIVE,
+@@ -1761,6 +1891,13 @@ void dynamic_filter_gate::record_keep_ratio(std::size_t rows_before,
+     _decided_filter_count.store(observed_filter_count, std::memory_order_relaxed);
+     _state.store(kept > _keep_threshold ? state::DISABLED : state::ACTIVE,
+                  std::memory_order_relaxed);
++    SIRIUS_LOG_DEBUG("[df_gate] gate={} endpoint-combined rows={}->{} keep={} gen={} state={}",
++                     static_cast<void const*>(this),
++                     rows_before,
++                     rows_after,
++                     kept,
++                     observed_filter_count,
++                     kept > _keep_threshold ? "DISABLED" : "ACTIVE");
+   } catch (...) {
+     // Failure to acquire optional decision state leaves its previous verdict intact.
+   }
+diff --git a/src/op/scan/sirius_gpu_scan_operator_data.cpp b/src/op/scan/sirius_gpu_scan_operator_data.cpp
+index e0d0737e..78ccef81 100644
+--- a/src/op/scan/sirius_gpu_scan_operator_data.cpp
++++ b/src/op/scan/sirius_gpu_scan_operator_data.cpp
+@@ -23,7 +23,10 @@
+ 
+ #include <compression/decompression_pushdown_policy.hpp>
+ #include <cucascade/cudf/gpu_data_representation.hpp>
++#include <cuda_runtime_api.h>
++
+ #include <data/sirius_converter_registry.hpp>
++#include <log/logging.hpp>
+ #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
+ #include <op/scan/decoded_batch_representation.hpp>
+ #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+@@ -95,7 +98,22 @@ membership_snapshot snapshot_membership_probes(decode_selection const& selection
+                                 std::uint32_t const* prior_mask_words,
+                                 ::cuda::stream_ref stream,
+                                 rmm::device_async_resource_ref mr) {
+-         return applicable->compute_mask(keys, prior_mask_words, use_current_device, stream, mr);
++         auto mask =
++           applicable->compute_mask(keys, prior_mask_words, use_current_device, stream, mr);
++         if (!mask) {
++           int device = -1;
++           (void)cudaGetDevice(&device);
++           SIRIUS_LOG_DEBUG(
++             "[df_gate] decode-probe DECLINED filter@{} kind={} key_type={} rows={} device={} "
++             "available_on_device={}",
++             reinterpret_cast<std::uintptr_t>(f.get()) & 0xffffff,
++             static_cast<int>(f->kind()),
++             static_cast<int>(keys.type().id()),
++             keys.size(),
++             device,
++             f->is_available_on_device(device));
++         }
++         return mask;
+        },
+        0,
+        order + 1,
+-- 
+2.43.0
+
+
+From 29889fbbdc424a9b05a31c3b29ae9698ca960c70 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-42-26.ec2.internal>
+Date: Thu, 19 Nov 2026 19:25:46 +0000
+Subject: [PATCH 2/3] recovered prototype: proto(op2): env-gated switches:
+ shadow skip, oracle skip, latch fix, endpoint apply, OP3 oracle sizing
+
+---
+ .../dynamic_filter_publisher.cpp              | 60 ++++++++++++-
+ src/op/dynamic_filter/proto_op2.hpp           | 88 +++++++++++++++++++
+ .../dynamic_filter/sirius_dynamic_filter.hpp  |  7 +-
+ src/op/scan/dynamic_filter_merge.cpp          |  7 ++
+ src/op/scan/sirius_gpu_scan_operator_data.cpp | 18 +++-
+ 5 files changed, 176 insertions(+), 4 deletions(-)
+ create mode 100644 src/op/dynamic_filter/proto_op2.hpp
+
+diff --git a/src/op/dynamic_filter/dynamic_filter_publisher.cpp b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
+index 70412286..6a7a5b59 100644
+--- a/src/op/dynamic_filter/dynamic_filter_publisher.cpp
++++ b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
+@@ -16,6 +16,8 @@
+ 
+ #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
+ 
++#include "op/dynamic_filter/proto_op2.hpp"
++
+ #include "log/logging.hpp"
+ #include "memory/size_arithmetic.hpp"
+ #include "op/dynamic_filter/bloom_sizing.hpp"
+@@ -683,6 +685,8 @@ struct dynamic_filter_publication_session::state {
+             if (auto const selectivity = estimated_selectivity_of(
+                   plan.admitted_keys()[built.admitted_key_index], key_rows)) {
+               built.membership->set_estimated_selectivity(*selectivity);
++              built.membership->set_estimate_reliable(
++                plan.admitted_keys()[built.admitted_key_index].domain_gate_eligible());
+             }
+           }
+         }
+@@ -981,16 +985,68 @@ bool dynamic_filter_publication_session::begin(complete_build_inventory inventor
+   };
+   construction_plan planned;
+   try {
++    // PROTO(op2): keys whose filters are not built. Dropping the key's bindings makes
++    // plan_construction pass over it.
++    auto key_bindings = binding_facts_of(plan);
++    auto const join   = operation.identity.operator_id;
++    for (std::size_t index = 0; index < plan.admitted_keys().size(); ++index) {
++      if (key_bindings[index].empty()) { continue; }
++      auto const& key = plan.admitted_keys()[index];
++      if (proto_op2::oracle_skip(join, key.planner_condition_index)) {
++        SIRIUS_LOG_DEBUG("[df_proto] skip join={} condition={} reason=oracle",
++                         join.value_or(0),
++                         key.planner_condition_index);
++        key_bindings[index].clear();
++        continue;
++      }
++      if (!proto_op2::shadow_skip()) { continue; }
++      auto const own = estimated_selectivity_of(key, inventory.total_rows());
++      if (!own || !key.domain_gate_eligible()) { continue; }
++      // Mirrors the endpoint's negligible-removed-share rule (dynamic_filter_merge.cpp) against
++      // the filters already on each target channel: skip only if every binding would skip it.
++      bool shadowed        = true;
++      std::size_t bound    = 0;
++      double weakest_cover = 0.0;
++      for (auto const& target : plan.probe_targets()) {
++        for (auto const& binding : target.key_bindings) {
++          if (binding.admitted_key_index != index) { continue; }
++          ++bound;
++          double survival = 1.0;
++          auto const snap = target.filter_set->snapshot();
++          for (auto const& [ordinal, filter] : snap.entries()) {
++            auto const other = filter->estimated_selectivity();
++            if (other && filter->estimate_reliable() && *other < *own) { survival *= *other; }
++          }
++          auto const removed = survival * (1.0 - *own);
++          weakest_cover      = std::max(weakest_cover, removed);
++          if (!(survival < 1.0 && removed < 0.10)) { shadowed = false; }
++        }
++      }
++      SIRIUS_LOG_DEBUG(
++        "[df_proto] shadow join={} condition={} rows={} own_est={} bindings={} "
++        "max_removed_share={} decision={}",
++        join.value_or(0),
++        key.planner_condition_index,
++        inventory.total_rows(),
++        *own,
++        bound,
++        weakest_cover,
++        shadowed && bound != 0 ? "skip" : "build");
++      if (shadowed && bound != 0) { key_bindings[index].clear(); }
++    }
++    auto const proto_bloom_keys = proto_op2::oracle_bloom_keys(join);
+     planned = plan_construction(inventory.facts(),
+                                 plan.admitted_keys(),
+-                                binding_facts_of(plan),
++                                key_bindings,
+                                 {.l2_bytes                  = device_l2_cache_bytes(replicas),
+                                  .inlist_max_l2_fraction    = plan.inlist_max_l2_fraction(),
+                                  .emit_zone_map_filters     = plan.emit_zone_map_filters(),
+                                  .domain_coverage_threshold = plan.domain_coverage_threshold(),
+                                  .max_bloom_bytes_per_gpu   = plan.max_bloom_bytes_per_gpu(),
+                                  .bloom_only                = plan.policy().bloom_only,
+-                                 .fixed_bloom_keys          = plan.policy().fixed_bloom_keys});
++                                 .fixed_bloom_keys          = proto_bloom_keys != 0
++                                                                ? proto_bloom_keys
++                                                                : plan.policy().fixed_bloom_keys});
+     // An empty build publishes nothing, so no filter is planned for it, unless a cross-rank merge
+     // waits on this process's part
+     // (`dynamic_filter_publication_policy::publish_when_empty_or_drained`).
+diff --git a/src/op/dynamic_filter/proto_op2.hpp b/src/op/dynamic_filter/proto_op2.hpp
+new file mode 100644
+index 00000000..e5edae2f
+--- /dev/null
++++ b/src/op/dynamic_filter/proto_op2.hpp
+@@ -0,0 +1,88 @@
++// PROTO(op2): throwaway prototype switches, read once from the environment.
++#pragma once
++
++#include <cstddef>
++#include <cstdlib>
++#include <optional>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace sirius::op::proto_op2 {
++
++inline bool flag(char const* name)
++{
++  auto const* value = std::getenv(name);
++  return value != nullptr && value[0] == '1';
++}
++
++/// SIRIUS_PROTO_OP2_SHADOW=1: at construction begin, do not build a key whose filter every
++/// consumer endpoint would skip under the negligible-removed-share rule, judged against the
++/// filters already published on its target channels (reliable estimates only).
++inline bool shadow_skip()
++{
++  static bool const on = flag("SIRIUS_PROTO_OP2_SHADOW");
++  return on;
++}
++
++/// SIRIUS_PROTO_OP2_LATCH=1: a decode that gave compaction up while it carried only part of the
++/// requested join filters does not latch the scan as unprofitable.
++inline bool latch_fix()
++{
++  static bool const on = flag("SIRIUS_PROTO_OP2_LATCH");
++  return on;
++}
++
++/// SIRIUS_PROTO_OP2_ENDPOINT=1: the endpoint's negligible-removed-share rule does not count a
++/// stronger filter that this batch's decode already applied.
++inline bool endpoint_apply()
++{
++  static bool const on = flag("SIRIUS_PROTO_OP2_ENDPOINT");
++  return on;
++}
++
++/// "join:value,join:value" pairs.
++inline std::vector<std::pair<std::size_t, std::size_t>> pairs(char const* name)
++{
++  std::vector<std::pair<std::size_t, std::size_t>> out;
++  auto const* value = std::getenv(name);
++  if (value == nullptr) { return out; }
++  std::string text{value};
++  std::size_t pos = 0;
++  while (pos < text.size()) {
++    auto const end   = text.find(',', pos);
++    auto const item  = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
++    auto const colon = item.find(':');
++    if (colon != std::string::npos) {
++      out.emplace_back(std::stoull(item.substr(0, colon)), std::stoull(item.substr(colon + 1)));
++    }
++    if (end == std::string::npos) { break; }
++    pos = end + 1;
++  }
++  return out;
++}
++
++/// SIRIUS_PROTO_OP2_SKIP="join:condition,...": oracle skip of one key's filters.
++inline bool oracle_skip(std::optional<std::size_t> join, std::size_t condition)
++{
++  static auto const list = pairs("SIRIUS_PROTO_OP2_SKIP");
++  if (!join) { return false; }
++  for (auto const& [j, c] : list) {
++    if (j == *join && c == condition) { return true; }
++  }
++  return false;
++}
++
++/// SIRIUS_PROTO_OP3_BLOOM_KEYS="join:keys,...": oracle distinct count a join's Bloom keys are
++/// sized on.
++inline std::size_t oracle_bloom_keys(std::optional<std::size_t> join)
++{
++  static auto const list = pairs("SIRIUS_PROTO_OP3_BLOOM_KEYS");
++  if (!join) { return 0; }
++  for (auto const& [j, keys] : list) {
++    if (j == *join) { return keys; }
++  }
++  return 0;
++}
++
++}  // namespace sirius::op::proto_op2
+diff --git a/src/op/dynamic_filter/sirius_dynamic_filter.hpp b/src/op/dynamic_filter/sirius_dynamic_filter.hpp
+index 51b39e19..d4767ed9 100644
+--- a/src/op/dynamic_filter/sirius_dynamic_filter.hpp
++++ b/src/op/dynamic_filter/sirius_dynamic_filter.hpp
+@@ -71,6 +71,10 @@ class sirius_dynamic_filter {
+     return _estimated_selectivity;
+   }
+ 
++  // PROTO(op2): whether the estimate comes from a build key with a uniqueness proof or declaration.
++  void set_estimate_reliable(bool value) noexcept { _estimate_reliable = value; }
++  [[nodiscard]] bool estimate_reliable() const noexcept { return _estimate_reliable; }
++
+   [[nodiscard]] virtual sirius_dynamic_filter_kind kind() const = 0;
+ 
+   [[nodiscard]] virtual bool is_available_on_device(int /*device_id*/) const noexcept
+@@ -79,7 +83,8 @@ class sirius_dynamic_filter {
+   }
+ 
+  private:
+-  bool _preserve_nulls = false;
++  bool _preserve_nulls    = false;
++  bool _estimate_reliable = false;
+   std::optional<double> _estimated_selectivity;
+ };
+ 
+diff --git a/src/op/scan/dynamic_filter_merge.cpp b/src/op/scan/dynamic_filter_merge.cpp
+index 6b45159a..1a63173d 100644
+--- a/src/op/scan/dynamic_filter_merge.cpp
++++ b/src/op/scan/dynamic_filter_merge.cpp
+@@ -36,6 +36,7 @@
+ #include <log/logging.hpp>
+ #include <op/dynamic_filter/dynamic_filter_device.hpp>
+ #include <op/dynamic_filter/dynamic_filter_mask_ops.hpp>
++#include <op/dynamic_filter/proto_op2.hpp>
+ #include <op/scan/detail/read_retirement.hpp>
+ #include <op/scan/dynamic_filter_merge.hpp>
+ #include <telemetry/nvtx.hpp>
+@@ -670,6 +671,12 @@ std::unique_ptr<application_program_state> prepare_state(
+     for (auto const& step : program->membership) {
+       double survival = 1.0;
+       for (auto const& other : program->membership) {
++        // PROTO(op2): a stronger filter this batch's decode already applied has removed its rows
++        // from the batch, so the probe no longer covers them.
++        if (sirius::op::proto_op2::endpoint_apply() &&
++            contains(program->receipt.decode_attached, other.identity)) {
++          continue;
++        }
+         if (other.estimated_selectivity && step.estimated_selectivity &&
+             *other.estimated_selectivity < *step.estimated_selectivity) {
+           survival *= *other.estimated_selectivity;
+diff --git a/src/op/scan/sirius_gpu_scan_operator_data.cpp b/src/op/scan/sirius_gpu_scan_operator_data.cpp
+index 78ccef81..f3048c8b 100644
+--- a/src/op/scan/sirius_gpu_scan_operator_data.cpp
++++ b/src/op/scan/sirius_gpu_scan_operator_data.cpp
+@@ -27,7 +27,9 @@
+ 
+ #include <data/sirius_converter_registry.hpp>
+ #include <log/logging.hpp>
++#include <op/dynamic_filter/proto_op2.hpp>
+ #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
++#include <op/scan/dynamic_filter_gate.hpp>
+ #include <op/scan/decoded_batch_representation.hpp>
+ #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+ #include <pipeline/batch_lock_utils.hpp>
+@@ -506,8 +508,22 @@ void scan_operator_input::record_decode_outcome(::cucascade::idata_representatio
+   pushdown_filter_only_columns_dropped = outcome.filter_only_columns_dropped;
+   pushdown_predicate_columns           = outcome.predicate_columns;
+   pushdown_predicates_enforced         = outcome.predicates_enforced;
++  // PROTO(op2): a decode that gave compaction up because every join filter it carried was weak
++  // says nothing about the filters it did not carry. The gate stops attaching the weak ones, so
++  // the next decode carries a different set and decides again.
++  bool const weak_probes_only =
++    sirius::op::proto_op2::latch_fix() && outcome.membership_keep &&
++    !outcome.membership_keep->complete && !outcome.membership_keep->probes.empty() &&
++    std::ranges::all_of(outcome.membership_keep->probes, [](auto const& probe) {
++      return probe.rows_before != 0 &&
++             sirius::op::scan::dynamic_filter_gate::filter_skippable(
++               static_cast<double>(probe.rows_after) / static_cast<double>(probe.rows_before));
++    });
+   if (pushdown_selection_unprofitable && outcome.selection_unprofitable) {
+-    pushdown_selection_unprofitable->store(true, std::memory_order_relaxed);
++    SIRIUS_LOG_DEBUG("[df_gate] decode gave compaction up: latch={}", !weak_probes_only);
++    if (!weak_probes_only) {
++      pushdown_selection_unprofitable->store(true, std::memory_order_relaxed);
++    }
+   }
+   // The decode consumed the mask: clear it, since re-applying selects wrong rows and clearing
+   // re-enables the zero-copy steal in prepare_for_processing.
+-- 
+2.43.0
+
+
+From 41d36d9d9a224ed503fba95118210fd95c717c04 Mon Sep 17 00:00:00 2001
+From: Ubuntu <ubuntu@ip-172-31-42-26.ec2.internal>
+Date: Thu, 19 Nov 2026 19:25:47 +0000
+Subject: [PATCH 3/3] recovered prototype: proto(op2): keep diagnostics free at
+ INFO
+
+---
+ src/op/scan/dynamic_filter_merge.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/op/scan/dynamic_filter_merge.cpp b/src/op/scan/dynamic_filter_merge.cpp
+index 1a63173d..e9deaee5 100644
+--- a/src/op/scan/dynamic_filter_merge.cpp
++++ b/src/op/scan/dynamic_filter_merge.cpp
+@@ -445,6 +445,8 @@ struct static_selectivity {
+ [[nodiscard]] std::string describe_filter(sirius::op::sirius_dynamic_filter const& filter)
+ {
+   std::string out;
++  // Arguments of a disabled log line are still evaluated: keep them free at INFO.
++  if (!sirius::log::get_sink()->should_log(sirius::log::level::debug)) { return out; }
+   if (auto const* small =
+         dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(&filter)) {
+     out = "small_in_list:" + std::to_string(small->size());
+-- 
+2.43.0
+

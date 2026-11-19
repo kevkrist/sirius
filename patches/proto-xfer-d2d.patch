@@ -1,0 +1,1634 @@
+diff --git a/cmake/sirius-test-sources.cmake b/cmake/sirius-test-sources.cmake
+index 12a8f946..873c2c23 100644
+--- a/cmake/sirius-test-sources.cmake
++++ b/cmake/sirius-test-sources.cmake
+@@ -301,6 +301,7 @@ set(TEST_SOURCES
+     test/cpp/operator/test_dynamic_filter_accumulation.cpp
+     test/cpp/operator/test_accumulated_bloom_key_types.cpp
+     test/cpp/operator/test_exact_key_and_bounds_accumulation.cpp
++    test/cpp/operator/bench_dynamic_filter_lifecycle.cpp
+     test/cpp/operator/test_build_filter_construction.cpp
+     test/cpp/operator/test_dynamic_filter_source_policy.cpp
+     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
+diff --git a/src/cuda/dynamic_filter_replica_transfer.cu b/src/cuda/dynamic_filter_replica_transfer.cu
+index 574e67fe..48f1242b 100644
+--- a/src/cuda/dynamic_filter_replica_transfer.cu
++++ b/src/cuda/dynamic_filter_replica_transfer.cu
+@@ -28,9 +28,11 @@
+ #include <cucascade/memory/memory_space.hpp>
+ #include <log/logging.hpp>
+ #include <memory/device_transfer.hpp>
++#include <memory/pool_peer_access.hpp>
+ #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
+ 
+ #include <cstddef>
++#include <cstdlib>
+ #include <exception>
+ #include <stdexcept>
+ #include <string_view>
+@@ -61,6 +63,34 @@ replica_transfer_route enqueue_replica_copy(
+                                              policy);
+ }
+ 
++replica_relay::replica_relay()
++{
++  auto const* text = std::getenv("SIRIUS_PROTO_XFER_D2D");
++  std::string_view const value{text == nullptr ? "" : text};
++  _enabled = !(value.empty() || value == "0" || value == "off");
++}
++
++replica_relay::origin replica_relay::pick(origin original, int destination_device) const
++{
++  if (!_enabled || _relays.empty() ||
++      sirius::memory::try_grant_pool_access(*original.space, destination_device)) {
++    return original;
++  }
++  for (auto const& relay : _relays) {
++    if (sirius::memory::try_grant_pool_access(*relay.space, destination_device)) { return relay; }
++  }
++  return original;
++}
++
++void replica_relay::offer(replica_transfer_route route,
++                          void const* data,
++                          cucascade::memory::memory_space const& space)
++{
++  if (_enabled && route == replica_transfer_route::host_staging) {
++    _relays.push_back({data, &space});
++  }
++}
++
+ bool replica_fanout_failures::skip_if_recoverable(std::string_view filter_name,
+                                                   int source_device,
+                                                   int destination_device) noexcept
+diff --git a/src/cuda/sirius_dynamic_bloom_filter.cu b/src/cuda/sirius_dynamic_bloom_filter.cu
+index 0e13451f..90808d06 100644
+--- a/src/cuda/sirius_dynamic_bloom_filter.cu
++++ b/src/cuda/sirius_dynamic_bloom_filter.cu
+@@ -58,6 +58,7 @@
+ #include <array>
+ #include <atomic>
+ #include <cstdint>
++#include <cstdlib>
+ #include <exception>
+ #include <limits>
+ #include <memory>
+@@ -66,6 +67,7 @@
+ #include <span>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
+ #include <type_traits>
+ #include <utility>
+ #include <variant>
+@@ -758,6 +760,7 @@ struct accumulated_bloom_builder::impl {
+   std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> filters;
+ 
+   class chunk_pipeline;
++  class island_reduce;  // PROTOTYPE [xfer-PR]
+ };
+ 
+ /**
+@@ -963,6 +966,491 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
+   std::size_t _sequence = 0;                // Global chunk index over (key, offset)
+ };
+ 
++//===----------------------------------------------------------------------===//
++// PROTOTYPE [xfer-PR]: topology-aware reduce, switched by SIRIUS_PROTO_XFER_D2D
++//===----------------------------------------------------------------------===//
++namespace {
++
++/**
++ * @brief Prototype switch: unset / "0" / "off" keep the all-or-nothing transport choice of the tip.
++ *
++ * "star": peer copies inside every island, today's HOST loop between the island leaders only.
++ * "1" / "exchange": the same, and with two islands the leaders exchange both ways at once.
++ */
++enum class proto_xfer_mode { off, star, exchange };
++
++[[nodiscard]] proto_xfer_mode proto_xfer() noexcept
++{
++  auto const* text = std::getenv("SIRIUS_PROTO_XFER_D2D");
++  if (text == nullptr || *text == '\0') { return proto_xfer_mode::off; }
++  std::string_view const value{text};
++  if (value == "0" || value == "off") { return proto_xfer_mode::off; }
++  if (value == "star") { return proto_xfer_mode::star; }
++  return proto_xfer_mode::exchange;
++}
++
++}  // namespace
++
++/**
++ * @brief Reduces and replicates one publication over the peer-access topology of its GPUs.
++ *
++ * The GPUs are partitioned into islands: sets whose pools grant each other access. Per chunk:
++ *  (A) merge: every contributing non-leader GPU of an island is peer-copied into its leader's
++ *      scratch and ORed into the leader's array (asynchronous, enqueued one chunk ahead);
++ *  (B) cross: the leaders make their chunks equal to the union through HOST staging: the only
++ *      legs that leave an island (`cross_star` / `cross_exchange`: the seam for a better bounce);
++ *  (C) fan-out: every leader peer-copies its chunk to the other GPUs of its island
++ *      (asynchronous, behind the leader's `settled` event).
++ * One island (full peer access) and all-singleton islands (no peer access) are left to the
++ * existing transports.
++ */
++class accumulated_bloom_builder::impl::island_reduce final {
++ public:
++  using window_type = cucascade::memory::fixed_multiple_blocks_allocation;
++
++  struct island {
++    partial* leader{};
++    std::vector<partial*> sources;  // Contributing GPUs other than the leader
++    std::vector<partial*> members;  // Every GPU other than the leader
++    bool contributed{};             // The leader or a source received a contribution
++    std::unique_ptr<rmm::cuda_stream> ingress;    // Leader GPU: peer copies into `merge_scratch`
++    std::unique_ptr<rmm::cuda_stream> xfer;       // Leader GPU: every cross-island leg
++    std::unique_ptr<rmm::device_buffer> scratch;  // Leaders other than the root
++    std::byte* merge_scratch{};                   // Two parities of `sources.size()` slots
++    std::byte* cross_scratch{};                   // One slot: a chunk arriving from another island
++    std::optional<cuda_event> ingress_done[2];
++    std::optional<cuda_event> merged[2];
++    std::optional<cuda_event> settled;       // The leader's chunk equals the union
++    std::optional<cuda_event> leader_ready;  // The leader's inserts are complete
++    std::vector<cuda_event> source_ready;
++    window_type window;
++  };
++
++  struct chunk {
++    std::size_t key;
++    std::size_t offset;
++    std::size_t bytes;
++  };
++
++  /**
++   * @brief Partitions the partials into islands, the root's first; nullopt when the existing
++   * transports already fit (one island, or no two GPUs with mutual access).
++   */
++  [[nodiscard]] static std::optional<std::vector<island>> plan(impl const& owner, partial& root)
++  {
++    auto const count = owner.partials.size();
++    if (count < 3) { return std::nullopt; }
++    std::vector<partial*> order{&root};
++    for (auto const& entry : owner.partials) {
++      if (entry.get() != &root) { order.push_back(entry.get()); }
++    }
++    std::vector<char> mutual(count * count, 0);
++    for (std::size_t left = 0; left < count; ++left) {
++      for (std::size_t right = left + 1; right < count; ++right) {
++        bool const both =
++          sirius::memory::try_grant_pool_access(*order[left]->space, order[right]->device_id) &&
++          sirius::memory::try_grant_pool_access(*order[right]->space, order[left]->device_id);
++        mutual[left * count + right] = mutual[right * count + left] = both;
++      }
++    }
++    std::vector<char> taken(count, 0);
++    std::vector<island> islands;
++    for (std::size_t seed = 0; seed < count; ++seed) {
++      if (taken[seed]) { continue; }
++      std::vector<std::size_t> group{seed};
++      taken[seed] = 1;
++      for (std::size_t other = seed + 1; other < count; ++other) {
++        if (taken[other]) { continue; }
++        if (std::ranges::all_of(
++              group, [&](auto member) { return mutual[member * count + other] != 0; })) {
++          group.push_back(other);
++          taken[other] = 1;
++        }
++      }
++      // The root leads its island; elsewhere a contributing GPU leads, saving its merge leg.
++      auto lead = group.front();
++      if (seed != 0) {
++        for (auto const member : group) {
++          if (order[member]->contributed.load(std::memory_order_relaxed)) {
++            lead = member;
++            break;
++          }
++        }
++      }
++      auto& made  = islands.emplace_back();
++      made.leader = order[lead];
++      made.contributed = made.leader->contributed.load(std::memory_order_relaxed);
++      for (auto const member : group) {
++        if (member == lead) { continue; }
++        made.members.push_back(order[member]);
++        if (order[member]->contributed.load(std::memory_order_relaxed)) {
++          made.sources.push_back(order[member]);
++          made.contributed = true;
++        }
++      }
++    }
++    if (islands.size() == 1 || islands.size() == count) { return std::nullopt; }
++    return islands;
++  }
++
++  island_reduce(impl const& owner, std::vector<island> islands, proto_xfer_mode mode)
++    : _owner{owner},
++      _islands{std::move(islands)},
++      _slot{owner.max_chunk_bytes()},
++      _exchange{mode == proto_xfer_mode::exchange && _islands.size() == 2}
++  {
++    for (std::size_t key = 0; key < owner.keys.size(); ++key) {
++      auto const& shape = owner.shapes[key];
++      for (std::size_t offset = 0; offset < shape.raw_bytes; offset += shape.chunk_bytes) {
++        _chunks.push_back({key, offset, std::min(shape.chunk_bytes, shape.raw_bytes - offset)});
++      }
++    }
++    _contributing = static_cast<std::size_t>(
++      std::ranges::count_if(_islands, [](auto const& entry) { return entry.contributed; }));
++  }
++
++  ~island_reduce() noexcept
++  {
++    // Every stream this object owns is drained before its scratch and HOST windows are released.
++    for (auto& entry : _islands) {
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
++      if (entry.ingress) { (void)cudaStreamSynchronize(entry.ingress->value()); }
++      if (entry.xfer) { (void)cudaStreamSynchronize(entry.xfer->value()); }
++      (void)cudaStreamSynchronize(entry.leader->stream->value());
++      entry.scratch.reset();
++      entry.window.reset();
++      entry.ingress.reset();
++      entry.xfer.reset();
++    }
++    (void)cudaGetLastError();
++  }
++
++  island_reduce(island_reduce const&)            = delete;
++  island_reduce& operator=(island_reduce const&) = delete;
++
++  /// Device scratch the root needs, in bytes.
++  [[nodiscard]] std::size_t root_scratch_bytes() const noexcept
++  {
++    return (parities() * _islands.front().sources.size() + 1) * _slot;
++  }
++
++  [[nodiscard]] std::size_t host_bytes() const noexcept { return _host_bytes; }
++  [[nodiscard]] std::size_t remote_scratch_bytes() const noexcept { return _remote_scratch; }
++  [[nodiscard]] bool exchanges() const noexcept { return _exchange; }
++  [[nodiscard]] std::size_t island_count() const noexcept { return _islands.size(); }
++
++  /**
++   * @brief Creates streams and events and takes every allocation; enqueues no copy.
++   *
++   * @param root_scratch The root's scratch of `root_scratch_bytes()`
++   * @return False when a leader's scratch reservation was refused: the caller falls back
++   */
++  [[nodiscard]] bool prepare(std::byte* root_scratch)
++  {
++    auto* host =
++      _islands.front().leader->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
++    if (host == nullptr || host->get_block_size() == 0) {
++      throw accumulation_invariant_error{"accumulated publication requires fixed HOST blocks"};
++    }
++    for (std::size_t index = 0; index < _islands.size(); ++index) {
++      auto& entry = _islands[index];
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
++      entry.xfer = std::make_unique<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking);
++      entry.settled.emplace();
++      entry.leader_ready.emplace();
++      auto const merge_bytes = parities() * entry.sources.size() * _slot;
++      if (!entry.sources.empty()) {
++        entry.ingress = std::make_unique<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking);
++        for (std::size_t parity = 0; parity < 2; ++parity) {
++          entry.ingress_done[parity].emplace();
++          entry.merged[parity].emplace();
++        }
++        for (auto* source : entry.sources) {
++          entry.source_ready.push_back(make_event_on(source->device_id));
++        }
++      }
++      if (index == 0) {
++        entry.merge_scratch = root_scratch;
++        entry.cross_scratch = root_scratch + merge_bytes;
++      } else if (auto const bytes = merge_bytes + (_exchange ? _slot : 0); bytes != 0) {
++        ::cuda::stream_ref const stream{entry.xfer->value()};
++        auto lease = scoped_replica_reservation::try_acquire(
++          *entry.leader->space, tracked_replica_allocation_bytes(bytes), stream);
++        if (!lease) { return false; }
++        entry.scratch = std::make_unique<rmm::device_buffer>(bytes, stream, lease->allocator());
++        entry.merge_scratch = static_cast<std::byte*>(entry.scratch->data());
++        entry.cross_scratch = entry.merge_scratch + merge_bytes;
++        _remote_scratch += tracked_replica_allocation_bytes(bytes);
++      }
++      if (index == 0 || _exchange) {
++        entry.window = host->allocate_multiple_blocks(_slot);
++        if (entry.window->size_bytes() < _slot) {
++          throw accumulation_invariant_error{
++            "accumulated publication HOST window is smaller than a chunk"};
++        }
++        _host_bytes += entry.window->size_bytes();
++      }
++    }
++    _copies.reserve(_slot / host->get_block_size() + 1);
++    return true;
++  }
++
++  /**
++   * @brief Enqueues the whole publication and waits for it on the host.
++   */
++  void run()
++  {
++    // Without any contribution every array is still zero on every GPU: nothing moves.
++    for (auto& entry : _islands) {
++      if (_contributing == 0) { break; }
++      for (std::size_t index = 0; index < entry.sources.size(); ++index) {
++        auto const* source = entry.sources[index];
++        {
++          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{source->device_id}};
++          check_cuda(cudaEventRecord(entry.source_ready[index].get(), source->stream->value()),
++                     "cudaEventRecord(island source ready)");
++        }
++        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
++        check_cuda(
++          cudaStreamWaitEvent(entry.ingress->value(), entry.source_ready[index].get(), 0),
++          "cudaStreamWaitEvent(island source ready)");
++      }
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
++      check_cuda(cudaEventRecord(entry.leader_ready->get(), entry.leader->stream->value()),
++                 "cudaEventRecord(island leader ready)");
++      check_cuda(cudaStreamWaitEvent(entry.xfer->value(), entry.leader_ready->get(), 0),
++                 "cudaStreamWaitEvent(island leader ready)");
++    }
++    if (_contributing != 0) { enqueue_merge(0); }
++    for (std::size_t sequence = 0; _contributing != 0 && sequence < _chunks.size(); ++sequence) {
++      // One chunk of lookahead: its peer ingress overlaps this chunk's HOST legs.
++      if (sequence + 1 < _chunks.size()) { enqueue_merge(sequence + 1); }
++      auto const parity = sequence % 2;
++      for (auto& entry : _islands) {
++        if (entry.sources.empty()) { continue; }
++        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
++        check_cuda(cudaStreamWaitEvent(entry.xfer->value(), entry.merged[parity]->get(), 0),
++                   "cudaStreamWaitEvent(island merged)");
++      }
++      if (_exchange) {
++        cross_exchange(_chunks[sequence]);
++      } else {
++        cross_star(_chunks[sequence]);
++      }
++      enqueue_fan_out(_chunks[sequence]);
++    }
++    for (auto& entry : _islands) {
++      if (entry.ingress) {
++        check_cuda(cudaStreamSynchronize(entry.ingress->value()),
++                   "cudaStreamSynchronize(island ingress)");
++      }
++      check_cuda(cudaStreamSynchronize(entry.xfer->value()), "cudaStreamSynchronize(island xfer)");
++    }
++    for (auto const& entry : _owner.partials) {
++      check_cuda(cudaStreamSynchronize(entry->stream->value()),
++                 "cudaStreamSynchronize(island publication)");
++    }
++  }
++
++ private:
++  [[nodiscard]] std::size_t parities() const noexcept
++  {
++    return std::min<std::size_t>(2, _chunks.size());
++  }
++
++  [[nodiscard]] static std::byte* chunk_of(partial const& owner, chunk const& piece) noexcept
++  {
++    return static_cast<std::byte*>(owner.arrays[piece.key]->data()) + piece.offset;
++  }
++
++  /// (A) Peer ingress of chunk `sequence` into every leader's scratch and its OR into the leader.
++  void enqueue_merge(std::size_t sequence)
++  {
++    auto const& piece = _chunks[sequence];
++    auto const parity = sequence % 2;
++    for (auto& entry : _islands) {
++      if (entry.sources.empty()) { continue; }
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
++      auto const ingress = entry.ingress->value();
++      if (sequence >= 2) {
++        // The merge of chunk (sequence - 2) read this parity's slots.
++        check_cuda(cudaStreamWaitEvent(ingress, entry.merged[parity]->get(), 0),
++                   "cudaStreamWaitEvent(island scratch reuse)");
++      }
++      auto* const slots = entry.merge_scratch + parity * entry.sources.size() * _slot;
++      for (std::size_t index = 0; index < entry.sources.size(); ++index) {
++        auto const* source = entry.sources[index];
++        check_cuda(cudaMemcpyPeerAsync(slots + index * _slot,
++                                       entry.leader->device_id,
++                                       chunk_of(*source, piece),
++                                       source->device_id,
++                                       piece.bytes,
++                                       ingress),
++                   "cudaMemcpyPeerAsync(island ingress)");
++      }
++      check_cuda(cudaEventRecord(entry.ingress_done[parity]->get(), ingress),
++                 "cudaEventRecord(island ingress)");
++      auto const leader_stream = entry.leader->stream->value();
++      check_cuda(cudaStreamWaitEvent(leader_stream, entry.ingress_done[parity]->get(), 0),
++                 "cudaStreamWaitEvent(island ingress)");
++      enqueue_or_chunk(
++        chunk_of(*entry.leader, piece), slots, _slot, entry.sources.size(), piece.bytes,
++        leader_stream);
++      check_cuda(cudaEventRecord(entry.merged[parity]->get(), leader_stream),
++                 "cudaEventRecord(island merged)");
++    }
++  }
++
++  /// One HOST-staged leg on the island's cross stream: device -> window or window -> device.
++  void submit(island& entry, window_type& window, std::byte* device_bytes, std::size_t bytes,
++              bool to_host)
++  {
++    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
++    _copies.clear();
++    std::size_t offset = 0;
++    for (std::size_t index = 0; offset < bytes; ++index) {
++      auto block       = window->at(index);
++      auto const count = std::min(block.size(), bytes - offset);
++      if (to_host) {
++        _copies.add(block.data(), device_bytes + offset, count);
++      } else {
++        _copies.add(device_bytes + offset, block.data(), count);
++      }
++      offset += count;
++    }
++    check_cuda(_copies.enqueue(::cuda::stream_ref{entry.xfer->value()}),
++               "device_copy_batch::enqueue(island staging)");
++    ++_host_legs;
++  }
++
++  static void wait(island const& entry)
++  {
++    check_cuda(cudaStreamSynchronize(entry.xfer->value()),
++               "cudaStreamSynchronize(island staging)");
++  }
++
++  void enqueue_cross_or(island& entry, chunk const& piece)
++  {
++    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
++    enqueue_or_chunk(
++      chunk_of(*entry.leader, piece), entry.cross_scratch, _slot, 1, piece.bytes,
++      entry.xfer->value());
++  }
++
++  void record_settled(island& entry)
++  {
++    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.leader->device_id}};
++    check_cuda(cudaEventRecord(entry.settled->get(), entry.xfer->value()),
++               "cudaEventRecord(island final)");
++  }
++
++  /**
++   * @brief (B) Today's HOST loop over the leaders: contributing leaders into the root, the root
++   * out to the leaders. SEAM: a pipelined or CPU-OR bounce replaces this body.
++   */
++  void cross_star(chunk const& piece)
++  {
++    auto& root    = _islands.front();
++    auto& window  = root.window;
++    bool uploads  = false;
++    for (std::size_t index = 1; index < _islands.size(); ++index) {
++      auto& entry = _islands[index];
++      if (!entry.contributed) { continue; }
++      submit(entry, window, chunk_of(*entry.leader, piece), piece.bytes, true);
++      wait(entry);
++      submit(root, window, root.cross_scratch, piece.bytes, false);
++      wait(root);
++      enqueue_cross_or(root, piece);
++    }
++    // A leader that is the only contributor already holds the union.
++    auto const needs = [&](island const& entry) { return !(entry.contributed && _contributing == 1); };
++    for (std::size_t index = 1; index < _islands.size(); ++index) {
++      uploads = uploads || needs(_islands[index]);
++    }
++    if (uploads) {
++      submit(root, window, chunk_of(*root.leader, piece), piece.bytes, true);
++      wait(root);
++      for (std::size_t index = 1; index < _islands.size(); ++index) {
++        if (needs(_islands[index])) {
++          submit(_islands[index], window, chunk_of(*_islands[index].leader, piece), piece.bytes,
++                 false);
++        }
++      }
++      for (std::size_t index = 1; index < _islands.size(); ++index) {
++        wait(_islands[index]);
++      }
++    }
++    for (auto& entry : _islands) {
++      record_settled(entry);
++    }
++  }
++
++  /**
++   * @brief (B) Two islands: both leaders download at once, then both upload at once and OR.
++   * SEAM: a pipelined bounce replaces this body.
++   */
++  void cross_exchange(chunk const& piece)
++  {
++    auto& left        = _islands[0];
++    auto& right       = _islands[1];
++    auto* left_chunk  = chunk_of(*left.leader, piece);
++    auto* right_chunk = chunk_of(*right.leader, piece);
++    if (left.contributed && right.contributed) {
++      submit(left, left.window, left_chunk, piece.bytes, true);
++      submit(right, right.window, right_chunk, piece.bytes, true);
++      wait(left);
++      wait(right);
++      submit(left, right.window, left.cross_scratch, piece.bytes, false);
++      enqueue_cross_or(left, piece);
++      submit(right, left.window, right.cross_scratch, piece.bytes, false);
++      enqueue_cross_or(right, piece);
++      record_settled(left);
++      record_settled(right);
++      wait(left);
++      wait(right);
++      return;
++    }
++    auto& from = left.contributed ? left : right;
++    auto& to   = left.contributed ? right : left;
++    submit(from, from.window, chunk_of(*from.leader, piece), piece.bytes, true);
++    record_settled(from);
++    wait(from);
++    submit(to, from.window, chunk_of(*to.leader, piece), piece.bytes, false);
++    record_settled(to);
++    wait(to);
++  }
++
++  /// (C) Peer copy of the leader's final chunk to every other GPU of its island.
++  void enqueue_fan_out(chunk const& piece)
++  {
++    for (auto& entry : _islands) {
++      for (auto* member : entry.members) {
++        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{member->device_id}};
++        check_cuda(cudaStreamWaitEvent(member->stream->value(), entry.settled->get(), 0),
++                   "cudaStreamWaitEvent(island final)");
++        check_cuda(cudaMemcpyPeerAsync(chunk_of(*member, piece),
++                                       member->device_id,
++                                       chunk_of(*entry.leader, piece),
++                                       entry.leader->device_id,
++                                       piece.bytes,
++                                       member->stream->value()),
++                   "cudaMemcpyPeerAsync(island fan-out)");
++      }
++    }
++  }
++
++  impl const& _owner;
++  std::vector<island> _islands;  // The root's island first
++  std::size_t _slot;             // Bytes of one slot: the largest chunk of any key
++  bool _exchange;
++  std::vector<chunk> _chunks;
++  std::size_t _contributing = 0;  // Islands with a contribution
++  std::size_t _host_bytes   = 0;
++  std::size_t _remote_scratch = 0;
++  std::size_t _host_legs      = 0;
++  sirius::cuda::device_copy_batch _copies;
++};
++
+ //===----------------------------------------------------------------------===//
+ // accumulated_bloom_builder
+ //===----------------------------------------------------------------------===//
+@@ -1186,6 +1674,8 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
+   sirius::cuda::device_copy_batch copies;
+   bool prepared  = false;
+   auto transport = publication_transport::HOST_STAGED;
++  char const* island_route   = nullptr;  // PROTOTYPE [xfer-PR]
++  std::size_t island_scratch = 0;
+   try {
+     auto const execute = [&] {
+       bool direct = !force_host && !sirius::memory::find_pair_without_pool_access(spaces);
+@@ -1201,6 +1691,35 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
+           }
+         }
+       };
++      // PROTOTYPE [xfer-PR]: per-island transport instead of the all-or-nothing choice.
++      if (auto const mode = force_host ? proto_xfer_mode::off : proto_xfer();
++          mode != proto_xfer_mode::off) {
++        if (auto islands = impl::island_reduce::plan(*_impl, *root)) {
++          impl::island_reduce reduce{*_impl, std::move(*islands), mode};
++          bool ready = false;
++          try {
++            allocate_scratch(reduce.root_scratch_bytes());
++            // As below: the root's task stream owns scratch allocation.
++            check_cuda(cudaStreamSynchronize(stream.get()),
++                       "cudaStreamSynchronize(island allocation)");
++            ready = reduce.prepare(static_cast<std::byte*>(scratch->data()));
++          } catch (rmm::out_of_memory const&) {
++            check_cuda(cudaStreamSynchronize(stream.get()),
++                       "cudaStreamSynchronize(island preparation)");
++          }
++          if (ready) {
++            if (observation) { observation->host_staging_bytes = reduce.host_bytes(); }
++            prepared = true;
++            island_route = reduce.exchanges() ? "island peer copies + HOST exchange"
++                                              : "island peer copies + HOST star";
++            island_scratch = reduce.remote_scratch_bytes();
++            reduce.run();
++            return;
++          }
++          scratch.reset();
++          if (observation) { *observation = {}; }
++        }
++      }
+       if (direct) {
+         auto const scratch_bytes =
+           multiply(multiply(std::min<std::size_t>(2, all_chunks), sources.size()), chunk_slot);
+@@ -1345,13 +1864,16 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
+   SIRIUS_LOG_DEBUG(
+     "[accumulated_bloom_builder::finish] root GPU {} reduced and replicated {} key(s), {} bytes in "
+     "all, "
+-    "through {}: {} contributing source(s), {} target(s).",
++    "through {}: {} contributing source(s), {} target(s), {} scratch byte(s) on other leaders.",
+     root->device_id,
+     _impl->keys.size(),
+     all_bytes,
+-    transport == publication_transport::PEER_COPY ? "peer copies" : "HOST staging",
++    island_route != nullptr                       ? island_route
++    : transport == publication_transport::PEER_COPY ? "peer copies"
++                                                    : "HOST staging",
+     sources.size(),
+-    targets.size());
++    targets.size(),
++    island_scratch);
+   make_filters(root->device_id);
+   return publication{{_impl->filters}, transport};
+ }
+diff --git a/src/cuda/sirius_dynamic_in_list_filter.cu b/src/cuda/sirius_dynamic_in_list_filter.cu
+index c6509154..ac9c033a 100644
+--- a/src/cuda/sirius_dynamic_in_list_filter.cu
++++ b/src/cuda/sirius_dynamic_in_list_filter.cu
+@@ -291,6 +291,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
+   pending.reserve(spaces.size());
+   _set->replicas.reserve(_set->replicas.size() + spaces.size());
+   detail::replica_fanout_failures failures;
++  detail::replica_relay relay;  // PROTOTYPE [xfer-PR]
+   for (auto const& target : spaces) {
+     auto const& target_space = target.get_gpu_space();
+     auto const device_id     = target_space.get_device_id();
+@@ -326,13 +327,15 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
+           }
+           auto result       = std::make_unique<set_replica>(device_id, std::move(destination_set));
+           auto& destination = *std::get<set_owner<key_type>>(result->set);
+-          detail::enqueue_replica_copy(destination.data(),
+-                                       rmm::cuda_device_id{device_id},
+-                                       source_set->data(),
+-                                       source_space,
+-                                       bytes,
+-                                       stream,
+-                                       target.get_host_staging_space());
++          auto const origin = relay.pick({source_set->data(), &source_space}, device_id);
++          auto const route  = detail::enqueue_replica_copy(destination.data(),
++                                                           rmm::cuda_device_id{device_id},
++                                                           origin.data,
++                                                           *origin.space,
++                                                           bytes,
++                                                           stream,
++                                                           target.get_host_staging_space());
++          relay.offer(route, destination.data(), target_space);
+           return result;
+         },
+         source->set);
+diff --git a/src/cuda/sirius_dynamic_small_in_list_filter.cu b/src/cuda/sirius_dynamic_small_in_list_filter.cu
+index d71ed0f7..c27e5e10 100644
+--- a/src/cuda/sirius_dynamic_small_in_list_filter.cu
++++ b/src/cuda/sirius_dynamic_small_in_list_filter.cu
+@@ -268,6 +268,7 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
+   pending.reserve(spaces.size());
+   _store->replicas.reserve(_store->replicas.size() + spaces.size());
+   detail::replica_fanout_failures failures;
++  detail::replica_relay relay;  // PROTOTYPE [xfer-PR]
+   for (auto const& target : spaces) {
+     auto const& target_space = target.get_gpu_space();
+     auto const device_id     = target_space.get_device_id();
+@@ -291,13 +292,15 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
+ 
+       auto replica = std::make_unique<needle_store::needle_replica>(
+         device_id, rmm::device_buffer{bytes, stream, reservation->allocator()});
+-      detail::enqueue_replica_copy(replica->needles.data(),
+-                                   rmm::cuda_device_id{device_id},
+-                                   source->needles.data(),
+-                                   source_space,
+-                                   bytes,
+-                                   stream,
+-                                   target.get_host_staging_space());
++      auto const origin = relay.pick({source->needles.data(), &source_space}, device_id);
++      auto const route  = detail::enqueue_replica_copy(replica->needles.data(),
++                                                       rmm::cuda_device_id{device_id},
++                                                       origin.data,
++                                                       *origin.space,
++                                                       bytes,
++                                                       stream,
++                                                       target.get_host_staging_space());
++      relay.offer(route, replica->needles.data(), target_space);
+       pending.emplace_back(std::move(replica), std::move(stream_lease));
+     } catch (...) {
+       if (failures.skip_if_recoverable(
+diff --git a/src/op/dynamic_filter/complete_build_inventory.cpp b/src/op/dynamic_filter/complete_build_inventory.cpp
+index 4d925c8d..471e8836 100644
+--- a/src/op/dynamic_filter/complete_build_inventory.cpp
++++ b/src/op/dynamic_filter/complete_build_inventory.cpp
+@@ -31,6 +31,7 @@
+ #include <cucascade/memory/disk_table.hpp>
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <exception>
+ #include <limits>
+ #include <stdexcept>
+@@ -303,10 +304,15 @@ void build_arrival_ledger::close(construction_decline reason) noexcept
+ std::size_t detail::accumulated_bloom_chunk_bytes(std::size_t raw_bytes) noexcept
+ {
+   auto constexpr alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
++  // PROTOTYPE (mb/lifecycle, H12): SIRIUS_PROTO_BLOOM_CHUNK_MIB overrides the largest chunk.
++  auto maximum = k_max_bloom_transfer_chunk_bytes;
++  if (auto const* text = std::getenv("SIRIUS_PROTO_BLOOM_CHUNK_MIB")) {
++    auto const mib = std::strtoull(text, nullptr, 10);
++    if (mib != 0) { maximum = static_cast<std::size_t>(mib) << 20; }
++  }
+   return std::min(
+-    rmm::align_up(
+-      std::clamp(raw_bytes / 8, k_min_bloom_transfer_chunk_bytes, k_max_bloom_transfer_chunk_bytes),
+-      alignment),
++    rmm::align_up(std::clamp(raw_bytes / 8, k_min_bloom_transfer_chunk_bytes, maximum),
++                  alignment),
+     rmm::align_up(raw_bytes, alignment));
+ }
+ 
+diff --git a/src/op/dynamic_filter/dynamic_filter_replica_transfer.hpp b/src/op/dynamic_filter/dynamic_filter_replica_transfer.hpp
+index c02ce881..97d67725 100644
+--- a/src/op/dynamic_filter/dynamic_filter_replica_transfer.hpp
++++ b/src/op/dynamic_filter/dynamic_filter_replica_transfer.hpp
+@@ -25,6 +25,7 @@
+ #include <cstddef>
+ #include <exception>
+ #include <string_view>
++#include <vector>
+ 
+ namespace cucascade::memory {
+ class memory_space;
+@@ -61,6 +62,39 @@ replica_transfer_route enqueue_replica_copy(
+   cucascade::memory::memory_space const& host_staging_space,
+   replica_transfer_policy policy = replica_transfer_policy::automatic);
+ 
++/**
++ * @brief PROTOTYPE [xfer-PR] (SIRIUS_PROTO_XFER_D2D): relays a replica fan-out through replicas
++ * that already completed, so a destination without peer access to the source GPU is peer-copied
++ * from a GPU of its own island instead of being staged through the host a second time.
++ *
++ * Only HOST-staged replicas are offered as relays: `enqueue_replica_copy` completes them before
++ * returning. The relay's allocation must outlive the copies read from it.
++ */
++class replica_relay final {
++ public:
++  struct origin {
++    void const* data;
++    cucascade::memory::memory_space const* space;
++  };
++
++  replica_relay();
++
++  /**
++   * @brief The copy source for @p destination_device: @p original when its pool grants the
++   * destination or no relay does, else the first relay whose pool grants it.
++   */
++  [[nodiscard]] origin pick(origin original, int destination_device) const;
++
++  /// Offers a replica that was copied through @p route as a relay.
++  void offer(replica_transfer_route route,
++             void const* data,
++             cucascade::memory::memory_space const& space);
++
++ private:
++  bool _enabled;
++  std::vector<origin> _relays;
++};
++
+ /**
+  * @brief Keeps the first fatal replica failure while remaining submitted work drains
+  *
+diff --git a/test/cpp/operator/bench_dynamic_filter_lifecycle.cpp b/test/cpp/operator/bench_dynamic_filter_lifecycle.cpp
+new file mode 100644
+index 00000000..12d2ffe5
+--- /dev/null
++++ b/test/cpp/operator/bench_dynamic_filter_lifecycle.cpp
+@@ -0,0 +1,827 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*
++ * PROTOTYPE microbenchmarks of the dynamic-filter construction lifecycle (not for landing as is).
++ *
++ * Every case drives the production API: the publication session PARTITION uses
++ * (`begin` -> `contribute` -> `publish_if_final`) or, where the Bloom array size must be chosen
++ * independently of the build's rows, `accumulated_bloom_builder` directly.
++ *
++ *   MB0  prices of the primitives (host wait, stream, event)
++ *   MB2  fixed cost per contribution
++ *   MB3  cost of `begin` (lease + zero-fill + streams) against bytes and GPUs
++ *   MB4  cost of `finish` against bytes, GPUs, transfer chunk and exact slices
++ *   MB5  small build end to end against the one-shot shape (column constructor + replicate)
++ *   MB7  zone-map bounds against rows
++ *
++ * Each row is printed as `ROW,<case>,key=value,...`; times are microseconds, median and minimum of
++ * `SIRIUS_BENCH_DF_REPS` repetitions after one unreported warm-up. Sweeps are narrowed with
++ * `SIRIUS_BENCH_DF_*` lists (comma separated).
++ */
++
++#include "operator/dynamic_filter_accumulation_test_utils.hpp"
++
++#include <cudf/column/column_factories.hpp>
++#include <cudf/concatenate.hpp>
++#include <cudf/filling.hpp>
++#include <cudf/scalar/scalar.hpp>
++#include <cudf/table/table.hpp>
++
++#include <rmm/cuda_device.hpp>
++#include <rmm/cuda_stream.hpp>
++#include <rmm/device_buffer.hpp>
++
++#include <cuda_profiler_api.h>
++#include <cuda_runtime_api.h>
++
++#include <catch.hpp>
++#include <op/dynamic_filter/bloom_sizing.hpp>
++#include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
++#include <op/dynamic_filter/dynamic_filter_publish_plan.hpp>
++#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
++
++#include <algorithm>
++#include <bit>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <memory>
++#include <optional>
++#include <span>
++#include <sstream>
++#include <string>
++#include <vector>
++
++namespace {
++
++namespace op  = sirius::op;
++namespace acc = sirius::test::accumulation;
++using clock_type = std::chrono::steady_clock;
++
++[[nodiscard]] double us_between(clock_type::time_point from, clock_type::time_point to)
++{
++  return std::chrono::duration<double, std::micro>(to - from).count();
++}
++
++[[nodiscard]] std::vector<std::uint64_t> env_list(char const* name,
++                                                  std::vector<std::uint64_t> fallback)
++{
++  auto const* text = std::getenv(name);
++  if (text == nullptr || *text == '\0') { return fallback; }
++  std::vector<std::uint64_t> values;
++  std::stringstream stream{text};
++  for (std::string item; std::getline(stream, item, ',');) {
++    values.push_back(std::strtoull(item.c_str(), nullptr, 10));
++  }
++  return values;
++}
++
++[[nodiscard]] std::vector<std::string> env_names(char const* name,
++                                                 std::vector<std::string> fallback)
++{
++  auto const* text = std::getenv(name);
++  if (text == nullptr || *text == '\0') { return fallback; }
++  std::vector<std::string> values;
++  std::stringstream stream{text};
++  for (std::string item; std::getline(stream, item, ',');) {
++    values.push_back(item);
++  }
++  return values;
++}
++
++[[nodiscard]] std::size_t reps() { return env_list("SIRIUS_BENCH_DF_REPS", {7}).front(); }
++
++/**
++ * @brief Samples of one metric; reports the median and the minimum.
++ */
++struct samples {
++  std::vector<double> values;
++  void add(double value) { values.push_back(value); }
++  [[nodiscard]] double median() const
++  {
++    if (values.empty()) { return 0; }
++    auto sorted = values;
++    std::ranges::sort(sorted);
++    return sorted[sorted.size() / 2];
++  }
++  [[nodiscard]] double minimum() const
++  {
++    return values.empty() ? 0 : *std::ranges::min_element(values);
++  }
++};
++
++void sync_devices(std::size_t devices)
++{
++  for (std::size_t device = 0; device < devices; ++device) {
++    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
++    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
++  }
++}
++
++/**
++ * @brief A batch of `columns` INT64 key columns of `rows` distinct values starting at `start`.
++ */
++[[nodiscard]] acc::batch_ptr make_keys(acc::fixture const& fixture,
++                                       int device,
++                                       std::int64_t start,
++                                       cudf::size_type rows,
++                                       std::size_t columns)
++{
++  auto& space = fixture.gpu(device);
++  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
++  auto const stream = space.acquire_stream();
++  auto const mr     = space.get_default_allocator();
++  std::vector<std::unique_ptr<cudf::column>> made;
++  for (std::size_t column = 0; column < columns; ++column) {
++    auto const step = static_cast<std::int64_t>(2 * column + 1);
++    made.push_back(cudf::sequence(rows,
++                                  cudf::numeric_scalar<std::int64_t>(start * step, true, stream, mr),
++                                  cudf::numeric_scalar<std::int64_t>(step, true, stream, mr),
++                                  stream,
++                                  mr));
++  }
++  auto table = std::make_unique<cudf::table>(std::move(made));
++  stream.sync();
++  return sirius::make_data_batch(
++    std::move(table), space, stream, sirius::telemetry::batch_telemetry_info{});
++}
++
++/**
++ * @brief One session-level case.
++ *
++ * `kind`: "bloom" plans Bloom filters only; "auto" is the production choice (exact IN-list while
++ * the keys fit the L2 fraction, Bloom otherwise); "bloomzone" and "autozone" add zone maps.
++ */
++struct session_case {
++  std::string kind      = "bloom";
++  std::size_t keys      = 1;
++  std::size_t gpus      = 1;      ///< Replica GPUs of the plan
++  std::size_t batches   = 1;
++  std::uint64_t rows    = 1;      ///< Rows per batch
++  bool spread           = false;  ///< Batches round-robin over the GPUs; otherwise all on GPU 0
++  bool one_shot         = false;  ///< Also time the one-shot shape
++};
++
++struct session_result {
++  samples begin, enqueue, wait, publish, total, shot_build, shot_replicate;
++  std::string published = "?";
++  std::size_t filters   = 0;
++};
++
++[[nodiscard]] op::dynamic_filter_publish_plan plan_for(acc::fixture const& fixture,
++                                                       session_case const& subject)
++{
++  using plan_type = op::dynamic_filter_publish_plan;
++  bool const zone = subject.kind.ends_with("zone");
++  std::vector<plan_type::admitted_key> keys;
++  std::vector<plan_type::key_binding> bindings;
++  cudf::data_type const type{cudf::type_id::INT64};
++  for (std::size_t index = 0; index < subject.keys; ++index) {
++    keys.push_back({.planner_condition_index = index,
++                    .build_key_ordinal       = static_cast<cudf::size_type>(index),
++                    .probe_key_ordinal       = static_cast<cudf::size_type>(index),
++                    .storage_type            = type,
++                    .probe_storage_type      = type});
++    bindings.push_back(
++      {.admitted_key_index = index, .channel_push_ordinal = index, .probe_storage_type = type});
++  }
++  std::vector<op::dynamic_filter_replica_space> replicas(
++    fixture.spaces.begin(), fixture.spaces.begin() + static_cast<std::ptrdiff_t>(subject.gpus));
++  op::dynamic_filter_publication_policy policy{};
++  policy.emit_zone_map_filters   = zone;
++  policy.max_bloom_bytes_per_gpu = std::uint64_t{16} << 30;
++  policy.bloom_only              = subject.kind.starts_with("bloom");
++  return plan_type{std::move(keys),
++                   {{fixture.channel, op::dynamic_filter_route_class::scan, zone, std::move(bindings)}},
++                   std::move(replicas),
++                   policy};
++}
++
++[[nodiscard]] std::string describe(op::sirius_dynamic_filter_set const& channel,
++                                   std::size_t& count)
++{
++  std::size_t bloom = 0, small = 0, hash = 0, zone = 0;
++  auto const snapshot = channel.snapshot();
++  for (auto const& entry : snapshot.entries()) {
++    auto const* filter = entry.filter.get();
++    if (dynamic_cast<op::sirius_dynamic_bloom_filter const*>(filter)) {
++      ++bloom;
++    } else if (dynamic_cast<op::sirius_dynamic_small_in_list_filter const*>(filter)) {
++      ++small;
++    } else if (dynamic_cast<op::sirius_dynamic_in_list_filter const*>(filter)) {
++      ++hash;
++    } else {
++      ++zone;
++    }
++  }
++  count = bloom + small + hash + zone;
++  if (count == 0) { return "NONE"; }
++  std::string text;
++  if (bloom) { text += "bloom" + std::to_string(bloom); }
++  if (small) { text += "small" + std::to_string(small); }
++  if (hash) { text += "hash" + std::to_string(hash); }
++  if (zone) { text += "zone" + std::to_string(zone); }
++  return text;
++}
++
++/**
++ * @brief The one-shot shape the base built: one column constructor per key over the whole build on
++ * GPU 0, then `replicate_to_devices`. The concatenation itself is not timed: the join needs it
++ * either way.
++ */
++void one_shot(acc::fixture const& fixture,
++              session_case const& subject,
++              cudf::table_view const& whole,
++              std::string const& published,
++              session_result& result)
++{
++  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
++  auto const stream = fixture.publication_stream(0);
++  auto const mr     = fixture.gpu(0).get_default_allocator();
++  std::vector<std::shared_ptr<op::sirius_dynamic_filter>> filters;
++  auto const start = clock_type::now();
++  for (std::size_t key = 0; key < subject.keys; ++key) {
++    auto const column = whole.column(static_cast<cudf::size_type>(key));
++    if (published.starts_with("small")) {
++      filters.push_back(std::make_shared<op::sirius_dynamic_small_in_list_filter>(column, stream, mr));
++    } else if (published.starts_with("hash")) {
++      filters.push_back(std::make_shared<op::sirius_dynamic_in_list_filter>(column, stream, mr));
++    } else {
++      filters.push_back(std::make_shared<op::sirius_dynamic_bloom_filter>(column, stream, mr));
++    }
++  }
++  stream.sync();
++  auto const built = clock_type::now();
++  std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(),
++                                                                 subject.gpus};
++  if (subject.gpus > 1) {
++    for (auto const& filter : filters) {
++      auto* replicable = dynamic_cast<op::sirius_device_replicable*>(filter.get());
++      REQUIRE(replicable != nullptr);
++      replicable->replicate_to_devices(spaces);
++    }
++    sync_devices(subject.gpus);
++  }
++  auto const replicated = clock_type::now();
++  result.shot_build.add(us_between(start, built));
++  result.shot_replicate.add(us_between(built, replicated));
++  filters.clear();
++  sync_devices(subject.gpus);
++}
++
++/**
++ * @brief Runs `subject` through the publication session `reps()` times after one warm-up.
++ */
++[[nodiscard]] session_result run_session(acc::fixture& fixture, session_case const& subject)
++{
++  session_result result;
++  std::vector<acc::batch_ptr> batches;
++  for (std::size_t index = 0; index < subject.batches; ++index) {
++    auto const device = subject.spread ? static_cast<int>(index % subject.gpus) : 0;
++    batches.push_back(make_keys(fixture,
++                                device,
++                                static_cast<std::int64_t>(index * subject.rows),
++                                static_cast<cudf::size_type>(subject.rows),
++                                subject.keys));
++  }
++  std::unique_ptr<cudf::table> whole;
++  if (subject.one_shot) {
++    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
++    auto const stream = fixture.publication_stream(0);
++    std::vector<acc::batch_ptr> local;
++    std::vector<cudf::table_view> views;
++    for (std::size_t index = 0; index < subject.batches; ++index) {
++      // The one-shot build sees every batch on GPU 0, as CONCAT delivered it.
++      local.push_back(subject.spread ? make_keys(fixture,
++                                                 0,
++                                                 static_cast<std::int64_t>(index * subject.rows),
++                                                 static_cast<cudf::size_type>(subject.rows),
++                                                 subject.keys)
++                                     : batches[index]);
++      views.push_back(sirius::get_cudf_table_view(*local.back()));
++    }
++    whole = cudf::concatenate(views, stream, fixture.gpu(0).get_default_allocator());
++    stream.sync();
++  }
++  sync_devices(fixture.devices);
++
++  for (std::size_t rep = 0; rep <= reps(); ++rep) {
++    bool const record = rep != 0;
++    fixture.session.reset();
++    fixture.channel = std::make_shared<op::sirius_dynamic_filter_set>();
++    fixture.session =
++      std::make_unique<op::dynamic_filter_publication_session>(plan_for(fixture, subject),
++                                                               &fixture.stats);
++    auto certified = acc::fixture::certify(batches);
++    REQUIRE(std::holds_alternative<op::complete_build_inventory>(certified));
++
++    auto const start = clock_type::now();
++    bool const begun =
++      fixture.session->begin(std::move(std::get<op::complete_build_inventory>(certified)));
++    auto const begin_done = clock_type::now();
++    REQUIRE(begun);
++
++    double enqueue = 0;
++    double wait    = 0;
++    for (auto const& batch : batches) {
++      auto source       = batch->to_read_only();
++      auto const device = source.get_memory_space()->get_device_id();
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
++      auto const stream = fixture.task_stream(device);
++      auto const before = clock_type::now();
++      fixture.session->contribute(batch->get_batch_id(), source, stream);
++      auto const queued = clock_type::now();
++      // The task's post-operator sync, which retires the inserts before the input is released.
++      stream.sync();
++      auto const retired = clock_type::now();
++      enqueue += us_between(before, queued);
++      wait += us_between(queued, retired);
++    }
++    auto const last = batches.back();
++    auto const root = last->to_read_only().get_memory_space()->get_device_id();
++    auto const publish_start = clock_type::now();
++    fixture.publish(root, last->get_batch_id());
++    auto const published = clock_type::now();
++
++    if (record) {
++      result.begin.add(us_between(start, begin_done));
++      result.enqueue.add(enqueue / static_cast<double>(subject.batches));
++      result.wait.add(wait / static_cast<double>(subject.batches));
++      result.publish.add(us_between(publish_start, published));
++      result.total.add(us_between(start, begin_done) + enqueue + wait +
++                       us_between(publish_start, published));
++    }
++    result.published = describe(*fixture.channel, result.filters);
++    fixture.session->finalize_input();
++    fixture.session.reset();
++    fixture.channel.reset();
++    sync_devices(fixture.devices);
++    if (subject.one_shot && result.filters != 0 && (record || rep == 0)) {
++      session_result discard;
++      one_shot(fixture, subject, whole->view(), result.published, record ? result : discard);
++    }
++  }
++  return result;
++}
++
++void print(char const* name, session_case const& subject, session_result const& result)
++{
++  std::printf(
++    "ROW,%s,kind=%s,keys=%zu,gpus=%zu,spread=%d,batches=%zu,rows=%llu,published=%s,"
++    "begin_us=%.1f,begin_min=%.1f,enq_us=%.2f,enq_min=%.2f,wait_us=%.2f,wait_min=%.2f,"
++    "publish_us=%.1f,publish_min=%.1f,total_us=%.1f,total_min=%.1f",
++    name,
++    subject.kind.c_str(),
++    subject.keys,
++    subject.gpus,
++    subject.spread ? 1 : 0,
++    subject.batches,
++    static_cast<unsigned long long>(subject.rows),
++    result.published.c_str(),
++    result.begin.median(),
++    result.begin.minimum(),
++    result.enqueue.median(),
++    result.enqueue.minimum(),
++    result.wait.median(),
++    result.wait.minimum(),
++    result.publish.median(),
++    result.publish.minimum(),
++    result.total.median(),
++    result.total.minimum());
++  if (subject.one_shot) {
++    std::printf(",shot_build_us=%.1f,shot_build_min=%.1f,shot_repl_us=%.1f,shot_repl_min=%.1f",
++                result.shot_build.median(),
++                result.shot_build.minimum(),
++                result.shot_replicate.median(),
++                result.shot_replicate.minimum());
++  }
++  std::printf("\n");
++  std::fflush(stdout);
++}
++
++[[nodiscard]] std::size_t usable_gpus(std::size_t wanted)
++{
++  return std::min<std::size_t>(wanted, static_cast<std::size_t>(acc::visible_gpus()));
++}
++
++/**
++ * @brief Flushes the CUDA trace when a case ends: nsys loses the API trace of this binary
++ * otherwise.
++ */
++struct trace_flush {
++  trace_flush()                              = default;
++  trace_flush(trace_flush const&)            = delete;
++  trace_flush& operator=(trace_flush const&) = delete;
++  ~trace_flush() { (void)cudaProfilerStop(); }
++};
++
++}  // namespace
++
++TEST_CASE("bench dynamic filter primitives (MB0)", "[!benchmark][dynamic_filter][mb0]")
++{
++  trace_flush const flush;
++  acc::fixture fixture({.devices = 1, .gpu_bytes = 1024 * acc::mib});
++  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
++  auto const stream = fixture.task_stream(0);
++  rmm::device_buffer buffer{4096, stream, fixture.gpu(0).get_default_allocator()};
++  std::size_t constexpr rounds = 2000;
++  auto const price = [&](char const* name, auto&& body) {
++    samples each;
++    for (std::size_t rep = 0; rep <= reps(); ++rep) {
++      auto const start = clock_type::now();
++      for (std::size_t round = 0; round < rounds; ++round) {
++        body();
++      }
++      stream.sync();
++      if (rep != 0) { each.add(us_between(start, clock_type::now()) / rounds); }
++    }
++    std::printf("ROW,MB0,what=%s,us=%.3f,min=%.3f\n", name, each.median(), each.minimum());
++  };
++  price("memset4_enqueue", [&] { (void)cudaMemsetAsync(buffer.data(), 0, 4, stream.get()); });
++  price("memset4_plus_wait", [&] {
++    (void)cudaMemsetAsync(buffer.data(), 0, 4, stream.get());
++    stream.sync();
++  });
++  price("idle_stream_sync", [&] { stream.sync(); });
++  std::uint32_t word = 0;
++  price("d2h4_plus_wait", [&] {
++    (void)cudaMemcpyAsync(&word, buffer.data(), 4, cudaMemcpyDeviceToHost, stream.get());
++    stream.sync();
++  });
++  price("stream_create_destroy",
++        [&] { rmm::cuda_stream made{rmm::cuda_stream::flags::non_blocking}; });
++  price("event_create_record_destroy", [&] {
++    cudaEvent_t event{};
++    (void)cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
++    (void)cudaEventRecord(event, stream.get());
++    (void)cudaEventDestroy(event);
++  });
++  cudaEvent_t shared{};
++  REQUIRE(cudaEventCreateWithFlags(&shared, cudaEventDisableTiming) == cudaSuccess);
++  rmm::cuda_stream other{rmm::cuda_stream::flags::non_blocking};
++  price("event_record_plus_wait_event", [&] {
++    (void)cudaEventRecord(shared, stream.get());
++    (void)cudaStreamWaitEvent(other.value(), shared, 0);
++  });
++  int device = 0;
++  price("stream_get_device", [&] { (void)cudaStreamGetDevice(stream.get(), &device); });
++  price("alloc_free_4k", [&] {
++    rmm::device_buffer scratch{4096, stream, fixture.gpu(0).get_default_allocator()};
++  });
++  other.synchronize();
++  REQUIRE(cudaEventDestroy(shared) == cudaSuccess);
++}
++
++TEST_CASE("bench dynamic filter contribution fixed cost (MB2)", "[!benchmark][dynamic_filter][mb2]")
++{
++  trace_flush const flush;
++  auto const gpus_list = env_list("SIRIUS_BENCH_DF_GPUS", {1});
++  for (auto const wanted : gpus_list) {
++    auto const gpus = usable_gpus(wanted);
++    if (gpus != wanted) { continue; }
++    acc::fixture fixture({.devices = gpus, .gpu_bytes = 8192 * acc::mib});
++    for (auto const& kind : env_names("SIRIUS_BENCH_DF_KINDS", {"bloom", "auto", "bloomzone"})) {
++      for (auto const keys : env_list("SIRIUS_BENCH_DF_KEYS", {1, 2, 4})) {
++        for (auto const rows : env_list("SIRIUS_BENCH_DF_ROWS", {1, 32, 1000})) {
++          for (auto const batches : env_list("SIRIUS_BENCH_DF_BATCHES", {1, 8, 64, 512})) {
++            session_case const subject{.kind    = kind,
++                                       .keys    = keys,
++                                       .gpus    = gpus,
++                                       .batches = batches,
++                                       .rows    = rows,
++                                       .spread  = gpus > 1};
++            print("MB2", subject, run_session(fixture, subject));
++          }
++        }
++      }
++    }
++  }
++}
++
++TEST_CASE("bench dynamic filter begin (MB3)", "[!benchmark][dynamic_filter][mb3]")
++{
++  trace_flush const flush;
++  using builder = op::detail::accumulated_bloom_builder;
++  for (auto const wanted : env_list("SIRIUS_BENCH_DF_GPUS", {1, 2, 4})) {
++    auto const gpus = usable_gpus(wanted);
++    if (gpus != wanted) { continue; }
++    acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{40} << 30});
++    std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), gpus};
++    for (auto const keys : env_list("SIRIUS_BENCH_DF_KEYS", {1, 2})) {
++      for (auto const megabytes :
++           env_list("SIRIUS_BENCH_DF_MB", {1, 16, 128, 512, 1024, 3072, 12288})) {
++        auto const bytes  = megabytes << 20;
++        auto const blocks = bytes / op::bloom_bytes_per_block / keys;
++        samples create, zero, destroy;
++        for (std::size_t rep = 0; rep <= reps(); ++rep) {
++          std::vector<builder::key> planned;
++          for (std::size_t key = 0; key < keys; ++key) {
++            planned.push_back(
++              {static_cast<cudf::size_type>(key), cudf::data_type{cudf::type_id::INT64}, blocks});
++          }
++          auto const start = clock_type::now();
++          auto made        = builder::try_create(std::move(planned), spaces);
++          auto const leased = clock_type::now();
++          REQUIRE(made);
++          sync_devices(gpus);
++          auto const zeroed = clock_type::now();
++          made.reset();
++          sync_devices(gpus);
++          auto const released = clock_type::now();
++          if (rep != 0) {
++            create.add(us_between(start, leased));
++            zero.add(us_between(leased, zeroed));
++            destroy.add(us_between(zeroed, released));
++          }
++        }
++        std::printf(
++          "ROW,MB3,gpus=%zu,keys=%zu,total_mb=%llu,create_us=%.1f,create_min=%.1f,"
++          "zero_wait_us=%.1f,zero_wait_min=%.1f,destroy_us=%.1f,destroy_min=%.1f\n",
++          gpus,
++          keys,
++          static_cast<unsigned long long>(megabytes),
++          create.median(),
++          create.minimum(),
++          zero.median(),
++          zero.minimum(),
++          destroy.median(),
++          destroy.minimum());
++        std::fflush(stdout);
++      }
++    }
++  }
++}
++
++TEST_CASE("bench dynamic filter Bloom finish (MB4)", "[!benchmark][dynamic_filter][mb4]")
++{
++  trace_flush const flush;
++  using builder = op::detail::accumulated_bloom_builder;
++  for (auto const wanted : env_list("SIRIUS_BENCH_DF_GPUS", {1, 2, 4})) {
++    auto const gpus = usable_gpus(wanted);
++    if (gpus != wanted) { continue; }
++    acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{40} << 30});
++    std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), gpus};
++    std::vector<acc::batch_ptr> batches;
++    for (std::size_t device = 0; device < gpus; ++device) {
++      batches.push_back(make_keys(
++        fixture, static_cast<int>(device), static_cast<std::int64_t>(device) * 1000, 1000, 1));
++    }
++    for (auto const chunk : env_list("SIRIUS_BENCH_DF_CHUNK_MIB", {0, 32, 64})) {
++      if (chunk == 0) {
++        unsetenv("SIRIUS_PROTO_BLOOM_CHUNK_MIB");
++      } else {
++        setenv("SIRIUS_PROTO_BLOOM_CHUNK_MIB", std::to_string(chunk).c_str(), 1);
++      }
++      for (auto const megabytes : env_list("SIRIUS_BENCH_DF_MB", {1, 16, 256, 1024, 3072})) {
++        // Mask: bit d set = GPU d contributed. Default: only the root, and every GPU.
++        for (auto const mask : env_list("SIRIUS_BENCH_DF_MASKS", {1, (1ull << gpus) - 1})) {
++          auto const sources = static_cast<std::size_t>(std::popcount(mask));
++          if ((mask >> gpus) != 0) { continue; }
++        for (auto const& xfer : env_names("SIRIUS_BENCH_DF_XFER", {""})) {
++          if (!xfer.empty()) { setenv("SIRIUS_PROTO_XFER_D2D", xfer.c_str(), 1); }
++          auto const blocks = (megabytes << 20) / op::bloom_bytes_per_block;
++          samples finish;
++          int transport = -1;
++          for (std::size_t rep = 0; rep <= reps(); ++rep) {
++            auto made = builder::try_create(
++              {{0, cudf::data_type{cudf::type_id::INT64}, blocks}}, spaces);
++            REQUIRE(made);
++            for (std::size_t device = 0; device < gpus; ++device) {
++              if (((mask >> device) & 1) == 0) { continue; }
++              auto source = batches[device]->to_read_only();
++              rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
++              REQUIRE(made->enqueue_add(sirius::get_cudf_table_view(source),
++                                        rmm::cuda_device_id{static_cast<int>(device)},
++                                        fixture.task_stream(static_cast<int>(device))));
++              fixture.task_stream(static_cast<int>(device)).sync();
++            }
++            sync_devices(gpus);
++            {
++              rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
++              auto const start = clock_type::now();
++              auto published   = made->finish(rmm::cuda_device_id{0},
++                                              fixture.publication_stream(0),
++                                              fixture.gpu(0).get_default_allocator());
++              auto const done  = clock_type::now();
++              REQUIRE(published);
++              transport = static_cast<int>(published->transport);
++              if (rep != 0) { finish.add(us_between(start, done)); }
++            }
++            sync_devices(gpus);
++            made.reset();
++            sync_devices(gpus);
++          }
++          std::printf(
++            "ROW,MB4,gpus=%zu,sources=%zu,mask=%llu,xfer=%s,mb=%llu,chunk_mib=%llu,transport=%s,"
++            "finish_us=%.1f,finish_min=%.1f,finish_max=%.1f\n",
++            gpus,
++            sources,
++            static_cast<unsigned long long>(mask),
++            xfer.empty() ? "env" : xfer.c_str(),
++            static_cast<unsigned long long>(megabytes),
++            static_cast<unsigned long long>(chunk == 0 ? 8 : chunk),
++            transport == 0 ? "PEER" : "HOST",
++            finish.median(),
++            finish.minimum(),
++            finish.values.empty() ? 0.0 : *std::ranges::max_element(finish.values));
++          std::fflush(stdout);
++        }
++          if (gpus == 1) { break; }
++        }
++      }
++    }
++    unsetenv("SIRIUS_PROTO_BLOOM_CHUNK_MIB");
++  }
++}
++
++/**
++ * PROTOTYPE gate for SIRIUS_PROTO_XFER_D2D: for every transport mode, every contribution mask and
++ * two root GPUs, every replica of every GPU must equal the OR of the partials taken before
++ * `finish`. The partials are identical across modes, so the replicas are bit-identical to the
++ * tip's (mode "off").
++ */
++TEST_CASE("gate dynamic filter Bloom finish identity (MBID)", "[!benchmark][dynamic_filter][mbid]")
++{
++  using builder = op::detail::accumulated_bloom_builder;
++  auto const gpus = usable_gpus(env_list("SIRIUS_BENCH_DF_GPUS", {4}).front());
++  REQUIRE(gpus >= 2);
++  acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{8} << 30});
++  std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), gpus};
++  auto const rows = static_cast<cudf::size_type>(env_list("SIRIUS_BENCH_DF_ROWS", {300000}).front());
++  std::vector<acc::batch_ptr> batches;
++  for (std::size_t device = 0; device < gpus; ++device) {
++    batches.push_back(make_keys(
++      fixture, static_cast<int>(device), static_cast<std::int64_t>(device + 1) * 10000019, rows, 2));
++  }
++  std::size_t cases = 0;
++  std::size_t bad   = 0;
++  // Two keys of different sizes exercise the per-key chunking and the chunk parity.
++  for (auto const megabytes : env_list("SIRIUS_BENCH_DF_MB", {1, 3, 20, 57})) {
++    auto const blocks = (megabytes << 20) / op::bloom_bytes_per_block;
++    for (std::uint64_t mask = 0; mask < (1ull << gpus); ++mask) {
++      for (auto const root : std::vector<int>{0, static_cast<int>(gpus) - 1}) {
++        std::vector<std::vector<std::byte>> reference;  // Mode "off", per key x GPU
++        for (auto const& xfer : env_names("SIRIUS_BENCH_DF_XFER", {"off", "star", "exchange"})) {
++          setenv("SIRIUS_PROTO_XFER_D2D", xfer.c_str(), 1);
++          auto made = builder::try_create({{0, cudf::data_type{cudf::type_id::INT64}, blocks},
++                                           {1, cudf::data_type{cudf::type_id::INT64}, blocks / 3 + 1}},
++                                          spaces);
++          REQUIRE(made);
++          for (std::size_t device = 0; device < gpus; ++device) {
++            if (((mask >> device) & 1) == 0) { continue; }
++            auto source = batches[device]->to_read_only();
++            rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
++            REQUIRE(made->enqueue_add(sirius::get_cudf_table_view(source),
++                                      rmm::cuda_device_id{static_cast<int>(device)},
++                                      fixture.task_stream(static_cast<int>(device))));
++            fixture.task_stream(static_cast<int>(device)).sync();
++          }
++          sync_devices(gpus);
++          std::vector<std::vector<std::byte>> expected(2);
++          for (std::size_t key = 0; key < 2; ++key) {
++            for (std::size_t device = 0; device < gpus; ++device) {
++              auto partial = made->inspect_partial(key, rmm::cuda_device_id{static_cast<int>(device)});
++              REQUIRE(partial);
++              if (expected[key].empty()) { expected[key].assign(partial->bytes.size(), std::byte{0}); }
++              for (std::size_t index = 0; index < partial->bytes.size(); ++index) {
++                expected[key][index] |= partial->bytes[index];
++              }
++            }
++          }
++          std::size_t mismatched = 0;
++          std::size_t set_bytes  = 0;
++          {
++            rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root}};
++            auto published = made->finish(rmm::cuda_device_id{root},
++                                          fixture.publication_stream(root),
++                                          fixture.gpu(root).get_default_allocator());
++            REQUIRE(published);
++            for (std::size_t key = 0; key < 2; ++key) {
++              for (auto const byte : expected[key]) {
++                set_bytes += byte != std::byte{0};
++              }
++              for (std::size_t device = 0; device < gpus; ++device) {
++                auto replica = builder::inspect_replica(
++                  *published->filters[key], rmm::cuda_device_id{static_cast<int>(device)});
++                REQUIRE(replica);
++                bool const same = replica->bytes == expected[key];
++                mismatched += !same;
++                if (xfer == "off") {
++                  reference.push_back(std::move(replica->bytes));
++                } else if (!reference.empty()) {
++                  mismatched += reference[key * gpus + device] != replica->bytes;
++                }
++              }
++            }
++          }
++          sync_devices(gpus);
++          made.reset();
++          sync_devices(gpus);
++          ++cases;
++          bad += mismatched != 0;
++          if (mismatched != 0 || mask == (1ull << gpus) - 1) {
++            std::printf("ROW,MBID,gpus=%zu,mb=%llu,mask=%llu,root=%d,xfer=%s,set_bytes=%zu,"
++                        "mismatched_replicas=%zu\n",
++                        gpus,
++                        static_cast<unsigned long long>(megabytes),
++                        static_cast<unsigned long long>(mask),
++                        root,
++                        xfer.c_str(),
++                        set_bytes,
++                        mismatched);
++            std::fflush(stdout);
++          }
++        }
++      }
++    }
++  }
++  unsetenv("SIRIUS_PROTO_XFER_D2D");
++  std::printf("ROW,MBID_SUMMARY,cases=%zu,bad=%zu\n", cases, bad);
++  CHECK(bad == 0);
++}
++
++TEST_CASE("bench dynamic filter exact slices at finish (MB4x)",
++          "[!benchmark][dynamic_filter][mb4x]")
++{
++  trace_flush const flush;
++  for (auto const wanted : env_list("SIRIUS_BENCH_DF_GPUS", {1, 2, 4})) {
++    auto const gpus = usable_gpus(wanted);
++    if (gpus != wanted) { continue; }
++    acc::fixture fixture({.devices = gpus, .gpu_bytes = 8192 * acc::mib});
++    for (auto const keys : env_list("SIRIUS_BENCH_DF_KEYS", {1, 2})) {
++      for (auto const total : env_list("SIRIUS_BENCH_DF_TOTAL_ROWS", {512, 32768})) {
++        for (auto const batches : env_list("SIRIUS_BENCH_DF_BATCHES", {1, 64, 512})) {
++          for (auto const spread : std::vector<bool>{false, true}) {
++            if (spread && gpus == 1) { continue; }
++            session_case const subject{.kind    = "auto",
++                                       .keys    = keys,
++                                       .gpus    = gpus,
++                                       .batches = batches,
++                                       .rows    = total / batches,
++                                       .spread  = spread};
++            print("MB4x", subject, run_session(fixture, subject));
++          }
++        }
++      }
++    }
++  }
++}
++
++TEST_CASE("bench dynamic filter small build against one shot (MB5)",
++          "[!benchmark][dynamic_filter][mb5]")
++{
++  trace_flush const flush;
++  for (auto const wanted : env_list("SIRIUS_BENCH_DF_GPUS", {1, 2, 4})) {
++    auto const gpus = usable_gpus(wanted);
++    if (gpus != wanted) { continue; }
++    acc::fixture fixture({.devices = gpus, .gpu_bytes = 8192 * acc::mib});
++    for (auto const& kind : env_names("SIRIUS_BENCH_DF_KINDS", {"auto", "bloom"})) {
++      for (auto const keys : env_list("SIRIUS_BENCH_DF_KEYS", {1, 2})) {
++        for (auto const total :
++             env_list("SIRIUS_BENCH_DF_TOTAL_ROWS", {12, 1000, 100000, 10000000})) {
++          for (auto const batches : env_list("SIRIUS_BENCH_DF_BATCHES", {1, 16, 128})) {
++            if (total < batches) { continue; }
++            for (auto const spread : std::vector<bool>{false, true}) {
++              if (spread && (gpus == 1 || batches < gpus)) { continue; }
++              session_case const subject{.kind     = kind,
++                                         .keys     = keys,
++                                         .gpus     = gpus,
++                                         .batches  = batches,
++                                         .rows     = total / batches,
++                                         .spread   = spread,
++                                         .one_shot = true};
++              print("MB5", subject, run_session(fixture, subject));
++            }
++          }
++        }
++      }
++    }
++  }
++}
++
++TEST_CASE("bench dynamic filter bounds against rows (MB7)", "[!benchmark][dynamic_filter][mb7]")
++{
++  trace_flush const flush;
++  acc::fixture fixture({.devices = 1, .gpu_bytes = 16384 * acc::mib});
++  for (auto const rows : env_list("SIRIUS_BENCH_DF_ROWS", {1000000, 10000000, 100000000})) {
++    for (auto const& kind : std::vector<std::string>{"bloom", "bloomzone"}) {
++      session_case const subject{.kind = kind, .keys = 1, .gpus = 1, .batches = 1, .rows = rows};
++      print("MB7", subject, run_session(fixture, subject));
++    }
++  }
++}

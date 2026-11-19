@@ -1,0 +1,519 @@
+diff --git a/src/op/dynamic_filter/dynamic_filter_publisher.cpp b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
+index 70412286..726b7a37 100644
+--- a/src/op/dynamic_filter/dynamic_filter_publisher.cpp
++++ b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
+@@ -49,6 +49,7 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <condition_variable>
+ #include <concepts>
+ #include <cstddef>
+ #include <cstdint>
+@@ -404,7 +405,9 @@ struct dynamic_filter_publication_session::state {
+     for (auto const& producer : producers) {
+       producer.finish(result);
+     }
+-    current = phase::TERMINAL;
++    current     = phase::TERMINAL;
++    terminal_at = std::chrono::steady_clock::now();
++    terminal_cv.notify_all();
+     if (stats && account_attempt) {
+       if (result == completion::PUBLISHED || result == completion::SKIPPED) {
+         stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
+@@ -811,6 +814,12 @@ struct dynamic_filter_publication_session::state {
+   bool sealed        = false;
+   bool input_closed  = false;
+   bool cancelled     = false;
++  // PROTO OP1B: a publication was claimed for a deferred run; the join point waits on `terminal_cv`.
++  bool deferred = false;
++  std::chrono::steady_clock::time_point deferred_claimed{};
++  std::chrono::steady_clock::time_point terminal_at{};
++  mutable bool gate_reported = false;
++  mutable std::condition_variable terminal_cv;
+ };
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1186,6 +1195,70 @@ void dynamic_filter_publication_session::publish_if_final(
+   operation.publish(task_space, stream);
+ }
+ 
++bool dynamic_filter_publication_session::claim_publication(std::uint64_t original_id)
++{
++  auto& operation = *_state;
++  std::scoped_lock lock(operation.mutex);
++  if (operation.pending_publication != original_id || operation.accumulation_result) {
++    return false;
++  }
++  operation.pending_publication.reset();
++  ++operation.active_operations;
++  operation.deferred         = true;
++  operation.deferred_claimed = std::chrono::steady_clock::now();
++  return true;
++}
++
++void dynamic_filter_publication_session::run_claimed_publication(
++  cucascade::memory::memory_space const& task_space, ::cuda::stream_ref stream)
++{
++  auto& operation = *_state;
++  auto const begin = std::chrono::steady_clock::now();
++  {
++    state::active_operation active{operation};
++    active.claimed = true;
++    operation.publish(task_space, stream);
++  }
++  auto const end = std::chrono::steady_clock::now();
++  bool closed    = false;
++  bool terminal  = false;
++  double since_claim = 0;
++  {
++    std::scoped_lock lock(operation.mutex);
++    closed      = operation.input_closed;
++    terminal    = operation.current == state::phase::TERMINAL;
++    since_claim =
++      std::chrono::duration<double, std::milli>(begin - operation.deferred_claimed).count();
++  }
++  sirius::log::log_noexcept([&] {
++    SIRIUS_LOG_INFO(
++      "[op1b] deferred publication ran {:.2f} ms (started {:.2f} ms after claim), terminal={}",
++      std::chrono::duration<double, std::milli>(end - begin).count(),
++      since_claim,
++      terminal);
++  });
++  // The site's finalizer may already have run (its release found the publication active).
++  if (closed) { release_retired_storage(); }
++}
++
++double dynamic_filter_publication_session::await_deferred_publication() const
++{
++  auto& operation = *_state;
++  std::unique_lock lock(operation.mutex);
++  if (!operation.deferred) { return 0.0; }
++  auto const begin = std::chrono::steady_clock::now();
++  if (operation.current == state::phase::TERMINAL) {
++    if (std::exchange(operation.gate_reported, true)) { return 0.0; }
++    // Negative: the publication was Terminal this long before the join point was reached.
++    return -std::chrono::duration<double, std::milli>(begin - operation.terminal_at).count();
++  }
++  operation.gate_reported = true;
++  operation.terminal_cv.wait(lock,
++                             [&] { return operation.current == state::phase::TERMINAL; });
++  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
++    .count();
++}
++
+ namespace {
+ 
+ /**
+diff --git a/src/op/dynamic_filter/dynamic_filter_publisher.hpp b/src/op/dynamic_filter/dynamic_filter_publisher.hpp
+index c452b8f9..70c61e51 100644
+--- a/src/op/dynamic_filter/dynamic_filter_publisher.hpp
++++ b/src/op/dynamic_filter/dynamic_filter_publisher.hpp
+@@ -138,6 +138,29 @@ class dynamic_filter_publication_session final {
+                         cucascade::memory::memory_space const& task_space,
+                         ::cuda::stream_ref stream);
+ 
++  // --- PROTO OP1B (throwaway): publication deferred past the Publishing Task's deposit ---------
++  /**
++   * @brief Claims the pending publication of @p original_id for a deferred run.
++   *
++   * The claim counts as an active operation, so closing the input (`finish_input`) no longer
++   * abandons the publication, and `await_deferred_publication` blocks until the session is
++   * Terminal. A true return obliges the caller to call `run_claimed_publication` exactly once.
++   */
++  [[nodiscard]] bool claim_publication(std::uint64_t original_id);
++
++  /// Runs the publication claimed by `claim_publication` (same contract as `publish_if_final`).
++  void run_claimed_publication(cucascade::memory::memory_space const& task_space,
++                               ::cuda::stream_ref stream);
++
++  /**
++   * @brief The join point: blocks while a claimed (deferred) publication has not made the session
++   * Terminal. Returns at once when nothing was deferred.
++   *
++   * @return Milliseconds waited when it blocked; on the first non-blocking call after a deferral,
++   * minus the milliseconds the session had been Terminal already; 0 otherwise.
++   */
++  double await_deferred_publication() const;
++
+   /**
+    * @brief Ends a collecting attempt whose task input cannot identify one certified batch.
+    *
+diff --git a/src/op/dynamic_filter/hash_join_partition_observer.cpp b/src/op/dynamic_filter/hash_join_partition_observer.cpp
+index 4faacb22..a8548e5e 100644
+--- a/src/op/dynamic_filter/hash_join_partition_observer.cpp
++++ b/src/op/dynamic_filter/hash_join_partition_observer.cpp
+@@ -57,11 +57,23 @@ void hash_join_partition_observer::after_transform(uint64_t id,
+   _join.dynamic_filter_session().publish_if_final(id, space, stream);
+ }
+ 
++bool hash_join_partition_observer::claim_publication(uint64_t id)
++{
++  return _join.dynamic_filter_session().claim_publication(id);
++}
++
++void hash_join_partition_observer::run_claimed_publication(cucascade::memory::memory_space& space,
++                                                           ::cuda::stream_ref stream)
++{
++  _join.dynamic_filter_session().run_claimed_publication(space, stream);
++}
++
+ void hash_join_partition_observer::finalize_input()
+ {
+   auto& session = _join.dynamic_filter_session();
+   session.finalize_input();
+-  D_ASSERT(!session.plan().enabled() || session.terminal());
++  // PROTO OP1B: a deferred publication may still be running here; the join point
++  // (`await_deferred_publication`) and the hash join's finalizer take over the Terminal guarantee.
+ }
+ 
+ std::size_t hash_join_partition_observer::task_scratch_bytes() const noexcept
+diff --git a/src/op/dynamic_filter/hash_join_partition_observer.hpp b/src/op/dynamic_filter/hash_join_partition_observer.hpp
+index 113940a6..6937d583 100644
+--- a/src/op/dynamic_filter/hash_join_partition_observer.hpp
++++ b/src/op/dynamic_filter/hash_join_partition_observer.hpp
+@@ -36,6 +36,9 @@ class hash_join_partition_observer final : public partition_input_observer {
+                                            cucascade::read_only_data_batch const&,
+                                            ::cuda::stream_ref) override;
+   void after_transform(uint64_t, cucascade::memory::memory_space&, ::cuda::stream_ref) override;
++  [[nodiscard]] bool claim_publication(uint64_t id) override;
++  void run_claimed_publication(cucascade::memory::memory_space& space,
++                               ::cuda::stream_ref stream) override;
+   void finalize_input() override;
+   [[nodiscard]] std::size_t task_scratch_bytes() const noexcept override;
+ 
+diff --git a/src/op/partition/partition_input_observer.hpp b/src/op/partition/partition_input_observer.hpp
+index 68a488d9..fe9e6f4d 100644
+--- a/src/op/partition/partition_input_observer.hpp
++++ b/src/op/partition/partition_input_observer.hpp
+@@ -41,6 +41,13 @@ class partition_input_observer {
+   virtual void after_transform(uint64_t id,
+                                cucascade::memory::memory_space& space,
+                                ::cuda::stream_ref stream)                         = 0;
++  // PROTO OP1B: deferred publication. `claim_publication` runs after the task's deposit and
++  // before its early completion; a true return obliges one `run_claimed_publication`.
++  [[nodiscard]] virtual bool claim_publication(uint64_t /*id*/) { return false; }
++  virtual void run_claimed_publication(cucascade::memory::memory_space& /*space*/,
++                                       ::cuda::stream_ref /*stream*/)
++  {
++  }
+   virtual void finalize_input()                                                   = 0;
+   /**
+    * @brief Bytes a task of the observed input may take from its allocator beyond its input and
+diff --git a/src/op/sirius_physical_hash_join.cpp b/src/op/sirius_physical_hash_join.cpp
+index 128334f3..5f582089 100644
+--- a/src/op/sirius_physical_hash_join.cpp
++++ b/src/op/sirius_physical_hash_join.cpp
+@@ -928,7 +928,22 @@ void sirius_physical_hash_join::reclaim_build_only_slots_if_probe_complete(bool
+ 
+ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
+ {
+-  std::lock_guard<std::mutex> lg(op_state_mutex);
++  std::unique_lock<std::mutex> lg(op_state_mutex);
++  // PROTO OP1B join point: the probe side is activated only through these hints, so a deferred
++  // publication is awaited here, outside the operator mutex, before the hint names the probe
++  // producer. No consumer scan of this join's probe subtree is created before its filters are
++  // visible.
++  auto const to_probe = [&](sirius_physical_operator* producer) {
++    lg.unlock();
++    auto const waited = _dynamic_filter_session.await_deferred_publication();
++    if (waited != 0.0) {
++      SIRIUS_LOG_INFO("[op1b] join {} probe activation: {} {:.2f} ms",
++                      this->get_operator_id(),
++                      waited > 0 ? "waited for the deferred publication" : "publication was done",
++                      waited > 0 ? waited : -waited);
++    }
++    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
++  };
+   auto* build_port = get_port("build");
+   auto* probe_port = get_port("default");
+   if (!build_port || !probe_port) {
+@@ -961,7 +976,7 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
+     }
+     if (probe_port->src_pipeline && !probe_port->src_pipeline->is_pipeline_finished()) {
+       auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
+-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
++      return to_probe(producer);
+     }
+     return std::nullopt;
+   }
+@@ -989,7 +1004,7 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
+       }
+       case build_probe_action::wait_for_probe: {
+         auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
+-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
++        return to_probe(producer);
+       }
+       case build_probe_action::none:
+       default:
+@@ -1016,7 +1031,7 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
+       }
+       case cross_schedule_kind::wait_probe: {
+         auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
+-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
++        return to_probe(producer);
+       }
+       case cross_schedule_kind::done:
+       default: return std::nullopt;
+diff --git a/src/op/sirius_physical_operator.hpp b/src/op/sirius_physical_operator.hpp
+index 7fdec598..f36e61a8 100644
+--- a/src/op/sirius_physical_operator.hpp
++++ b/src/op/sirius_physical_operator.hpp
+@@ -414,6 +414,17 @@ class routed_operator_data : public pipelineable_operator_data {
+     }
+   }
+   [[nodiscard]] std::vector<std::size_t> const& destinations() const { return _destinations; }
++
++  /// PROTO OP1B: a dynamic-filter publication this task owes after its deposit (`after_sink`).
++  struct deferred_publication {
++    std::uint64_t id;
++    cucascade::memory::memory_space* space;
++    /// Whether the task also reports completion early when it does not publish (OP1b: takes the
++    /// wait for its own insert kernels off the pipeline's completion).
++    bool complete_early_always;
++  };
++  void set_deferred_publication(deferred_publication value) { _deferred = value; }
++  [[nodiscard]] std::optional<deferred_publication> const& deferred() const { return _deferred; }
+   [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+     std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
+   {
+@@ -424,6 +435,7 @@ class routed_operator_data : public pipelineable_operator_data {
+ 
+  private:
+   std::vector<std::size_t> _destinations;
++  std::optional<deferred_publication> _deferred;
+ };
+ 
+ /**
+@@ -774,6 +786,19 @@ class sirius_physical_operator {
+   // Sink interface
+   virtual void sink(const operator_data& input_data, ::cuda::stream_ref stream);
+ 
++  /**
++   * @brief PROTO OP1B: work a sink owes after the task's output is deposited.
++   *
++   * `complete_task_early` reports the running task as completed to its pipeline (downstream work
++   * whose readiness is producer completion may then start) while the task keeps its stream,
++   * reservation and inputs until this returns.
++   */
++  virtual void after_sink(const operator_data& /*output*/,
++                          ::cuda::stream_ref /*stream*/,
++                          std::function<void()> const& /*complete_task_early*/)
++  {
++  }
++
+   //! An operator is a pipeline sink iff its tree parent is a PARTITION, BUILD_FILTER,
+   //! RIGHT_DELIM_JOIN, or DENSE_COUNT_JOIN — computed from `_parent_op` from the final tree. Those
+   //! parents consume a child's output through a repository, so the child terminates its own
+diff --git a/src/op/sirius_physical_partition.cpp b/src/op/sirius_physical_partition.cpp
+index 7b417765..8129170c 100644
+--- a/src/op/sirius_physical_partition.cpp
++++ b/src/op/sirius_physical_partition.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <limits>
+ #include <mutex>
+ #include <numeric>
+@@ -38,6 +39,19 @@
+ namespace sirius {
+ namespace op {
+ 
++namespace {
++/// PROTO OP1B: `SIRIUS_DF_DEFER_PUBLISH` = 0 publish before deposit (stack tip), 1 publish after
++/// deposit and early task completion (default), 2 also complete non-publishing contributors early.
++int op1b_defer_mode()
++{
++  static int const mode = [] {
++    auto const* value = std::getenv("SIRIUS_DF_DEFER_PUBLISH");
++    return value == nullptr ? 1 : std::atoi(value);
++  }();
++  return mode;
++}
++}  // namespace
++
+ namespace {
+ 
+ constexpr bool producer_requires_full_partition_input(SiriusPhysicalOperatorType type) noexcept
+@@ -191,7 +205,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
+     auto result =
+       std::make_unique<routed_operator_data>(std::move(batches), std::move(destinations));
+     if (forward_publication_id && space != nullptr) {
+-      _input_observer->after_transform(*forward_publication_id, *space, stream);
++      if (auto const mode = op1b_defer_mode(); mode != 0) {
++        result->set_deferred_publication(
++          {.id = *forward_publication_id, .space = space, .complete_early_always = mode >= 2});
++      } else {
++        _input_observer->after_transform(*forward_publication_id, *space, stream);
++      }
+     }
+     record_actual_bytes();
+     return result;
+@@ -243,7 +262,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
+   std::iota(destinations.begin(), destinations.end(), std::size_t{0});
+   auto result =
+     std::make_unique<routed_operator_data>(std::move(partitioned_results), std::move(destinations));
+-  if (publication_id) { _input_observer->after_transform(*publication_id, *space, stream); }
++  if (publication_id) {
++    if (auto const mode = op1b_defer_mode(); mode != 0) {
++      result->set_deferred_publication(
++        {.id = *publication_id, .space = space, .complete_early_always = mode >= 2});
++    } else {
++      _input_observer->after_transform(*publication_id, *space, stream);
++    }
++  }
+   record_actual_bytes();
+   return result;
+ }
+@@ -267,6 +293,31 @@ void sirius_physical_partition::sink(operator_data const& input_data, ::cuda::st
+   }
+ }
+ 
++void sirius_physical_partition::after_sink(operator_data const& output_data,
++                                           ::cuda::stream_ref stream,
++                                           std::function<void()> const& complete_task_early)
++{
++  auto const* routed = dynamic_cast<routed_operator_data const*>(&output_data);
++  if (routed == nullptr || !routed->deferred() || !_input_observer) { return; }
++  auto const& deferred = *routed->deferred();
++  // Claim before the early completion: the pipeline's finalizer closes the session's input, which
++  // would abandon an unclaimed pending publication.
++  if (_input_observer->claim_publication(deferred.id)) {
++    nvtx_scoped_range nvtx_range{"op1b::deferred_publication"};
++    try {
++      complete_task_early();
++    } catch (...) {
++      _input_observer->run_claimed_publication(*deferred.space, stream);
++      throw;
++    }
++    _input_observer->run_claimed_publication(*deferred.space, stream);
++  } else if (deferred.complete_early_always) {
++    // Not the Publishing Task: only its own insert kernels are left, which the task's final
++    // stream sync retires before its input is released.
++    complete_task_early();
++  }
++}
++
+ namespace {
+ 
+ /// `rows * (to_bytes / from_bytes)`, saturating; zero when `from_bytes` is zero.
+diff --git a/src/op/sirius_physical_partition.hpp b/src/op/sirius_physical_partition.hpp
+index 78b16596..6eaa402e 100644
+--- a/src/op/sirius_physical_partition.hpp
++++ b/src/op/sirius_physical_partition.hpp
+@@ -54,6 +54,9 @@ class sirius_physical_partition : public sirius_physical_operator {
+                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
+   std::unique_ptr<operator_data> execute(operator_data const&, ::cuda::stream_ref) override;
+   void sink(operator_data const&, ::cuda::stream_ref) override;
++  void after_sink(operator_data const&,
++                  ::cuda::stream_ref,
++                  std::function<void()> const&) override;
+   std::optional<task_creation_hint> get_next_task_hint() override;
+   std::unique_ptr<operator_data> get_next_task_input_data() override;
+   std::size_t no_history_peak_memory_estimate(input_stats const&) const override;
+diff --git a/src/pipeline/gpu_pipeline_task.cpp b/src/pipeline/gpu_pipeline_task.cpp
+index aae3448a..ed3a1af8 100644
+--- a/src/pipeline/gpu_pipeline_task.cpp
++++ b/src/pipeline/gpu_pipeline_task.cpp
+@@ -25,6 +25,7 @@
+ #include "memory/size_arithmetic.hpp"
+ #include "op/scan/sirius_gpu_scan_operator.hpp"
+ #include "op/scan/sirius_gpu_scan_operator_data.hpp"
++#include "creator/task_creator.hpp"
+ #include "pipeline/oom_reschedule_exception.hpp"
+ #include "telemetry-bridge/gen/quent.hpp"
+ #include "telemetry/nvtx.hpp"
+@@ -47,6 +48,7 @@
+ #include <optional>
+ #include <stdexcept>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ namespace sirius {
+@@ -441,9 +443,24 @@ gpu_pipeline_task::~gpu_pipeline_task()
+       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
+     return;
+   }
++  if (_completion_reported) { return; }
+   _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->mark_task_completed();
+ }
+ 
++void gpu_pipeline_task::report_completion_early()
++{
++  if (std::exchange(_completion_reported, true)) { return; }
++  auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
++  // Same order as the executor's epilogue: the completion (which closes the pipeline and notifies
++  // its consumers when this was the last task), then the per-task consumer nomination.
++  pipeline->mark_task_completed();
++  if (auto* creator = pipeline->get_task_creator()) {
++    for (auto* consumer : pipeline->get_output_consumers()) {
++      if (consumer != nullptr) { creator->schedule(consumer); }
++    }
++  }
++}
++
+ const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
+ {
+   return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+@@ -843,6 +860,11 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
+           std::move(output_data), operators.size(), "OOM restoring a deferral at the sink");
+       }
+       publish_output(*output_data, materialized.get(), stream);
++      // PROTO OP1B: a sink may owe work after its deposit (a deferred dynamic-filter publication)
++      // and may report this task completed to the pipeline before running it.
++      if (auto sink_operator = pipeline->get_sink()) {
++        sink_operator->after_sink(*output_data, stream, [this] { report_completion_early(); });
++      }
+     }
+ 
+     // Record memory metrics for future reservation estimates. Measured after publish_output, not
+diff --git a/src/pipeline/gpu_pipeline_task.hpp b/src/pipeline/gpu_pipeline_task.hpp
+index 668988cb..4baef084 100644
+--- a/src/pipeline/gpu_pipeline_task.hpp
++++ b/src/pipeline/gpu_pipeline_task.hpp
+@@ -178,6 +178,10 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
+    */
+   void execute(::cuda::stream_ref stream) override;
+ 
++  /// PROTO OP1B: reports this task completed to its pipeline while it is still running; the
++  /// destructor then reports nothing. The task keeps its stream, reservation and inputs.
++  void report_completion_early();
++
+   /**
+    * @brief Get the preferred GPU device ID for this task.
+    *
+@@ -316,6 +320,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
+     uint64_t task_id, std::unique_ptr<sirius_pipeline_task_local_state> local_state);
+ 
+  private:
++  bool _completion_reported = false;  ///< PROTO OP1B: completion already reported early.
+   std::vector<cucascade::shared_data_repository*> _data_repos;
+   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
+   /// Non-owning subscription ledger: the input data_batches this task subscribed to in its
+diff --git a/src/sirius_config.cpp b/src/sirius_config.cpp
+index 94714215..58178ea7 100644
+--- a/src/sirius_config.cpp
++++ b/src/sirius_config.cpp
+@@ -35,6 +35,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstddef>
+ #include <cstdint>
+ #include <exception>
+@@ -801,6 +802,11 @@ struct topology {
+     } else {
+       long long n = 0;
+       r.optional("num_gpus", n);
++      // PROTO OP1B (measurement only): run on the first N GPUs without editing the config, to
++      // measure on the P2P pair 0-1.
++      if (auto const* override_gpus = std::getenv("SIRIUS_PROTO_NUM_GPUS")) {
++        n = std::atoll(override_gpus);
++      }
+       if (n < 0) { throw std::runtime_error("topology.num_gpus must be non-negative"); }
+       opt.num_gpus_or_gpu_ids = static_cast<size_t>(n);
+     }
