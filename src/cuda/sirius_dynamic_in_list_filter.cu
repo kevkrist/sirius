@@ -291,6 +291,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
   pending.reserve(spaces.size());
   _set->replicas.reserve(_set->replicas.size() + spaces.size());
   detail::replica_fanout_failures failures;
+  detail::replica_relay relay;  // PROTOTYPE [xfer-PR]
   for (auto const& target : spaces) {
     auto const& target_space = target.get_gpu_space();
     auto const device_id     = target_space.get_device_id();
@@ -326,13 +327,15 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
           }
           auto result       = std::make_unique<set_replica>(device_id, std::move(destination_set));
           auto& destination = *std::get<set_owner<key_type>>(result->set);
-          detail::enqueue_replica_copy(destination.data(),
-                                       rmm::cuda_device_id{device_id},
-                                       source_set->data(),
-                                       source_space,
-                                       bytes,
-                                       stream,
-                                       target.get_host_staging_space());
+          auto const origin = relay.pick({source_set->data(), &source_space}, device_id);
+          auto const route  = detail::enqueue_replica_copy(destination.data(),
+                                                           rmm::cuda_device_id{device_id},
+                                                           origin.data,
+                                                           *origin.space,
+                                                           bytes,
+                                                           stream,
+                                                           target.get_host_staging_space());
+          relay.offer(route, destination.data(), target_space);
           return result;
         },
         source->set);

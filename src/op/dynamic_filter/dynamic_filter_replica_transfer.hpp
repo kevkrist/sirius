@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <exception>
 #include <string_view>
+#include <vector>
 
 namespace cucascade::memory {
 class memory_space;
@@ -60,6 +61,39 @@ replica_transfer_route enqueue_replica_copy(
   ::cuda::stream_ref destination_stream,
   cucascade::memory::memory_space const& host_staging_space,
   replica_transfer_policy policy = replica_transfer_policy::automatic);
+
+/**
+ * @brief PROTOTYPE [xfer-PR] (SIRIUS_PROTO_XFER_D2D): relays a replica fan-out through replicas
+ * that already completed, so a destination without peer access to the source GPU is peer-copied
+ * from a GPU of its own island instead of being staged through the host a second time.
+ *
+ * Only HOST-staged replicas are offered as relays: `enqueue_replica_copy` completes them before
+ * returning. The relay's allocation must outlive the copies read from it.
+ */
+class replica_relay final {
+ public:
+  struct origin {
+    void const* data;
+    cucascade::memory::memory_space const* space;
+  };
+
+  replica_relay();
+
+  /**
+   * @brief The copy source for @p destination_device: @p original when its pool grants the
+   * destination or no relay does, else the first relay whose pool grants it.
+   */
+  [[nodiscard]] origin pick(origin original, int destination_device) const;
+
+  /// Offers a replica that was copied through @p route as a relay.
+  void offer(replica_transfer_route route,
+             void const* data,
+             cucascade::memory::memory_space const& space);
+
+ private:
+  bool _enabled;
+  std::vector<origin> _relays;
+};
 
 /**
  * @brief Keeps the first fatal replica failure while remaining submitted work drains
