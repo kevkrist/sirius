@@ -17,6 +17,7 @@
 #pragma once
 
 #include "memory/device_transfer.hpp"
+#include "memory/proto_xfer.hpp"
 
 #include <rmm/cuda_device.hpp>
 
@@ -24,6 +25,7 @@
 
 #include <cstddef>
 #include <exception>
+#include <optional>
 #include <string_view>
 
 namespace cucascade::memory {
@@ -59,7 +61,8 @@ replica_transfer_route enqueue_replica_copy(
   std::size_t bytes,
   ::cuda::stream_ref destination_stream,
   cucascade::memory::memory_space const& host_staging_space,
-  replica_transfer_policy policy = replica_transfer_policy::automatic);
+  replica_transfer_policy policy            = replica_transfer_policy::automatic,
+  sirius::memory::host_bounce_scope* bounce = nullptr);
 
 /**
  * @brief Keeps the first fatal replica failure while remaining submitted work drains

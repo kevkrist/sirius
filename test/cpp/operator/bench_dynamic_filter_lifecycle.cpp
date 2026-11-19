@@ -33,6 +33,7 @@
  * `SIRIUS_BENCH_DF_*` lists (comma separated).
  */
 
+#include "memory/proto_xfer.hpp"
 #include "operator/dynamic_filter_accumulation_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -710,5 +711,291 @@ TEST_CASE("bench dynamic filter bounds against rows (MB7)", "[!benchmark][dynami
       session_case const subject{.kind = kind, .keys = 1, .gpus = 1, .batches = 1, .rows = rows};
       print("MB7", subject, run_session(fixture, subject));
     }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// PROTOTYPE [xfer-PR] (proto/xfer-host): the rebuilt HOST-staged Bloom finish
+//===----------------------------------------------------------------------===//
+namespace {
+
+namespace proto = sirius::memory::proto_xfer;
+
+struct proto_config {
+  std::string mode;         ///< SIRIUS_PROTO_XFER_HOST
+  std::uint64_t window{4};  ///< SIRIUS_PROTO_XFER_WINDOW
+  std::uint64_t threads{16};
+  bool fail_host{false};
+
+  void apply() const
+  {
+    setenv("SIRIUS_PROTO_XFER_HOST", mode.c_str(), 1);
+    setenv("SIRIUS_PROTO_XFER_WINDOW", std::to_string(window).c_str(), 1);
+    setenv("SIRIUS_PROTO_XFER_OR_THREADS", std::to_string(threads).c_str(), 1);
+    setenv("SIRIUS_PROTO_XFER_FAIL_HOST", fail_host ? "1" : "0", 1);
+  }
+
+  [[nodiscard]] std::string label() const
+  {
+    return mode + (fail_host ? "+fail" : "") + "/w" + std::to_string(window) + "/t" +
+           std::to_string(threads);
+  }
+};
+
+struct proto_finish {
+  double finish_us{};
+  proto::finish_observation seen;
+  int transport{-1};
+};
+
+/**
+ * @brief Builds one Bloom accumulation over `spaces`, contributes `batches[d]` on every device of
+ * `contributing`, and finishes it on `root`. Only `finish` is timed.
+ */
+[[nodiscard]] proto_finish run_proto_finish(acc::fixture& fixture,
+                                            std::span<op::dynamic_filter_replica_space const> spaces,
+                                            std::vector<std::size_t> const& key_blocks,
+                                            std::vector<acc::batch_ptr> const& batches,
+                                            std::vector<int> const& contributing,
+                                            int root,
+                                            bool force_host)
+{
+  using builder = op::detail::accumulated_bloom_builder;
+  std::vector<builder::key> planned;
+  for (std::size_t key = 0; key < key_blocks.size(); ++key) {
+    planned.push_back(
+      {static_cast<cudf::size_type>(key), cudf::data_type{cudf::type_id::INT64}, key_blocks[key]});
+  }
+  auto made = builder::try_create(std::move(planned), spaces);
+  REQUIRE(made);
+  for (auto const device : contributing) {
+    auto source = batches[static_cast<std::size_t>(device)]->to_read_only();
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    REQUIRE(made->enqueue_add(sirius::get_cudf_table_view(source),
+                              rmm::cuda_device_id{device},
+                              fixture.task_stream(device)));
+    fixture.task_stream(device).sync();
+  }
+  sync_devices(spaces.size());
+  proto_finish out;
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root}};
+    auto const start = clock_type::now();
+    auto published   = acc::builder_access::finish(*made,
+                                                   rmm::cuda_device_id{root},
+                                                   fixture.publication_stream(root),
+                                                   fixture.gpu(root).get_default_allocator(),
+                                                   force_host);
+    auto const done  = clock_type::now();
+    REQUIRE(published);
+    out.finish_us = us_between(start, done);
+    out.transport = static_cast<int>(published->transport);
+    out.seen      = proto::last_finish();
+  }
+  sync_devices(spaces.size());
+  made.reset();
+  sync_devices(spaces.size());
+  return out;
+}
+
+/// Every partial holds the same array per key; returns the per-key checksums.
+[[nodiscard]] std::vector<std::uint64_t> agreed_checksums(proto::finish_observation const& seen,
+                                                          std::size_t partials,
+                                                          std::size_t keys)
+{
+  REQUIRE(seen.checksums.size() == partials * keys);
+  std::vector<std::uint64_t> out(seen.checksums.begin(),
+                                 seen.checksums.begin() + static_cast<std::ptrdiff_t>(keys));
+  for (std::size_t partial = 0; partial < partials; ++partial) {
+    for (std::size_t key = 0; key < keys; ++key) {
+      REQUIRE(seen.checksums[partial * keys + key] == out[key]);
+    }
+  }
+  return out;
+}
+
+void clear_proto_env()
+{
+  for (auto const* name : {"SIRIUS_PROTO_XFER_HOST",
+                           "SIRIUS_PROTO_XFER_WINDOW",
+                           "SIRIUS_PROTO_XFER_OR_THREADS",
+                           "SIRIUS_PROTO_XFER_FAIL_HOST",
+                           "SIRIUS_PROTO_XFER_CHECKSUM"}) {
+    unsetenv(name);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("proto xfer host: every schedule leaves the tip loop's Bloom arrays on every GPU",
+          "[.][xfer_proto]")
+{
+  auto const gpus = usable_gpus(env_list("SIRIUS_BENCH_DF_GPUS", {4}).front());
+  REQUIRE(gpus >= 2);
+  acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{8} << 30});
+  std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), gpus};
+  std::vector<acc::batch_ptr> batches;
+  for (std::size_t device = 0; device < gpus; ++device) {
+    batches.push_back(make_keys(fixture,
+                                static_cast<int>(device),
+                                static_cast<std::int64_t>(device) * 7'000'000 + 11,
+                                1'500'000,
+                                2));
+  }
+  std::vector<proto_config> const configs{
+    {"gpuor", 1, 16},  {"gpuor", 2, 16},  {"gpuor", 4, 16},        {"hostor", 1, 16},
+    {"hostor", 4, 16}, {"hostor", 3, 1},  {"hostor", 8, 5},        {"gpuor", 4, 16, true},
+    {"hostor", 4, 16, true}};
+  // Array bytes per key: one chunk, a ragged tail, several windows of chunks.
+  std::vector<std::vector<std::size_t>> const shapes{
+    {std::size_t{96}},
+    {(std::size_t{1} << 20) + 96},
+    {(std::size_t{20} << 20) + 32},
+    {std::size_t{70} << 20},
+    {(std::size_t{5} << 20) + 64, std::size_t{33} << 20}};
+  std::vector<std::vector<int>> contributions{{0}, {1}, {0, 1}};
+  if (gpus > 2) { contributions.push_back({1, static_cast<int>(gpus) - 1}); }
+  std::vector<int> everyone;
+  for (std::size_t device = 0; device < gpus; ++device) {
+    everyone.push_back(static_cast<int>(device));
+  }
+  contributions.push_back(everyone);
+  contributions.push_back({});
+  std::size_t checked = 0;
+  for (auto const& bytes : shapes) {
+    std::vector<std::size_t> blocks;
+    for (auto const size : bytes) {
+      blocks.push_back(size / op::bloom_bytes_per_block);
+    }
+    for (auto const& contributing : contributions) {
+      for (auto const root : {0, static_cast<int>(gpus) - 1}) {
+        clear_proto_env();
+        setenv("SIRIUS_PROTO_XFER_CHECKSUM", "1", 1);
+        auto const tip =
+          run_proto_finish(fixture, spaces, blocks, batches, contributing, root, true);
+        REQUIRE(tip.seen.schedule == -1);
+        auto const expected = agreed_checksums(tip.seen, gpus, blocks.size());
+        if (!contributing.empty()) { REQUIRE(expected.front() != 0); }
+        for (auto const& config : configs) {
+          config.apply();
+          CAPTURE(config.label(), bytes, contributing, root);
+          auto const got =
+            run_proto_finish(fixture, spaces, blocks, batches, contributing, root, true);
+          REQUIRE(agreed_checksums(got.seen, gpus, blocks.size()) == expected);
+          if (config.fail_host) {
+            REQUIRE(got.seen.fell_back);
+            REQUIRE(got.seen.schedule == -1);
+          } else {
+            REQUIRE_FALSE(got.seen.fell_back);
+            auto const contributors = contributing.size();
+            bool const root_in =
+              std::ranges::find(contributing, root) != contributing.end();
+            auto const sources = contributors - (root_in ? 1 : 0);
+            auto const want    = sources == 0 || contributors == 1 ? 0
+                                 : config.mode == "hostor"         ? 2
+                                                                   : 1;
+            REQUIRE(got.seen.schedule == want);
+            REQUIRE(got.seen.host_bytes != 0);
+          }
+          ++checked;
+        }
+      }
+    }
+  }
+  clear_proto_env();
+  std::printf("ROW,XFERCHECK,gpus=%zu,finishes_checked=%zu\n", gpus, checked);
+  std::fflush(stdout);
+}
+
+TEST_CASE("bench proto xfer host: Bloom finish by schedule (MB4P)",
+          "[!benchmark][dynamic_filter][mb4p]")
+{
+  trace_flush const flush;
+  bool const force_host = env_list("SIRIUS_BENCH_DF_FORCE_HOST", {0}).front() != 0;
+  for (auto const wanted : env_list("SIRIUS_BENCH_DF_GPUS", {4})) {
+    auto const gpus = usable_gpus(wanted);
+    if (gpus != wanted) { continue; }
+    acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{40} << 30});
+    std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), gpus};
+    std::vector<acc::batch_ptr> batches;
+    for (std::size_t device = 0; device < gpus; ++device) {
+      batches.push_back(make_keys(fixture,
+                                  static_cast<int>(device),
+                                  static_cast<std::int64_t>(device) * 7'000'000 + 11,
+                                  2'000'000,
+                                  1));
+    }
+    std::vector<proto_config> configs;
+    for (auto const& mode : env_names("SIRIUS_BENCH_DF_MODES", {"off", "gpuor", "hostor"})) {
+      for (auto const window : env_list("SIRIUS_BENCH_DF_WINDOWS", {4})) {
+        for (auto const threads : env_list("SIRIUS_BENCH_DF_OR_THREADS", {16})) {
+          if (mode != "hostor" && threads != env_list("SIRIUS_BENCH_DF_OR_THREADS", {16}).front()) {
+            continue;
+          }
+          if (mode == "off" && window != env_list("SIRIUS_BENCH_DF_WINDOWS", {4}).front()) {
+            continue;
+          }
+          configs.push_back({mode, window, threads});
+        }
+      }
+    }
+    for (auto const megabytes : env_list("SIRIUS_BENCH_DF_MB", {57, 174, 281, 1434})) {
+      std::vector<std::size_t> const blocks{(megabytes << 20) / op::bloom_bytes_per_block};
+      for (auto const sources : env_list("SIRIUS_BENCH_DF_SOURCES", {1, 2, 4})) {
+        if (sources > gpus) { continue; }
+        std::vector<int> contributing;
+        for (std::size_t device = 0; device < sources; ++device) {
+          contributing.push_back(static_cast<int>(device));
+        }
+        std::vector<std::uint64_t> expected;
+        for (auto const& config : configs) {
+          clear_proto_env();
+          config.apply();
+          samples finish;
+          proto_finish last;
+          bool verified = false;
+          for (std::size_t rep = 0; rep <= reps(); ++rep) {
+            // Repetition 0 warms up and verifies; the checksum runs inside `finish`, so the timed
+            // repetitions leave it off.
+            if (rep == 0) {
+              setenv("SIRIUS_PROTO_XFER_CHECKSUM", "1", 1);
+            } else {
+              unsetenv("SIRIUS_PROTO_XFER_CHECKSUM");
+            }
+            last = run_proto_finish(fixture, spaces, blocks, batches, contributing, 0, force_host);
+            if (rep == 0) {
+              auto const got = agreed_checksums(last.seen, gpus, 1);
+              if (expected.empty()) { expected = got; }
+              REQUIRE(got == expected);
+              verified = true;
+            } else {
+              finish.add(last.finish_us);
+            }
+          }
+          auto const gib = static_cast<double>(megabytes) / 1024.0;
+          std::printf(
+            "ROW,MB4P,gpus=%zu,sources=%llu,mb=%llu,mode=%s,window=%llu,threads=%llu,"
+            "transport=%s,schedule=%d,host_mib=%.1f,scratch_mib=%.1f,host_waits=%zu,"
+            "finish_us=%.1f,finish_min=%.1f,ms_per_gib=%.1f,verified=%d\n",
+            gpus,
+            static_cast<unsigned long long>(sources),
+            static_cast<unsigned long long>(megabytes),
+            config.mode.c_str(),
+            static_cast<unsigned long long>(config.window),
+            static_cast<unsigned long long>(config.threads),
+            last.transport == 0 ? "PEER" : "HOST",
+            last.seen.schedule,
+            static_cast<double>(last.seen.host_bytes) / 1048576.0,
+            static_cast<double>(last.seen.device_scratch_bytes) / 1048576.0,
+            last.seen.host_waits,
+            finish.median(),
+            finish.minimum(),
+            finish.median() / 1000.0 / gib,
+            verified ? 1 : 0);
+          std::fflush(stdout);
+        }
+      }
+    }
+    clear_proto_env();
   }
 }

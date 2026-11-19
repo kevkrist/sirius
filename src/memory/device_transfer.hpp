@@ -23,6 +23,7 @@
 #include <cucascade/cuda/event.hpp>
 
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <variant>
 
@@ -37,6 +38,33 @@ using transfer_readiness = std::variant<source_already_complete, cucascade::cuda
 
 enum class device_transfer_route { none, local, peer_copy, host_staging };
 enum class device_transfer_policy { automatic, force_host_staging };
+
+/**
+ * @brief PROTOTYPE [xfer-PR]: makes the HOST-staged legs of `enqueue_device_copy` asynchronous.
+ *
+ * With a scope, a HOST-staged copy downloads its source extent once, on a stream of the source
+ * GPU, and every destination uploads from that one HOST copy on its own stream after the
+ * download's event; nothing waits on the host. A second copy of the same source extent (a replica
+ * fan-out) reuses the staged bytes. The scope owns the pinned blocks and the source streams; its
+ * destructor waits for every stream it used before the blocks return to their pool. Destroy it
+ * before the source and destination allocations it copied between.
+ */
+class host_bounce_scope {
+ public:
+  host_bounce_scope();
+  ~host_bounce_scope();
+  host_bounce_scope(host_bounce_scope const&)            = delete;
+  host_bounce_scope& operator=(host_bounce_scope const&) = delete;
+
+  /// Waits for every leg the scope enqueued; throws on a CUDA failure.
+  void drain();
+
+  struct impl;
+  [[nodiscard]] impl& state() noexcept { return *_impl; }
+
+ private:
+  std::unique_ptr<impl> _impl;
+};
 
 /**
  * @brief Copies device bytes using a granted source pool or managed pinned HOST staging
@@ -72,6 +100,7 @@ enum class device_transfer_policy { automatic, force_host_staging };
   cucascade::memory::memory_space const* source_space,
   transfer_readiness ready,
   cucascade::memory::memory_space const* host_staging_space,
-  device_transfer_policy policy = device_transfer_policy::automatic);
+  device_transfer_policy policy = device_transfer_policy::automatic,
+  host_bounce_scope* bounce     = nullptr);
 
 }  // namespace sirius::memory

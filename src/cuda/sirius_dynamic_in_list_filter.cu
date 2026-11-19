@@ -289,6 +289,10 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
   std::vector<std::pair<std::unique_ptr<set_replica>, sirius::memory::runtime_stream_pool::lease>>
     pending;
   pending.reserve(spaces.size());
+  // PROTOTYPE [xfer-PR]: one HOST copy of the source serves every HOST-staged target, and no leg
+  // waits on the host; destroyed (drained) before `pending`.
+  std::optional<sirius::memory::host_bounce_scope> bounce;
+  if (sirius::memory::proto_xfer::replica_enabled()) { bounce.emplace(); }
   _set->replicas.reserve(_set->replicas.size() + spaces.size());
   detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
@@ -332,7 +336,9 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
                                        source_space,
                                        bytes,
                                        stream,
-                                       target.get_host_staging_space());
+                                       target.get_host_staging_space(),
+                                       detail::replica_transfer_policy::automatic,
+                                       bounce ? &*bounce : nullptr);
           return result;
         },
         source->set);

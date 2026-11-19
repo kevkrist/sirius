@@ -16,6 +16,7 @@
 
 #include "cuda/device_copy_batch.hpp"
 #include "memory/pool_peer_access.hpp"
+#include "memory/proto_xfer.hpp"
 #include "memory/runtime_stream_pool.hpp"
 
 #include <cudf/table/table_view.hpp>
@@ -25,6 +26,7 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
+#include <rmm/exec_policy.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
@@ -37,7 +39,9 @@
 #include <cuda/std/cstddef>
 #include <cuda/stream>
 #include <cuda/utility>
+#include <thrust/functional.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/transform_reduce.h>
 
 #include <cucascade/cuda/event.hpp>
 #include <cucascade/memory/common.hpp>
@@ -102,7 +106,8 @@ void copy_filter_storage(Filter const& source,
                          rmm::cuda_device_id destination_device,
                          ::cuda::stream_ref stream,
                          cucascade::memory::memory_space const& host_staging_space,
-                         std::size_t& bytes)
+                         std::size_t& bytes,
+                         sirius::memory::host_bounce_scope* bounce = nullptr)
 {
   auto const source_blocks = source.block_extent();
   if (destination.block_extent() != source_blocks) {
@@ -115,7 +120,9 @@ void copy_filter_storage(Filter const& source,
                                source_space,
                                bytes,
                                stream,
-                               host_staging_space);
+                               host_staging_space,
+                               detail::replica_transfer_policy::automatic,
+                               bounce);
 }
 
 template <class Filter>
@@ -324,6 +331,24 @@ __global__ void or_bloom_chunk(uint4* destination,
     destination[index] = value;
   }
 }
+
+/// PROTOTYPE [xfer-PR]: position-dependent hash of one 64-bit word; zero words add nothing.
+struct proto_word_checksum {
+  std::uint64_t const* words;
+
+  __device__ std::uint64_t operator()(std::size_t index) const
+  {
+    auto const word = words[index];
+    if (word == 0) { return 0; }
+    auto mixed = word ^ (0x9E3779B97F4A7C15ull * (index + 1));
+    mixed ^= mixed >> 30;
+    mixed *= 0xBF58476D1CE4E5B9ull;
+    mixed ^= mixed >> 27;
+    mixed *= 0x94D049BB133111EBull;
+    mixed ^= mixed >> 31;
+    return mixed;
+  }
+};
 
 /**
  * @brief Launches `or_bloom_chunk` over one chunk of @p bytes, a whole number of 16-byte words.
@@ -566,6 +591,10 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
   std::vector<std::pair<std::unique_ptr<bloom_replica>, sirius::memory::runtime_stream_pool::lease>>
     pending;
   pending.reserve(spaces.size());
+  // PROTOTYPE [xfer-PR]: one HOST copy of the source serves every HOST-staged target, and no leg
+  // waits on the host; destroyed (drained) before `pending`.
+  std::optional<sirius::memory::host_bounce_scope> bounce;
+  if (sirius::memory::proto_xfer::replica_enabled()) { bounce.emplace(); }
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
   detail::replica_fanout_failures failures;
   for (auto const& target : spaces) {
@@ -604,7 +633,8 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
                               rmm::cuda_device_id{device_id},
                               stream,
                               target.get_host_staging_space(),
-                              bytes);
+                              bytes,
+                              bounce ? &*bounce : nullptr);
           return result;
         },
         source->bloom);
@@ -758,6 +788,7 @@ struct accumulated_bloom_builder::impl {
   std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> filters;
 
   class chunk_pipeline;
+  class host_pipeline;
 };
 
 /**
@@ -961,6 +992,426 @@ class accumulated_bloom_builder::impl::chunk_pipeline final {
   std::vector<cuda_event> _source_ready;    // Per source: its inserts are complete
   std::vector<cuda_event> _target_done;     // Per target: its egress landed
   std::size_t _sequence = 0;                // Global chunk index over (key, offset)
+};
+
+/**
+ * @brief PROTOTYPE [xfer-PR]: the HOST-staged publication as pipelines over pinned HOST slots.
+ *
+ * Same star as `chunk_pipeline` and the same result on every GPU; only the transport of each leg
+ * changes, so a per-edge transport choice composes with it leg by leg. Three schedules:
+ *
+ * - `fanout`: one GPU holds the union already (at most one GPU contributed). Each chunk is
+ *   downloaded once into a HOST slot and uploaded from that slot to every other GPU, each upload on
+ *   its GPU's own stream. Event ordered; nothing waits on the host until the end.
+ * - `gpu_or`: every source downloads its chunk into its own HOST slot on its own stream; the root
+ *   uploads the slots into device scratch, ORs them into its array, downloads the merged chunk
+ *   once and every target uploads from that slot. Event ordered; one host wait at the end.
+ * - `host_or`: every contributing GPU downloads its chunk; the CPU ORs the slots into an output
+ *   slot; every GPU uploads the output. The host waits for the downloads of each chunk only.
+ *
+ * Downloads of a GPU run on its partial stream (after its inserts); uploads run on a second stream
+ * of that GPU, so both directions of its link stay busy. A window of slots per array bounds the
+ * pinned HOST bytes; a slot is reused after its readers' events.
+ */
+class accumulated_bloom_builder::impl::host_pipeline final {
+ public:
+  enum class schedule : std::uint8_t { fanout, gpu_or, host_or };
+
+  /**
+   * @brief Allocates the HOST window, the upload streams and the events; enqueues nothing.
+   *
+   * @throw std::bad_alloc (or `rmm::out_of_memory`) if the pinned window cannot be allocated
+   */
+  host_pipeline(impl const& owner,
+                partial& root,
+                std::span<partial* const> sources,
+                ::cuda::stream_ref stream,
+                cucascade::memory::fixed_size_host_memory_resource& host,
+                schedule kind,
+                std::size_t window,
+                std::size_t chunk_count)
+    : _chunk_slot{owner.max_chunk_bytes()},
+      _root{root},
+      _stream{stream},
+      _kind{kind},
+      _window{std::max<std::size_t>(1, std::min(window, chunk_count))},
+      _block_bytes{host.get_block_size()},
+      _slot_blocks{::cuda::ceil_div(owner.max_chunk_bytes(), host.get_block_size())},
+      _merged{make_event_on(root.device_id), make_event_on(root.device_id)}
+  {
+    bool const root_contributed = root.contributed.load(std::memory_order_relaxed);
+    if (kind == schedule::fanout) {
+      _inputs.push_back(sources.empty() ? &root : sources.front());
+    } else if (kind == schedule::gpu_or) {
+      _inputs.assign(sources.begin(), sources.end());
+    } else {
+      if (root_contributed) { _inputs.push_back(&root); }
+      _inputs.insert(_inputs.end(), sources.begin(), sources.end());
+    }
+    // fanout: the window of output slots only. Otherwise one window per input, then the output's.
+    _input_slots    = kind == schedule::fanout ? 0 : _inputs.size() * _window;
+    auto const slots = _input_slots + _window;
+    _staging        = host.allocate_multiple_blocks(slots * _slot_blocks * _block_bytes);
+    if (_staging->size() < slots * _slot_blocks) {
+      throw accumulation_invariant_error{"accumulated publication HOST window is too small"};
+    }
+    _copies.reserve(_slot_blocks);
+    _peers.reserve(owner.partials.size());
+    for (auto const& entry : owner.partials) {
+      auto& peer = _peers.emplace_back();
+      peer.part  = entry.get();
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry->device_id}};
+      if (entry.get() == &root) {
+        peer.down = stream.get();
+      } else {
+        peer.owned = std::make_unique<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking);
+        peer.down  = peer.owned->value();
+      }
+      peer.up_done.reserve(_window);
+      for (std::size_t slot = 0; slot < _window; ++slot) {
+        peer.up_done.emplace_back();
+      }
+    }
+    auto const stager_device = kind == schedule::fanout ? _inputs.front()->device_id : root.device_id;
+    for (std::size_t slot = 0; slot < _window; ++slot) {
+      _out_staged.push_back(make_event_on(stager_device));
+      _in_consumed.push_back(make_event_on(root.device_id));
+    }
+    _in_staged.reserve(_input_slots);
+    for (auto const* input : _inputs) {
+      for (std::size_t slot = 0; slot < _window; ++slot) {
+        _in_staged.push_back(make_event_on(input->device_id));
+      }
+    }
+    for (std::size_t key_index = 0; key_index < owner.keys.size(); ++key_index) {
+      auto const& shape = owner.shapes[key_index];
+      for (std::size_t offset = 0; offset < shape.raw_bytes; offset += shape.chunk_bytes) {
+        _chunks.push_back(
+          {key_index, offset, std::min(shape.chunk_bytes, shape.raw_bytes - offset)});
+      }
+    }
+  }
+
+  ~host_pipeline()
+  {
+    for (auto& peer : _peers) {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{peer.part->device_id}};
+      peer.up_done.clear();
+      peer.ready.reset();
+      peer.fin.reset();
+      peer.owned.reset();
+    }
+  }
+
+  host_pipeline(host_pipeline const&)            = delete;
+  host_pipeline& operator=(host_pipeline const&) = delete;
+
+  /// Pinned HOST bytes this pipeline holds until it is destroyed.
+  [[nodiscard]] std::size_t host_bytes() const noexcept { return _staging->size_bytes(); }
+
+  /// Host waits the schedule performed before its final one (`host_or` only).
+  [[nodiscard]] std::size_t host_waits() const noexcept { return _host_waits; }
+
+  /// The upload streams this pipeline owns; a failure joins them like the partial streams.
+  void append_streams(std::vector<::cuda::stream_ref>& joined) const
+  {
+    for (auto const& peer : _peers) {
+      if (peer.owned) { joined.emplace_back(peer.down); }
+    }
+  }
+
+  /**
+   * @brief Enqueues (and for `host_or`, drives) the whole publication, then waits for it once.
+   *
+   * @param scratch Device scratch of `scratch_slots x sources x chunk slot` bytes on the root GPU
+   * (`gpu_or` only)
+   * @param scratch_slots Chunks of device scratch in flight, 1 or 2 (`gpu_or` only)
+   * @param threads CPU threads of the host OR (`host_or` only)
+   */
+  void run(std::byte* scratch, std::size_t scratch_slots, unsigned threads)
+  {
+    nvtx_scoped_range range{"dynfilter::accum::host_pipeline"};
+    order_uploads_after_partials();
+    switch (_kind) {
+      case schedule::fanout: enqueue_fanout(); break;
+      case schedule::gpu_or: enqueue_gpu_or(scratch, scratch_slots); break;
+      case schedule::host_or: drive_host_or(threads); break;
+    }
+    wait_until_replicas_ready();
+  }
+
+ private:
+  struct peer_state {
+    partial* part{};
+    cudaStream_t down{};                      // Upload stream: owned, or the publication stream
+    std::unique_ptr<rmm::cuda_stream> owned;  // Null for the root
+    std::optional<cuda_event> ready;          // The partial's work before the publication
+    std::optional<cuda_event> fin;            // The partial's whole publication work
+    std::vector<cuda_event> up_done;          // Per output slot: this GPU's upload of it landed
+  };
+  struct chunk {
+    std::size_t key_index;
+    std::size_t offset;
+    std::size_t bytes;
+  };
+
+  static void record(cuda_event const& event, int device, cudaStream_t stream)
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    check_cuda(cudaEventRecord(event.get(), stream), "cudaEventRecord(host pipeline)");
+  }
+
+  static void wait(int device, cudaStream_t stream, cuda_event const& event)
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    check_cuda(cudaStreamWaitEvent(stream, event.get(), 0), "cudaStreamWaitEvent(host pipeline)");
+  }
+
+  [[nodiscard]] static std::byte* array_of(partial const& owner, chunk const& piece)
+  {
+    return static_cast<std::byte*>(owner.arrays[piece.key_index]->data()) + piece.offset;
+  }
+
+  [[nodiscard]] std::size_t in_slot(std::size_t input, std::size_t slot) const noexcept
+  {
+    return input * _window + slot;
+  }
+
+  [[nodiscard]] std::size_t out_slot(std::size_t slot) const noexcept
+  {
+    return _input_slots + slot;
+  }
+
+  /// One leg between device bytes and HOST slot @p slot, on @p stream of GPU @p device.
+  void copy(int device,
+            cudaStream_t stream,
+            std::byte* device_bytes,
+            std::size_t slot,
+            std::size_t bytes,
+            bool to_host)
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    _copies.clear();
+    std::size_t offset = 0;
+    for (std::size_t index = slot * _slot_blocks; offset < bytes; ++index) {
+      auto const block = _staging->at(index);
+      auto const count = std::min(block.size(), bytes - offset);
+      if (to_host) {
+        _copies.add(block.data(), device_bytes + offset, count);
+      } else {
+        _copies.add(device_bytes + offset, block.data(), count);
+      }
+      offset += count;
+    }
+    check_cuda(_copies.enqueue(::cuda::stream_ref{stream}),
+               "device_copy_batch::enqueue(host pipeline)");
+  }
+
+  /// Every upload stream starts after its partial's allocation, zero fill and inserts.
+  void order_uploads_after_partials()
+  {
+    for (auto& peer : _peers) {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{peer.part->device_id}};
+      peer.ready.emplace();
+      peer.fin.emplace();
+      record(*peer.ready, peer.part->device_id, peer.part->stream->value());
+      wait(peer.part->device_id, peer.down, *peer.ready);
+    }
+  }
+
+  void upload_to(peer_state& peer, chunk const& piece, std::size_t slot)
+  {
+    auto const device = peer.part->device_id;
+    copy(device, peer.down, array_of(*peer.part, piece), out_slot(slot), piece.bytes, false);
+    record(peer.up_done[slot], device, peer.down);
+  }
+
+  void enqueue_fanout()
+  {
+    auto& from              = *_inputs.front();
+    auto const from_stream  = from.stream->value();
+    for (std::size_t sequence = 0; sequence < _chunks.size(); ++sequence) {
+      auto const& piece = _chunks[sequence];
+      auto const slot   = sequence % _window;
+      if (sequence >= _window) {
+        // The uploads of chunk (sequence - window) read this slot.
+        for (auto const& peer : _peers) {
+          if (peer.part != &from) { wait(from.device_id, from_stream, peer.up_done[slot]); }
+        }
+      }
+      copy(from.device_id, from_stream, array_of(from, piece), out_slot(slot), piece.bytes, true);
+      record(_out_staged[slot], from.device_id, from_stream);
+      for (auto& peer : _peers) {
+        if (peer.part == &from) { continue; }
+        wait(peer.part->device_id, peer.down, _out_staged[slot]);
+        upload_to(peer, piece, slot);
+      }
+    }
+  }
+
+  void enqueue_gpu_or(std::byte* scratch, std::size_t scratch_slots)
+  {
+    auto const root_device = _root.device_id;
+    auto const root_stream = _root.stream->value();
+    auto const sources     = _inputs.size();
+    for (std::size_t sequence = 0; sequence < _chunks.size(); ++sequence) {
+      auto const& piece  = _chunks[sequence];
+      auto const slot    = sequence % _window;
+      auto const buffer  = sequence % scratch_slots;
+      auto* const slots  = scratch + buffer * sources * _chunk_slot;
+      // Ingress, first half: every source downloads into its own HOST slot on its own stream.
+      for (std::size_t index = 0; index < sources; ++index) {
+        auto& source              = *_inputs[index];
+        auto const source_stream  = source.stream->value();
+        auto const& staged        = _in_staged[in_slot(index, slot)];
+        if (sequence >= _window) {
+          // The root's uploads of chunk (sequence - window) read this slot.
+          wait(source.device_id, source_stream, _in_consumed[slot]);
+        }
+        copy(source.device_id,
+             source_stream,
+             array_of(source, piece),
+             in_slot(index, slot),
+             piece.bytes,
+             true);
+        record(staged, source.device_id, source_stream);
+      }
+      // Ingress, second half: the root uploads the slots into scratch on the publication stream.
+      for (std::size_t index = 0; index < sources; ++index) {
+        wait(root_device, _stream.get(), _in_staged[in_slot(index, slot)]);
+      }
+      if (sequence >= scratch_slots) {
+        // The merge of chunk (sequence - scratch_slots) read this scratch buffer.
+        wait(root_device, _stream.get(), _merged[buffer]);
+      }
+      for (std::size_t index = 0; index < sources; ++index) {
+        copy(root_device,
+             _stream.get(),
+             slots + index * _chunk_slot,
+             in_slot(index, slot),
+             piece.bytes,
+             false);
+      }
+      record(_in_consumed[slot], root_device, _stream.get());
+      // Merge, then stage the merged chunk once, both on the root partial's stream.
+      auto* const root_chunk = array_of(_root, piece);
+      wait(root_device, root_stream, _in_consumed[slot]);
+      enqueue_or_chunk(root_chunk, slots, _chunk_slot, sources, piece.bytes, root_stream);
+      record(_merged[buffer], root_device, root_stream);
+      if (sequence >= _window) {
+        for (auto const& peer : _peers) {
+          if (peer.part != &_root) { wait(root_device, root_stream, peer.up_done[slot]); }
+        }
+      }
+      copy(root_device, root_stream, root_chunk, out_slot(slot), piece.bytes, true);
+      record(_out_staged[slot], root_device, root_stream);
+      // Egress: every target uploads from the one staged copy, on its own stream.
+      for (auto& peer : _peers) {
+        if (peer.part == &_root) { continue; }
+        wait(peer.part->device_id, peer.down, _out_staged[slot]);
+        upload_to(peer, piece, slot);
+      }
+    }
+  }
+
+  void drive_host_or(unsigned threads)
+  {
+    auto const inputs = _inputs.size();
+    std::vector<std::vector<std::byte*>> in_blocks(inputs);
+    std::vector<std::span<std::byte* const>> in_spans(inputs);
+    std::vector<std::byte*> out_blocks(_slot_blocks);
+    auto const blocks_of = [&](std::size_t slot, std::vector<std::byte*>& out) {
+      out.resize(_slot_blocks);
+      for (std::size_t index = 0; index < _slot_blocks; ++index) {
+        out[index] = _staging->at(slot * _slot_blocks + index).data();
+      }
+    };
+    std::size_t submitted = 0;
+    for (std::size_t sequence = 0; sequence < _chunks.size(); ++sequence) {
+      // Keep one window of downloads in flight per input; slot reuse follows the host OR below.
+      for (; submitted < std::min(_chunks.size(), sequence + _window); ++submitted) {
+        auto const& ahead = _chunks[submitted];
+        auto const slot   = submitted % _window;
+        for (std::size_t index = 0; index < inputs; ++index) {
+          auto& input             = *_inputs[index];
+          auto const input_stream = input.stream->value();
+          copy(input.device_id,
+               input_stream,
+               array_of(input, ahead),
+               in_slot(index, slot),
+               ahead.bytes,
+               true);
+          record(_in_staged[in_slot(index, slot)], input.device_id, input_stream);
+        }
+      }
+      auto const& piece = _chunks[sequence];
+      auto const slot   = sequence % _window;
+      for (std::size_t index = 0; index < inputs; ++index) {
+        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_inputs[index]->device_id}};
+        check_cuda(cudaEventSynchronize(_in_staged[in_slot(index, slot)].get()),
+                   "cudaEventSynchronize(host OR download)");
+        ++_host_waits;
+      }
+      if (sequence >= _window) {
+        // The uploads of chunk (sequence - window) read this output slot.
+        for (auto const& peer : _peers) {
+          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{peer.part->device_id}};
+          check_cuda(cudaEventSynchronize(peer.up_done[slot].get()),
+                     "cudaEventSynchronize(host OR upload)");
+          ++_host_waits;
+        }
+      }
+      for (std::size_t index = 0; index < inputs; ++index) {
+        blocks_of(in_slot(index, slot), in_blocks[index]);
+        in_spans[index] = in_blocks[index];
+      }
+      blocks_of(out_slot(slot), out_blocks);
+      {
+        nvtx_scoped_range or_range{"dynfilter::accum::host_or"};
+        sirius::memory::proto_xfer::host_or(
+          out_blocks, in_spans, _block_bytes, piece.bytes, threads);
+      }
+      for (auto& peer : _peers) {
+        upload_to(peer, piece, slot);
+      }
+    }
+  }
+
+  /// Folds every upload stream into its partial's stream and the publication stream; one wait.
+  void wait_until_replicas_ready()
+  {
+    for (auto& peer : _peers) {
+      auto const device = peer.part->device_id;
+      if (peer.owned) {
+        record(*peer.fin, device, peer.down);
+        // Later reads and the release of this partial's arrays follow its uploads.
+        wait(device, peer.part->stream->value(), *peer.fin);
+      }
+      record(*peer.ready, device, peer.part->stream->value());
+      wait(_root.device_id, _stream.get(), *peer.ready);
+    }
+    nvtx_scoped_range wait_range{"dynfilter::accum::late_wait"};
+    check_cuda(cudaStreamSynchronize(_stream.get()), "cudaStreamSynchronize(publication)");
+  }
+
+  std::size_t _chunk_slot;
+  partial& _root;
+  ::cuda::stream_ref _stream;
+  schedule _kind;
+  std::size_t _window;       // HOST slots per array in flight
+  std::size_t _block_bytes;  // One fixed HOST block
+  std::size_t _slot_blocks;  // HOST blocks of one slot: the largest chunk of any key
+  std::array<cuda_event, 2> _merged;  // Per scratch buffer: its merge finished
+  std::size_t _input_slots{};
+  std::vector<partial*> _inputs;  // fanout: the holder; gpu_or: sources; host_or: contributors
+  cucascade::memory::fixed_multiple_blocks_allocation _staging;
+  sirius::cuda::device_copy_batch _copies;
+  std::vector<peer_state> _peers;         // Every partial, in the builder's order
+  std::vector<cuda_event> _in_staged;     // Per (input, slot): its download landed
+  std::vector<cuda_event> _in_consumed;   // Per slot: the root uploaded every input slot
+  std::vector<cuda_event> _out_staged;    // Per slot: the output chunk landed on the host
+  std::vector<chunk> _chunks;
+  std::size_t _host_waits{};
 };
 
 //===----------------------------------------------------------------------===//
@@ -1183,6 +1634,10 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
   std::unique_ptr<rmm::device_buffer> scratch;
   cucascade::memory::fixed_multiple_blocks_allocation staging;
   std::unique_ptr<impl::chunk_pipeline> pipeline;
+  // PROTOTYPE [xfer-PR]: the rebuilt HOST-staged path; null means the loop below (tip behaviour).
+  std::unique_ptr<impl::host_pipeline> host_pipe;
+  std::size_t proto_scratch_slots = 0;
+  sirius::memory::proto_xfer::finish_observation proto_seen;
   sirius::cuda::device_copy_batch copies;
   bool prepared  = false;
   auto transport = publication_transport::HOST_STAGED;
@@ -1213,7 +1668,51 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
           direct = false;
         }
       }
-      if (!direct) {
+      namespace proto = sirius::memory::proto_xfer;
+      if (!direct && !targets.empty() && proto::bloom_host_mode() != proto::bloom_mode::off) {
+        // PROTOTYPE [xfer-PR]: at most one contributing GPU holds the union already and only
+        // fans out; otherwise the union is reduced on the root GPU or on the host.
+        using schedule = impl::host_pipeline::schedule;
+        auto const contributors =
+          sources.size() + (root->contributed.load(std::memory_order_relaxed) ? 1 : 0);
+        auto const mode = proto::bloom_host_mode();
+        bool const on_host =
+          mode == proto::bloom_mode::hostor ||
+          (mode == proto::bloom_mode::automatic && sources.size() >= 2);
+        auto const kind = sources.empty() || contributors == 1 ? schedule::fanout
+                          : on_host                             ? schedule::host_or
+                                                                : schedule::gpu_or;
+        try {
+          if (proto::fail_host_allocation()) { throw std::bad_alloc{}; }
+          auto* host = root->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+          if (host == nullptr || host->get_block_size() == 0) {
+            throw accumulation_invariant_error{
+              "accumulated publication requires fixed HOST blocks"};
+          }
+          if (kind == schedule::gpu_or) {
+            // The direct transport's scratch: within the task's publication reservation.
+            proto_scratch_slots = std::min<std::size_t>(2, all_chunks);
+            allocate_scratch(
+              multiply(multiply(proto_scratch_slots, sources.size()), chunk_slot));
+          }
+          host_pipe = std::make_unique<impl::host_pipeline>(
+            *_impl, *root, sources, stream, *host, kind, proto::window_slots(), all_chunks);
+          host_pipe->append_streams(joined);
+          proto_seen.schedule = static_cast<int>(kind);
+        } catch (std::bad_alloc const&) {
+          // Pinned HOST memory (or device scratch) is short: the loop below needs one chunk.
+          check_cuda(cudaStreamSynchronize(stream.get()),
+                     "cudaStreamSynchronize(pipeline preparation)");
+          host_pipe.reset();
+          scratch.reset();
+          proto_scratch_slots = 0;
+          if (observation) { *observation = {}; }
+          proto_seen.fell_back = true;
+        }
+      }
+      if (host_pipe) {
+        if (observation) { observation->host_staging_bytes = host_pipe->host_bytes(); }
+      } else if (!direct) {
         allocate_scratch(sources.empty() ? 0 : chunk_slot);
         if (!targets.empty()) {
           auto* host = root->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
@@ -1252,6 +1751,14 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
           }
         }
         pipeline->wait_until_replicas_ready();
+      } else if (host_pipe) {
+        host_pipe->run(scratch ? static_cast<std::byte*>(scratch->data()) : nullptr,
+                       proto_scratch_slots,
+                       proto::or_threads());
+        for (auto const partial_stream : joined) {
+          check_cuda(cudaStreamSynchronize(partial_stream.get()),
+                     "cudaStreamSynchronize(pipelined publication)");
+        }
       } else {
         // The root's task stream owns scratch allocation; all other root work follows this join.
         check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(staged allocation)");
@@ -1334,14 +1841,49 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
       _impl->leak_storage.store(true);
       (void)staging.release();
       (void)scratch.release();
+      (void)host_pipe.release();
       throw;
     } catch (std::bad_alloc const&) {
       if (prepared) { throw; }
       return std::nullopt;
     }
   }
+  if (host_pipe) {
+    proto_seen.host_bytes = host_pipe->host_bytes();
+    proto_seen.host_waits = host_pipe->host_waits();
+    proto_seen.device_scratch_bytes =
+      scratch ? tracked_replica_allocation_bytes(scratch->size()) : 0;
+    SIRIUS_LOG_DEBUG(
+      "[accumulated_bloom_builder::finish] PROTO host pipeline schedule {} (0 fan-out, 1 GPU OR, "
+      "2 host OR): {} pinned HOST bytes, {} device scratch bytes, {} host waits before the last.",
+      proto_seen.schedule,
+      proto_seen.host_bytes,
+      proto_seen.device_scratch_bytes,
+      proto_seen.host_waits);
+  } else if (transport == publication_transport::HOST_STAGED) {
+    proto_seen.host_bytes           = staging ? staging->size_bytes() : 0;
+    proto_seen.device_scratch_bytes = scratch ? tracked_replica_allocation_bytes(scratch->size()) : 0;
+  }
   scratch.reset();
   staging.reset();
+  host_pipe.reset();
+  if (sirius::memory::proto_xfer::checksum_enabled()) {
+    for (auto const& entry : _impl->partials) {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry->device_id}};
+      for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
+        auto const* words = static_cast<std::uint64_t const*>(entry->arrays[key_index]->data());
+        auto const count  = shapes[key_index].raw_bytes / sizeof(std::uint64_t);
+        proto_seen.checksums.push_back(
+          thrust::transform_reduce(rmm::exec_policy(entry->stream_ref()),
+                                   thrust::counting_iterator<std::size_t>{0},
+                                   thrust::counting_iterator<std::size_t>{count},
+                                   proto_word_checksum{words},
+                                   std::uint64_t{0},
+                                   thrust::plus<std::uint64_t>{}));
+      }
+    }
+  }
+  sirius::memory::proto_xfer::set_last_finish(std::move(proto_seen));
   SIRIUS_LOG_DEBUG(
     "[accumulated_bloom_builder::finish] root GPU {} reduced and replicated {} key(s), {} bytes in "
     "all, "

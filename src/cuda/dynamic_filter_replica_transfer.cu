@@ -45,7 +45,8 @@ replica_transfer_route enqueue_replica_copy(
   std::size_t bytes,
   ::cuda::stream_ref destination_stream,
   cucascade::memory::memory_space const& host_staging_space,
-  replica_transfer_policy policy)
+  replica_transfer_policy policy,
+  sirius::memory::host_bounce_scope* bounce)
 {
   if (bytes != 0 && (destination == nullptr || source == nullptr)) {
     throw std::invalid_argument("[enqueue_replica_copy] nonempty copies require non-null pointers");
@@ -58,7 +59,8 @@ replica_transfer_route enqueue_replica_copy(
                                              &source_space,
                                              sirius::memory::source_already_complete{},
                                              &host_staging_space,
-                                             policy);
+                                             policy,
+                                             bounce);
 }
 
 bool replica_fanout_failures::skip_if_recoverable(std::string_view filter_name,

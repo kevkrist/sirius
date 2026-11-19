@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+#include "cuda/device_copy_batch.hpp"
+#include "memory/pool_peer_access.hpp"
+#include "memory/proto_xfer.hpp"
+
 #include <cudf/column/column_view.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 
@@ -22,6 +26,8 @@
 #include <cub/device/device_scan.cuh>
 #include <cuda/accumulation_partial.cuh>
 
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <op/dynamic_filter/detail/exact_key_stager.hpp>
 #include <op/dynamic_filter/dynamic_filter_key_domain.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
@@ -34,7 +40,9 @@
 #include <cstdint>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <utility>
+#include <vector>
 
 namespace sirius::op::detail {
 
@@ -267,6 +275,9 @@ std::optional<exact_key_stager::gathered> exact_key_stager::gather(rmm::cuda_dev
   auto words =
     cudf::detail::make_pinned_vector_async<std::uint32_t>(partials.size() * keys.size(), stream);
   std::fill(words.begin(), words.end(), std::uint32_t{0});
+  // PROTOTYPE [xfer-PR]: pinned HOST blocks of the batched gather; alive until the final wait.
+  std::vector<cucascade::memory::fixed_multiple_blocks_allocation> proto_stagings;
+  bool const proto_gather = sirius::memory::proto_xfer::replica_enabled();
   try {
     join_on_failure(joined, [&] {
       // A copy staged through the host reads its source there, so another GPU's writes complete
@@ -276,6 +287,69 @@ std::optional<exact_key_stager::gathered> exact_key_stager::gather(rmm::cuda_dev
         bool const wrote   = std::ranges::any_of(_impl->written[partial],
                                                [](auto const& slices) { return !slices.empty(); });
         if (&source == root || !wrote) { continue; }
+        if (proto_gather &&
+            !sirius::memory::try_grant_pool_access(*source.space, root_device.value())) {
+          // PROTOTYPE [xfer-PR]: one download batch on the source's own stream (it follows the
+          // source's writes there, so nothing waits on the host), one event, one upload batch on
+          // the publication stream. Slices are packed back to back in the HOST blocks.
+          auto* host = root->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+          std::size_t total = 0;
+          for (std::size_t index = 0; index < keys.size(); ++index) {
+            for (auto const& written : _impl->written[partial][index]) {
+              total += written.rows * _impl->rep_bytes(index);
+            }
+          }
+          cucascade::memory::fixed_multiple_blocks_allocation blocks;
+          if (total != 0 && host != nullptr && host->get_block_size() != 0 &&
+              !sirius::memory::proto_xfer::fail_host_allocation()) {
+            try {
+              blocks = host->allocate_multiple_blocks(total);
+            } catch (std::bad_alloc const&) {
+              blocks.reset();  // Pinned memory is short: the per-slice path below needs less.
+            }
+          }
+          if (blocks) {
+            auto const block_size = host->get_block_size();
+            sirius::cuda::device_copy_batch download;
+            sirius::cuda::device_copy_batch upload;
+            std::size_t cursor = 0;
+            for (std::size_t index = 0; index < keys.size(); ++index) {
+              auto const rep_bytes = _impl->rep_bytes(index);
+              for (auto const& written : _impl->written[partial][index]) {
+                auto const offset = written.offset * rep_bytes;
+                auto const bytes  = written.rows * rep_bytes;
+                auto* const from =
+                  static_cast<std::byte*>(source.arrays[buffer_of(index)]->data()) + offset;
+                auto* const to =
+                  static_cast<std::byte*>(root->arrays[buffer_of(index)]->data()) + offset;
+                for (std::size_t done = 0; done < bytes;) {
+                  auto const within = cursor % block_size;
+                  auto const count  = std::min(block_size - within, bytes - done);
+                  auto* const staged = blocks->at(cursor / block_size).data() + within;
+                  download.add(staged, from + done, count);
+                  upload.add(to + done, staged, count);
+                  cursor += count;
+                  done += count;
+                }
+              }
+            }
+            proto_stagings.push_back(std::move(blocks));
+            {
+              rmm::cuda_set_device_raii guard{rmm::cuda_device_id{source.device_id}};
+              check_cuda(download.enqueue(source.stream_ref()),
+                         "device_copy_batch::enqueue(staging gather download)");
+              cuda_event staged;
+              check_cuda(cudaEventRecord(staged.get(), source.stream->value()),
+                         "cudaEventRecord(staging gather download)");
+              check_cuda(cudaStreamWaitEvent(stream.get(), staged.get(), 0),
+                         "cudaStreamWaitEvent(staging gather download)");
+            }
+            check_cuda(upload.enqueue(stream), "device_copy_batch::enqueue(staging gather upload)");
+            sirius::memory::proto_xfer::stats().gather_batches.fetch_add(
+              1, std::memory_order_relaxed);
+            continue;
+          }
+        }
         check_cuda(cudaStreamSynchronize(source.stream->value()),
                    "cudaStreamSynchronize(staged contributions)");
         for (std::size_t index = 0; index < keys.size(); ++index) {
@@ -317,8 +391,12 @@ std::optional<exact_key_stager::gathered> exact_key_stager::gather(rmm::cuda_dev
     });
   } catch (unjoined_gpu_work const&) {
     _impl->leak_storage.store(true);
+    for (auto& blocks : proto_stagings) {
+      (void)blocks.release();
+    }
     throw;
   }
+  proto_stagings.clear();
   std::vector<bool> overflowed(keys.size(), false);
   for (std::size_t index = 0; index < keys.size(); ++index) {
     for (std::size_t partial = 0; partial < partials.size(); ++partial) {

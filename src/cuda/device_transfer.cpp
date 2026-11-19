@@ -16,8 +16,10 @@
 
 #include "memory/device_transfer.hpp"
 
+#include "cuda/device_copy_batch.hpp"
 #include "log/logging.hpp"
 #include "memory/pool_peer_access.hpp"
+#include "memory/proto_xfer.hpp"
 #include "memory/runtime_stream_pool.hpp"
 
 #include <rmm/cuda_stream.hpp>
@@ -30,6 +32,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -82,6 +85,139 @@ cudaError_t drain(::cuda::stream_ref stream, rmm::cuda_device_id device) noexcep
 
 }  // namespace
 
+//===----------------------------------------------------------------------===//
+// PROTOTYPE [xfer-PR]: host_bounce_scope
+//===----------------------------------------------------------------------===//
+struct host_bounce_scope::impl {
+  struct staged {
+    std::byte const* source{};
+    std::size_t bytes{};
+    int device{};
+    bool valid{false};
+    cucascade::memory::fixed_multiple_blocks_allocation blocks;
+    cucascade::cuda::cuda_event done;  // Created on the source GPU
+  };
+  struct source_stream {
+    int device{};
+    std::optional<runtime_stream_pool::lease> lease;
+    std::optional<rmm::cuda_stream> owned;
+
+    [[nodiscard]] ::cuda::stream_ref get() const
+    {
+      return lease ? lease->get() : ::cuda::stream_ref{owned->value()};
+    }
+  };
+
+  [[nodiscard]] staged* find(std::byte const* source, std::size_t bytes, int device) noexcept
+  {
+    for (auto const& entry : stagings) {
+      if (entry->valid && entry->source == source && entry->bytes == bytes &&
+          entry->device == device) {
+        return entry.get();
+      }
+    }
+    return nullptr;
+  }
+
+  /// The scope's stream on @p device, which must be the current device.
+  [[nodiscard]] ::cuda::stream_ref stream_on(rmm::cuda_device_id device,
+                                             cucascade::memory::memory_space const* space)
+  {
+    for (auto const& entry : sources) {
+      if (entry->device == device.value()) { return entry->get(); }
+    }
+    auto made    = std::make_unique<source_stream>();
+    made->device = device.value();
+    if (space) {
+      made->lease.emplace(runtime_stream_pool::acquire(*space));
+    } else {
+      made->owned.emplace(rmm::cuda_stream::flags::non_blocking);
+    }
+    sources.push_back(std::move(made));
+    return sources.back()->get();
+  }
+
+  void note_destination(int device, cudaStream_t stream)
+  {
+    for (auto const& [known_device, known] : destinations) {
+      if (known == stream && known_device == device) { return; }
+    }
+    destinations.emplace_back(device, stream);
+  }
+
+  /// Waits for every stream; returns the first failure.
+  [[nodiscard]] cudaError_t join() noexcept
+  {
+    auto failed = cudaSuccess;
+    for (auto const& entry : sources) {
+      auto const status = drain(entry->get(), rmm::cuda_device_id{entry->device});
+      if (failed == cudaSuccess) { failed = status; }
+    }
+    for (auto const& [device, stream] : destinations) {
+      auto const status = drain(::cuda::stream_ref{stream}, rmm::cuda_device_id{device});
+      if (failed == cudaSuccess) { failed = status; }
+    }
+    return failed;
+  }
+
+  ~impl()
+  {
+    if (join() != cudaSuccess) {
+      // Unfinished DMA may still touch the pinned blocks: never return them.
+      for (auto& entry : stagings) {
+        (void)entry->blocks.release();
+      }
+    }
+    for (auto& entry : sources) {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry->device}};
+      entry->lease.reset();
+      entry->owned.reset();
+    }
+  }
+
+  std::vector<std::unique_ptr<staged>> stagings;
+  std::vector<std::unique_ptr<source_stream>> sources;
+  std::vector<std::pair<int, cudaStream_t>> destinations;
+};
+
+host_bounce_scope::host_bounce_scope() : _impl{std::make_unique<impl>()} {}
+host_bounce_scope::~host_bounce_scope() = default;
+
+void host_bounce_scope::drain()
+{
+  auto const status = _impl->join();
+  if (status != cudaSuccess) {
+    throw cucascade::cuda_error{"[host_bounce_scope] synchronization failed: " +
+                                std::string{cudaGetErrorName(status)}};
+  }
+}
+
+namespace {
+
+/// Enqueues one leg between @p device_bytes and the HOST blocks of @p blocks on @p stream.
+void enqueue_block_leg(cucascade::memory::fixed_multiple_blocks_allocation const& blocks,
+                       std::byte* device_bytes,
+                       std::size_t bytes,
+                       bool to_host,
+                       ::cuda::stream_ref stream)
+{
+  sirius::cuda::device_copy_batch batch;
+  batch.reserve(blocks->size());
+  for (std::size_t offset = 0, index = 0; offset < bytes; ++index) {
+    auto const block = blocks->at(index);
+    auto const count = std::min(block.size(), bytes - offset);
+    if (to_host) {
+      batch.add(block.data(), device_bytes + offset, count);
+    } else {
+      batch.add(device_bytes + offset, block.data(), count);
+    }
+    offset += count;
+  }
+  CUCASCADE_CUDA_TRY(batch.enqueue(stream));
+}
+
+}  // namespace
+
 device_transfer_route enqueue_device_copy(std::span<std::byte> destination,
                                           rmm::cuda_device_id destination_device,
                                           ::cuda::stream_ref destination_stream,
@@ -90,7 +226,8 @@ device_transfer_route enqueue_device_copy(std::span<std::byte> destination,
                                           cucascade::memory::memory_space const* source_space,
                                           transfer_readiness ready,
                                           cucascade::memory::memory_space const* host_staging_space,
-                                          device_transfer_policy policy)
+                                          device_transfer_policy policy,
+                                          host_bounce_scope* bounce)
 {
   if (destination.size() != source.size()) {
     throw std::invalid_argument("[enqueue_device_copy] source and destination extents differ");
@@ -132,6 +269,47 @@ device_transfer_route enqueue_device_copy(std::span<std::byte> destination,
   }
 
   auto& resource = staging_resource(host_staging_space);
+  if (bounce != nullptr) {
+    // PROTOTYPE [xfer-PR]: stage the source extent once, asynchronously; every destination uploads
+    // from that HOST copy after the download's event. The scope's owner waits.
+    auto& scope = bounce->state();
+    auto* entry = scope.find(source.data(), source.size(), source_device.value());
+    if (entry == nullptr) {
+      rmm::cuda_set_device_raii source_guard{source_device};
+      auto made    = std::make_unique<host_bounce_scope::impl::staged>();
+      made->source = source.data();
+      made->bytes  = source.size();
+      made->device = source_device.value();
+      made->blocks = resource.allocate_multiple_blocks(source.size());
+      auto const source_stream = scope.stream_on(source_device, source_space);
+      scope.stagings.push_back(std::move(made));
+      auto* const staged = scope.stagings.back().get();
+      try {
+        wait_for_source(ready, source_stream);
+        enqueue_block_leg(
+          staged->blocks, const_cast<std::byte*>(source.data()), source.size(), true, source_stream);
+        CUCASCADE_CUDA_TRY(cudaEventRecord(staged->done.get(), source_stream.get()));
+      } catch (...) {
+        (void)drain(source_stream, source_device);
+        throw;
+      }
+      staged->valid = true;
+      entry         = staged;
+      proto_xfer::stats().staged_sources.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      proto_xfer::stats().staged_once_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+    scope.note_destination(destination_device.value(), destination_stream.get());
+    try {
+      CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(destination_stream.get(), entry->done.get(), 0));
+      enqueue_block_leg(
+        entry->blocks, destination.data(), destination.size(), false, destination_stream);
+    } catch (...) {
+      (void)drain(destination_stream, destination_device);
+      throw;
+    }
+    return device_transfer_route::host_staging;
+  }
   auto staging   = resource.allocate_multiple_blocks(source.size());
   std::vector<void*> d2h_destinations;
   std::vector<void const*> d2h_sources;
