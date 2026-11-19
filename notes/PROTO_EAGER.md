@@ -170,6 +170,23 @@ Critical path per site: tip `F + C + S`; eager option 1 `F + max(C', S')` with `
   - eager + build tail recovered (upper bound +332): ~14745;
   - eager + bounce-free finish (-385, model): ~14690; both: ~14360 (-5.7% vs base). The last two lines are models.
 
+## 6. Throttle, option 2, S6 gate, contention (2026-11-19 re-run after the wipe) - DRAFT, replaced by the final text below when done
+
+WORK IN PROGRESS (handoff state, written while batches run; final tables replace this block).
+- Rebuilt `wt-eager` (f05cfd12) and `wt-eager2` (now ca0c150b + cf26812b + mode-2 commit): gate variants
+  `SIRIUS_EAGER_GATE` 0/1/2, Memory Admission placeholder `SIRIUS_EAGER_ADMIT_GIB`, scan-only throttle
+  (`SIRIUS_EAGER_THROTTLE_ALL=1` = first version, which also counted the CONCAT's own tasks),
+  cuCascade patch `proto/cucascade-batch-staging.patch` (`CUCASCADE_PROTO_BATCH_STAGING` 1/2).
+- Scripts: `runs/eager/bin/{unit2,plan,batch2,nsys3}.sh`, `{arms,raw,gatelog,iterpipes,nsys_move,nsys_seg}.py`, plans
+  `runs/eager/plans/*.plan` (copy in `notes/scripts_eager/`). Tags: `v1` (tip vs pro), `b2` (q3 q8 q21: tip o1 k1 k2 k3 o2),
+  `c3` (q3 q8: batched staging mode 1), `fs` (q3 only), `c4` = calc2.plan, `fs2` = suite2.plan (running).
+- Results so far (ms vs tip, n = 8 hot per arm): v1 pro q3 -32, q8 -39, q21 -51; b2 q3 o1 -44 / k1 -61 / k2 -34 / k3 -44 /
+  o2 -31; q8 -39 / -72 / -51 / -33 / -52; q21 -64 / -62 / -62 / -64 / -35. Batched staging mode 1: no gain (q3 -32, q8 -31;
+  with eager off +6 / +20).
+- Mechanism (nsys q3, `runs/profile/eg_{tip,o1,k1}`): the build move's host-to-device half waits one whole round of the
+  scan's queued copy trains per buffer (about 84 ms with 3 scan tasks per GPU, 28 ms with 1), 10 buffers per task;
+  device-to-host and peer halves are not delayed. See `nsys_seg.py`.
+
 ## 7. Files changed and owning PR
 
 | piece | files | owner |
