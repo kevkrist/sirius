@@ -212,7 +212,7 @@ hostor 3.15 / 13.2 / 64.7 (46-56).
 
 | Case (hash IN-list) | 1 key | 2 keys |
 |---|---|---|
-| all batches on GPU 0 (replica fan-out only), 12 cases | 190-508 -> 169-466 (0.95-1.15x) | 639-826 -> 716-784 (0.88-1.10x) |
+| all batches on GPU 0 or a single batch (replica fan-out only), 8 cases per key count | 190-508 -> 169-466 (0.95-1.20x) | 639-826 -> 716-784 (0.88-1.10x) |
 | round-robin, 64 batches (512 / 32768 rows) | 1001 -> 508, 1206 -> 564 (2.0-2.1x) | 1913 -> 936, 2180 -> 981 (2.0-2.2x) |
 | round-robin, 512 batches | 5409 -> 1202, 5798 -> 1187 (4.5-4.9x) | 10601 -> 2332, 11508 -> 2385 (4.6-4.8x) |
 | MB2 round-robin 1 / 8 / 64 batches, 1000 rows | 190 -> 173, 377 -> 281, 1280 -> 567 | 815 -> 728, 986 -> 845, 2555 -> 1049 |
