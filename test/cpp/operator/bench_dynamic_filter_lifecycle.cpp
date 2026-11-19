@@ -55,6 +55,7 @@
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -64,6 +65,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -710,5 +712,199 @@ TEST_CASE("bench dynamic filter bounds against rows (MB7)", "[!benchmark][dynami
       session_case const subject{.kind = kind, .keys = 1, .gpus = 1, .batches = 1, .rows = rows};
       print("MB7", subject, run_session(fixture, subject));
     }
+  }
+}
+
+
+// PROTOTYPE (OP1A) MB8: the publication continuation against the synchronous publication, session
+// level, with and without a concurrent cross-GPU copy load (what a build CONCAT's moves look like).
+//
+// Per Bloom size (SIRIUS_BENCH_DF_MB, sized through the row count at 16 bits per key), one batch per
+// GPU, so every GPU contributes:
+//   sync : `publish_if_final` wall time
+//   async: `publish_if_final_async` return latency (what the Publishing Task still pays) and the
+//          time until `await_publication` returns (visible latency)
+//   load : SIRIUS_BENCH_DF_LOAD_MB-sized copies between GPU 0 and GPU 1, both directions, each on its
+//          own thread and stream, running through the publication; reports the load's throughput
+//          alone and during the publication.
+namespace {
+
+struct copy_load {
+  std::atomic<bool> stop{false};
+  std::atomic<std::uint64_t> bytes{0};
+  std::vector<std::thread> threads;
+
+  copy_load(acc::fixture const& fixture, std::size_t gpus, std::size_t chunk)
+  {
+    for (std::size_t source = 0; source < gpus; ++source) {
+      auto const target = (source + 1) % gpus;
+      threads.emplace_back([this, &fixture, source, target, chunk] {
+        auto const from = static_cast<int>(source);
+        auto const to   = static_cast<int>(target);
+        std::unique_ptr<rmm::device_buffer> input;
+        std::unique_ptr<rmm::device_buffer> output;
+        std::unique_ptr<rmm::cuda_stream> stream;
+        {
+          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{from}};
+          stream = std::make_unique<rmm::cuda_stream>();
+          input  = std::make_unique<rmm::device_buffer>(
+            chunk, stream->view(), fixture.gpu(from).get_default_allocator());
+          (void)cudaMemsetAsync(input->data(), 1, chunk, stream->value());
+          (void)cudaStreamSynchronize(stream->value());
+        }
+        {
+          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{to}};
+          rmm::cuda_stream local;
+          output = std::make_unique<rmm::device_buffer>(
+            chunk, local.view(), fixture.gpu(to).get_default_allocator());
+          (void)cudaMemsetAsync(output->data(), 0, chunk, local.value());
+          (void)cudaStreamSynchronize(local.value());
+        }
+        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{from}};
+        while (!stop.load(std::memory_order_relaxed)) {
+          // 32 MiB pieces so the counter advances inside a short publication.
+          std::size_t const piece = std::size_t{32} << 20;
+          for (std::size_t offset = 0; offset < chunk && !stop.load(std::memory_order_relaxed);
+               offset += piece) {
+            auto const count = std::min(piece, chunk - offset);
+            (void)cudaMemcpyPeerAsync(static_cast<std::byte*>(output->data()) + offset,
+                                      to,
+                                      static_cast<std::byte const*>(input->data()) + offset,
+                                      from,
+                                      count,
+                                      stream->value());
+            (void)cudaStreamSynchronize(stream->value());
+            bytes.fetch_add(count, std::memory_order_relaxed);
+          }
+        }
+        (void)cudaStreamSynchronize(stream->value());
+        input.reset();
+        {
+          rmm::cuda_set_device_raii target_guard{rmm::cuda_device_id{to}};
+          output.reset();
+        }
+        stream.reset();
+      });
+    }
+  }
+  ~copy_load()
+  {
+    stop.store(true);
+    for (auto& thread : threads) {
+      thread.join();
+    }
+  }
+};
+
+}  // namespace
+
+TEST_CASE("bench dynamic filter publication continuation (MB8)",
+          "[!benchmark][dynamic_filter][mb8]")
+{
+  trace_flush const flush;
+  auto const gpus = usable_gpus(env_list("SIRIUS_BENCH_DF_GPUS", {2}).front());
+  REQUIRE(gpus >= 2);
+  auto const load_chunk = env_list("SIRIUS_BENCH_DF_LOAD_MB", {1024}).front() << 20;
+  acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{60} << 30});
+  for (auto const megabytes : env_list("SIRIUS_BENCH_DF_MB", {57, 87, 133, 174, 281, 1394})) {
+    session_case subject{.kind = "bloom", .keys = 1, .gpus = gpus, .batches = gpus, .spread = true};
+    // 16 bits per key.
+    subject.rows = ((megabytes << 20) / 2) / gpus;
+    std::vector<acc::batch_ptr> batches;
+    for (std::size_t index = 0; index < subject.batches; ++index) {
+      batches.push_back(make_keys(fixture,
+                                  static_cast<int>(index % gpus),
+                                  static_cast<std::int64_t>(index * subject.rows),
+                                  static_cast<cudf::size_type>(subject.rows),
+                                  1));
+    }
+    sync_devices(fixture.devices);
+    for (int const with_load : {0, 1}) {
+      double load_alone_gbps = 0;
+      std::unique_ptr<copy_load> load;
+      if (with_load) {
+        load = std::make_unique<copy_load>(fixture, gpus, load_chunk);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        auto const b0 = load->bytes.load();
+        auto const t0 = clock_type::now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        auto const b1 = load->bytes.load();
+        load_alone_gbps =
+          static_cast<double>(b1 - b0) / 1e9 / (us_between(t0, clock_type::now()) / 1e6);
+      }
+      for (int const async : {0, 1}) {
+        samples returned, visible, load_rate;
+        std::string published = "?";
+        for (std::size_t rep = 0; rep <= reps(); ++rep) {
+          fixture.session.reset();
+          fixture.channel = std::make_shared<op::sirius_dynamic_filter_set>();
+          fixture.session = std::make_unique<op::dynamic_filter_publication_session>(
+            plan_for(fixture, subject), &fixture.stats);
+          auto certified = acc::fixture::certify(batches);
+          REQUIRE(std::holds_alternative<op::complete_build_inventory>(certified));
+          REQUIRE(
+            fixture.session->begin(std::move(std::get<op::complete_build_inventory>(certified))));
+          for (auto const& batch : batches) {
+            auto source       = batch->to_read_only();
+            auto const device = source.get_memory_space()->get_device_id();
+            rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+            auto const stream = fixture.task_stream(device);
+            fixture.session->contribute(batch->get_batch_id(), source, stream);
+            stream.sync();
+          }
+          auto const last = batches.back();
+          auto const root = last->to_read_only().get_memory_space()->get_device_id();
+          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root}};
+          auto const b0    = load ? load->bytes.load() : 0;
+          auto const start = clock_type::now();
+          if (async) {
+            fixture.session->publish_if_final_async(
+              last->get_batch_id(), fixture.gpu(root), fixture.publication_stream(root));
+          } else {
+            fixture.session->publish_if_final(
+              last->get_batch_id(), fixture.gpu(root), fixture.publication_stream(root));
+          }
+          auto const back = clock_type::now();
+          fixture.session->await_publication();
+          auto const done = clock_type::now();
+          auto const b1   = load ? load->bytes.load() : 0;
+          if (rep != 0) {
+            returned.add(us_between(start, back));
+            visible.add(us_between(start, done));
+            if (load) {
+              load_rate.add(static_cast<double>(b1 - b0) / 1e9 / (us_between(start, done) / 1e6));
+            }
+          }
+          std::size_t filters = 0;
+          published           = describe(*fixture.channel, filters);
+          fixture.session->join_continuation();
+          fixture.session->finalize_input();
+          fixture.session.reset();
+          fixture.channel.reset();
+          sync_devices(fixture.devices);
+        }
+        std::printf(
+          "ROW,MB8,gpus=%zu,bloom_mb=%llu,rows=%llu,load=%d,async=%d,published=%s,"
+          "return_us=%.1f,return_min=%.1f,visible_us=%.1f,visible_min=%.1f,"
+          "load_alone_gbps=%.1f,load_during_gbps=%.1f\n",
+          gpus,
+          static_cast<unsigned long long>(megabytes),
+          static_cast<unsigned long long>(subject.rows * gpus),
+          with_load,
+          async,
+          published.c_str(),
+          returned.median(),
+          returned.minimum(),
+          visible.median(),
+          visible.minimum(),
+          load_alone_gbps,
+          load_rate.median());
+        std::fflush(stdout);
+      }
+      load.reset();
+      sync_devices(fixture.devices);
+    }
+    batches.clear();
+    sync_devices(fixture.devices);
   }
 }
