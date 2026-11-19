@@ -181,4 +181,121 @@ PLACEHOLDER_ABBA
 - In the query the 1.39 GiB publication of q21 takes 66-81 ms (48-58 ms/GiB) against 62.7 ms in the microbench: the
   query has other work on the links and CPUs.
 
-PLACEHOLDER_REST
+## 7. Sweeps (MB4P)
+
+PLACEHOLDER_SWEEPS
+
+## 8. Existing DF unit tests on the prototype binary
+
+Filters as planned: single GPU `[dynamic_filter]~[multi_gpu]~[cuda_status_fault]~[.]`; 4 GPUs
+`[dynamic_filter][multi_gpu],[device_transfer],[publisher],[construction_plan],[physical_partition],[build_filter]`.
+
+| Arm | single GPU | 4 GPUs |
+|---|---|---|
+| `SIRIUS_PROTO_XFER_HOST=auto` (replica switch on with it) | 638 cases, 141567 assertions, all pass | 159 cases: 155 pass, **4 fail** (36 assertions) |
+| switch off | PLACEHOLDER_UT_OFF |
+
+The 4 failures under `auto` all pin the tip loop's workspace, none compares filter contents:
+- `accumulated publication matches the complete partial union and bounded ...` (`test_dynamic_filter_accumulation.cpp:2131,2134`,
+  32 assertions) and `HOST scratch uses the unused task reservation and returns its excess` (`:2208`): require
+  `workspace.host_staging_bytes == 1 chunk` and `device_scratch_bytes == 1 chunk`. The prototype holds a window of
+  chunks on the host and no device scratch (hostor / fan-out). The union checks of the same test pass.
+- `optional publication scratch OOM deposits without rescheduling the PARTITION` (`test_in_task_publication.cpp:895`):
+  requires exactly one device-scratch request; hostor makes none.
+- `publication scratch allocation failure retires ordinary-pool partials` (`:953`): injects a failing scratch allocator and
+  requires `finish` to return no publication. hostor needs no device scratch, so it **publishes** where the tip gives the
+  filter up. A behaviour change in the good direction, but a product version must decide it and update the test.
+
+## 9. What ran / what did not
+
+Ran (all under `flock $R/machine.lock`, one queued job per hold, `runs/xfer_host/queue.log`): build (2 holds), `[xfer_proto]`
+G=4, MB4P short + sweeps, ABBA on PLACEHOLDER_NQ queries, nsys q21 + q3 (2 arms), `[xfer_proto_exact]` G=4, DF unit tests
+(arms: PLACEHOLDER_UT_ARMS), MB4x / MB2 exact-kind microbench.
+Not run / unverified:
+- `gpuor`-only and `hostor`-only arms in TPC-H (only `auto`); `SIRIUS_PROTO_XFER_REPLICA` alone in TPC-H.
+- Unit-test arms `hostor` and `gpuor` (only `auto` and off). `[cuda_status_fault]` tests not run with the switch on:
+  the failure paths after enqueueing (join of the upload streams, leak on an unjoinable stream) are **untested**.
+- Contention with a concurrent heavy copy (MB_TRANSFER section 7 predicts hostor is the least sensitive schedule; not
+  re-measured in the engine). Eager probe scheduling (S6) is not in this binary: the gain here is measured with the finish
+  inside the Publishing Task at the tip's place.
+- A machine with NUMA nodes, a full-P2P 4-GPU machine and a machine with one root port per GPU: models only (section 10).
+- Lock contention was heavy (8-9 waiters, 10-20 min per turn), so queries without a HOST-staged Bloom got one A/U pair
+  (4 hot per arm) instead of ABBA; marked in section 5.
+
+## 10. Expected behaviour on other machines
+
+- **Full P2P (every pair has pool access).** `finish_impl` takes the PEER `chunk_pipeline` before the prototype is
+  consulted, and `enqueue_device_copy` takes the peer route: the prototype code is not reached. Zero gain, zero loss
+  (PLACEHOLDER_G2PEER). The 20 ms/GiB per target of MB4 stays.
+- **This machine (P2P inside pairs only).** Measured: finish 186 -> 45-58 ms/GiB with all GPUs contributing, -PLACEHOLDER_SUITE
+  on the suite. It is already at the uplink bound for host-only legs; what the per-pair D2D prototype can still add is the
+  difference between 2 x B and B on each pair uplink (bound 38 ms/GiB instead of 49; `c2` measured 52 in the primitives
+  bench, i.e. no better than hostor as built here).
+- **No P2P at all, one root port per GPU.** Today's loop is the same 186 ms/GiB (serial legs do not use parallel links).
+  hostor needs B up + B down per GPU link in duplex (47 GiB/s each way): bound 21-22 ms/GiB, i.e. the PEER rate.
+  PLACEHOLDER_G2HOST
+- **No P2P, shared uplinks** (this machine with the pair P2P ignored) = exactly what was measured: the prototype never uses
+  P2P when one pair lacks access.
+- More GPUs: hostor is O(1) in host waits per chunk and its pinned window grows as (contributors + 1) x W x chunk; the CPU OR
+  reads `contributors` streams per chunk (16 threads were enough for 4; see the thread sweep).
+
+## 11. Files changed, memory held
+
+Own delta over the lifecycle-bench cherry-pick (`git diff a57417f7 HEAD`): 12 files, +1734 / -11.
+- New: `src/memory/proto_xfer.hpp` (switches, observation), `src/cuda/proto_xfer.cpp` (AVX-512 host OR, helper threads).
+- `src/cuda/sirius_dynamic_bloom_filter.cu` (+558): `host_pipeline` (3 schedules), selection in `finish_impl`, checksum / dump.
+- `src/memory/device_transfer.hpp`, `src/cuda/device_transfer.cpp` (+211): `host_bounce_scope` (stage once, event-ordered).
+- `src/cuda/exact_key_stager.cu` (+80): batched gather. In-list filters, `dynamic_filter_replica_transfer.{hpp,cu}`: pass the scope.
+- `test/cpp/operator/bench_dynamic_filter_lifecycle.cpp` (+471): MB4P, `[xfer_proto]`, `[xfer_proto_exact]`.
+Nothing in #2569 / #2570 files other than the two call sites above changes shape: the whole delta is [xfer-PR].
+
+Memory held for one publication (measured, MB4P `host_mib` / `scratch_mib`; chunk 8 MiB, W=4):
+
+| schedule | pinned HOST | device scratch (root) | tip |
+|---|---|---|---|
+| fan-out | W x chunk = 32 MiB | 0 | 8 MiB pinned, 0 |
+| gpuor | (S+1) x W x chunk = 64-128 MiB | min(2, chunks) x S x chunk = 16-48 MiB | 8 MiB pinned, 8 MiB |
+| hostor | (C+1) x W x chunk = 96-160 MiB | 0 | 8 MiB pinned, 8 MiB |
+
+W=2 halves the pinned window (sweep in section 7). Replica scope: the source extent once (tip: once per target, one
+after the other). Batched gather: the slices' bytes, packed (tip: >= 1 block per slice, one at a time).
+The pinned blocks come from the engine's fixed-block HOST pool (`allocate_multiple_blocks`), like the tip's window, and
+like the tip **without a reservation**; they return to the pool when `finish` returns (after the final wait), or are leaked
+with the arrays if a stream cannot be joined.
+
+## 12. Production issues (what a real PR must do beyond this prototype)
+
+1. Reserve the HOST window: take it under the task's host reservation (`allocate_multiple_blocks(bytes, reservation*)`)
+   and size W to what is granted (W=2 costs little); keep the tip loop as the floor.
+2. Streams and events are created per publication (3 `cudaStreamCreate` + ~50 events): 40 us fixed cost, which makes
+   arrays under ~4 MiB slower than the tip (0.12 vs 0.08 ms at 1 MiB). Lease upload streams from `runtime_stream_pool`
+   and take the tip loop (or a 1-slot fan-out) below a size threshold.
+3. CPU OR: a private pool of 15 helper threads that spin 500 us after a job, one job at a time process-wide. Move it to
+   an engine pool, bound it, and place threads / blocks on the staging NUMA node. AVX-512 with non-temporal stores is
+   detected at run time; the generic path is 8-byte words.
+4. Failure paths after enqueueing are untested (no fault-injection run). The upload streams are joined with the partial
+   streams; an unjoinable stream leaks the pipeline like the tip leaks its staging.
+5. Tests that pin the workspace (section 8) need new expectations; the scratch-OOM publication change must be decided.
+6. `host_bounce_scope` stages whole extents (not chunked): 57 instead of 39 ms/GiB for a large one-shot Bloom replica
+   (MB_TRANSFER section 4). Irrelevant on the suite (replicas are < 1 ms), worth chunking if large one-shot Blooms return.
+7. Contention: all legs of one chunk are queued up front and uploads are queued in bursts, which is the shape the
+   primitives bench found least sensitive to a concurrent copy; not verified in the engine with eager scans.
+8. Remove the observation globals (`last_finish`, counters) and the env switches; choose `auto` in code.
+
+## 13. Seam with the per-pair D2D / topology-aware prototype (`proto/xfer-d2d`)
+
+- Three independent decisions: (1) transport per edge (peer copy vs HOST slots), (2) reduce topology (star on the root,
+  pair-local pre-merge, host OR), (3) leg schedule (event graph, windows). This prototype owns (3) and the HOST half of
+  (1), and adds the host OR to (2); it leaves `find_pair_without_pool_access` and the PEER pipeline untouched.
+- Composition: a pair-local P2P pre-merge leaves one holder per pair; the cross-pair stage is then this `host_pipeline`
+  with `_inputs` = the pair holders (host OR over 2 inputs instead of 4) and the uploads of the non-holders replaced by
+  in-pair peer copies after the holder's upload event (`upload_to` is the only place that changes). The slot / event
+  bookkeeping is per leg, so a peer leg simply has no slot.
+- Replica copies and the gather choose the route per (source, destination) already; the scope only changes what the HOST
+  route does.
+- Given section 4 (hostor 45-48 ms/GiB vs `c2` 52 in the primitives bench), the D2D prototype has to beat 45-48 on this
+  machine to be worth its extra topology code; its bound is 38.
+
+## 14. Recommendation
+
+PLACEHOLDER_RECO
