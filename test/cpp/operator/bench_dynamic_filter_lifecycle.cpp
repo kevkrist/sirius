@@ -61,6 +61,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -922,6 +923,171 @@ TEST_CASE("proto xfer host: every schedule leaves the tip loop's Bloom arrays on
               gpus,
               checked,
               compared);
+  std::fflush(stdout);
+}
+
+namespace {
+
+struct exact_probe {
+  std::string published;
+  std::vector<bool> exact;               ///< Per mask: the filter is an exact IN-list
+  std::vector<std::size_t> step;         ///< Per mask: the key column's value step
+  std::vector<std::vector<bool>> masks;  ///< Per (key filter, GPU): membership of the probe range
+};
+
+/**
+ * @brief One session over `total` keys per column, then every published membership filter probed on
+ * every GPU with the dense range [-8, total * step + 8).
+ */
+[[nodiscard]] exact_probe run_exact_once(acc::fixture& fixture,
+                                         session_case const& subject,
+                                         std::size_t total)
+{
+  std::vector<acc::batch_ptr> batches;
+  for (std::size_t index = 0; index < subject.batches; ++index) {
+    auto const device = subject.spread ? static_cast<int>(index % subject.gpus) : 0;
+    batches.push_back(make_keys(fixture,
+                                device,
+                                static_cast<std::int64_t>(index * subject.rows),
+                                static_cast<cudf::size_type>(subject.rows),
+                                subject.keys));
+  }
+  sync_devices(fixture.devices);
+  fixture.session.reset();
+  fixture.channel = std::make_shared<op::sirius_dynamic_filter_set>();
+  fixture.session =
+    std::make_unique<op::dynamic_filter_publication_session>(plan_for(fixture, subject),
+                                                             &fixture.stats);
+  auto certified = acc::fixture::certify(batches);
+  REQUIRE(std::holds_alternative<op::complete_build_inventory>(certified));
+  REQUIRE(fixture.session->begin(std::move(std::get<op::complete_build_inventory>(certified))));
+  for (auto const& batch : batches) {
+    auto source       = batch->to_read_only();
+    auto const device = source.get_memory_space()->get_device_id();
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    auto const stream = fixture.task_stream(device);
+    fixture.session->contribute(batch->get_batch_id(), source, stream);
+    stream.sync();
+  }
+  auto const last = batches.back();
+  auto const root = last->to_read_only().get_memory_space()->get_device_id();
+  fixture.publish(root, last->get_batch_id());
+
+  exact_probe out;
+  std::size_t filters = 0;
+  out.published       = describe(*fixture.channel, filters);
+  for (std::size_t key = 0; key < subject.keys; ++key) {
+    auto const step = 2 * key + 1;
+    for (auto const& filter : acc::filters_on_column(*fixture.channel, key)) {
+      auto const* mask = dynamic_cast<op::sirius_mask_applicable const*>(filter.get());
+      if (mask == nullptr) { continue; }
+      for (std::size_t device = 0; device < subject.gpus; ++device) {
+        auto& space = fixture.gpu(static_cast<int>(device));
+        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+        auto const stream = space.acquire_stream();
+        auto const mr     = space.get_default_allocator();
+        auto const probe  = cudf::sequence(static_cast<cudf::size_type>(total * step + 16),
+                                           cudf::numeric_scalar<std::int64_t>(-8, true, stream, mr),
+                                           cudf::numeric_scalar<std::int64_t>(1, true, stream, mr),
+                                           stream,
+                                           mr);
+        auto const result =
+          mask->compute_mask(probe->view(), nullptr, static_cast<int>(device), stream, mr);
+        REQUIRE(result);
+        out.masks.push_back(
+          sirius::test::operator_utils::copy_column_to_host<bool>(result->view(), stream));
+        out.exact.push_back(filter->kind() == op::sirius_dynamic_filter_kind::IN_LIST);
+        out.step.push_back(step);
+      }
+    }
+  }
+  fixture.session->finalize_input();
+  fixture.session.reset();
+  fixture.channel.reset();
+  sync_devices(fixture.devices);
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("proto xfer host: exact-kind filters hold the tip's key set on every GPU",
+          "[.][xfer_proto_exact]")
+{
+  auto const gpus = usable_gpus(env_list("SIRIUS_BENCH_DF_GPUS", {4}).front());
+  REQUIRE(gpus >= 2);
+  acc::fixture fixture({.devices = gpus, .gpu_bytes = 8192 * acc::mib});
+  std::size_t sessions = 0, masks = 0, exact_masks = 0;
+  std::map<std::string, std::size_t> kinds;
+  auto const before_sources = proto::stats().staged_sources.load();
+  auto const before_hits    = proto::stats().staged_once_hits.load();
+  auto const before_gather  = proto::stats().gather_batches.load();
+  for (auto const keys : std::vector<std::size_t>{1, 2}) {
+    for (auto const total : std::vector<std::size_t>{12, 1920, 30720, 199680}) {
+      for (auto const batches : std::vector<std::size_t>{1, 6, 8, 64}) {
+        if (total % batches != 0) { continue; }
+        for (auto const spread : std::vector<bool>{false, true}) {
+          if (spread && batches == 1) { continue; }
+          session_case const subject{.kind    = "auto",
+                                     .keys    = keys,
+                                     .gpus    = gpus,
+                                     .batches = batches,
+                                     .rows    = total / batches,
+                                     .spread  = spread};
+          CAPTURE(keys, total, batches, spread);
+          clear_proto_env();
+          setenv("SIRIUS_PROTO_XFER_REPLICA", "0", 1);
+          auto const tip = run_exact_once(fixture, subject, total);
+          // The tip's own masks: exact filters hold exactly the inserted keys on every GPU.
+          for (std::size_t index = 0; index < tip.masks.size(); ++index) {
+            auto const step = static_cast<std::int64_t>(tip.step[index]);
+            for (std::size_t row = 0; row < tip.masks[index].size(); ++row) {
+              auto const value  = static_cast<std::int64_t>(row) - 8;
+              bool const member = value >= 0 && value % step == 0 &&
+                                  value / step < static_cast<std::int64_t>(total);
+              if (tip.exact[index]) {
+                if (tip.masks[index][row] != member) { FAIL("tip exact filter differs from keys"); }
+              } else if (member && !tip.masks[index][row]) {
+                FAIL("tip Bloom filter misses a key");
+              }
+            }
+          }
+          for (auto const fail_host : {false, true}) {
+            clear_proto_env();
+            setenv("SIRIUS_PROTO_XFER_REPLICA", "1", 1);
+            if (fail_host) { setenv("SIRIUS_PROTO_XFER_FAIL_HOST", "1", 1); }
+            auto const got = run_exact_once(fixture, subject, total);
+            REQUIRE(got.published == tip.published);
+            REQUIRE(got.exact == tip.exact);
+            REQUIRE(got.masks.size() == tip.masks.size());
+            for (std::size_t index = 0; index < got.masks.size(); ++index) {
+              bool const same = got.masks[index] == tip.masks[index];
+              REQUIRE(same);
+              ++masks;
+              if (got.exact[index]) { ++exact_masks; }
+            }
+            ++sessions;
+          }
+          ++kinds[tip.published];
+        }
+      }
+    }
+  }
+  clear_proto_env();
+  std::string seen;
+  for (auto const& [name, count] : kinds) {
+    seen += name + "x" + std::to_string(count) + " ";
+  }
+  std::printf(
+    "ROW,XFEREXACT,gpus=%zu,sessions_checked=%zu,masks_compared=%zu,exact_masks=%zu,"
+    "staged_sources=%llu,staged_once_hits=%llu,gather_batches=%llu,kinds=%s\n",
+    gpus,
+    sessions,
+    masks,
+    exact_masks,
+    static_cast<unsigned long long>(proto::stats().staged_sources.load() - before_sources),
+    static_cast<unsigned long long>(proto::stats().staged_once_hits.load() - before_hits),
+    static_cast<unsigned long long>(proto::stats().gather_batches.load() - before_gather),
+    seen.c_str());
   std::fflush(stdout);
 }
 
