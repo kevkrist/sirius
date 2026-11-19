@@ -68,6 +68,9 @@ void bind_partition_inputs(sirius_physical_hash_join& join,
   if (!probe_drives) {
     build.add_finalize_listener(
       [&join, build_concat] { join.activate_probe_after_build_partition(build_concat); });
+    if (build_concat != nullptr) {
+      build_concat->add_finalize_listener([&join] { join.eager_build_move_finished(); });
+    }
   }
   partition_exchange::bind(
     {&build, &probe},

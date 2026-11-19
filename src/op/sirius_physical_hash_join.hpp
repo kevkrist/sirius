@@ -324,6 +324,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// Switch SIRIUS_EAGER_PROBE: 0/unset = off, 1 = joins with an enabled filter plan, 2 = every
   /// BUILD_PROBE join. SIRIUS_EAGER_CONCAT_FIRST (default 1): nominate the build CONCAT first.
   void activate_probe_after_build_partition(sirius_physical_operator* build_concat) noexcept;
+  /// @brief PROTOTYPE (eager probe): the build CONCAT pipeline has finished (scan throttle ends).
+  void eager_build_move_finished() noexcept;
 
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
   [[nodiscard]] bool is_build_probe_mode();
@@ -438,6 +440,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::atomic<bool> _partitioned_build_has_null{false};
   std::atomic<bool> _build_observer_attached{false};
   std::atomic<bool> _eager_probe_activated{false};
+  int _eager_move_state{0};  // guarded by eager_throttle::state().mutex
 
   /// Global build facts a MARK probe needs: whether a build key is NULL, and whether marks are
   /// definite (all-null-safe keys, or a globally empty build).

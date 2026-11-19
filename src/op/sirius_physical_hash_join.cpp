@@ -40,6 +40,7 @@
 #include "log/logging.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
+#include "op/eager_probe_throttle.hpp"
 #include "op/key_preparation.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -961,6 +962,7 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
     if (!creator) { return; }
     if (_eager_probe_activated.exchange(true, std::memory_order_acq_rel)) { return; }
     auto* probe_head = &probe_port->src_pipeline->get_operators()[0].get();
+    eager_throttle::build_move_begin(_eager_move_state);
     if (concat_first != 0 && build_concat != nullptr) { creator->schedule(build_concat); }
     creator->schedule(probe_head);
     SIRIUS_LOG_INFO("[eager] join {} probe activated {} (filter_plan={}, session_terminal={}, "
@@ -972,6 +974,14 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
                     concat_first);
   } catch (std::exception const& e) {
     SIRIUS_LOG_ERROR("[eager] join {}: early probe activation failed: {}", get_operator_id(), e.what());
+  } catch (...) {
+  }
+}
+
+void sirius_physical_hash_join::eager_build_move_finished() noexcept
+{
+  try {
+    eager_throttle::build_move_end(_eager_move_state);
   } catch (...) {
   }
 }

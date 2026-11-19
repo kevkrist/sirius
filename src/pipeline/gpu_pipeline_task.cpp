@@ -23,6 +23,7 @@
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
 #include "memory/size_arithmetic.hpp"
+#include "op/eager_probe_throttle.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "creator/task_creator.hpp"
@@ -749,6 +750,14 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
                                  ->get_memory_handle(requested_memory_space->get_id());
     if (memory_handle) { _reservation_memory_resource_id = memory_handle->get().id().raw(); }
   }
+  // PROTOTYPE (eager probe): optionally hold back scan tasks while an overlapped build move runs.
+  op::eager_throttle::scan_slot eager_scan_slot;
+  if (op::eager_throttle::limit() > 0 && source_op && requested_memory_space != nullptr) {
+    eager_scan_slot.device =
+      op::eager_throttle::scan_acquire(requested_memory_space->get_device_id())
+        ? requested_memory_space->get_device_id()
+        : -1;
+  }
   telemetry_fsm().preparing(
     {.origin_tier     = local_state._input_data->get_origin_tiers(),
      .target_tier     = "GPU",
@@ -763,6 +772,7 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
     // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
     // is accurate.
     stream.sync();
+    eager_scan_slot.reset();
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
     std::optional<std::size_t> retry_requested_bytes;
