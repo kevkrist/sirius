@@ -22,6 +22,7 @@
 #include "memory/size_arithmetic.hpp"
 #include "yaml_reader.hpp"
 
+#include <cstdlib>
 #include <cuda_runtime_api.h>
 
 #include <cucascade/exec/thread_util.hpp>
@@ -801,6 +802,11 @@ struct topology {
     } else {
       long long n = 0;
       r.optional("num_gpus", n);
+      // PROTOTYPE (OP1A): measurement-only override, so a PEER-capable GPU pair can be measured
+      // without editing the config file.
+      if (auto const* proto = std::getenv("SIRIUS_PROTO_NUM_GPUS"); proto != nullptr && *proto) {
+        n = std::atoll(proto);
+      }
       if (n < 0) { throw std::runtime_error("topology.num_gpus must be non-negative"); }
       opt.num_gpus_or_gpu_ids = static_cast<size_t>(n);
     }
