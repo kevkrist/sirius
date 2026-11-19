@@ -41,6 +41,13 @@ class partition_input_observer {
   virtual void after_transform(uint64_t id,
                                cucascade::memory::memory_space& space,
                                ::cuda::stream_ref stream)                         = 0;
+  // PROTO OP1B: deferred publication. `claim_publication` runs after the task's deposit and
+  // before its early completion; a true return obliges one `run_claimed_publication`.
+  [[nodiscard]] virtual bool claim_publication(uint64_t /*id*/) { return false; }
+  virtual void run_claimed_publication(cucascade::memory::memory_space& /*space*/,
+                                       ::cuda::stream_ref /*stream*/)
+  {
+  }
   virtual void finalize_input()                                                   = 0;
   /**
    * @brief Bytes a task of the observed input may take from its allocator beyond its input and

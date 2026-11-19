@@ -178,6 +178,10 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   void execute(::cuda::stream_ref stream) override;
 
+  /// PROTO OP1B: reports this task completed to its pipeline while it is still running; the
+  /// destructor then reports nothing. The task keeps its stream, reservation and inputs.
+  void report_completion_early();
+
   /**
    * @brief Get the preferred GPU device ID for this task.
    *
@@ -316,6 +320,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
     uint64_t task_id, std::unique_ptr<sirius_pipeline_task_local_state> local_state);
 
  private:
+  bool _completion_reported = false;  ///< PROTO OP1B: completion already reported early.
   std::vector<cucascade::shared_data_repository*> _data_repos;
   cucascade::memory::reservation_aware_resource_adaptor* _allocator = nullptr;
   /// Non-owning subscription ledger: the input data_batches this task subscribed to in its

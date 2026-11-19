@@ -57,11 +57,23 @@ void hash_join_partition_observer::after_transform(uint64_t id,
   _join.dynamic_filter_session().publish_if_final(id, space, stream);
 }
 
+bool hash_join_partition_observer::claim_publication(uint64_t id)
+{
+  return _join.dynamic_filter_session().claim_publication(id);
+}
+
+void hash_join_partition_observer::run_claimed_publication(cucascade::memory::memory_space& space,
+                                                           ::cuda::stream_ref stream)
+{
+  _join.dynamic_filter_session().run_claimed_publication(space, stream);
+}
+
 void hash_join_partition_observer::finalize_input()
 {
   auto& session = _join.dynamic_filter_session();
   session.finalize_input();
-  D_ASSERT(!session.plan().enabled() || session.terminal());
+  // PROTO OP1B: a deferred publication may still be running here; the join point
+  // (`await_deferred_publication`) and the hash join's finalizer take over the Terminal guarantee.
 }
 
 std::size_t hash_join_partition_observer::task_scratch_bytes() const noexcept

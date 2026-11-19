@@ -138,6 +138,29 @@ class dynamic_filter_publication_session final {
                         cucascade::memory::memory_space const& task_space,
                         ::cuda::stream_ref stream);
 
+  // --- PROTO OP1B (throwaway): publication deferred past the Publishing Task's deposit ---------
+  /**
+   * @brief Claims the pending publication of @p original_id for a deferred run.
+   *
+   * The claim counts as an active operation, so closing the input (`finish_input`) no longer
+   * abandons the publication, and `await_deferred_publication` blocks until the session is
+   * Terminal. A true return obliges the caller to call `run_claimed_publication` exactly once.
+   */
+  [[nodiscard]] bool claim_publication(std::uint64_t original_id);
+
+  /// Runs the publication claimed by `claim_publication` (same contract as `publish_if_final`).
+  void run_claimed_publication(cucascade::memory::memory_space const& task_space,
+                               ::cuda::stream_ref stream);
+
+  /**
+   * @brief The join point: blocks while a claimed (deferred) publication has not made the session
+   * Terminal. Returns at once when nothing was deferred.
+   *
+   * @return Milliseconds waited when it blocked; on the first non-blocking call after a deferral,
+   * minus the milliseconds the session had been Terminal already; 0 otherwise.
+   */
+  double await_deferred_publication() const;
+
   /**
    * @brief Ends a collecting attempt whose task input cannot identify one certified batch.
    *

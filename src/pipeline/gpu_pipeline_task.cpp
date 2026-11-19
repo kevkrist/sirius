@@ -25,6 +25,7 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "creator/task_creator.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
@@ -47,6 +48,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -441,7 +443,22 @@ gpu_pipeline_task::~gpu_pipeline_task()
       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
     return;
   }
+  if (_completion_reported) { return; }
   _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->mark_task_completed();
+}
+
+void gpu_pipeline_task::report_completion_early()
+{
+  if (std::exchange(_completion_reported, true)) { return; }
+  auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  // Same order as the executor's epilogue: the completion (which closes the pipeline and notifies
+  // its consumers when this was the last task), then the per-task consumer nomination.
+  pipeline->mark_task_completed();
+  if (auto* creator = pipeline->get_task_creator()) {
+    for (auto* consumer : pipeline->get_output_consumers()) {
+      if (consumer != nullptr) { creator->schedule(consumer); }
+    }
+  }
 }
 
 const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
@@ -843,6 +860,11 @@ void gpu_pipeline_task::execute(::cuda::stream_ref stream)
           std::move(output_data), operators.size(), "OOM restoring a deferral at the sink");
       }
       publish_output(*output_data, materialized.get(), stream);
+      // PROTO OP1B: a sink may owe work after its deposit (a deferred dynamic-filter publication)
+      // and may report this task completed to the pipeline before running it.
+      if (auto sink_operator = pipeline->get_sink()) {
+        sink_operator->after_sink(*output_data, stream, [this] { report_completion_early(); });
+      }
     }
 
     // Record memory metrics for future reservation estimates. Measured after publish_output, not

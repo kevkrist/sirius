@@ -54,6 +54,9 @@ class sirius_physical_partition : public sirius_physical_operator {
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
   std::unique_ptr<operator_data> execute(operator_data const&, ::cuda::stream_ref) override;
   void sink(operator_data const&, ::cuda::stream_ref) override;
+  void after_sink(operator_data const&,
+                  ::cuda::stream_ref,
+                  std::function<void()> const&) override;
   std::optional<task_creation_hint> get_next_task_hint() override;
   std::unique_ptr<operator_data> get_next_task_input_data() override;
   std::size_t no_history_peak_memory_estimate(input_stats const&) const override;

@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -37,6 +38,19 @@
 
 namespace sirius {
 namespace op {
+
+namespace {
+/// PROTO OP1B: `SIRIUS_DF_DEFER_PUBLISH` = 0 publish before deposit (stack tip), 1 publish after
+/// deposit and early task completion (default), 2 also complete non-publishing contributors early.
+int op1b_defer_mode()
+{
+  static int const mode = [] {
+    auto const* value = std::getenv("SIRIUS_DF_DEFER_PUBLISH");
+    return value == nullptr ? 1 : std::atoi(value);
+  }();
+  return mode;
+}
+}  // namespace
 
 namespace {
 
@@ -191,7 +205,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     auto result =
       std::make_unique<routed_operator_data>(std::move(batches), std::move(destinations));
     if (forward_publication_id && space != nullptr) {
-      _input_observer->after_transform(*forward_publication_id, *space, stream);
+      if (auto const mode = op1b_defer_mode(); mode != 0) {
+        result->set_deferred_publication(
+          {.id = *forward_publication_id, .space = space, .complete_early_always = mode >= 2});
+      } else {
+        _input_observer->after_transform(*forward_publication_id, *space, stream);
+      }
     }
     record_actual_bytes();
     return result;
@@ -243,7 +262,14 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   std::iota(destinations.begin(), destinations.end(), std::size_t{0});
   auto result =
     std::make_unique<routed_operator_data>(std::move(partitioned_results), std::move(destinations));
-  if (publication_id) { _input_observer->after_transform(*publication_id, *space, stream); }
+  if (publication_id) {
+    if (auto const mode = op1b_defer_mode(); mode != 0) {
+      result->set_deferred_publication(
+        {.id = *publication_id, .space = space, .complete_early_always = mode >= 2});
+    } else {
+      _input_observer->after_transform(*publication_id, *space, stream);
+    }
+  }
   record_actual_bytes();
   return result;
 }
@@ -264,6 +290,31 @@ void sirius_physical_partition::sink(operator_data const& input_data, ::cuda::st
       next.next_operator->push_data_batch_partitioned(
         next.next_operator_port_name, batches[i], destination);
     }
+  }
+}
+
+void sirius_physical_partition::after_sink(operator_data const& output_data,
+                                           ::cuda::stream_ref stream,
+                                           std::function<void()> const& complete_task_early)
+{
+  auto const* routed = dynamic_cast<routed_operator_data const*>(&output_data);
+  if (routed == nullptr || !routed->deferred() || !_input_observer) { return; }
+  auto const& deferred = *routed->deferred();
+  // Claim before the early completion: the pipeline's finalizer closes the session's input, which
+  // would abandon an unclaimed pending publication.
+  if (_input_observer->claim_publication(deferred.id)) {
+    nvtx_scoped_range nvtx_range{"op1b::deferred_publication"};
+    try {
+      complete_task_early();
+    } catch (...) {
+      _input_observer->run_claimed_publication(*deferred.space, stream);
+      throw;
+    }
+    _input_observer->run_claimed_publication(*deferred.space, stream);
+  } else if (deferred.complete_early_always) {
+    // Not the Publishing Task: only its own insert kernels are left, which the task's final
+    // stream sync retires before its input is released.
+    complete_task_early();
   }
 }
 

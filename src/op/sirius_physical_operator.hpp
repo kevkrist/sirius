@@ -414,6 +414,17 @@ class routed_operator_data : public pipelineable_operator_data {
     }
   }
   [[nodiscard]] std::vector<std::size_t> const& destinations() const { return _destinations; }
+
+  /// PROTO OP1B: a dynamic-filter publication this task owes after its deposit (`after_sink`).
+  struct deferred_publication {
+    std::uint64_t id;
+    cucascade::memory::memory_space* space;
+    /// Whether the task also reports completion early when it does not publish (OP1b: takes the
+    /// wait for its own insert kernels off the pipeline's completion).
+    bool complete_early_always;
+  };
+  void set_deferred_publication(deferred_publication value) { _deferred = value; }
+  [[nodiscard]] std::optional<deferred_publication> const& deferred() const { return _deferred; }
   [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
     std::vector<std::shared_ptr<cucascade::data_batch>> batches) const override
   {
@@ -424,6 +435,7 @@ class routed_operator_data : public pipelineable_operator_data {
 
  private:
   std::vector<std::size_t> _destinations;
+  std::optional<deferred_publication> _deferred;
 };
 
 /**
@@ -773,6 +785,19 @@ class sirius_physical_operator {
  public:
   // Sink interface
   virtual void sink(const operator_data& input_data, ::cuda::stream_ref stream);
+
+  /**
+   * @brief PROTO OP1B: work a sink owes after the task's output is deposited.
+   *
+   * `complete_task_early` reports the running task as completed to its pipeline (downstream work
+   * whose readiness is producer completion may then start) while the task keeps its stream,
+   * reservation and inputs until this returns.
+   */
+  virtual void after_sink(const operator_data& /*output*/,
+                          ::cuda::stream_ref /*stream*/,
+                          std::function<void()> const& /*complete_task_early*/)
+  {
+  }
 
   //! An operator is a pipeline sink iff its tree parent is a PARTITION, BUILD_FILTER,
   //! RIGHT_DELIM_JOIN, or DENSE_COUNT_JOIN — computed from `_parent_op` from the final tree. Those

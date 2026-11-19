@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -404,7 +405,9 @@ struct dynamic_filter_publication_session::state {
     for (auto const& producer : producers) {
       producer.finish(result);
     }
-    current = phase::TERMINAL;
+    current     = phase::TERMINAL;
+    terminal_at = std::chrono::steady_clock::now();
+    terminal_cv.notify_all();
     if (stats && account_attempt) {
       if (result == completion::PUBLISHED || result == completion::SKIPPED) {
         stats->publications_finished.fetch_add(1, std::memory_order_relaxed);
@@ -811,6 +814,12 @@ struct dynamic_filter_publication_session::state {
   bool sealed        = false;
   bool input_closed  = false;
   bool cancelled     = false;
+  // PROTO OP1B: a publication was claimed for a deferred run; the join point waits on `terminal_cv`.
+  bool deferred = false;
+  std::chrono::steady_clock::time_point deferred_claimed{};
+  std::chrono::steady_clock::time_point terminal_at{};
+  mutable bool gate_reported = false;
+  mutable std::condition_variable terminal_cv;
 };
 
 //===----------------------------------------------------------------------===//
@@ -1184,6 +1193,70 @@ void dynamic_filter_publication_session::publish_if_final(
     active.claimed = true;
   }
   operation.publish(task_space, stream);
+}
+
+bool dynamic_filter_publication_session::claim_publication(std::uint64_t original_id)
+{
+  auto& operation = *_state;
+  std::scoped_lock lock(operation.mutex);
+  if (operation.pending_publication != original_id || operation.accumulation_result) {
+    return false;
+  }
+  operation.pending_publication.reset();
+  ++operation.active_operations;
+  operation.deferred         = true;
+  operation.deferred_claimed = std::chrono::steady_clock::now();
+  return true;
+}
+
+void dynamic_filter_publication_session::run_claimed_publication(
+  cucascade::memory::memory_space const& task_space, ::cuda::stream_ref stream)
+{
+  auto& operation = *_state;
+  auto const begin = std::chrono::steady_clock::now();
+  {
+    state::active_operation active{operation};
+    active.claimed = true;
+    operation.publish(task_space, stream);
+  }
+  auto const end = std::chrono::steady_clock::now();
+  bool closed    = false;
+  bool terminal  = false;
+  double since_claim = 0;
+  {
+    std::scoped_lock lock(operation.mutex);
+    closed      = operation.input_closed;
+    terminal    = operation.current == state::phase::TERMINAL;
+    since_claim =
+      std::chrono::duration<double, std::milli>(begin - operation.deferred_claimed).count();
+  }
+  sirius::log::log_noexcept([&] {
+    SIRIUS_LOG_INFO(
+      "[op1b] deferred publication ran {:.2f} ms (started {:.2f} ms after claim), terminal={}",
+      std::chrono::duration<double, std::milli>(end - begin).count(),
+      since_claim,
+      terminal);
+  });
+  // The site's finalizer may already have run (its release found the publication active).
+  if (closed) { release_retired_storage(); }
+}
+
+double dynamic_filter_publication_session::await_deferred_publication() const
+{
+  auto& operation = *_state;
+  std::unique_lock lock(operation.mutex);
+  if (!operation.deferred) { return 0.0; }
+  auto const begin = std::chrono::steady_clock::now();
+  if (operation.current == state::phase::TERMINAL) {
+    if (std::exchange(operation.gate_reported, true)) { return 0.0; }
+    // Negative: the publication was Terminal this long before the join point was reached.
+    return -std::chrono::duration<double, std::milli>(begin - operation.terminal_at).count();
+  }
+  operation.gate_reported = true;
+  operation.terminal_cv.wait(lock,
+                             [&] { return operation.current == state::phase::TERMINAL; });
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+    .count();
 }
 
 namespace {

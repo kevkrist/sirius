@@ -36,6 +36,9 @@ class hash_join_partition_observer final : public partition_input_observer {
                                            cucascade::read_only_data_batch const&,
                                            ::cuda::stream_ref) override;
   void after_transform(uint64_t, cucascade::memory::memory_space&, ::cuda::stream_ref) override;
+  [[nodiscard]] bool claim_publication(uint64_t id) override;
+  void run_claimed_publication(cucascade::memory::memory_space& space,
+                               ::cuda::stream_ref stream) override;
   void finalize_input() override;
   [[nodiscard]] std::size_t task_scratch_bytes() const noexcept override;
 

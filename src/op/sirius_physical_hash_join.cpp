@@ -928,7 +928,22 @@ void sirius_physical_hash_join::reclaim_build_only_slots_if_probe_complete(bool 
 
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
 {
-  std::lock_guard<std::mutex> lg(op_state_mutex);
+  std::unique_lock<std::mutex> lg(op_state_mutex);
+  // PROTO OP1B join point: the probe side is activated only through these hints, so a deferred
+  // publication is awaited here, outside the operator mutex, before the hint names the probe
+  // producer. No consumer scan of this join's probe subtree is created before its filters are
+  // visible.
+  auto const to_probe = [&](sirius_physical_operator* producer) {
+    lg.unlock();
+    auto const waited = _dynamic_filter_session.await_deferred_publication();
+    if (waited != 0.0) {
+      SIRIUS_LOG_INFO("[op1b] join {} probe activation: {} {:.2f} ms",
+                      this->get_operator_id(),
+                      waited > 0 ? "waited for the deferred publication" : "publication was done",
+                      waited > 0 ? waited : -waited);
+    }
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+  };
   auto* build_port = get_port("build");
   auto* probe_port = get_port("default");
   if (!build_port || !probe_port) {
@@ -961,7 +976,7 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
     }
     if (probe_port->src_pipeline && !probe_port->src_pipeline->is_pipeline_finished()) {
       auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+      return to_probe(producer);
     }
     return std::nullopt;
   }
@@ -989,7 +1004,7 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
       }
       case build_probe_action::wait_for_probe: {
         auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+        return to_probe(producer);
       }
       case build_probe_action::none:
       default:
@@ -1016,7 +1031,7 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
       }
       case cross_schedule_kind::wait_probe: {
         auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+        return to_probe(producer);
       }
       case cross_schedule_kind::done:
       default: return std::nullopt;
