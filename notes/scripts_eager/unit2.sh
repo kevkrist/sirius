@@ -9,6 +9,7 @@
 #   o2    E2 option 2 (deferred publication + callback)     adm  eager 1, gate 2, admit 1000 GiB (never admitted)
 #   bs    o1 + CUCASCADE_PROTO_BATCH_STAGING=1 (build move queues the whole table's copies at once)   b0  same, eager off
 #   bsk   bs + scan throttle 1          bf   f1 + batched staging
+#   bs2 / b02 / bs2k / bf2: as bs / b0 / bsk / bf with CUCASCADE_PROTO_BATCH_STAGING=2 (all D2H first, then one H2D train)
 #   f1    E2 eager 2, gate 2, admit 16 GiB (S6 shape)   f1k  f1 + scan throttle 2
 tag=$1; iters=$2; q=$3; shift 3
 B=/opt/dlami/nvme/dfperf/runs/eager/bin; R=/opt/dlami/nvme/dfperf; E2=$R/wt-eager2
@@ -33,6 +34,10 @@ for spec in "$@"; do
     b0)   REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=1 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=0 $B/one_query.sh $label $q $iters ;;
     bsk)  REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=1 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=1 SIRIUS_EAGER_SCAN_THROTTLE=1 $B/one_query.sh $label $q $iters ;;
     bf)   REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=1 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=2 SIRIUS_EAGER_GATE=2 SIRIUS_EAGER_ADMIT_GIB=16 $B/one_query.sh $label $q $iters ;;
+    bs2)  REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=2 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=1 $B/one_query.sh $label $q $iters ;;
+    b02)  REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=2 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=0 $B/one_query.sh $label $q $iters ;;
+    bs2k) REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=2 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=1 SIRIUS_EAGER_SCAN_THROTTLE=1 $B/one_query.sh $label $q $iters ;;
+    bf2)  REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=2 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=2 SIRIUS_EAGER_GATE=2 SIRIUS_EAGER_ADMIT_GIB=16 $B/one_query.sh $label $q $iters ;;
     *) echo "unknown arm $arm"; exit 9 ;;
   esac
 done
