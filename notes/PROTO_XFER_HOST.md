@@ -412,7 +412,7 @@ sources, `gpuor` for one source, fan-out for a single contributor = the prototyp
 the fallback and for arrays under a few MiB.
 
 - Measured: suite -417.5 ms (-2.73%; 15280 -> 14863), q21 -14.5%, q3 -6.2%, q7 -5.5%, q4 -4.4%, q10 -3.9%; no query slower.
-  It passes the campaign gate (>= 0.5% of the suite) by 5x and is the largest verified gain of the campaign so far.
+  It passes the campaign gate (>= 0.5% of the suite) by 5x and is the largest measured gain of the campaign so far (eager probe option 1: -295 ms; not yet re-measured by a verifier).
   Filters bit-identical, results identical.
 - It is a transfer-mechanics change only: no planner, session or probe change, no change on a full-P2P machine, 80-160 MiB
   of pinned HOST for the duration of one finish, no device scratch.
