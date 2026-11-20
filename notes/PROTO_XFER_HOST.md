@@ -1,7 +1,7 @@
 # PROTO_XFER_HOST: doing the unavoidable host bounce well (DF finish chain) - prototype + measurements
 
 2026-11-19. Worktree `/opt/dlami/nvme/dfperf/wt-xfer-host`, branch `proto/xfer-host` on top of pr2570 `ae939824`
-(+ cherry-pick of the lifecycle microbench `a5b37728`). Local commits only, nothing pushed.
+(+ cherry-pick of the lifecycle microbench `a5b37728`). Head `699b3dd8`; backed up to the fork as `dfperf/proto/xfer-host`.
 Scripts `$R/runs/xfer_host/bin/` (copy committed on the branch under `dfperf_scripts/xfer_host/`), raw output `$R/runs/xfer_host/`, Quent `$R/telemetry/xfer-host*`.
 Every build and GPU process ran under `flock $R/machine.lock` (one queued command per hold, `bin/next.sh`).
 Config `/home/ubuntu/sirius/specific_config.yaml` untouched; the prototype is switched by environment variables only.
@@ -9,7 +9,7 @@ Config `/home/ubuntu/sirius/specific_config.yaml` untouched; the prototype is sw
 STATUS (2026-11-19, second session after the wipe): BUILT, gates pass, measured. Sections 1-2 are design (code facts, written
 before the first build; still accurate), 3+ are measurements of this session. Section 9 lists what ran and what did not.
 Commits on `proto/xfer-host`: `a57417f7` (mb/lifecycle cherry-pick), `336915e1` (design as recovered), `ff814aec` (compile fix +
-byte dump for the identity test), `e683d765` (exact-kind identity test). Pushed to the fork as `dfperf/proto/xfer-host` by backup.sh.
+byte dump for the identity test), `e683d765` (exact-kind identity test), `699b3dd8` (scripts + small logs). Pushed to the fork as `dfperf/proto/xfer-host` by backup.sh.
 
 ## 1. Scope and seam
 
