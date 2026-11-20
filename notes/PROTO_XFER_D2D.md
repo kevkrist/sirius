@@ -147,21 +147,80 @@ Reading:
 - One contributor per pair (mask 5): `star` = tip (the star through the root is still two serial bounces);
   `exchange` / `pipe` 2.3-2.4x.
 
-## 5. (b) TPC-H SF1000 ABBA timing, tip binary vs prototype with `SIRIUS_PROTO_XFER_D2D=pipe`
+## 5. (b) TPC-H SF1000 ABBA timing, tip binary (`$R/repo`) vs prototype with `SIRIUS_PROTO_XFER_D2D=pipe`
 
-INTERIM (replaced by the final table when the queue finishes): gates passed (section 7); first blocks, fresh process
-per query, 1 warm + 5 hot, first hot dropped, ABBA, n = 8 per arm:
+`bin/abba_q.sh` (`abba_guard.sh`: only after the gates passed): per query 4 fresh processes tip, proto, proto, tip, each
+1 warm + 5 hot iterations, first hot dropped -> 4 kept per process, n = 8 per arm; pooled medians; one ABBA block per
+query (no second block). Raw: `runs/xfer_d2d/p1_{tipA,protoA,protoB,tipB}/`. Results = md5 of `result.txt`.
 
 | q | tip med ms (n) [min-max] | proto med ms (n) [min-max] | delta ms | delta % | per-block deltas ms | results |
 |---|---|---|---|---|---|---|
+| 1 | 470.8 (8) [459-477] | 468.8 (8) [461-475] | -2.0 | -0.43 | -2.0 | identical |
+| 2 | 149.2 (8) [148-151] | 147.6 (8) [146-150] | -1.6 | -1.05 | -1.6 | identical |
 | 3 | 658.7 (8) [653-668] | 621.9 (8) [615-626] | -36.8 | -5.59 | -36.8 | identical |
 | 4 | 324.3 (8) [321-327] | 310.6 (8) [308-312] | -13.7 | -4.23 | -13.7 | identical |
+| 5 | 693.9 (8) [680-714] | 679.6 (8) [666-702] | -14.4 | -2.07 | -14.4 | identical |
+| 6 | 380.5 (8) [379-388] | 380.2 (8) [379-388] | -0.3 | -0.07 | -0.3 | identical |
 | 7 | 746.9 (8) [741-752] | 710.9 (8) [707-713] | -35.9 | -4.81 | -35.9 | identical |
 | 8 | 936.1 (8) [927-942] | 912.4 (8) [904-913] | -23.7 | -2.54 | -23.7 | identical |
 | 9 | 1420.5 (8) [1404-1438] | 1394.1 (8) [1365-1409] | -26.4 | -1.86 | -26.4 | identical |
 | 10 | 849.7 (8) [840-869] | 820.2 (8) [813-833] | -29.5 | -3.47 | -29.5 | identical |
+| 11 | 172.3 (8) [167-183] | 172.1 (8) [168-183] | -0.2 | -0.11 | -0.2 | row order of ties only (see below) |
+| 12 | 705.1 (8) [702-708] | 693.5 (8) [692-700] | -11.6 | -1.65 | -11.6 | identical |
+| 13 | 1311.8 (8) [1279-1496] | 1306.1 (8) [1298-1495] | -5.7 | -0.44 | -5.7 | identical |
+| 14 | 685.8 (8) [676-709] | 687.8 (8) [676-707] | +2.0 | +0.29 | +2.0 | identical |
+| 15 | 527.6 (8) [526-530] | 527.9 (8) [526-531] | +0.3 | +0.06 | +0.3 | identical |
+| 16 | 311.4 (8) [302-318] | 301.2 (8) [300-312] | -10.2 | -3.29 | -10.2 | identical |
+| 17 | 497.1 (8) [487-508] | 497.9 (8) [487-507] | +0.8 | +0.16 | +0.8 | identical |
+| 18 | 1098.4 (8) [1082-1114] | 1086.1 (8) [1079-1092] | -12.2 | -1.11 | -12.2 | identical |
+| 19 | 879.8 (8) [876-892] | 880.5 (8) [877-892] | +0.7 | +0.08 | +0.7 | identical |
+| 20 | 714.8 (8) [698-734] | 715.2 (8) [696-735] | +0.4 | +0.06 | +0.4 | identical |
 | 21 | 1442.0 (8) [1429-1454] | 1244.1 (8) [1227-1258] | -197.9 | -13.72 | -197.9 | identical |
-| sum | 6378 | 6014 | -363.9 | -5.71 | | |
+| 22 | 338.6 (8) [338-340] | 333.5 (8) [333-334] | -5.1 | -1.50 | -5.1 | identical |
+| sum | 15315 | 14892 | -423.1 | -2.76 | | |
+
+Per-process medians (the A-B columns are the same binary run twice = the noise of this protocol):
+
+| q | tipA | protoA | protoB | tipB | tipA-tipB | protoA-protoB | proto-tip (mean of process medians) |
+|---|---|---|---|---|---|---|---|
+| 1 | 475.2 | 470.8 | 466.2 | 464.3 | +10.9 | +4.7 | -1.2 |
+| 2 | 149.2 | 147.6 | 147.9 | 149.3 | -0.1 | -0.3 | -1.5 |
+| 3 | 658.1 | 621.4 | 622.9 | 660.6 | -2.6 | -1.5 | -37.2 |
+| 4 | 323.9 | 310.5 | 311.2 | 324.3 | -0.4 | -0.7 | -13.3 |
+| 5 | 694.3 | 679.0 | 680.2 | 691.2 | +3.1 | -1.2 | -13.1 |
+| 6 | 380.3 | 379.6 | 381.0 | 380.7 | -0.4 | -1.4 | -0.2 |
+| 7 | 748.3 | 709.8 | 711.9 | 745.1 | +3.2 | -2.1 | -35.8 |
+| 8 | 936.8 | 912.6 | 911.8 | 934.3 | +2.5 | +0.8 | -23.3 |
+| 9 | 1412.4 | 1403.4 | 1382.0 | 1427.0 | -14.6 | +21.4 | -27.0 |
+| 10 | 843.3 | 819.7 | 820.2 | 865.1 | -21.8 | -0.5 | -34.2 |
+| 11 | 175.4 | 176.1 | 172.1 | 172.1 | +3.4 | +4.0 | +0.4 |
+| 12 | 703.9 | 694.0 | 692.9 | 705.9 | -2.0 | +1.1 | -11.4 |
+| 13 | 1309.5 | 1314.3 | 1306.1 | 1314.3 | -4.9 | +8.2 | -1.7 |
+| 14 | 682.5 | 687.8 | 686.8 | 690.4 | -8.0 | +0.9 | +0.8 |
+| 15 | 527.7 | 527.7 | 527.9 | 527.5 | +0.1 | -0.3 | +0.2 |
+| 16 | 311.4 | 305.1 | 301.2 | 309.1 | +2.3 | +3.9 | -7.1 |
+| 17 | 497.1 | 497.9 | 497.7 | 496.7 | +0.3 | +0.3 | +0.9 |
+| 18 | 1099.2 | 1079.7 | 1090.3 | 1092.4 | +6.8 | -10.6 | -10.8 |
+| 19 | 880.2 | 882.3 | 880.5 | 879.8 | +0.4 | +1.8 | +1.4 |
+| 20 | 715.1 | 715.2 | 715.2 | 714.8 | +0.3 | -0.0 | +0.3 |
+| 21 | 1443.9 | 1244.1 | 1246.9 | 1441.8 | +2.1 | -2.8 | -197.3 |
+| 22 | 338.4 | 333.6 | 333.5 | 338.7 | -0.3 | +0.1 | -5.0 |
+| sum | 15306 | 14912 | 14886 | 15325 | -20 | +26 | -416 |
+
+- **Suite: 15315 -> 14892 ms, -423 ms, -2.76%** (mean of process medians: -416 ms). Two runs of the same arm differ by
+  20-26 ms on the suite sum, so the gain is -420 +- 25 ms. Tip total 15315 vs the reference 15372 (-0.4%).
+  With this the stack tip goes from 147 ms slower than base (15225) to ~275 ms faster, without touching #2569 / #2570.
+- The 8 named queries: q21 -198 (-13.7%), q3 -37 (-5.6%), q7 -36 (-4.8%), q10 -30 (-3.5%; same-arm spread 22 ms),
+  q9 -26 (-1.9%; same-arm spread 15-21 ms), q8 -24 (-2.5%), q4 -14 (-4.2%), q5 -14 (-2.1%): -379 ms together.
+  Further: q12 -12 (-1.7%), q16 -10 (-3.3%; same-arm spread 2-4), q22 -5 (-1.5%).
+- Controls: q6 -0.3 ms, q2 -1.6 ms (-1.1%; q2 only has exact-kind filters: relay), q15 / q17 / q19 / q20 within
+  +-1.4 ms. q18 -12 and q13 -6 are inside their own same-arm spread (7-11 ms): not counted as gains.
+- Against the model (MB_TRANSFER section 9: finish chain 600 -> ~170 ms, -430): measured -423. Per query the wall gain
+  is 65-70% of the tip's HOST-staged finish time (PROFILE section 4: q21 296, q3 56, q7 56, q8 39, q10 37, q9 35,
+  q4 21, q5 20 ms), i.e. the 3.5x of MB4, except q10 / q9 (noisier) and q7 / q8 (several filters, not all on the
+  critical path).
+- Results: identical md5 for 21 queries. q11: all four processes differ from each other (tip vs tip too) only in
+  the order of rows with equal `value`; the sorted outputs are byte-identical (md5 `730f7529...` for all four).
 
 ## 6. (a, continued) Small Blooms (fixed cost), exact kinds, full-P2P pair
 
