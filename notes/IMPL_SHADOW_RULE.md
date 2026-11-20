@@ -244,3 +244,16 @@ q21 j18 / q8 j41). The telemetry of every run is kept under `R/telemetry/shadow_
 - Reference systems were not consulted by the developer either.
 - Quent verification not done (section 6). nsys not run.
 - Lock contention: `flock` is not fair; some of these runs waited 25+ minutes. Timings were always taken under the lock.
+
+## 8. Review resolution (2026-11-20, developer; IN PROGRESS - numbers pending)
+
+State while runs are queued (so a fresh session can resume):
+- `prod/shadow-2569`: 258f8046 + a53c7095 (docs, F004) + 95f0e55e (test, F002). Building / testing via
+  `R/runs/shadow_fix/bin/chain_ut.sh wt-prod-69` (log `R/runs/shadow_fix/chain_ut_wt-prod-69.log`).
+- `prod/shadow-2570` still at 3db07d40 in `R/wt-prod-70`, which temporarily carries the UNCOMMITTED measurement patch
+  `R/runs/shadow_fix/flip/late_only.patch` (env `SIRIUS_DF_SHADOW_LATE_ONLY=1` skips the judgement at `begin`). Forced-flip
+  measurement for F001: `R/runs/shadow_fix/bin/chain1.sh` -> labels `R/runs/shadow/f1_*`, table `flip_table.py f1 21`.
+- Rebased series + F003 fix is ready on the scratch branch `tmp/shadow-2570-rebase` (worktree `R/wt-prod-70-rebase`,
+  head df741f03). Next: `git -C R/wt-prod-70 checkout -- . && git -C R/wt-prod-70 reset --hard tmp/shadow-2570-rebase`,
+  then `R/runs/shadow_fix/bin/chain_final.sh` (build, unit, q21/q8 ABBA `r1`, DEBUG pass `dbg_fix`), then
+  `keylines.py dbg_tip dbg_fix`, `abba_table.py r1`.
