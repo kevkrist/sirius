@@ -15,7 +15,7 @@ This file is generated from `runs/vxfer_host/notes_template.md` by `bin/make_not
 
 | Claim | Author | Verifier | Status |
 |---|---|---|---|
-| Suite, tip vs `auto` | -417.5 ms (-2.73%) | **15293 -> 14902 ms = -390.7 ms (-2.55%)** | confirmed (about 94% of the claimed saving) |
+| Suite, tip vs `auto` | -417.5 ms (-2.73%) | **15298 -> 14902 ms = -396.4 ms (-2.59%)** | confirmed (about 95% of the claimed saving) |
 | q21 | -208.5 (-14.5%) | **-214.6 (-14.9%)**, n=8 | confirmed |
 | q3 / q7 / q8 | -41.0 / -40.6 / -25.8 | **-41.5 / -42.6 / -26.0**, n=8 | confirmed |
 | q10 | -33.0 (-3.9%) | **-20.8 (-2.4%)**, n=8 | weaker (each inside the other's +-10 ms noise) |
@@ -57,21 +57,21 @@ the other queries the two halves ran in different holds, 20-60 minutes apart). n
 | 11 | 171.0 (8) [168-185] | 174.9 (8) [166-186] | +3.9 (+2.28%) | 173 169 / 175 177 | +3.1 | order differs (sorted identical) |
 | 12 | 701.2 (8) [699-706] | 694.9 (8) [690-700] | -6.3 (-0.89%) | 701 702 / 695 694 | -9.6 | identical |
 | 13 | 1295.8 (8) [1257-1519] | 1296.2 (8) [1280-1315] | +0.5 (+0.04%) | 1302 1292 / 1291 1303 | +5.8 | identical |
-| 14 | 687.6 (4) [676-708] | 688.3 (4) [687-708] | +0.6 (+0.09%) | 688 / 688 | -5.6 | identical |
-| 15 | 527.2 (4) [526-529] | 527.7 (4) [527-529] | +0.5 (+0.10%) | 527 / 528 | +0.0 | identical |
+| 14 | 691.9 (8) [676-708] | 688.3 (8) [677-708] | -3.6 (-0.52%) | 688 692 / 688 688 | -5.6 | identical |
+| 15 | 527.7 (8) [526-530] | 527.4 (8) [527-529] | -0.3 (-0.05%) | 527 529 / 528 527 | +0.0 | identical |
 | 16 | 311.4 (8) [302-315] | 308.3 (8) [297-313] | -3.1 (-0.99%) | 308 313 / 308 305 | -4.2 | identical |
-| 17 | 497.8 (4) [487-509] | 497.2 (4) [488-508] | -0.6 (-0.12%) | 498 / 497 | -0.8 | identical |
+| 17 | 498.3 (8) [487-509] | 497.0 (8) [488-508] | -1.3 (-0.26%) | 498 498 / 497 497 | -0.8 | identical |
 | 18 | 1090.4 (8) [1072-1105] | 1087.1 (8) [1077-1102] | -3.4 (-0.31%) | 1082 1094 / 1090 1086 | -4.6 | identical |
 | 19 | 881.0 (4) [876-891] | 880.4 (4) [876-888] | -0.6 (-0.07%) | 881 / 880 | +2.0 | identical |
 | 20 | 716.0 (4) [701-734] | 716.6 (4) [703-732] | +0.5 (+0.07%) | 716 / 717 | -3.2 | identical |
 | 21 | 1441.4 (8) [1417-1456] | 1226.9 (8) [1219-1243] | -214.6 (-14.89%) | 1441 1441 / 1230 1227 | -208.5 | identical |
 | 22 | 338.6 (8) [337-340] | 333.6 (8) [333-335] | -5.0 (-1.48%) | 338 339 / 333 334 | -4.8 | identical |
-| sum | 15293 | 14902 | -390.7 (-2.55%) | | -417.5 | |
+| sum | 15298 | 14902 | -396.4 (-2.59%) | | -417.5 | |
 
-Alternative estimator (mean of per-process medians): -389.5 ms.
+Alternative estimator (mean of per-process medians): -393.4 ms.
 
-- Suite: **15293 -> 14902 ms = -390.7 ms (-2.55%)** (author: 15280 -> 14863 = -417.5, -2.73%). Campaign references: base 15225, tip 15372 ms.
-- Queries with a HOST-staged Bloom (3 4 5 7 8 9 10 12 16 21 22): -397.9 ms (author -407). The other 11 queries: +7.2 ms
+- Suite: **15298 -> 14902 ms = -396.4 ms (-2.59%)** (author: 15280 -> 14863 = -417.5, -2.73%). Campaign references: base 15225, tip 15372 ms.
+- Queries with a HOST-staged Bloom (3 4 5 7 8 9 10 12 16 21 22): -397.9 ms (author -407). The other 11 queries: +1.5 ms
   (noise: the only prototype code that can run there is the exact-kind replica copy).
 - Switch off (arm O, n=8): q21 1441.8 vs 1441.4 (+0.4 ms), q3 662.2 vs 665.6 (-3.4 ms).
 - Spread: per-arm min-max in the table. The slow maxima of q3 (one iteration of 700-755 ms in each of the three arms) and of q13
@@ -85,7 +85,7 @@ Other arms (same protocol, one lock hold each):
 |---|---|---|---|
 | U (W=4, 16 threads, 160 MiB pinned) vs W (`WINDOW=2`, `OR_THREADS=8`, 80 MiB) | 1228.8 vs 1227.9 (n=8 / 8) | 624.6 vs 626.2 (n=4 / 4) | the recommended configuration keeps the whole gain |
 | U vs R (`SIRIUS_PROTO_XFER_REPLICA=0`: Bloom pipeline only) | 1231.8 vs 1231.0 (n=8 / 8) | 624.6 vs 620.5 (n=4 / 4) | the TPC-H gain is the Bloom pipeline alone; replica scope + batched gather add nothing here |
-| G (`gpuor`) vs H (`hostor`) | not run | - | lock turn did not arrive |
+| G (`gpuor`) vs H (`hostor`) | gpuor 1308.6 [1295-1319] vs hostor 1236.3 [1220-1245] (n=8 / 8) | - | against the tip's 1441.4: gpuor -132.9 ms, hostor -205.2 ms; results identical: True |
 
 ## 2. Is the transfer really faster, or is waiting shifted? (nsys)
 
@@ -274,7 +274,7 @@ scans (S6).
 - All of it is the Bloom `host_pipeline` (`SIRIUS_PROTO_XFER_REPLICA=0` gives the same TPC-H times).
 - In TPC-H the schedules that run are `hostor` (2-3 sources) and `fanout` (0 sources). `gpuor` does not run in the 7 DF-heavy queries I
   logged; it is needed only for "one non-root source + root contributed".
-- `gpuor`-only / `hostor`-only arms in TPC-H: not run.
+- q21 with `gpuor` alone: -132.9 ms against the tip; with `hostor` alone: -205.2 ms (`auto` -214.6). The CPU OR is what carries the gain with 3 sources.
 - W=2 / 8 threads is as fast as W=4 / 16 in TPC-H.
 
 ## 8. Production issues (beyond the author's list, which I agree with)
@@ -308,9 +308,9 @@ scans (S6).
 - Queries with n=4 in the table carry about +-10 ms each; see the table for which.
 - The binaries are the author's build; I checked only that no source is newer than the library, not a clean rebuild.
 
-## 10. What ran (lock holds 2026-11-20 01:06 - 03:03)
+## 10. What ran (lock holds 2026-11-20 01:06 - 03:13)
 
-ABBA v1: 22 queries (n=8 for q1 2 3 4 5 6 7 8 9 10 11 12 13 16 18 21 22; n=4 for q14 15 17 19 20), O arm on q21 / q3; W arm q21 / q3; R arm q21 / q3; G / H arms q21. Identity gates: 5 GPU sets + 2 stress
+ABBA v1: 22 queries (n=8 for q1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 21 22; n=4 for q19 20), O arm on q21 / q3; W arm q21 / q3; R arm q21 / q3; G / H arms q21. Identity gates: 5 GPU sets + 2 stress
 runs. Fault binary: 4 arms x (multi + single). DF unit tests multi-GPU: `auto`, `hostor`, `gpuor`. nsys: q21, q7 (2 arms). Trace log
 pass: q21 q3 q7 q10 q8 (2 arms). Debug repetition: 7 queries x 12 iterations. MB4P: quiet + 2 contention runs (+ 1 first attempt whose
 hostor background ended early: its 1434 MiB rows are discarded). One timing chain was restarted before its first hold (no data lost).

@@ -420,3 +420,89 @@ TEST_CASE("verifier: refused scratch lease on the other leader falls back (VX3)"
   unsetenv("SIRIUS_PROTO_XFER_D2D");
   CHECK(bad == 0);
 }
+
+TEST_CASE("verifier: pinned HOST shortage (VX4)", "[!benchmark][dynamic_filter][vx4]")
+{
+  auto const gpus = std::min<std::size_t>(vx_list("VX_GPUS", {4}).front(), static_cast<std::size_t>(acc::visible_gpus()));
+  REQUIRE(gpus >= 3);
+  acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{4} << 30});
+  auto const in        = vx_make_input(fixture, gpus, 1, 1000000);
+  auto const mask      = (1ull << gpus) - 1;
+  auto const megabytes = vx_list("VX_MB", {57}).front();
+  auto const expected  = vx_expected(fixture, in, megabytes, mask);
+  auto* host = fixture.spaces[0].get_host_staging_space().get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host != nullptr);
+  std::size_t window = 0;  // one tip window, from an unblocked tip publication
+  std::size_t bad    = 0;
+  for (auto const& xfer : vx_names("VX_XFER", {"off", "pipe", "star", "exchange"})) {
+    for (auto const left : vx_list("VX_LEFT", {99, 4, 3, 2, 1, 0})) {
+      setenv("SIRIUS_PROTO_XFER_D2D", xfer.c_str(), 1);
+      vx_sync(gpus);
+      auto const baseline    = fixture.allocated_bytes();
+      auto const host_before = host->get_total_allocated_bytes();
+      std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), gpus};
+      auto made = vx_create(spaces, megabytes);
+      REQUIRE(made);
+      for (std::size_t device = 0; device < gpus; ++device) {
+        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+        auto source = in.batches[device][0]->to_read_only();
+        REQUIRE(made->enqueue_add(sirius::get_cudf_table_view(source), rmm::cuda_device_id{static_cast<int>(device)},
+                                  fixture.task_stream(static_cast<int>(device))));
+        fixture.task_stream(static_cast<int>(device)).sync();
+      }
+      vx_sync(gpus);
+      // Reserve all but `left` tip windows of the pinned HOST capacity (accounting only).
+      decltype(host->reserve_upto(0)) blocker;
+      std::size_t const available = host->get_available_memory();
+      if (left != 99 && window != 0) {
+        auto const keep = std::min<std::size_t>(available, left * window);
+        if (available > keep) { blocker = host->reserve_upto(available - keep); }
+      }
+      // `reserve_upto` is capped by the resource; take what is still allocatable as real blocks (as the tip's fault test does).
+      cucascade::memory::fixed_multiple_blocks_allocation rest;
+      if (left != 99 && window != 0) {
+        auto const keep = left * window;
+        auto const free_now = host->get_available_memory();
+        if (free_now > keep) { rest = host->allocate_multiple_blocks(free_now - keep); }
+      }
+      std::size_t const after_block = host->get_available_memory();
+      std::size_t mismatched = 0;
+      acc::builder_access::workspace_observation seen{};
+      int published_state = -1;  // 1 published, 0 refused (nullopt), -1 threw
+      std::string error;
+      try {
+        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
+        auto published = acc::builder_access::finish(*made, rmm::cuda_device_id{0}, fixture.publication_stream(0),
+                                                     fixture.gpu(0).get_default_allocator(), false, &seen);
+        published_state = published ? 1 : 0;
+        if (published) {
+          for (std::size_t key = 0; key < 2; ++key) {
+            for (std::size_t device = 0; device < gpus; ++device) {
+              auto replica = builder::inspect_replica(*published->filters[key], rmm::cuda_device_id{static_cast<int>(device)});
+              if (!replica || replica->bytes != expected[key]) { ++mismatched; }
+            }
+          }
+        }
+      } catch (std::exception const& failure) {
+        error = failure.what();
+      }
+      if (left == 99 && xfer == "off") { window = seen.host_staging_bytes; }
+      vx_sync(gpus);
+      made.reset();
+      vx_sync(gpus);
+      rest.reset();
+      blocker.reset();
+      bool const returned = fixture.allocated_bytes() == baseline && host->get_total_allocated_bytes() == host_before;
+      std::printf("ROW,VX4,gpus=%zu,mb=%llu,xfer=%s,windows_left=%llu,host_available=%zu,published=%d,mismatched=%zu,"
+                  "host_bytes=%zu,root_scratch=%zu,storage_returned=%d,error=%s\n",
+                  gpus, static_cast<unsigned long long>(megabytes), xfer.c_str(), static_cast<unsigned long long>(left),
+                  after_block, published_state, mismatched, seen.host_staging_bytes, seen.device_scratch_bytes,
+                  returned ? 1 : 0, error.c_str());
+      std::fflush(stdout);
+      // A wrong replica or lost storage is a defect; a refusal or a throw is reported, not judged here.
+      bad += (mismatched != 0 || !returned) ? 1 : 0;
+    }
+  }
+  unsetenv("SIRIUS_PROTO_XFER_D2D");
+  CHECK(bad == 0);
+}
