@@ -267,7 +267,31 @@ hostor 3.15 / 13.2 / 64.7 (46-56).
 
 ### 7.4 Larger chunks and G=2
 
-PLACEHOLDER_CHUNK_G2
+Larger chunks (`SIRIUS_PROTO_BLOOM_CHUNK_MIB` = 16 / 32, G=4; `out/mb4p_g4_chunk{16,32}.log`), ms/GiB:
+
+| Bloom, batches on | tip 8 / 16 / 32 MiB | hostor w2: 8 / 16 / 32 MiB | fan-out 8 / 16 / 32 |
+|---|---|---|---|
+| 57 MiB, 4 | 188 / 188 / 188 | 58 / 57 / 58 | 42 / 42 / 42 |
+| 281 MiB, 4 | 186 / 181 / 179 | 49 / 48 / 54 | 39 / 40 / 41 |
+| 1434 MiB, 4 | 186 / 181 / 178 | 47 / 45 / 46 | 39 / 39 / 39 |
+
+Larger chunks buy nothing once the legs overlap (and 32 MiB with W=4 is worse: 53-60); the tip loop gains 3-4%. Keep the
+2-8 MiB clamp: it also keeps the pinned window small.
+
+G=2 (`out/mb4p_g2_*.log`), ms/GiB at 57 / 281 / 1434 MiB:
+
+| GPUs | batches on | tip | fan-out / gpuor | hostor |
+|---|---|---|---|---|
+| 0,2 (no P2P, one uplink each), HOST | 1 | 42 / 41 / 41 | 23 / 20 / 20 | - |
+| 0,2 | 2 | 84 / 84 / 84 | 32 / 26 / 24 | 35 / 27 / 25 |
+| 0,1 forced HOST (shared uplink) | 1 | 41 / 41 / 41 | 24 / 22 / 21 | - |
+| 0,1 forced HOST | 2 | 84 / 83 / 84 | 49 / 45 / 44 | 55 / 48 / 46 |
+| 0,1 PEER (pool access) | 1 | 20.5 / 20.3 / 20.3 | 20.6 / 20.4 / 20.3 (PEER, prototype not reached) | same |
+| 0,1 PEER | 2 | 26.3 / 23.2 / 22.4 | 26.2 / 23.1 / 22.4 (PEER) | same |
+
+- Without P2P and with one uplink per GPU the pipelined bounce runs at the PEER rate (20-25 against 20-23 ms/GiB).
+- With pool access the switch changes nothing (same code path, same times).
+- Identity gate at G=2 on GPUs 0,2: 450 finishes, 1080 arrays byte-identical (`out/check_g2_02.log`).
 
 ## 8. Existing DF unit tests on the prototype binary
 
@@ -310,14 +334,15 @@ Not run / unverified:
 
 - **Full P2P (every pair has pool access).** `finish_impl` takes the PEER `chunk_pipeline` before the prototype is
   consulted, and `enqueue_device_copy` takes the peer route: the prototype code is not reached. Zero gain, zero loss
-  (PLACEHOLDER_G2PEER). The 20 ms/GiB per target of MB4 stays.
+  (measured at G=2 on the P2P pair, section 7.4: 20.3-26.3 ms/GiB with the switch on or off). The 20 ms/GiB per target of MB4 stays.
 - **This machine (P2P inside pairs only).** Measured: finish 186 -> 45-58 ms/GiB with all GPUs contributing, -417 ms (-2.7%)
   on the suite. It is already at the uplink bound for host-only legs; what the per-pair D2D prototype can still add is the
   difference between 2 x B and B on each pair uplink (bound 38 ms/GiB instead of 49; `c2` measured 52 in the primitives
   bench, i.e. no better than hostor as built here).
 - **No P2P at all, one root port per GPU.** Today's loop is the same 186 ms/GiB (serial legs do not use parallel links).
   hostor needs B up + B down per GPU link in duplex (47 GiB/s each way): bound 21-22 ms/GiB, i.e. the PEER rate.
-  PLACEHOLDER_G2HOST
+  Measured at G=2 on GPUs 0 and 2 (one uplink each): 84 -> 24-32 ms/GiB with both contributing, 41 -> 20-23 fan-out.
+  For 4 such GPUs the model says today 186 -> about 22-25 ms/GiB (8x); not measurable here.
 - **No P2P, shared uplinks** (this machine with the pair P2P ignored) = exactly what was measured: the prototype never uses
   P2P when one pair lacks access.
 - More GPUs: hostor is O(1) in host waits per chunk and its pinned window grows as (contributors + 1) x W x chunk; the CPU OR
