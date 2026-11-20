@@ -223,6 +223,17 @@ Per-process medians (the A-B columns are the same binary run twice = the noise o
 - Results: identical md5 for 21 queries. q11: all four processes differ from each other (tip vs tip too) only in
   the order of rows with equal `value`; the sorted outputs are byte-identical (md5 `730f7529...` for all four).
 
+### 5.1 q21 by mode (one ABBA block each, n = 8 per arm; `e1_*`, `s1_*`)
+
+| mode | tip ms | proto ms | delta ms | delta % | MB4-predicted finish saving (1394 + 133 MiB, S=3) |
+|---|---|---|---|---|---|
+| `star` (P2P inside pairs, today's HOST loop between leaders) | 1442.8 | 1318.8 | -124.0 | -8.6 | -129 |
+| `exchange` (+ both directions at once) | 1437.1 | 1259.3 | -177.8 | -12.4 | -193 |
+| `pipe` (+ event ordering, one host wait) | 1442.0 | 1244.1 | -197.9 | -13.7 | -213 |
+
+Results identical in all three. 63% of the q21 gain needs no new host-staging code (`star`), 90% is reached by
+`exchange`; the engine follows the microbench decomposition (section 4) to within 5-15 ms.
+
 ## 6. (a, continued) Small Blooms (fixed cost), exact kinds, full-P2P pair
 
 ### 6.1 Fixed cost: small Blooms at G=4 (`mb/mb4_small.log`, median of 9)
