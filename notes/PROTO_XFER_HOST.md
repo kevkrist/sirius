@@ -2,7 +2,7 @@
 
 2026-11-19. Worktree `/opt/dlami/nvme/dfperf/wt-xfer-host`, branch `proto/xfer-host` on top of pr2570 `ae939824`
 (+ cherry-pick of the lifecycle microbench `a5b37728`). Local commits only, nothing pushed.
-Scripts `$R/runs/xfer_host/bin/`, raw output `$R/runs/xfer_host/`, Quent `$R/telemetry/xfer-host*`.
+Scripts `$R/runs/xfer_host/bin/` (copy committed on the branch under `dfperf_scripts/xfer_host/`), raw output `$R/runs/xfer_host/`, Quent `$R/telemetry/xfer-host*`.
 Every build and GPU process ran under `flock $R/machine.lock` (one queued command per hold, `bin/next.sh`).
 Config `/home/ubuntu/sirius/specific_config.yaml` untouched; the prototype is switched by environment variables only.
 
@@ -301,7 +301,7 @@ Filters as planned: single GPU `[dynamic_filter]~[multi_gpu]~[cuda_status_fault]
 | Arm | single GPU | 4 GPUs |
 |---|---|---|
 | `SIRIUS_PROTO_XFER_HOST=auto` (replica switch on with it) | 638 cases, 141567 assertions, all pass | 159 cases: 155 pass, **4 fail** (36 assertions) |
-| switch off | PLACEHOLDER_UT_OFF |
+| switch off | 638 cases, 141565 assertions, all pass | 159 cases, 10418 assertions, all pass |
 
 The 4 failures under `auto` all pin the tip loop's workspace, none compares filter contents:
 - `accumulated publication matches the complete partial union and bounded ...` (`test_dynamic_filter_accumulation.cpp:2131,2134`,
@@ -318,7 +318,7 @@ The 4 failures under `auto` all pin the tip loop's workspace, none compares filt
 
 Ran (all under `flock $R/machine.lock`, one queued job per hold, `runs/xfer_host/queue.log`): build (2 holds), `[xfer_proto]`
 G=4, MB4P short + sweeps, ABBA on 22 queries, nsys q21 + q3 (2 arms), `[xfer_proto_exact]` G=4, DF unit tests
-(arms: PLACEHOLDER_UT_ARMS), MB4x / MB2 exact-kind microbench.
+(arms: `auto` and switch off), MB4x / MB2 exact-kind microbench.
 Not run / unverified:
 - `gpuor`-only and `hostor`-only arms in TPC-H (only `auto`); `SIRIUS_PROTO_XFER_REPLICA` alone in TPC-H.
 - Unit-test arms `hostor` and `gpuor` (only `auto` and off). `[cuda_status_fault]` tests not run with the switch on:
