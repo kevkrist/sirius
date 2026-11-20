@@ -5,7 +5,8 @@
 Every build and GPU process ran under `flock $R/machine.lock`. Config untouched; one binary, env switch.
 THROWAWAY PROTOTYPE. Everything here belongs to the separate transfer PR ([xfer-PR]), nothing to #2569 / #2570.
 
-STATUS: see section 8 (what ran / what did not). Sections 1-3 are design, 4-7 measurements.
+STATUS: complete; section 12 lists what ran and what is unverified. Sections 1-3 design, 4-8 measurements and gates,
+9-11 memory / production / other machines, 13 recommendation.
 
 ## 1. What the tip does, and what the prototype changes
 
@@ -209,16 +210,16 @@ Per-process medians (the A-B columns are the same binary run twice = the noise o
 
 - **Suite: 15315 -> 14892 ms, -423 ms, -2.76%** (mean of process medians: -416 ms). Two runs of the same arm differ by
   20-26 ms on the suite sum, so the gain is -420 +- 25 ms. Tip total 15315 vs the reference 15372 (-0.4%).
-  With this the stack tip goes from 147 ms slower than base (15225) to ~275 ms faster, without touching #2569 / #2570.
+  Tip + this = ~14.95 s against the base reference 15.225 s (base measured earlier, without any transfer change),
+  without touching #2569 / #2570.
 - The 8 named queries: q21 -198 (-13.7%), q3 -37 (-5.6%), q7 -36 (-4.8%), q10 -30 (-3.5%; same-arm spread 22 ms),
   q9 -26 (-1.9%; same-arm spread 15-21 ms), q8 -24 (-2.5%), q4 -14 (-4.2%), q5 -14 (-2.1%): -379 ms together.
   Further: q12 -12 (-1.7%), q16 -10 (-3.3%; same-arm spread 2-4), q22 -5 (-1.5%).
 - Controls: q6 -0.3 ms, q2 -1.6 ms (-1.1%; q2 only has exact-kind filters: relay), q15 / q17 / q19 / q20 within
   +-1.4 ms. q18 -12 and q13 -6 are inside their own same-arm spread (7-11 ms): not counted as gains.
 - Against the model (MB_TRANSFER section 9: finish chain 600 -> ~170 ms, -430): measured -423. Per query the wall gain
-  is 65-70% of the tip's HOST-staged finish time (PROFILE section 4: q21 296, q3 56, q7 56, q8 39, q10 37, q9 35,
-  q4 21, q5 20 ms), i.e. the 3.5x of MB4, except q10 / q9 (noisier) and q7 / q8 (several filters, not all on the
-  critical path).
+  is 61-81% (median 66%) of the tip's HOST-staged finish time (PROFILE section 4: q21 296, q3 56, q7 56, q8 39,
+  q10 37, q9 35, q4 21, q5 20 ms); a 3.5x faster finish (MB4) would give 71%.
 - Results: identical md5 for 21 queries. q11: all four processes differ from each other (tip vs tip too) only in
   the order of rows with equal `value`; the sorted outputs are byte-identical (md5 `730f7529...` for all four).
 
@@ -272,3 +273,108 @@ difference <= 2%).
 281 MiB: off 5.57 / 6.42 ms (S=0 / S=1), `pipe` 5.58 / 6.41 ms; 1434 MiB: off 28.37 / 31.85, `pipe` 28.36 / 31.84.
 Identical: with one island `plan()` declines and the tip PEER pipeline runs.
 
+## 7. (c) nsys on q21 and q3: finish wall, bytes by transport, sync count
+
+`bin/nsys_q.sh <q>` (3 iterations per arm, iteration 0 warm; captures under `runs/xfer_d2d/ns_tip`, `ns_pipe`),
+analysis `bin/nsys_xport.py` (copies issued by the finish thread inside `dynfilter::accum::finish`, followed by
+correlation id; a `cudaMemcpyBatchAsync` = one HOST-staged leg, direction from the memory kinds; CUPTI's `copyKind`
+is not usable for batch copies) and `bin/nsys_tab.py`. Two hot iterations each; the two iterations agree to < 1 ms and
+to the byte.
+
+| q | arm | `accum::finish` wall ms per iteration (each finish) | host waits (`cudaStreamSynchronize`) | D2H MiB | H2D MiB | P2P MiB | query wall under nsys ms |
+|---|---|---|---|---|---|---|---|
+| 21 | tip | 307.7 (281 + 27) | 1932 | 6107 | 9161 | 0 | 1450 |
+| 21 | proto `pipe` | 84.4 (76 + 9) | 38 | 3054 | 3054 | 6107 | 1258 |
+| 3 | tip | 62.2 (58 + 4.2) | 404 | 1179 | 1855 | 0 | 667 |
+| 3 | proto `pipe` | 23.4 (20.4 + 3.0) | 34 | 618 | 618 | 1236 | 634 |
+
+- q21: finish 308 -> 84 ms (3.6x), host-staged bytes 15.3 GiB -> 6.1 GiB (10 x B -> 4 x B), P2P 0 -> 6.1 GiB (4 x B),
+  host waits 1932 -> 38 (19 per finish: island streams + partial streams at the end, allocation joins).
+  q3: 62 -> 23 ms, host-staged 3.0 GiB -> 1.2 GiB, waits 404 -> 34.
+- Engine vs microbench: q21's 1394 MiB array takes 76 ms in the engine under nsys (55 ms/GiB; MB4 52), q3's 281 MiB
+  array 20.4 ms (MB4 14.3 ms; the tip's 58 ms is also 7 ms above MB4's 51: the finish first waits for the insert
+  kernels still running on the partial streams).
+- Query wall under nsys: q21 -192 ms, q3 -33 ms: consistent with the ABBA deltas (-198, -37 ms). About 30 ms of q21's
+  223 ms finish saving does not reach the wall (the second, 133 MiB filter is not fully on the critical path).
+- Debug-log pass (`bin/logpass.sh 3 21`, 2 iterations): all 8 Bloom finishes logged `through island peer copies +
+  HOST pipelined exchange`, roots GPU 0, 1, 2 and 3 all occurred; 0 fallback lines. Scratch on the other leader:
+  32 MiB (2 x 2 slots of 8 MiB) for S=3, 15 MiB for the 57 MiB S=0 filters (allocated but unused: see section 10).
+
+## 8. Correctness gates
+
+| Gate | What | Result |
+|---|---|---|
+| `[mbid]` G=4 (`mb/gate_g4.log`) | 4 sizes (1, 3, 20, 57 MiB; 2 keys of different size -> 1 to 8+ chunks, both chunk parities) x all 16 contribution masks x roots {0, 3} x modes {off, star, exchange, pipe}: every replica on every GPU compared byte for byte with the OR of the partials read before `finish`, and with the `off` replica | 512 cases, **0 bad** |
+| `[mbid]` G=3 on GPUs 0,1,2 and on GPUs 0,2,3 | islands {pair, single} with the root in the pair / as the single | 128 + 128 cases, 0 bad |
+| `[xfer_relay]` (`test_sirius_dynamic_filter_mgpu.cpp`) | hash IN-list (200k keys), small IN-list (7 keys), one-shot Bloom (200k keys), roots {0, 3}: mask of a 700k-row probe on every GPU, switch on vs off, identical (exact kinds also checked against the exact key set; Bloom includes its false positives) | 24 masks identical, 6 copies relayed (1 per filter, as designed) |
+| TPC-H results | `result.txt` md5 of every ABBA process, tip vs prototype | identical for all 22 queries (section 5) |
+| Existing unit tests, switch `pipe` | `sirius_unittest "[dynamic_filter][multi_gpu]~[.]"` (32 cases, incl. the relay gate) | all 32 pass, run twice (4917 / 4920 assertions)  |
+| Existing unit tests, switch off (same binary) | same filter | all 32 pass, run twice (4920 / 4917 assertions: the count varies by 3 between runs in either mode) |
+| Other multi-GPU tests, switch `pipe` | `[multi_gpu]~[dynamic_filter]~[.]` | 115 cases pass (5,655,402 assertions) |
+| Fault injection, switch off / `pipe` | separate binary `sirius_cuda_fault_test "[cuda_status_fault][multi_gpu]~[.]"` (`bin/fault.sh`) | FAULT_RESULT |
+
+Not run: the single-GPU DF tests (`plan()` declines below 3 GPUs and the relay never engages without a HOST-staged
+copy, so they cannot reach new code), the integration shards, `make test`.
+
+## 9. Memory held during a finish (G=4, two pair islands, 8 MiB chunks = any Bloom >= 64 MiB)
+
+| | pinned HOST | device scratch, root GPU | device scratch, other leader | other GPUs |
+|---|---|---|---|---|
+| tip, HOST staged (this machine) | 8 MiB (1 window) | 8 MiB (1 slot; 0 when S=0) | 0 | 0 |
+| tip, PEER (full P2P) | 0 | 48 MiB (2 parities x 3 sources) | 0 | 0 |
+| `star` | 8 MiB | 24 MiB (2 merge + 1 cross) | 16 MiB (2 merge) | 0 |
+| `exchange` | 16 MiB (1 window per leader) | 24 MiB | 24 MiB | 0 |
+| `pipe` | 32 MiB (2 windows per leader) | 32 MiB (2 merge + 2 cross) | 32 MiB | 0 |
+
+- Slots scale with the chunk (clamp(B/8, 2, 8 MiB)), not with B. The root's scratch stays inside the bound the task
+  already reserves (`publication_scratch_bytes` = 2 x (G-1) slots = 48 MiB at G=4).
+- New: the other leader's scratch is leased at finish time through `scoped_replica_reservation` on a GPU the
+  Publishing Task does not run on (a refusal falls back to the tip transports). It is held only for the finish.
+- All of it is released before `finish` returns. The array memory itself (B per GPU) is unchanged.
+- CUDA Best Practices 10.1.1 ("pinned memory should not be overused"): 32 MiB transient from the engine's existing
+  fixed-block pinned pool, no new pinning.
+
+## 10. Production issues (what a real [xfer-PR] must fix; the prototype is not mergeable)
+
+1. **Scratch on the other leader is not in the plan's upfront lease.** Either add it to the session's reservation at
+   `begin` (it is known then: islands depend only on the replica spaces) or accept the finish-time lease + fallback.
+   The prototype also leases the cross slots when the other island contributes nothing (15-16 MiB unused).
+2. **Per-finish object churn**: 6 streams, 22 events, 4 windows, 1 lease per finish = the ~0.06 ms fixed cost (6.1).
+   Use `runtime_stream_pool` leases and keep the tip loop for tiny single-contributor filters.
+3. **Topology is recomputed per finish** from `try_grant_pool_access` (N x (N-1) calls; `cudaMemPoolGetAccess`
+   shows 20 calls per 2 finishes in nsys). Compute the islands once per context and hand them to the builder.
+4. **Islands = greedy cliques of mutual access.** Exact for pair / full / none topologies; for a non-transitive access
+   graph a greedy clique cover is legal but not necessarily the best.
+5. **More than two islands** only has `cross_star` (serial HOST loop over the leaders). The right cross stage for N
+   leaders is the other agent's `host_or` over N inputs (section 3).
+6. **Failure paths**: `island_reduce`'s destructor drains its own streams before its scratch and windows go away, and
+   `finish_impl`'s `join_on_failure` still joins the partial streams; the 4 accumulation fault-injection tests pass
+   with the switch on, but they were written for the tip's call sequence: island-specific faults (failed peer copy on
+   the other leader, failed event wait) have no test. `leak_storage` is not set for a failed island-stream join.
+7. **Observability contract**: `publication.transport` still reports `HOST_STAGED` for an island publication and
+   `workspace_observation` reports only the root's scratch and the summed windows. A third route value
+   (`ISLAND`) and per-GPU scratch are needed before tests can assert on it.
+8. **The cross stage is the prototype's weakest code**: three hand-written variants. In the real PR it should be one
+   leg-graph primitive shared with the host pipeline (`proto/xfer-host`), with P2P legs and HOST legs as two leg kinds.
+9. **Replica relay** relies on "HOST-staged copies are complete on return". If the host route becomes asynchronous
+   (the other agent's `host_bounce_scope`), a relayed copy must wait on the relay's upload event: the relay then has
+   to carry an event, not only a pointer.
+10. **Concurrency with other traffic** (build CONCAT move, eager probe scans of S6): `pipe` uses both pair uplinks
+    and all four ports at once for 50-80 ms on q21. MB_TRANSFER section 7 measured the contention of such schedules
+    with a synthetic background; nothing was measured here with eager scans on.
+11. Exact-key gather still pays `D2H, sync, H2D, sync` per slice from the two cross-pair GPUs (5.3 ms at 512 spread
+    slices): owned by the host-bounce prototype (batched gather), not changed here.
+
+## 11. Expected behaviour on other machine classes
+
+| Machine | Bloom finish | Replicas / gather | Evidence |
+|---|---|---|---|
+| Full P2P (every pair has pool access) | one island -> `plan()` declines -> tip PEER pipeline, byte for byte. **No change, no gain, no cost** (one extra N^2 grant query) | relay never engages (every copy is already a peer copy) | G=2 pair: off = on within 0.2% (6.3); G=4 full P2P: by code only, no such machine here |
+| Partial P2P (this box: 2 pairs) | islands; 185 -> 52-56 ms/GiB at S=3, 61 -> 40 at S=0 | one bounce instead of two per fan-out | sections 4-7 |
+| No P2P | all-singleton islands -> `plan()` declines -> tip HOST loop. **No change**: the whole gain there has to come from the host pipeline (`proto/xfer-host`: 53-76 ms/GiB modelled in MB_TRANSFER) | relay never engages (no relay grants anyone) | by code only; a 3-GPU no-P2P set cannot be formed on this box |
+| Full P2P, G >= 4, as a follow-up | the island code with a P2P cross leg would give 2 x B per port instead of the star's 3 x B (MB_TRANSFER: ~44 vs 62-67 ms/GiB, model) | - | not built: needs "islands" to mean a reduce tree, not access cliques |
+
+CUDA Best Practices Guide, memory chapter, as applied: 10.1 "minimize data transfer between the host and the device"
+(10 x B -> 4 x B through the host, the OR stays on the GPUs); 10.1.1 pinned memory, not overused (existing pool, 32 MiB);
+10.1.2 asynchronous transfers overlapped with computation on non-default streams, staged per chunk (`pipe`: copies and
+OR kernels of consecutive chunks overlap, one host wait at the end instead of 10 per chunk).
