@@ -407,4 +407,22 @@ with the arrays if a stream cannot be joined.
 
 ## 14. Recommendation
 
-PLACEHOLDER_RECO
+**Land it as the first commit of the transfer PR** ([xfer-PR], on top of #2570): the host OR pipeline (`hostor` for >= 2
+sources, `gpuor` for one source, fan-out for a single contributor = the prototype's `auto`), W=2, 8 OR threads, tip loop as
+the fallback and for arrays under a few MiB.
+
+- Measured: suite -417.5 ms (-2.73%; 15280 -> 14863), q21 -14.5%, q3 -6.2%, q7 -5.5%, q4 -4.4%, q10 -3.9%; no query slower.
+  It passes the campaign gate (>= 0.5% of the suite) by 5x and is the largest verified gain of the campaign so far.
+  Filters bit-identical, results identical.
+- It is a transfer-mechanics change only: no planner, session or probe change, no change on a full-P2P machine, 80-160 MiB
+  of pinned HOST for the duration of one finish, no device scratch.
+- It makes the eager-probe work (S6) cheaper to get right: the finish that S6 puts on the critical path shrinks 3-4x, and the
+  schedule is the one the primitives bench found most robust against a concurrent copy.
+- Order of work for the PR: (1) `host_pipeline` hostor + fan-out with a reserved HOST window and pooled streams (most of the
+  gain: every HOST-staged Bloom in the suite has 0, 2 or 3 sources), (2) batched exact-key gather (4.5-4.9x on many spread
+  slices; small in absolute terms), (3) stage-once replica scope (5-15% of sub-millisecond publishes; lowest priority),
+  (4) `gpuor` only if a one-source case shows up where the CPU OR is not wanted (it ties hostor there).
+- Per-pair D2D on top: bound 38 vs 45-48 ms/GiB measured here, i.e. at most ~20% of the remaining ~190 ms of finish
+  (< 40 ms per suite pass). Decide on the other prototype's numbers; this one does not need it.
+- Not yet shown: behaviour under S6's concurrent CONCAT move (expected good, unmeasured), failure paths after enqueueing,
+  NUMA placement.
