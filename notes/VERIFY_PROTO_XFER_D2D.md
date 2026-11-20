@@ -112,3 +112,12 @@ Defects / risks (all on paths no existing test reaches):
   Same code before the finish in both arms; which task publishes is decided by microseconds. Like for like the nsys
   wall gain is ~-213 ms = the finish saving (-222 ms). This lottery is a +-26 ms bimodal noise source on q21 in every
   arm of every q21 measurement of the campaign (my ABBA: tip 1436-1450, pipe 1228-1266).
+- Own nsys captures (q7, q10; tip vs pipe; 2 hot iterations each; `out/nsys_q*_*.txt`):
+  | q | arm | finish ms | host waits | D2H GiB | H2D GiB | P2P GiB | other H2D of the query, GiB / summed copy ms | CONCAT move ranges sum ms | wall ms |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 7 | tip | 54.0 / 54.2 | 394 | 1.109 | 1.697 | 0 | 56.84 / 2103, 2108 | 198, 227 | 773.8, 752.5 |
+  | 7 | pipe | 16.1 / 15.8 | 34 | 0.566 | 0.566 | 1.132 | 56.82 / 2105, 2105 | 205, 206 | 736.4, 710.3 |
+  | 10 | tip | 37.2 / 37.4 | 262 | 0.759 | 1.139 | 0 | 52.33 / 1824, 1828 | 1226, 1267 | 868.8, 863.5 |
+  | 10 | pipe | 11.4 / 11.0 | 38 | 0.380 | 0.380 | 0.759 | 52.33 / 1826, 1822 | 1218, 1289 | 831.2, 835.5 |
+  No CONCAT-move range (`convert:gpu_to_gpu:host_staging`) overlaps a finish in any capture of either arm; nothing is in
+  flight when `finish` returns (last GPU op 0.03-0.19 ms before the range end).
