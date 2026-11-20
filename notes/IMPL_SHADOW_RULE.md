@@ -5,7 +5,7 @@ R = `/opt/dlami/nvme/dfperf`. Nothing pushed except by `backup.sh` (fork, `dfper
 
 ## 0. Status
 
-DONE (2026-11-20 01:30). Both branches built, DF unit tests green on both, 22 queries checked against the tip, rule fires
+DONE (2026-11-20 01:30); review findings resolved 03:50, see section 8 (branch heads there supersede this table). Both branches built, DF unit tests green on both, 22 queries checked against the tip, rule fires
 exactly at q8 j41 and q21 j18, suite -342.8 ms (-2.24%) in ABBA. Open points in section 7.
 
 | | |
@@ -245,15 +245,79 @@ q21 j18 / q8 j41). The telemetry of every run is kept under `R/telemetry/shadow_
 - Quent verification not done (section 6). nsys not run.
 - Lock contention: `flock` is not fair; some of these runs waited 25+ minutes. Timings were always taken under the lock.
 
-## 8. Review resolution (2026-11-20, developer; IN PROGRESS - numbers pending)
+## 8. Review resolution (2026-11-20, developer)
 
-State while runs are queued (so a fresh session can resume):
-- `prod/shadow-2569`: 258f8046 + a53c7095 (docs, F004) + 95f0e55e (test, F002). Building / testing via
-  `R/runs/shadow_fix/bin/chain_ut.sh wt-prod-69` (log `R/runs/shadow_fix/chain_ut_wt-prod-69.log`).
-- `prod/shadow-2570` still at 3db07d40 in `R/wt-prod-70`, which temporarily carries the UNCOMMITTED measurement patch
-  `R/runs/shadow_fix/flip/late_only.patch` (env `SIRIUS_DF_SHADOW_LATE_ONLY=1` skips the judgement at `begin`). Forced-flip
-  measurement for F001: `R/runs/shadow_fix/bin/chain1.sh` -> labels `R/runs/shadow/f1_*`, table `flip_table.py f1 21`.
-- Rebased series + F003 fix is ready on the scratch branch `tmp/shadow-2570-rebase` (worktree `R/wt-prod-70-rebase`,
-  head df741f03). Next: `git -C R/wt-prod-70 checkout -- . && git -C R/wt-prod-70 reset --hard tmp/shadow-2570-rebase`,
-  then `R/runs/shadow_fix/bin/chain_final.sh` (build, unit, q21/q8 ABBA `r1`, DEBUG pass `dbg_fix`), then
-  `keylines.py dbg_tip dbg_fix`, `abba_table.py r1`.
+Resolves REVIEW_SHADOW_RULE.md. Scripts and raw output: `R/runs/shadow_fix/` (`bin/`, `flip/`, `unit/`, `mutants.txt`,
+`abba_r1.md`, `keylines_fix.txt`, chain logs); timing dirs `R/runs/shadow/{f1,r1}_*`, `dbg_fix`; telemetry
+`R/telemetry/shadow_{f1,r1}_*`, `shadow_dbg_fix`. Every build and GPU process ran under the machine lock.
+
+Readings for this pass (honest): `C++ Software Design` Guideline 4 (full), Guideline 2 from "Don't Repeat Yourself" to
+the summary; `CppCoreGuidelines` rule bodies NL.1-NL.3, C.86, F.2, F.8; `C++20 - The Complete Guide` 3.1.2 (operator ==
+rewriting, operator <=>) and 3.3.1. Agner Fog NOT read (no hot CPU code written), CUDA guide NOT read (no CUDA code), cudf
+DOCUMENTATION.md NOT fetched (comments follow the surrounding files). Campaign: OPPORTUNITIES (USER DECISIONS + top),
+durable README, BASELINE_SUITE 0, tooling 0, DESIGN (2.3, 3, 6, 7), IMPL and REVIEW in full.
+
+### 8.1 Branch heads and commits
+
+`prod/shadow-2569` = `8e049ef7` (pr2569 `a2d6bd5a` + 5; the reviewed head 258f8046 is an ancestor):
+
+| commit | subject |
+|---|---|
+| b68201ad, 2bee8412, 258f8046 | unchanged (section 3) |
+| a53c7095 | docs(dynamic-filter): name the Consumer rules a shadow judgement depends on (F004; 2 files, comments only) |
+| 8e049ef7 | test(dynamic-filter): check shadowed keys against a real Consumer on random Channels (F002; 1 test file, +158) |
+
+`prod/shadow-2570` = `cd89bbc8` (pr2570's 7 commits + the 3 of section 3, rebased again onto 8e049ef7 without conflict:
+2f7674f2 .. e89ae0b8, then 06ed4aa9 skip, b11df5d2 abandon, 2189bd1b docs), plus:
+
+| commit | subject |
+|---|---|
+| cd89bbc8 | fix(dynamic-filter): log the plan's verdict at the second shadow judgement (F003; construction_plan.cpp + 1 doc line) |
+
+Split unchanged: #2569 = shared rule + dormant policy + their tests; #2570 = session, planner, docs. The new test needs only
+#2569 symbols (`is_shadowed`, the Consumer). The log fix touches code that exists only in #2570. Fixes are appended
+commits, not rewrites of reviewed ones; only the two branch tips were built and tested.
+
+### 8.2 Findings
+
+| ID | Sev | Resolution |
+|---|---|---|
+| F001 second judgement unmeasured | P2 | **Measured (reviewer option b), kept.** Forced flip on q21: a scratch build of 3db07d40 + `flip/late_only.patch` (env `SIRIUS_DF_SHADOW_LATE_ONLY=1` makes `begin` not read the Channels, so j18 is planned, leased and inserted, and judged only before `finish`; never committed). One lock hold, order tip, late, begin, begin, late, tip, 6 iterations, 8 hot per arm: tip 1434.1 ms [1428-1456], late 1185.5 [1180-1211], begin 1136.4 [1122-1157]. **Late judgement alone: -248.6 ms (-17.3%) = 84% of the -297.7 ms the judgement at `begin` saves** (design said ~85%). DEBUG process of the late arm: j18 `reason=shadowed_late` in both iterations, `at=finish ... dead=1`; results identical in all 7 processes (md5 bae711f6), all rc=0; `construction started` 24 per process on late (as tip) vs 18 on begin. So commit b11df5d2 is worth 249 ms on q21 when the order flips and 0 ms in today's TPC-H order (0 occurrences in 22 queries, again in `dbg_fix`). It stays one separable commit; keep / drop remains the human's call, now with a number. Limits: one block, q21 only, flip forced by suppressing the first judgement, not by delaying the other join. |
+| F002 weak oracle | P2 | **Fixed** with a stronger form of RV-P1: `no Consumer uses the filter of a Shadowed Key, whatever else its Channel holds` (`[scan_merge][shadow]`, in #2569). 600 fixed-seed trials (raw `mt19937` output, so the trials are the same on every standard library): 1-3 published filters, small and hash IN-lists, proven / unproven / missing estimates, either column, caps 0-2, every fifth candidate tied in key count, candidate published at a random point, one producer per filter. Oracle is differential and does not restate the rule: on the Channel with the candidate, Filtered Decode's first `cap` steps never hold it, and the Consumer keeps the same row count as on the same Channel without it. Run: 152 of 600 trials shadowed, 57 of them with a candidate that would remove rows if applied, 83 decode-slot checks, 152 row-count checks, all pass on both branches. **Oracle checked with two mutants of `statically_selected`** (`mutants.txt`): M1 "a tie counts for the published filter" (the design's original rule, deviation 1) -> 8 decode-slot failures; M2 "taken decode slots alone suffice" -> 95 row-count failures; clean rebuild -> pass. The developer's one-fixture case is kept as the readable example. The 2000-round `[static_selection]` property is kept unchanged: its title states what it asserts (the two clauses of the predicate); it is not safety evidence and is no longer claimed as such. First attempt of the new test failed (a producer has room for one filter per column; test error, fixed by one producer per filter). |
+| F003 `at=finish decision=skip` for published keys | P3 | **Fixed** (cd89bbc8). At `finish` each judged key's line carries the plan's verdict, `decision=abandon` or `decision=finish`; `skip` / `build` remain the key's own decision at `begin`. Docs line updated. `dbg_fix`: 72 `at=finish` lines, all `decision=finish`; the forced-flip run above was taken before this fix and still shows the old token. No unit test (log text only). |
+| F004 Consumer-only facts without back-pointer | P3 | **Fixed** (a53c7095). Header says "by the same rules" and lists what stays in the Consumer (measured order, Usefulness Gate, Carrier Type, filters a batch already met); `in_decode_order` and the Negligible-Share loop in `dynamic_filter_merge.cpp` now name `statically_selected` / `is_shadowed` as dependents. Not annotated: `skip_measured_filter`, `accepts_carrier`, `receipt.applied`, source order in `compressed_scan.cpp` (they are the documented residuals, not inputs of the rule). |
+| F005 positional coupling of `binding_facts_of` / `read_published_filters` | P3 | **Not changed.** Merging them renames an API used by both PRs and by 4 test cases, and would leave the two reviewed #2570 commits unbuildable unless rewritten. The mismatch that can be detected (sizes) throws. Open, optional. |
+| F006 unreadable binding keeps a key alive | P3 | Not changed: same as tip, unmeasured, no TPC-H site. Open lead. |
+| Nit `static_filter_facts::operator==` | - | Kept: defaulted, used by the stamp-parity tests. |
+
+### 8.3 Test evidence after the fixes (each ran once)
+
+| branch @ commit | filter | result |
+|---|---|---|
+| prod/shadow-2569 @ 8e049ef7 | `[dynamic_filter]~[multi_gpu]~[cuda_status_fault]~[.]`, GPU 0 | All tests passed (138661 assertions in 637 test cases) |
+| prod/shadow-2569 @ 8e049ef7 | `[dynamic_filter][multi_gpu]`, 4 GPUs | All tests passed (4650 assertions in 32 test cases) |
+| prod/shadow-2570 @ cd89bbc8 | single-GPU filter | All tests passed (143845 assertions in 661 test cases) |
+| prod/shadow-2570 @ cd89bbc8 | multi-GPU filter | All tests passed (4652 assertions in 32 test cases) |
+| both | `[scan_merge][shadow]` with `-s` | All tests passed (1121 assertions in 2 test cases), 2.1 s |
+
+`pixi run make` succeeded on both worktrees; `pre-commit run --files` passes on every changed file. `R/wt-prod-69` was
+rebuilt clean after the mutants (source restored, `git status` clean, test passes).
+
+TPC-H SF1000, final binary (`R/wt-prod-70` @ cd89bbc8) vs tip (`R/repo`):
+- ABBA `r1`, one block per query, 6 iterations, 8 hot per arm, 8 processes rc=0: **q21 1439.7 -> 1141.3 ms = -298.4 ms
+  (-20.7%)** [tip 1418-1456, prod 1129-1153]; **q8 935.2 -> 900.5 ms = -34.7 ms (-3.7%)** [930-938, 889-903]; results
+  identical; `construction started` 24 -> 18 (q21) and 30 -> 24 (q8) per process. Same as before the fixes (-306.3 / -35.1)
+  and as the reviewer's block (-301.1 / -35.5).
+- 22-query DEBUG pass `dbg_fix` (2 iterations per query, 22 processes rc=0) against `dbg_tip` (same tip binary, earlier
+  pass): 21 of 22 `result.txt` byte-identical, q11 identical as a sorted row set; `[dynamic_filter_key]` lines differ only
+  at q8 j41 and q21 j18 (`kind=none reason=shadowed`, both iterations); 4 `decision=skip`, 72 `decision=build`, 72
+  `at=finish decision=finish`; 0 `shadowed_late`; 0 fallback / error lines.
+
+### 8.4 Still open / unverified
+
+- F005, F006 (above). Human decisions of the review stand: keep or drop b11df5d2 (now measured), ship without a kill
+  switch, accept the probe-skew residual.
+- Not run: the full 22-query timing (only q21 / q8 were re-timed; the fixes change comments, one test, one log string),
+  q9 re-measure (+6.3 ms of section 6 still unexplained), sanitizers, per-commit builds, Quent check, endpoint binding
+  with `column_index < 0`.
+- The forced-flip number is one block on one query. `shadowed_late` has still never occurred unforced.
