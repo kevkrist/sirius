@@ -53,6 +53,13 @@ STATUS: IN PROGRESS. Sections fill in as lock turns arrive (9 waiters on the loc
   `island peer copies + HOST pipelined exchange` (roots GPU 2 and 3 in q21), 33,554,432 scratch bytes on the other leader.
 - 02:53 my VX2 (4 threads publish concurrently, roots 0-3, own streams, inserts in flight, 15 rounds, 20 and 57 MiB):
   60 finishes per mode and size, 0 bad, 0 exceptions in off / pipe / star / exchange.
+- 03:04-03:16 ABBA: q8 935.1 -> 910.9 (-24.2), q12 -8.4, q16 -5.5 (same-arm spread 6-12), q22 -4.7 (n=8 per arm).
+- 03:11 VX1 at 130 MiB (8 MiB chunks, 17 + 6 chunks; 8 masks x 4 roots x 4 modes x 3 reps): 384 finishes, 0 bad.
+- 03:16 engine trace pass q7, q8, q10 (tip vs pipe, 3 iterations each): kept multisets identical (q7 182,211,392 /
+  2,254,690,081; q8 161,578,660 / 6,605,705,240; q10 86,644,247 / 683,433,385); 6 of 6 finishes per query on the island route.
+- 03:27 VX1 on other device sets: `CUDA_VISIBLE_DEVICES=0,2,1,3` (islands interleaved: {0,2} and {1,3} in logical ids)
+  1536 finishes, 0 bad; 3 GPUs `1,2,3` and `0,1,3` (pair + single, every root) 576 + 576, 0 bad; 2 GPUs `0,2` (no P2P;
+  `plan()` declines, same workspace as off) 96, 0 bad.
 
 ## 5. Findings from reading the prototype (`git diff 09a04c32 b7d0eb81`), not all provable by a test here
 
