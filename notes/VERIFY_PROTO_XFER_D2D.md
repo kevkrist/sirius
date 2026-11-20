@@ -29,5 +29,13 @@ STATUS: IN PROGRESS. Sections fill in as lock turns arrive (9 waiters on the loc
 - 01:50-01:53 q21 `A1 P1 O1 O2 P2 A2` (6 iterations each, first hot dropped, n=8 per arm): tip 1443.3 [1436-1450],
   pipe 1239.5 [1228-1266] = **-203.9 ms (-14.1%)**; proto binary switch off 1448.0 = +4.7 ms (+0.3%, neutral).
   Results identical (md5) across the 6 processes. Claim for q21 (-197.9 ms) reproduced.
+- 02:03 author's gates re-run by me (fresh process): `[mbid]` G=4 512 cases, 0 bad; `[xfer_relay]` 24 masks, 6 relayed.
+- 02:10-02:29 ABBA so far (n=8 per arm): q3 660.3 -> 623.1 (-37.1, -5.6%; switch off +1.0); q7 746.4 -> 707.4 (-39.0);
+  q9 1412.9 -> 1395.4 (-17.6, noisy). Results identical.
+- 02:17 my VX1 (inserts left in flight, no host sync before `finish`; 3 sizes x 16 masks x 4 roots x 4 modes x 3 reps):
+  2304 finishes, 0 bad.
+- 02:22 fault binary, 4 modes: 12/12 each; assertions off 961, pipe 956, star 956, exchange 962 (the count varies
+  run to run, it is not a mode effect). BUT: every fault case uses 2 GPUs (`plan()` declines below 3) or 3 GPUs with
+  `force_host = true` (prototype forces mode off) -> **no fault-injection case can reach `island_reduce`**.
 - 01:59 verifier test binary built out of tree (first attempt, rc=0); chains C (author's gates, fault binary, DF
   multi-GPU unit tests) and V (my tests VX1-VX3) queued.
