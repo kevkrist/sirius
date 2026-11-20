@@ -46,6 +46,13 @@ STATUS: IN PROGRESS. Sections fill in as lock turns arrive (9 waiters on the loc
 - 02:33 DF multi-GPU unit tests, switch `pipe`: 32 cases pass (4917 assertions). Coverage caveat: 14 of the fixtures in
   the accumulation / fault test files use 2 GPUs, 1 uses 3 with `force_host`; only the few `devices = <variable>` cases
   can reach the island route. The gate that really covers it is `[mbid]` (author) and VX1-VX3 (mine).
+- 02:45 ABBA: q4 324.4 -> 310.9 (-13.5), q5 692.6 -> 678.8 (-13.8), q10 849.9 -> 823.5 (-26.4); n=8 per arm; identical results.
+- 02:47 engine trace pass q21 + q3 (tip vs pipe, 3 iterations each): per-chunk `join filters kept X/Y` multisets identical
+  between arms and iterations (q21 48 chunks, 423,297,173 / 9,124,908,864 rows kept; q3 24 chunks, 160,514,096 /
+  1,927,817,321); DYNAMIC_FILTER operator rows per GPU identical. All 6 + 6 Bloom finishes of the pipe arm logged
+  `island peer copies + HOST pipelined exchange` (roots GPU 2 and 3 in q21), 33,554,432 scratch bytes on the other leader.
+- 02:53 my VX2 (4 threads publish concurrently, roots 0-3, own streams, inserts in flight, 15 rounds, 20 and 57 MiB):
+  60 finishes per mode and size, 0 bad, 0 exceptions in off / pipe / star / exchange.
 
 ## 5. Findings from reading the prototype (`git diff 09a04c32 b7d0eb81`), not all provable by a test here
 
