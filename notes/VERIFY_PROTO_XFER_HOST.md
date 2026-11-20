@@ -15,7 +15,7 @@ This file is generated from `runs/vxfer_host/notes_template.md` by `bin/make_not
 
 | Claim | Author | Verifier | Status |
 |---|---|---|---|
-| Suite, tip vs `auto` | -417.5 ms (-2.73%) | **15298 -> 14902 ms = -396.4 ms (-2.59%)** | confirmed (about 95% of the claimed saving) |
+| Suite, tip vs `auto` | -417.5 ms (-2.73%) | **15296 -> 14902 ms = -393.9 ms (-2.57%)** | confirmed (about 94% of the claimed saving) |
 | q21 | -208.5 (-14.5%) | **-214.6 (-14.9%)**, n=8 | confirmed |
 | q3 / q7 / q8 | -41.0 / -40.6 / -25.8 | **-41.5 / -42.6 / -26.0**, n=8 | confirmed |
 | q10 | -33.0 (-3.9%) | **-20.8 (-2.4%)**, n=8 | weaker (each inside the other's +-10 ms noise) |
@@ -40,7 +40,7 @@ What stays unverified is in section 9; production issues in section 8.
 Protocol: fresh process per query, 6 iterations (1 warm + 5 hot), first hot dropped, median of the kept hot iterations.
 Arms: A = tip binary, U = proto `auto` (defaults W=4, 16 OR threads, replica switch on), O = proto binary with the switch unset.
 n=8 = two processes per arm, the two A/U pairs in opposite order (A U U A or U A A U inside one lock hold for q21 3 7 8 6 2; for
-the other queries the two halves ran in different holds, 20-60 minutes apart). n=4 = one pair.
+the other queries the two halves ran in different holds, 20-90 minutes apart).
 
 | q | A tip med ms (n) [min-max] | U auto med (n) [min-max] | U-A ms (%) | per-process medians A / U | author U-A | results |
 |---|---|---|---|---|---|---|
@@ -62,16 +62,16 @@ the other queries the two halves ran in different holds, 20-60 minutes apart). n
 | 16 | 311.4 (8) [302-315] | 308.3 (8) [297-313] | -3.1 (-0.99%) | 308 313 / 308 305 | -4.2 | identical |
 | 17 | 498.3 (8) [487-509] | 497.0 (8) [488-508] | -1.3 (-0.26%) | 498 498 / 497 497 | -0.8 | identical |
 | 18 | 1090.4 (8) [1072-1105] | 1087.1 (8) [1077-1102] | -3.4 (-0.31%) | 1082 1094 / 1090 1086 | -4.6 | identical |
-| 19 | 881.0 (4) [876-891] | 880.4 (4) [876-888] | -0.6 (-0.07%) | 881 / 880 | +2.0 | identical |
-| 20 | 716.0 (4) [701-734] | 716.6 (4) [703-732] | +0.5 (+0.07%) | 716 / 717 | -3.2 | identical |
+| 19 | 879.8 (8) [876-892] | 880.7 (8) [876-888] | +0.9 (+0.10%) | 881 879 / 880 881 | +2.0 | identical |
+| 20 | 715.0 (8) [700-734] | 716.6 (8) [699-733] | +1.6 (+0.22%) | 716 715 / 717 717 | -3.2 | identical |
 | 21 | 1441.4 (8) [1417-1456] | 1226.9 (8) [1219-1243] | -214.6 (-14.89%) | 1441 1441 / 1230 1227 | -208.5 | identical |
 | 22 | 338.6 (8) [337-340] | 333.6 (8) [333-335] | -5.0 (-1.48%) | 338 339 / 333 334 | -4.8 | identical |
-| sum | 15298 | 14902 | -396.4 (-2.59%) | | -417.5 | |
+| sum | 15296 | 14902 | -393.9 (-2.57%) | | -417.5 | |
 
-Alternative estimator (mean of per-process medians): -393.4 ms.
+Alternative estimator (mean of per-process medians): -391.5 ms.
 
-- Suite: **15298 -> 14902 ms = -396.4 ms (-2.59%)** (author: 15280 -> 14863 = -417.5, -2.73%). Campaign references: base 15225, tip 15372 ms.
-- Queries with a HOST-staged Bloom (3 4 5 7 8 9 10 12 16 21 22): -397.9 ms (author -407). The other 11 queries: +1.5 ms
+- Suite: **15296 -> 14902 ms = -393.9 ms (-2.57%)** (author: 15280 -> 14863 = -417.5, -2.73%). Campaign references: base 15225, tip 15372 ms.
+- Queries with a HOST-staged Bloom (3 4 5 7 8 9 10 12 16 21 22): -397.9 ms (author -407). The other 11 queries: +4.0 ms
   (noise: the only prototype code that can run there is the exact-kind replica copy).
 - Switch off (arm O, n=8): q21 1441.8 vs 1441.4 (+0.4 ms), q3 662.2 vs 665.6 (-3.4 ms).
 - Spread: per-arm min-max in the table. The slow maxima of q3 (one iteration of 700-755 ms in each of the three arms) and of q13
@@ -305,12 +305,13 @@ scans (S6).
 - Failure injection with 4 GPUs / 3 sources in hostor; an unjoinable upload stream; real (not simulated) pinned-pool exhaustion.
 - Interaction with eager probe scheduling (S6) in the engine: only the microbench of 6.3.
 - NUMA hosts, hosts with few cores, full-P2P 4-GPU machines, machines with one root port per GPU.
-- Queries with n=4 in the table carry about +-10 ms each; see the table for which.
+- Per-query noise is +-10 ms / +-3%: the small differences of the queries without a HOST-staged Bloom (q1 +7.2, q11 +3.9, q18 -3.4 ...)
+  are not resolved; their sum is the uncertainty of the suite total (about +-20 ms).
 - The binaries are the author's build; I checked only that no source is newer than the library, not a clean rebuild.
 
-## 10. What ran (lock holds 2026-11-20 01:06 - 03:13)
+## 10. What ran (lock holds 2026-11-20 01:06 - 03:22)
 
-ABBA v1: 22 queries (n=8 for q1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 21 22; n=4 for q19 20), O arm on q21 / q3; W arm q21 / q3; R arm q21 / q3; G / H arms q21. Identity gates: 5 GPU sets + 2 stress
+ABBA v1: 22 queries (n=8 for q1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; n=4 for none), O arm on q21 / q3; W arm q21 / q3; R arm q21 / q3; G / H arms q21. Identity gates: 5 GPU sets + 2 stress
 runs. Fault binary: 4 arms x (multi + single). DF unit tests multi-GPU: `auto`, `hostor`, `gpuor`. nsys: q21, q7 (2 arms). Trace log
 pass: q21 q3 q7 q10 q8 (2 arms). Debug repetition: 7 queries x 12 iterations. MB4P: quiet + 2 contention runs (+ 1 first attempt whose
 hostor background ended early: its 1434 MiB rows are discarded). One timing chain was restarted before its first hold (no data lost).

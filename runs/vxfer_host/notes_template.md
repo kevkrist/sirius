@@ -40,7 +40,7 @@ What stays unverified is in section 9; production issues in section 8.
 Protocol: fresh process per query, 6 iterations (1 warm + 5 hot), first hot dropped, median of the kept hot iterations.
 Arms: A = tip binary, U = proto `auto` (defaults W=4, 16 OR threads, replica switch on), O = proto binary with the switch unset.
 n=8 = two processes per arm, the two A/U pairs in opposite order (A U U A or U A A U inside one lock hold for q21 3 7 8 6 2; for
-the other queries the two halves ran in different holds, 20-60 minutes apart). n=4 = one pair.
+the other queries the two halves ran in different holds, 20-90 minutes apart).
 
 @TABLE@
 
@@ -279,7 +279,8 @@ scans (S6).
 - Failure injection with 4 GPUs / 3 sources in hostor; an unjoinable upload stream; real (not simulated) pinned-pool exhaustion.
 - Interaction with eager probe scheduling (S6) in the engine: only the microbench of 6.3.
 - NUMA hosts, hosts with few cores, full-P2P 4-GPU machines, machines with one root port per GPU.
-- Queries with n=4 in the table carry about +-10 ms each; see the table for which.
+- Per-query noise is +-10 ms / +-3%: the small differences of the queries without a HOST-staged Bloom (q1 +7.2, q11 +3.9, q18 -3.4 ...)
+  are not resolved; their sum is the uncertainty of the suite total (about +-20 ms).
 - The binaries are the author's build; I checked only that no source is newer than the library, not a clean rebuild.
 
 ## 10. What ran (lock holds 2026-11-20 01:06 - @END@)
