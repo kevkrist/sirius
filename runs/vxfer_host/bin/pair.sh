@@ -10,5 +10,6 @@ for arm in "$@"; do
     G*) SIRIUS_PROTO_XFER_HOST=gpuor $B/one.sh $label $arm $P $q $iters;;
     U*) SIRIUS_PROTO_XFER_HOST=auto $B/one.sh $label $arm $P $q $iters;;
     O*) $B/one.sh $label $arm $P $q $iters;;
+    W*) SIRIUS_PROTO_XFER_HOST=auto SIRIUS_PROTO_XFER_WINDOW=2 SIRIUS_PROTO_XFER_OR_THREADS=8 $B/one.sh $label $arm $P $q $iters;;
   esac
 done
