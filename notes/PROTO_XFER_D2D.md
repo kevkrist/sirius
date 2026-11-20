@@ -311,7 +311,7 @@ to the byte.
 | Existing unit tests, switch `pipe` | `sirius_unittest "[dynamic_filter][multi_gpu]~[.]"` (32 cases, incl. the relay gate) | all 32 pass, run twice (4917 / 4920 assertions)  |
 | Existing unit tests, switch off (same binary) | same filter | all 32 pass, run twice (4920 / 4917 assertions: the count varies by 3 between runs in either mode) |
 | Other multi-GPU tests, switch `pipe` | `[multi_gpu]~[dynamic_filter]~[.]` | 115 cases pass (5,655,402 assertions) |
-| Fault injection, switch off / `pipe` | separate binary `sirius_cuda_fault_test "[cuda_status_fault][multi_gpu]~[.]"` (`bin/fault.sh`) | FAULT_RESULT |
+| Fault injection, switch off / `pipe` | separate binary `sirius_cuda_fault_test "[cuda_status_fault][multi_gpu]~[.]"` (`bin/fault.sh`) | off: 12 cases pass (962 assertions); `pipe`: 12 cases pass (956 assertions; these tests step an injected fault through the CUDA calls of a publication, and the island path issues a different call sequence, which is the likely reason for the 6 fewer assertions - not investigated) |
 
 Not run: the single-GPU DF tests (`plan()` declines below 3 GPUs and the relay never engages without a HOST-staged
 copy, so they cannot reach new code), the integration shards, `make test`.
@@ -348,7 +348,7 @@ copy, so they cannot reach new code), the integration shards, `make test`.
 5. **More than two islands** only has `cross_star` (serial HOST loop over the leaders). The right cross stage for N
    leaders is the other agent's `host_or` over N inputs (section 3).
 6. **Failure paths**: `island_reduce`'s destructor drains its own streams before its scratch and windows go away, and
-   `finish_impl`'s `join_on_failure` still joins the partial streams; the 4 accumulation fault-injection tests pass
+   `finish_impl`'s `join_on_failure` still joins the partial streams; the 12 multi-GPU fault-injection cases pass
    with the switch on, but they were written for the tip's call sequence: island-specific faults (failed peer copy on
    the other leader, failed event wait) have no test. `leak_storage` is not set for a failed island-stream join.
 7. **Observability contract**: `publication.transport` still reports `HOST_STAGED` for an island publication and
@@ -378,3 +378,49 @@ CUDA Best Practices Guide, memory chapter, as applied: 10.1 "minimize data trans
 (10 x B -> 4 x B through the host, the OR stays on the GPUs); 10.1.1 pinned memory, not overused (existing pool, 32 MiB);
 10.1.2 asynchronous transfers overlapped with computation on non-default streams, staged per chunk (`pipe`: copies and
 OR kernels of consecutive chunks overlap, one host wait at the end instead of 10 per chunk).
+
+## 12. What ran, repetitions, variance, what is unverified
+
+Ran (all under the machine lock; one binary = `proto/xfer-d2d` at `b7d0eb81`, never rebuilt after the gates):
+- Build: full build + one incremental rebuild; the recovered design compiled unchanged on the first attempt.
+- Gates: `[mbid]` 512 + 128 + 128 cases, `[xfer_relay]` 24 masks: once each, all clean.
+- MB4 G=4: 4 sizes x 5 masks x 4 modes, median of 5 (+1 warm-up), one process; small sizes median of 9; G=2 median
+  of 5; MB4x / MB5 median of 7, off run twice. Spread: <= 1.9% for >= 57 MiB, 4-30% below 1 ms.
+- ABBA, mode `pipe`: all 22 queries, **one block per query** (4 processes, n = 8 hot per arm). Same-arm
+  process-to-process differences: <= 4 ms for 16 queries; q1 11, q9 15-21, q10 22, q13 5-8, q14 8, q18 7-11 ms.
+- ABBA q21 with modes `exchange` and `star`: section 5.1 (one block each).
+- nsys: q21 and q3, tip and `pipe`, 2 hot iterations each, one capture each.
+- Debug-log pass q3, q21 (2 iterations): route confirmation.
+- Unit tests: section 8.
+
+Unverified / not done:
+- No second ABBA block on another day or after a reboot; no ABBA for `exchange` / `star` beyond q21.
+- Full-P2P at G >= 3 and no-P2P at G >= 3: by code inspection only (cannot be formed on this machine).
+- > 2 islands (`cross_star` over 3+ leaders): only the 3-GPU `[mbid]` topologies (2 islands) ran; a 3-island set
+  does not exist here. The N-island path is identity-tested only through `star` with 2 islands.
+- Interaction with eager probe scheduling (S6) and with a concurrent build CONCAT move: not measured.
+- Composition with `proto/xfer-host`: designed (section 3), not built, not measured.
+- OOM / refused-lease fallback of the island path (`prepare()` returning false): not exercised by any test.
+- Quent telemetry of the ABBA runs was moved to `$R/telemetry/xfer_d2d_*` and not analysed.
+- The single-contributor variant with every link at 1 x B (section 4) is a model.
+
+## 13. Recommendation
+
+1. **Land the per-island reduce for the Bloom finish in the transfer PR** (mode `pipe` semantics). Measured on this
+   machine: finish 185 -> 52-56 ms/GiB (3.5x), suite -423 ms (-2.8%), q21 -13.7%, q3 -5.6%, q7 -4.8%, q4 -4.2%,
+   q10 -3.5%; results and filter bits identical. It is the single largest measured item of the whole campaign and it
+   passes both gates (>= 1% of a query on 11 queries, >= 0.5% of the suite 5 times over). With eager probe scans
+   (S6) the finish is squarely on the critical path, so this gain is the one that survives S6.
+2. **Order of work**: (i) islands + P2P merge / fan-out with the existing HOST loop between leaders (`star`: no
+   new host code, already 1.8x on the finish); (ii) the symmetric exchange; (iii) event ordering. (ii) and (iii)
+   should not be written as a third hand-rolled variant: implement the cross stage once on the host-pipeline
+   leg primitive of `proto/xfer-host` (section 3 contract) and let it serve both the no-P2P machine and the island
+   leaders here.
+3. **Replica relay**: land it with the same PR only if the host route stays synchronous, otherwise give relays an
+   event (section 10.9). Gain is small (-18..-20% of a replica fan-out, <= 0.4 ms per filter).
+4. **Exact-key gather**: no transport change needed (already per pair); batching it is the host prototype's item.
+5. **Fix before merging**: reserve the other leader's scratch at `begin`, pool the streams, compute the islands once
+   per context, give the route its own `publication_transport` value and tests, add island fault-injection tests
+   (section 10, items 1-3, 6, 7).
+6. Not recommended now: a reduce tree for full-P2P machines at G >= 4 (model only, no machine to measure) and the
+   1 x B single-contributor fan-out (<= 1 ms per filter).
