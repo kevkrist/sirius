@@ -26,3 +26,8 @@ STATUS: IN PROGRESS. Sections fill in as lock turns arrive (9 waiters on the loc
     423 / 425 ms (+3-5%, inside the iteration-to-iteration spread of q21; q3 to re-check with my own capture). No such
     range overlaps a finish in either arm, so the finish and the CONCAT move never share the links in this stack.
   - query wall under nsys: q21 1447 / 1452 -> 1260 / 1257 ms; q3 666 / 668 -> 632 / 636 ms.
+- 01:50-01:53 q21 `A1 P1 O1 O2 P2 A2` (6 iterations each, first hot dropped, n=8 per arm): tip 1443.3 [1436-1450],
+  pipe 1239.5 [1228-1266] = **-203.9 ms (-14.1%)**; proto binary switch off 1448.0 = +4.7 ms (+0.3%, neutral).
+  Results identical (md5) across the 6 processes. Claim for q21 (-197.9 ms) reproduced.
+- 01:59 verifier test binary built out of tree (first attempt, rc=0); chains C (author's gates, fault binary, DF
+  multi-GPU unit tests) and V (my tests VX1-VX3) queued.

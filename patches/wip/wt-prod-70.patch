@@ -1,4 +1,29 @@
 # HEAD 3db07d406eef89f9a7d51a64ff303000a07fb986 branch prod/shadow-2570
+diff --git a/src/op/dynamic_filter/dynamic_filter_publisher.cpp b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
+index ab8098a6..7e15c4f3 100644
+--- a/src/op/dynamic_filter/dynamic_filter_publisher.cpp
++++ b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
+@@ -48,6 +48,7 @@
+ #include <cucascade/memory/memory_space.hpp>
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <chrono>
+ #include <concepts>
+ #include <cstddef>
+@@ -1004,7 +1005,11 @@ bool dynamic_filter_publication_session::begin(complete_build_inventory inventor
+     // A key whose membership filter no Consumer would select over what its Channels already hold
+     // is planned without it; the Channels are read here, before any lease is taken.
+     auto bindings = binding_facts_of(plan);
+-    read_published_filters(plan, bindings);
++    // MEASUREMENT ONLY (never committed to prod/*): skip the judgement at `begin` so that the
++    // judgement before `finish` is the one that fires.
++    if (std::getenv("SIRIUS_DF_SHADOW_LATE_ONLY") == nullptr) {
++      read_published_filters(plan, bindings);
++    }
+     planned = plan_construction(inventory.facts(),
+                                 plan.admitted_keys(),
+                                 bindings,
 diff --git a/REVIEW.md b/REVIEW.md
 new file mode 100644
 index 00000000..e15e7e73
