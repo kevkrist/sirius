@@ -1,0 +1,232 @@
+Filters: [scan_merge] [shadow]
+Randomness seeded to: 4263533508
+Running: the Consumer passes over the filter of a key the Construction Plan calls shadowed
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+sirius_unittest is a Catch2 v3.16.1 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+the Consumer passes over the filter of a key the Construction Plan calls
+shadowed
+  shadowed: the decode prefers the published filter and the endpoint skips the
+            other
+-------------------------------------------------------------------------------
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5356
+...............................................................................
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5364: PASSED:
+  REQUIRE( judge(published, candidate, 1) )
+with expansion:
+  true
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5365: PASSED:
+  REQUIRE_FALSE( judge(published, candidate, 2) )
+with expansion:
+  !false
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5367: PASSED:
+  REQUIRE( producer.push_filter(0, published) )
+with expansion:
+  true
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5368: PASSED:
+  REQUIRE( producer.push_filter(1, candidate) )
+with expansion:
+  true
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5370: PASSED:
+  REQUIRE( selection.steps.size() == 2 )
+with expansion:
+  2 == 2
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5372: PASSED:
+  CHECK( selection.steps[0].representative.filter == published )
+with expansion:
+  0x5e59fed50b00 == 0x5e59fed50b00
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5373: PASSED:
+  CHECK( selection.steps[1].representative.filter == candidate )
+with expansion:
+  0x5e5a023e4c20 == 0x5e5a023e4c20
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5377: PASSED:
+  REQUIRE( out != nullptr )
+with expansion:
+  0x5e5a0312fb80 != nullptr
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5378: PASSED:
+  CHECK( out->num_rows() == 10 )
+with expansion:
+  10 == 10
+
+0.036 s: shadowed: the decode prefers the published filter and the endpoint skips the other
+0.039 s: the Consumer passes over the filter of a key the Construction Plan calls shadowed
+-------------------------------------------------------------------------------
+the Consumer passes over the filter of a key the Construction Plan calls
+shadowed
+  not shadowed: the decode prefers the candidate although the published one is
+                stronger
+-------------------------------------------------------------------------------
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5380
+...............................................................................
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5387: PASSED:
+  REQUIRE_FALSE( judge(published, candidate, 1) )
+with expansion:
+  !false
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5389: PASSED:
+  REQUIRE( producer.push_filter(1, published) )
+with expansion:
+  true
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5390: PASSED:
+  REQUIRE( producer.push_filter(0, candidate) )
+with expansion:
+  true
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5392: PASSED:
+  REQUIRE( selection.steps.size() == 2 )
+with expansion:
+  2 == 2
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5393: PASSED:
+  CHECK( selection.steps[0].representative.filter == candidate )
+with expansion:
+  0x5e5a023e39a0 == 0x5e5a023e39a0
+
+0.000 s: not shadowed: the decode prefers the candidate although the published one is stronger
+0.001 s: the Consumer passes over the filter of a key the Construction Plan calls shadowed
+Running: no Consumer uses the filter of a Shadowed Key, whatever else its Channel holds
+-------------------------------------------------------------------------------
+no Consumer uses the filter of a Shadowed Key, whatever else its Channel holds
+-------------------------------------------------------------------------------
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5397
+...............................................................................
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5518: PASSED:
+  REQUIRE( producer_with.push_filter(specs[i].column, published[i]) )
+with expansion:
+  true
+with messages:
+  trial := 1
+  cap := 0
+  position := 1
+  specs.size() := 2
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5519: PASSED:
+  REQUIRE( producer_without.push_filter(specs[i].column, specs[i].make(stream)) )
+with expansion:
+  true
+with messages:
+  trial := 1
+  cap := 0
+  position := 1
+  specs.size() := 2
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5516: PASSED:
+  REQUIRE( producer_with.push_filter(candidate_spec.column, candidate) )
+with expansion:
+  true
+with messages:
+  trial := 1
+  cap := 0
+  position := 1
+  specs.size() := 2
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5518: PASSED:
+  REQUIRE( producer_with.push_filter(specs[i].column, published[i]) )
+with expansion:
+  true
+with messages:
+  trial := 1
+  cap := 0
+  position := 1
+  specs.size() := 2
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5519: PASSED:
+  REQUIRE( producer_without.push_filter(specs[i].column, specs[i].make(stream)) )
+with expansion:
+  true
+with messages:
+  trial := 1
+  cap := 0
+  position := 1
+  specs.size() := 2
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5530: PASSED:
+  CHECK( rows_kept(with_candidate) == rows_kept(without_candidate) )
+with expansion:
+  53 == 53
+with messages:
+  trial := 1
+  cap := 0
+  position := 1
+  specs.size() := 2
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5516: PASSED:
+  REQUIRE( producer_with.push_filter(candidate_spec.column, candidate) )
+with expansion:
+  true
+with messages:
+  trial := 2
+  cap := 0
+  position := 0
+  specs.size() := 3
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5518: PASSED:
+  REQUIRE( producer_with.push_filter(specs[i].column, published[i]) )
+with expansion:
+  true
+with messages:
+  trial := 2
+  cap := 0
+  position := 0
+  specs.size() := 3
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5519: PASSED:
+  REQUIRE( producer_without.push_filter(specs[i].column, specs[i].make(stream)) )
+with expansion:
+  true
+with messages:
+  trial := 2
+  cap := 0
+  position := 0
+  specs.size() := 3
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5518: PASSED:
+  REQUIRE( producer_with.push_filter(specs[i].column, published[i]) )
+with expansion:
+  true
+with messages:
+  trial := 2
+  cap := 0
+  position := 0
+  specs.size() := 3
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5519: PASSED:
+  REQUIRE( producer_without.push_filter(specs[i].column, specs[i].make(stream)) )
+with expansion:
+  true
+with messages:
+  trial := 2
+  cap := 0
+  position := 0
+  specs.size() := 3
+
+/opt/dlami/nvme/dfperf/wt-prod-69/test/cpp/scan/test_dynamic_filter_merge.cpp:5518: FAILED:
+  REQUIRE( producer_with.push_filter(specs[i].column, published[i]) )
+with expansion:
+  false
+with messages:
+  trial := 2
+  cap := 0
+  position := 0
+  specs.size() := 3
+
+0.000 s: no Consumer uses the filter of a Shadowed Key, whatever else its Channel holds
+===============================================================================
+test cases:  2 |  1 passed | 1 failed
+assertions: 26 | 25 passed | 1 failed
+

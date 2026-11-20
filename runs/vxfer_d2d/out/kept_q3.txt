@@ -1,0 +1,40 @@
+iterations: A 3 U 3
+== iteration 0
+  DYNAMIC_FILTER pipeline 3 id 5: A in 147834473 out 147834473 | U in 147834473 out 147834473 | SAME
+     A per GPU (in, out, tasks, out/in): g0: 32675147 32675147 2 1.000000; g1: 38386256 38386256 2 1.000000; g2: 38381651 38381651 2 1.000000; g3: 38391419 38391419 2 1.000000
+     U per GPU (in, out, tasks, out/in): g0: 32675147 32675147 2 1.000000; g1: 38386256 38386256 2 1.000000; g2: 38381651 38381651 2 1.000000; g3: 38391419 38391419 2 1.000000
+  DYNAMIC_FILTER pipeline 9 id 12: A in 34116680 out 34116680 | U in 34116680 out 34116680 | SAME
+     A per GPU (in, out, tasks, out/in): g0: 7965056 7965056 11 1.000000; g1: 8718510 8718510 11 1.000000; g2: 8720307 8720307 11 1.000000; g3: 8712807 8712807 11 1.000000
+     U per GPU (in, out, tasks, out/in): g0: 7965056 7965056 11 1.000000; g1: 8718510 8718510 11 1.000000; g2: 8720307 8720307 11 1.000000; g3: 8712807 8712807 11 1.000000
+  compressed-scan join filters kept: A [160514096, 1927817321, 24, 24, 24] U [160514096, 1927817321, 24, 24, 24] SAME
+  Bloom finishes (bytes, sources, targets, transport, root): A [(60007168, 0, 3, 'HOST staging', 0), (294120448, 3, 3, 'HOST staging', 2)]
+                                                              U [(60007168, 0, 3, 'island peer copies + HOST pipelined exchange', 0), (294120448, 3, 3, 'island peer copies + HOST pipelined exchange', 2)]
+  PROTO pipelines (schedule, pinned bytes, scratch, waits): U []  A []
+  published (host-staged bloom, filters, targets, ms after final): A [(True, 1, 1, 4.1), (True, 1, 1, 56.5)]
+                                                                    U [(True, 1, 1, 3.2), (True, 1, 1, 20.1)]
+== iteration 1
+  DYNAMIC_FILTER pipeline 3 id 5: A in 147834473 out 147834473 | U in 147834473 out 147834473 | SAME
+     A per GPU (in, out, tasks, out/in): g0: 38391419 38391419 2 1.000000; g1: 32675147 32675147 2 1.000000; g2: 38386256 38386256 2 1.000000; g3: 38381651 38381651 2 1.000000
+     U per GPU (in, out, tasks, out/in): g0: 38391419 38391419 2 1.000000; g1: 32675147 32675147 2 1.000000; g2: 38386256 38386256 2 1.000000; g3: 38381651 38381651 2 1.000000
+  DYNAMIC_FILTER pipeline 9 id 12: A in 34116680 out 34116680 | U in 34116680 out 34116680 | SAME
+     A per GPU (in, out, tasks, out/in): g0: 8712807 8712807 11 1.000000; g1: 7965056 7965056 11 1.000000; g2: 8718510 8718510 11 1.000000; g3: 8720307 8720307 11 1.000000
+     U per GPU (in, out, tasks, out/in): g0: 8712807 8712807 11 1.000000; g1: 7965056 7965056 11 1.000000; g2: 8718510 8718510 11 1.000000; g3: 8720307 8720307 11 1.000000
+  compressed-scan join filters kept: A [160514096, 1927817321, 24, 24, 24] U [160514096, 1927817321, 24, 24, 24] SAME
+  Bloom finishes (bytes, sources, targets, transport, root): A [(60007168, 0, 3, 'HOST staging', 1), (294120448, 3, 3, 'HOST staging', 2)]
+                                                              U [(60007168, 0, 3, 'island peer copies + HOST pipelined exchange', 1), (294120448, 3, 3, 'island peer copies + HOST pipelined exchange', 0)]
+  PROTO pipelines (schedule, pinned bytes, scratch, waits): U []  A []
+  published (host-staged bloom, filters, targets, ms after final): A [(True, 1, 1, 4.1), (True, 1, 1, 56.9)]
+                                                                    U [(True, 1, 1, 3.0), (True, 1, 1, 20.1)]
+== iteration 2
+  DYNAMIC_FILTER pipeline 3 id 5: A in 147834473 out 147834473 | U in 147834473 out 147834473 | SAME
+     A per GPU (in, out, tasks, out/in): g0: 38381651 38381651 2 1.000000; g1: 38391419 38391419 2 1.000000; g2: 32675147 32675147 2 1.000000; g3: 38386256 38386256 2 1.000000
+     U per GPU (in, out, tasks, out/in): g0: 38381651 38381651 2 1.000000; g1: 38391419 38391419 2 1.000000; g2: 32675147 32675147 2 1.000000; g3: 38386256 38386256 2 1.000000
+  DYNAMIC_FILTER pipeline 9 id 12: A in 34116680 out 34116680 | U in 34116680 out 34116680 | SAME
+     A per GPU (in, out, tasks, out/in): g0: 8720307 8720307 11 1.000000; g1: 8712807 8712807 11 1.000000; g2: 7965056 7965056 11 1.000000; g3: 8718510 8718510 11 1.000000
+     U per GPU (in, out, tasks, out/in): g0: 8720307 8720307 11 1.000000; g1: 8712807 8712807 11 1.000000; g2: 7965056 7965056 11 1.000000; g3: 8718510 8718510 11 1.000000
+  compressed-scan join filters kept: A [160514096, 1927817321, 24, 24, 24] U [160514096, 1927817321, 24, 24, 24] SAME
+  Bloom finishes (bytes, sources, targets, transport, root): A [(60007168, 0, 3, 'HOST staging', 2), (294120448, 3, 3, 'HOST staging', 1)]
+                                                              U [(60007168, 0, 3, 'island peer copies + HOST pipelined exchange', 2), (294120448, 3, 3, 'island peer copies + HOST pipelined exchange', 3)]
+  PROTO pipelines (schedule, pinned bytes, scratch, waits): U []  A []
+  published (host-staged bloom, filters, targets, ms after final): A [(True, 1, 1, 4.1), (True, 1, 1, 57.2)]
+                                                                    U [(True, 1, 1, 3.0), (True, 1, 1, 20.0)]
