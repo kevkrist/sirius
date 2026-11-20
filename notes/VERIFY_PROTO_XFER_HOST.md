@@ -36,3 +36,16 @@ STATUS: IN PROGRESS (checkpoint 1). Sections fill in as lock turns arrive (13 wa
   auto and between iterations (q21: 48 chunks, 423,297,173 of 9,124,908,864 rows kept; q3: 24 chunks, 160,514,096 of 1,927,817,321),
   while the scan tasks rotate over the GPUs between iterations. Schedules seen: q21 two hostor finishes (160 MiB pinned each),
   q3 one fan-out (32 MiB) + one hostor (160 MiB).
+- 01:40-02:11 (checkpoint 3):
+  - ABBA: q7 -42.6, q8 -26.0, q10 -20.8 (claimed -33.0), q6 +0.1, q2 -1.5 (all n=8).
+  - Own nsys (q21, q7; 1 capture per arm): q21 finish 291 / 308 -> 73 / 74 ms, q7 54 -> 14.5 ms; other copies and the CONCAT move unchanged.
+  - Microbench MB4P re-run (5 reps): tip 61 / 104 / 144 / 186 ms/GiB for batches on 1 / 2 / 3 / 4 GPUs; hostor 39 (fan-out) / 46-48 / 46-48 / 44-47;
+    gpuor 39 / 45-47 / 76 / 95-96. Matches the author within 1-2%.
+  - Unit tests, 4 GPUs: `auto` 4 failing cases of 159 (as claimed); `gpuor` the same 4; `hostor` 5 (extra:
+    `a tracked task thread admits a merge scratch larger than its reservation as its task would`, i.e. on a P2P pair, when the PEER
+    pipeline's scratch is refused, hostor publishes through the host instead of skipping: the prototype IS reached on a full-P2P machine
+    in that case). Fault binary: `hostor` and `gpuor` 11/12 like `auto` (same submission-order expectation).
+  - Identity gate on other GPU sets: `CUDA_VISIBLE_DEVICES=2,0,3,1` G=4 (540 finishes), `1,2,3` G=3 (540), `0,1,2` G=3 (540), `3,1` G=2 (450): all identical.
+  - Recommended configuration W=2 + 8 OR threads against the defaults (W=4, 16): q21 1227.9 vs 1228.8 ms (n=8 each), q3 626.2 vs 624.6 (n=4): no difference.
+  - Engine repetition (auto, 12 iterations in one process, debug log): q21, q3 per-chunk kept multisets equal to the tip's in 12/12 iterations; q7 12/12
+    self-consistent; the publication root lands on all 4 GPUs across iterations; no error / fallback line.
