@@ -1,0 +1,116 @@
+#### ns_tip/tpch_20261119_225231_nsys_gpu_iter3_q21/sirius/q21/nsys.sqlite
+== iter 1: query wall 1447.5 ms; finish ranges 2: 280.7, 26.6; sum 307.3 ms, union 307.3 ms
+   finish-thread waits: {'cudaStreamSynchronize': (1932, 288.6)} | total API calls 5014 | top API ms: [('cudaStreamSynchronize', 288.6), ('cudaMemcpyBatchAsync', 13.0), ('cudaLaunchKernel', 2.6), ('cuKernelGetName', 0.1)]
+   finish copies: {'D2H': (768, 5.964, 112.6), 'H2D': (1152, 8.946, 228.4)} total 14.91 GiB
+     gpu0: D2H 1.49 GiB, H2D 1.49 GiB, copy busy 57.1 ms of span 844.4 ms -> 52.2 GiB/s while busy
+     gpu1: D2H 1.49 GiB, H2D 4.47 GiB, copy busy 115.2 ms of span 844.1 ms -> 51.8 GiB/s while busy
+     gpu2: D2H 1.49 GiB, H2D 1.49 GiB, copy busy 84.1 ms of span 844.1 ms -> 35.5 GiB/s while busy
+     gpu3: D2H 1.49 GiB, H2D 1.49 GiB, copy busy 84.6 ms of span 826.6 ms -> 35.3 GiB/s while busy
+   other copies in query: {'D2D': (941, 33.17, 66.9), 'D2H': (6592, 5.7, 129.3), 'H2D': (85432, 81.54, 2985.1), 'P2P': (143, 2.85, 59.5)}
+   other copies overlapping a finish: n=23 5.44 GiB 10.1 ms (539.9 GiB/s per copy-time); outside: n=93085 117.82 GiB 3230.7 ms (36.5 GiB/s)
+   range convert:gpu_to_gpu:host_staging: n=126 sum 463.9 ms, max 34.6, overlapping finish: 0 ranges / 0.0 ms
+   range convert:gpu_to_gpu: n=189 sum 529.2 ms, max 34.6, overlapping finish: 0 ranges / 0.0 ms
+   range sirius_physical_concat::execute: n=41 sum 17.8 ms, max 2.3, overlapping finish: 0 ranges / 0.0 ms
+   range sirius::compression::host_to_gpu: n=68 sum 9837.8 ms, max 280.3, overlapping finish: 0 ranges / 0.0 ms
+   range hash_partition: n=53 sum 252.0 ms, max 58.4, overlapping finish: 2 ranges / 114.4 ms
+== iter 2: query wall 1452.2 ms; finish ranges 2: 281.6, 26.5; sum 308.0 ms, union 308.0 ms
+   finish-thread waits: {'cudaStreamSynchronize': (1932, 289.2)} | total API calls 5014 | top API ms: [('cudaStreamSynchronize', 289.2), ('cudaMemcpyBatchAsync', 13.1), ('cudaLaunchKernel', 2.5), ('cuKernelGetName', 0.1)]
+   finish copies: {'D2H': (768, 5.964, 112.6), 'H2D': (1152, 8.946, 228.4)} total 14.91 GiB
+     gpu0: D2H 1.49 GiB, H2D 1.49 GiB, copy busy 84.5 ms of span 830.6 ms -> 35.3 GiB/s while busy
+     gpu1: D2H 1.49 GiB, H2D 1.49 GiB, copy busy 84.2 ms of span 830.2 ms -> 35.4 GiB/s while busy
+     gpu2: D2H 1.49 GiB, H2D 1.49 GiB, copy busy 57.2 ms of span 829.8 ms -> 52.2 GiB/s while busy
+     gpu3: D2H 1.49 GiB, H2D 4.47 GiB, copy busy 115.2 ms of span 830.2 ms -> 51.8 GiB/s while busy
+   other copies in query: {'D2D': (939, 33.17, 66.0), 'D2H': (6571, 5.7, 130.4), 'H2D': (85409, 81.54, 2991.5), 'P2P': (141, 2.85, 59.6)}
+   other copies overlapping a finish: n=23 5.44 GiB 10.8 ms (504.6 GiB/s per copy-time); outside: n=93037 117.82 GiB 3236.7 ms (36.4 GiB/s)
+   range convert:gpu_to_gpu:host_staging: n=126 sum 484.1 ms, max 36.4, overlapping finish: 0 ranges / 0.0 ms
+   range convert:gpu_to_gpu: n=189 sum 549.1 ms, max 36.4, overlapping finish: 0 ranges / 0.0 ms
+   range sirius_physical_concat::execute: n=41 sum 82.3 ms, max 34.1, overlapping finish: 0 ranges / 0.0 ms
+   range sirius::compression::host_to_gpu: n=68 sum 9989.7 ms, max 281.2, overlapping finish: 0 ranges / 0.0 ms
+   range hash_partition: n=54 sum 255.6 ms, max 58.4, overlapping finish: 2 ranges / 114.5 ms
+#### ns_pipe/tpch_20261119_225301_nsys_gpu_iter3_q21/sirius/q21/nsys.sqlite
+== iter 1: query wall 1260.4 ms; finish ranges 2: 8.9, 76.5; sum 85.5 ms, union 85.5 ms
+   finish-thread waits: {'cudaStreamSynchronize': (38, 60.5)} | total API calls 8248 | top API ms: [('cudaStreamSynchronize', 60.5), ('cudaStreamWaitEvent', 6.2), ('cudaMemcpyBatchAsync', 5.1), ('cudaMemcpyPeerAsync', 4.2)]
+   finish copies: {'D2H': (384, 2.982, 74.0), 'H2D': (384, 2.982, 88.6), 'P2P': (768, 5.964, 170.2)} total 11.93 GiB
+     gpu0: D2H 1.49 GiB, H2D 1.49 GiB, copy busy 76.1 ms of span 622.3 ms -> 39.2 GiB/s while busy
+     gpu1: D2H 0.00 GiB, H2D 0.00 GiB, copy busy 49.9 ms of span 620.1 ms -> 0.0 GiB/s while busy
+     gpu2: D2H 0.00 GiB, H2D 0.00 GiB, copy busy 49.5 ms of span 619.9 ms -> 0.0 GiB/s while busy
+     gpu3: D2H 1.49 GiB, H2D 1.49 GiB, copy busy 75.7 ms of span 622.2 ms -> 39.4 GiB/s while busy
+   other copies in query: {'D2D': (939, 33.17, 69.5), 'D2H': (6569, 5.7, 129.1), 'H2D': (85407, 81.54, 2987.0), 'P2P': (143, 2.86, 60.9)}
+   other copies overlapping a finish: n=8 2.16 GiB 6.0 ms (362.3 GiB/s per copy-time); outside: n=93050 121.09 GiB 3240.5 ms (37.4 GiB/s)
+   range convert:gpu_to_gpu:host_staging: n=126 sum 498.0 ms, max 34.1, overlapping finish: 0 ranges / 0.0 ms
+   range convert:gpu_to_gpu: n=189 sum 564.3 ms, max 34.1, overlapping finish: 0 ranges / 0.0 ms
+   range sirius_physical_concat::execute: n=41 sum 83.8 ms, max 34.6, overlapping finish: 0 ranges / 0.0 ms
+   range sirius::compression::host_to_gpu: n=68 sum 10115.7 ms, max 281.3, overlapping finish: 0 ranges / 0.0 ms
+   range hash_partition: n=54 sum 255.8 ms, max 58.3, overlapping finish: 1 ranges / 58.3 ms
+== iter 2: query wall 1256.5 ms; finish ranges 2: 9.0, 74.4; sum 83.4 ms, union 83.4 ms
+   finish-thread waits: {'cudaStreamSynchronize': (38, 58.1)} | total API calls 8248 | top API ms: [('cudaStreamSynchronize', 58.1), ('cudaStreamWaitEvent', 6.2), ('cudaMemcpyBatchAsync', 5.3), ('cudaMemcpyPeerAsync', 4.2)]
+   finish copies: {'D2H': (384, 2.982, 73.9), 'H2D': (384, 2.982, 88.7), 'P2P': (768, 5.964, 170.8)} total 11.93 GiB
+     gpu0: D2H 1.36 GiB, H2D 1.36 GiB, copy busy 73.8 ms of span 619.9 ms -> 36.9 GiB/s while busy
+     gpu1: D2H 0.13 GiB, H2D 0.13 GiB, copy busy 51.8 ms of span 622.6 ms -> 5.0 GiB/s while busy
+     gpu2: D2H 1.49 GiB, H2D 1.49 GiB, copy busy 76.3 ms of span 622.6 ms -> 39.1 GiB/s while busy
+     gpu3: D2H 0.00 GiB, H2D 0.00 GiB, copy busy 49.9 ms of span 620.3 ms -> 0.0 GiB/s while busy
+   other copies in query: {'D2D': (941, 33.17, 65.8), 'D2H': (6590, 5.7, 130.9), 'H2D': (85430, 81.54, 2977.5), 'P2P': (145, 2.86, 59.6)}
+   other copies overlapping a finish: n=8 2.16 GiB 6.0 ms (363.4 GiB/s per copy-time); outside: n=93098 121.09 GiB 3227.8 ms (37.5 GiB/s)
+   range convert:gpu_to_gpu:host_staging: n=126 sum 472.8 ms, max 33.3, overlapping finish: 0 ranges / 0.0 ms
+   range convert:gpu_to_gpu: n=189 sum 537.8 ms, max 33.3, overlapping finish: 0 ranges / 0.0 ms
+   range sirius_physical_concat::execute: n=41 sum 19.3 ms, max 2.2, overlapping finish: 0 ranges / 0.0 ms
+   range sirius::compression::host_to_gpu: n=68 sum 9961.7 ms, max 280.3, overlapping finish: 0 ranges / 0.0 ms
+   range hash_partition: n=53 sum 257.9 ms, max 58.3, overlapping finish: 0 ranges / 0.0 ms
+#### ns_tip/tpch_20261119_230117_nsys_gpu_iter3_q3/sirius/q3/nsys.sqlite
+== iter 1: query wall 666.2 ms; finish ranges 2: 4.2, 58.0; sum 62.1 ms, union 62.1 ms
+   finish-thread waits: {'cudaStreamSynchronize': (404, 58.3)} | total API calls 1020 | top API ms: [('cudaStreamSynchronize', 58.3), ('cudaMemcpyBatchAsync', 2.7), ('cudaLaunchKernel', 0.5), ('cuKernelGetName', 0.0)]
+   finish copies: {'D2H': (152, 1.152, 21.7), 'H2D': (240, 1.811, 47.2)} total 2.96 GiB
+     gpu0: D2H 0.27 GiB, H2D 0.33 GiB, copy busy 16.5 ms of span 172.2 ms -> 36.6 GiB/s while busy
+     gpu1: D2H 0.33 GiB, H2D 0.27 GiB, copy busy 16.5 ms of span 172.3 ms -> 36.6 GiB/s while busy
+     gpu2: D2H 0.27 GiB, H2D 0.88 GiB, copy busy 23.2 ms of span 172.1 ms -> 49.5 GiB/s while busy
+     gpu3: D2H 0.27 GiB, H2D 0.33 GiB, copy busy 12.6 ms of span 172.1 ms -> 48.0 GiB/s while busy
+   other copies in query: {'D2D': (409, 13.57, 20.2), 'D2H': (4802, 4.47, 108.1), 'H2D': (46223, 44.11, 1613.3), 'P2P': (37, 2.24, 46.1)}
+   other copies overlapping a finish: n=0 0.00 GiB 0.0 ms (0.0 GiB/s per copy-time); outside: n=51471 64.39 GiB 1787.7 ms (36.0 GiB/s)
+   range convert:gpu_to_gpu:host_staging: n=20 sum 403.3 ms, max 56.6, overlapping finish: 0 ranges / 0.0 ms
+   range convert:gpu_to_gpu: n=30 sum 450.5 ms, max 56.6, overlapping finish: 0 ranges / 0.0 ms
+   range sirius_physical_concat::execute: n=16 sum 4.4 ms, max 0.8, overlapping finish: 0 ranges / 0.0 ms
+   range sirius::compression::host_to_gpu: n=53 sum 4840.1 ms, max 117.4, overlapping finish: 0 ranges / 0.0 ms
+   range hash_partition: n=4 sum 1.8 ms, max 0.5, overlapping finish: 0 ranges / 0.0 ms
+== iter 2: query wall 667.8 ms; finish ranges 2: 58.2, 4.1; sum 62.3 ms, union 62.3 ms
+   finish-thread waits: {'cudaStreamSynchronize': (404, 58.4)} | total API calls 1020 | top API ms: [('cudaStreamSynchronize', 58.4), ('cudaMemcpyBatchAsync', 2.7), ('cudaLaunchKernel', 0.5), ('cuKernelGetName', 0.0)]
+   finish copies: {'D2H': (152, 1.152, 21.7), 'H2D': (240, 1.811, 47.2)} total 2.96 GiB
+     gpu0: D2H 0.27 GiB, H2D 0.33 GiB, copy busy 17.5 ms of span 172.4 ms -> 34.5 GiB/s while busy
+     gpu1: D2H 0.27 GiB, H2D 0.33 GiB, copy busy 17.5 ms of span 172.4 ms -> 34.4 GiB/s while busy
+     gpu2: D2H 0.33 GiB, H2D 0.27 GiB, copy busy 11.5 ms of span 172.6 ms -> 52.3 GiB/s while busy
+     gpu3: D2H 0.27 GiB, H2D 0.88 GiB, copy busy 22.2 ms of span 172.4 ms -> 51.8 GiB/s while busy
+   other copies in query: {'D2D': (409, 13.57, 20.2), 'D2H': (4802, 4.47, 103.2), 'H2D': (46223, 44.11, 1614.8), 'P2P': (37, 2.24, 46.5)}
+   other copies overlapping a finish: n=0 0.00 GiB 0.0 ms (0.0 GiB/s per copy-time); outside: n=51471 64.39 GiB 1784.7 ms (36.1 GiB/s)
+   range convert:gpu_to_gpu:host_staging: n=20 sum 410.2 ms, max 54.7, overlapping finish: 0 ranges / 0.0 ms
+   range convert:gpu_to_gpu: n=30 sum 458.1 ms, max 54.7, overlapping finish: 0 ranges / 0.0 ms
+   range sirius_physical_concat::execute: n=16 sum 4.1 ms, max 0.7, overlapping finish: 0 ranges / 0.0 ms
+   range sirius::compression::host_to_gpu: n=53 sum 4836.0 ms, max 117.4, overlapping finish: 0 ranges / 0.0 ms
+   range hash_partition: n=4 sum 1.9 ms, max 0.5, overlapping finish: 0 ranges / 0.0 ms
+#### ns_pipe/tpch_20261119_230143_nsys_gpu_iter3_q3/sirius/q3/nsys.sqlite
+== iter 1: query wall 632.4 ms; finish ranges 2: 20.5, 3.0; sum 23.5 ms, union 23.5 ms
+   finish-thread waits: {'cudaStreamSynchronize': (34, 17.9)} | total API calls 1766 | top API ms: [('cudaStreamSynchronize', 17.9), ('cudaMemcpyBatchAsync', 1.1), ('cudaStreamWaitEvent', 1.0), ('cudaMemcpyPeerAsync', 0.9)]
+   finish copies: {'D2H': (80, 0.604, 15.4), 'H2D': (80, 0.604, 17.4), 'P2P': (160, 1.207, 32.7)} total 2.41 GiB
+     gpu0: D2H 0.27 GiB, H2D 0.27 GiB, copy busy 13.9 ms of span 14.2 ms -> 39.5 GiB/s while busy
+     gpu1: D2H 0.06 GiB, H2D 0.00 GiB, copy busy 11.3 ms of span 130.1 ms -> 4.9 GiB/s while busy
+     gpu2: D2H 0.27 GiB, H2D 0.33 GiB, copy busy 15.4 ms of span 134.7 ms -> 39.2 GiB/s while busy
+     gpu3: D2H 0.00 GiB, H2D 0.00 GiB, copy busy 9.2 ms of span 9.4 ms -> 0.0 GiB/s while busy
+   other copies in query: {'D2D': (409, 13.57, 20.1), 'D2H': (4802, 4.47, 104.6), 'H2D': (46223, 44.11, 1617.1), 'P2P': (37, 2.24, 46.3)}
+   other copies overlapping a finish: n=0 0.00 GiB 0.0 ms (0.0 GiB/s per copy-time); outside: n=51471 64.39 GiB 1788.1 ms (36.0 GiB/s)
+   range convert:gpu_to_gpu:host_staging: n=20 sum 423.0 ms, max 55.5, overlapping finish: 0 ranges / 0.0 ms
+   range convert:gpu_to_gpu: n=30 sum 470.5 ms, max 55.5, overlapping finish: 0 ranges / 0.0 ms
+   range sirius_physical_concat::execute: n=16 sum 4.1 ms, max 0.7, overlapping finish: 0 ranges / 0.0 ms
+   range sirius::compression::host_to_gpu: n=53 sum 4843.4 ms, max 117.8, overlapping finish: 0 ranges / 0.0 ms
+   range hash_partition: n=4 sum 1.8 ms, max 0.5, overlapping finish: 0 ranges / 0.0 ms
+== iter 2: query wall 636.1 ms; finish ranges 2: 3.0, 20.4; sum 23.3 ms, union 23.3 ms
+   finish-thread waits: {'cudaStreamSynchronize': (34, 17.5)} | total API calls 1766 | top API ms: [('cudaStreamSynchronize', 17.5), ('cudaStreamWaitEvent', 1.3), ('cudaMemcpyBatchAsync', 1.1), ('cudaMemcpyPeerAsync', 0.9)]
+   finish copies: {'D2H': (80, 0.604, 14.5), 'H2D': (80, 0.604, 17.5), 'P2P': (160, 1.207, 33.4)} total 2.41 GiB
+     gpu0: D2H 0.27 GiB, H2D 0.33 GiB, copy busy 15.5 ms of span 133.7 ms -> 38.9 GiB/s while busy
+     gpu1: D2H 0.00 GiB, H2D 0.00 GiB, copy busy 9.2 ms of span 9.5 ms -> 0.0 GiB/s while busy
+     gpu2: D2H 0.06 GiB, H2D 0.00 GiB, copy busy 11.1 ms of span 128.7 ms -> 5.0 GiB/s while busy
+     gpu3: D2H 0.27 GiB, H2D 0.27 GiB, copy busy 13.7 ms of span 14.0 ms -> 40.1 GiB/s while busy
+   other copies in query: {'D2D': (409, 13.57, 20.1), 'D2H': (4802, 4.47, 104.7), 'H2D': (46223, 44.11, 1617.8), 'P2P': (37, 2.24, 46.3)}
+   other copies overlapping a finish: n=0 0.00 GiB 0.0 ms (0.0 GiB/s per copy-time); outside: n=51471 64.39 GiB 1788.9 ms (36.0 GiB/s)
+   range convert:gpu_to_gpu:host_staging: n=20 sum 425.2 ms, max 59.2, overlapping finish: 0 ranges / 0.0 ms
+   range convert:gpu_to_gpu: n=30 sum 472.9 ms, max 59.2, overlapping finish: 0 ranges / 0.0 ms
+   range sirius_physical_concat::execute: n=16 sum 4.1 ms, max 0.8, overlapping finish: 0 ranges / 0.0 ms
+   range sirius::compression::host_to_gpu: n=53 sum 4849.2 ms, max 118.1, overlapping finish: 0 ranges / 0.0 ms
+   range hash_partition: n=4 sum 1.8 ms, max 0.5, overlapping finish: 0 ranges / 0.0 ms

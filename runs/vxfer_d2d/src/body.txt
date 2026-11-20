@@ -1,0 +1,389 @@
+#include <atomic>
+#include <barrier>
+#include <mutex>
+#include <thread>
+
+// VERIFIER tests for proto/xfer-d2d (SIRIUS_PROTO_XFER_D2D). Not part of the prototype: compiled out of tree against the
+// prototype's objects (see runs/vxfer_d2d/bin/vx_build.sh).
+namespace {
+
+namespace op  = sirius::op;
+namespace acc = sirius::test::accumulation;
+using builder = op::detail::accumulated_bloom_builder;
+using contents = std::vector<std::vector<std::byte>>;  // per key
+
+std::vector<std::uint64_t> vx_list(char const* name, std::vector<std::uint64_t> fallback)
+{
+  auto const* text = std::getenv(name);
+  if (text == nullptr || *text == '\0') { return fallback; }
+  std::vector<std::uint64_t> out;
+  std::stringstream stream{text};
+  for (std::string item; std::getline(stream, item, ',');) { out.push_back(std::stoull(item)); }
+  return out;
+}
+
+std::vector<std::string> vx_names(char const* name, std::vector<std::string> fallback)
+{
+  auto const* text = std::getenv(name);
+  if (text == nullptr || *text == '\0') { return fallback; }
+  std::vector<std::string> out;
+  std::stringstream stream{text};
+  for (std::string item; std::getline(stream, item, ',');) { out.push_back(item); }
+  return out;
+}
+
+void vx_sync(std::size_t devices)
+{
+  for (std::size_t device = 0; device < devices; ++device) {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+    (void)cudaDeviceSynchronize();
+  }
+}
+
+acc::batch_ptr vx_keys(acc::fixture const& fixture, int device, std::int64_t start, cudf::size_type rows)
+{
+  auto& space = fixture.gpu(device);
+  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+  auto const stream = space.acquire_stream();
+  auto const mr     = space.get_default_allocator();
+  std::vector<std::unique_ptr<cudf::column>> made;
+  for (std::size_t column = 0; column < 2; ++column) {
+    auto const step = static_cast<std::int64_t>(2 * column + 1);
+    made.push_back(cudf::sequence(rows,
+                                  cudf::numeric_scalar<std::int64_t>(start * step, true, stream, mr),
+                                  cudf::numeric_scalar<std::int64_t>(step, true, stream, mr),
+                                  stream,
+                                  mr));
+  }
+  auto table = std::make_unique<cudf::table>(std::move(made));
+  stream.sync();
+  return sirius::make_data_batch(std::move(table), space, stream, sirius::telemetry::batch_telemetry_info{});
+}
+
+struct vx_input {
+  std::size_t gpus;
+  std::vector<std::vector<acc::batch_ptr>> batches;  // per device
+};
+
+vx_input vx_make_input(acc::fixture const& fixture, std::size_t gpus, std::size_t per_device, cudf::size_type rows)
+{
+  vx_input in{gpus, {}};
+  for (std::size_t device = 0; device < gpus; ++device) {
+    auto& list = in.batches.emplace_back();
+    for (std::size_t index = 0; index < per_device; ++index) {
+      list.push_back(vx_keys(fixture, static_cast<int>(device),
+                             static_cast<std::int64_t>(device * per_device + index + 1) * 10000019, rows));
+    }
+  }
+  return in;
+}
+
+auto vx_create(std::span<op::dynamic_filter_replica_space const> spaces, std::uint64_t megabytes)
+{
+  auto const blocks = (megabytes << 20) / op::bloom_bytes_per_block;
+  return builder::try_create({{0, cudf::data_type{cudf::type_id::INT64}, blocks},
+                              {1, cudf::data_type{cudf::type_id::INT64}, blocks / 3 + 1}},
+                             spaces);
+}
+
+// OR of the partials of a fully synced builder in the tip code path = the expected replica of every GPU.
+contents vx_expected(acc::fixture const& fixture, vx_input const& in, std::uint64_t megabytes, std::uint64_t mask)
+{
+  setenv("SIRIUS_PROTO_XFER_D2D", "off", 1);
+  std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), in.gpus};
+  auto made = vx_create(spaces, megabytes);
+  REQUIRE(made);
+  for (std::size_t device = 0; device < in.gpus; ++device) {
+    if (((mask >> device) & 1) == 0) { continue; }
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+    for (auto const& batch : in.batches[device]) {
+      auto source = batch->to_read_only();
+      REQUIRE(made->enqueue_add(sirius::get_cudf_table_view(source), rmm::cuda_device_id{static_cast<int>(device)},
+                                fixture.task_stream(static_cast<int>(device))));
+      fixture.task_stream(static_cast<int>(device)).sync();
+    }
+  }
+  vx_sync(in.gpus);
+  contents expected(2);
+  for (std::size_t key = 0; key < 2; ++key) {
+    for (std::size_t device = 0; device < in.gpus; ++device) {
+      auto partial = made->inspect_partial(key, rmm::cuda_device_id{static_cast<int>(device)});
+      REQUIRE(partial);
+      if (expected[key].empty()) { expected[key].assign(partial->bytes.size(), std::byte{0}); }
+      for (std::size_t index = 0; index < partial->bytes.size(); ++index) { expected[key][index] |= partial->bytes[index]; }
+    }
+  }
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
+    auto published = made->finish(rmm::cuda_device_id{0}, fixture.publication_stream(0), fixture.gpu(0).get_default_allocator());
+    REQUIRE(published);
+    for (std::size_t key = 0; key < 2; ++key) {
+      for (std::size_t device = 0; device < in.gpus; ++device) {
+        auto replica = builder::inspect_replica(*published->filters[key], rmm::cuda_device_id{static_cast<int>(device)});
+        REQUIRE(replica);
+        REQUIRE(replica->bytes == expected[key]);
+      }
+    }
+  }
+  vx_sync(in.gpus);
+  made.reset();
+  vx_sync(in.gpus);
+  return expected;
+}
+
+struct vx_result {
+  std::size_t mismatched = 0;  // replicas that differ from the expected union
+  std::size_t host_bytes = 0;
+  std::size_t scratch    = 0;
+  double finish_us       = 0;
+};
+
+// One publication with the inserts left in flight (no host sync between enqueue_add and finish).
+vx_result vx_unsynced(acc::fixture const& fixture, vx_input const& in, std::uint64_t megabytes, std::uint64_t mask, int root,
+                      contents const& expected, std::vector<std::unique_ptr<rmm::cuda_stream>> const* task_streams,
+                      ::cuda::stream_ref publication_stream, bool sync_first)
+{
+  std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), in.gpus};
+  auto made = vx_create(spaces, megabytes);
+  vx_result out;
+  if (!made) { out.mismatched = 1000; return out; }
+  std::vector<decltype(in.batches[0][0]->to_read_only())> held;
+  for (std::size_t device = 0; device < in.gpus; ++device) {
+    if (((mask >> device) & 1) == 0) { continue; }
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+    auto const stream = task_streams != nullptr ? ::cuda::stream_ref{(*task_streams)[device]->value()}
+                                                : fixture.task_stream(static_cast<int>(device));
+    for (auto const& batch : in.batches[device]) {
+      held.push_back(batch->to_read_only());
+      if (!made->enqueue_add(sirius::get_cudf_table_view(held.back()), rmm::cuda_device_id{static_cast<int>(device)}, stream)) {
+        out.mismatched += 1000;
+      }
+    }
+  }
+  if (sync_first) { vx_sync(in.gpus); }
+  {
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root}};
+    acc::builder_access::workspace_observation seen{};
+    auto const start = std::chrono::steady_clock::now();
+    auto published = acc::builder_access::finish(*made, rmm::cuda_device_id{root}, publication_stream,
+                                                 fixture.gpu(root).get_default_allocator(), false, &seen);
+    out.finish_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    out.host_bytes = seen.host_staging_bytes;
+    out.scratch    = seen.device_scratch_bytes;
+    if (!published) { out.mismatched += 1000; return out; }
+    for (std::size_t key = 0; key < 2; ++key) {
+      for (std::size_t device = 0; device < in.gpus; ++device) {
+        auto replica = builder::inspect_replica(*published->filters[key], rmm::cuda_device_id{static_cast<int>(device)});
+        if (!replica || replica->bytes != expected[key]) { ++out.mismatched; }
+      }
+    }
+  }
+  held.clear();
+  made.reset();
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("verifier: unsynced finish identity, all masks and roots (VX1)", "[!benchmark][dynamic_filter][vx1]")
+{
+  auto const gpus = std::min<std::size_t>(vx_list("VX_GPUS", {4}).front(), static_cast<std::size_t>(acc::visible_gpus()));
+  REQUIRE(gpus >= 2);
+  acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{16} << 30});
+  auto const rows = static_cast<cudf::size_type>(vx_list("VX_ROWS", {3000000}).front());
+  auto const in   = vx_make_input(fixture, gpus, vx_list("VX_BATCHES", {3}).front(), rows);
+  auto const reps = vx_list("VX_REPS", {3}).front();
+  bool const sync_first = vx_list("VX_SYNC", {0}).front() != 0;
+  std::vector<std::uint64_t> all_masks;
+  for (std::uint64_t mask = 0; mask < (1ull << gpus); ++mask) { all_masks.push_back(mask); }
+  std::size_t cases = 0, bad = 0, printed = 0;
+  for (auto const megabytes : vx_list("VX_MB", {3, 20, 57, 130})) {
+    for (auto const mask : vx_list("VX_MASKS", all_masks)) {
+      if ((mask >> gpus) != 0) { continue; }
+      auto const expected = vx_expected(fixture, in, megabytes, mask);
+      for (auto const& xfer : vx_names("VX_XFER", {"pipe", "star", "exchange", "off"})) {
+        setenv("SIRIUS_PROTO_XFER_D2D", xfer.c_str(), 1);
+        std::size_t local_bad = 0, host_max = 0, scratch_max = 0;
+        for (int root = 0; root < static_cast<int>(gpus); ++root) {
+          for (std::uint64_t rep = 0; rep < reps; ++rep) {
+            auto const got = vx_unsynced(fixture, in, megabytes, mask, root, expected, nullptr,
+                                         fixture.publication_stream(root), sync_first);
+            ++cases;
+            host_max    = std::max(host_max, got.host_bytes);
+            scratch_max = std::max(scratch_max, got.scratch);
+            if (got.mismatched != 0) {
+              ++bad;
+              ++local_bad;
+              if (printed++ < 60) {
+                std::printf("ROW,VX1_BAD,gpus=%zu,mb=%llu,mask=%llu,root=%d,xfer=%s,rep=%llu,mismatched=%zu\n", gpus,
+                            static_cast<unsigned long long>(megabytes), static_cast<unsigned long long>(mask), root,
+                            xfer.c_str(), static_cast<unsigned long long>(rep), got.mismatched);
+              }
+            }
+          }
+        }
+        std::printf("ROW,VX1,gpus=%zu,mb=%llu,mask=%llu,xfer=%s,finishes=%llu,bad=%zu,host_bytes_max=%zu,root_scratch_max=%zu\n",
+                    gpus, static_cast<unsigned long long>(megabytes), static_cast<unsigned long long>(mask), xfer.c_str(),
+                    static_cast<unsigned long long>(reps * gpus), local_bad, host_max, scratch_max);
+        std::fflush(stdout);
+      }
+    }
+  }
+  unsetenv("SIRIUS_PROTO_XFER_D2D");
+  vx_sync(gpus);
+  std::printf("ROW,VX1_SUMMARY,gpus=%zu,sync_first=%d,cases=%zu,bad=%zu\n", gpus, sync_first ? 1 : 0, cases, bad);
+  CHECK(bad == 0);
+}
+
+TEST_CASE("verifier: concurrent publications from several threads (VX2)", "[!benchmark][dynamic_filter][vx2]")
+{
+  auto const gpus = std::min<std::size_t>(vx_list("VX_GPUS", {4}).front(), static_cast<std::size_t>(acc::visible_gpus()));
+  REQUIRE(gpus >= 2);
+  acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{24} << 30});
+  auto const rows    = static_cast<cudf::size_type>(vx_list("VX_ROWS", {3000000}).front());
+  auto const in      = vx_make_input(fixture, gpus, vx_list("VX_BATCHES", {2}).front(), rows);
+  auto const rounds  = vx_list("VX_ROUNDS", {15}).front();
+  auto const threads = vx_list("VX_THREADS", {4}).front();
+  auto const mask    = vx_list("VX_MASKS", {(1ull << gpus) - 1}).front();
+  std::size_t total_bad = 0;
+  for (auto const megabytes : vx_list("VX_MB", {20, 57})) {
+    auto const expected = vx_expected(fixture, in, megabytes, mask);
+    for (auto const& xfer : vx_names("VX_XFER", {"off", "pipe", "star", "exchange"})) {
+      setenv("SIRIUS_PROTO_XFER_D2D", xfer.c_str(), 1);
+      std::atomic<std::size_t> bad{0}, thrown{0}, done{0};
+      std::mutex text_lock;
+      std::string first_error;
+      std::barrier gate{static_cast<std::ptrdiff_t>(threads)};
+      std::vector<std::thread> pool;
+      for (std::uint64_t index = 0; index < threads; ++index) {
+        pool.emplace_back([&, index] {
+          std::vector<std::unique_ptr<rmm::cuda_stream>> mine;
+          for (std::size_t device = 0; device < gpus; ++device) {
+            rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+            mine.push_back(std::make_unique<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking));
+          }
+          int const root = static_cast<int>(index % gpus);
+          std::unique_ptr<rmm::cuda_stream> publication;
+          {
+            rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root}};
+            publication = std::make_unique<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking);
+          }
+          gate.arrive_and_wait();
+          for (std::uint64_t round = 0; round < rounds; ++round) {
+            try {
+              auto const got = vx_unsynced(fixture, in, megabytes, mask, root, expected, &mine,
+                                           ::cuda::stream_ref{publication->value()}, false);
+              if (got.mismatched != 0) { bad.fetch_add(1); }
+            } catch (std::exception const& error) {
+              thrown.fetch_add(1);
+              std::scoped_lock lock{text_lock};
+              if (first_error.empty()) { first_error = error.what(); }
+            }
+            done.fetch_add(1);
+          }
+          for (std::size_t device = 0; device < gpus; ++device) {
+            rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+            (void)cudaStreamSynchronize(mine[device]->value());
+            mine[device].reset();
+          }
+          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root}};
+          (void)cudaStreamSynchronize(publication->value());
+          publication.reset();
+        });
+      }
+      for (auto& thread : pool) { thread.join(); }
+      std::printf("ROW,VX2,gpus=%zu,mb=%llu,mask=%llu,xfer=%s,threads=%llu,finishes=%zu,bad=%zu,thrown=%zu,first_error=%s\n", gpus,
+                  static_cast<unsigned long long>(megabytes), static_cast<unsigned long long>(mask), xfer.c_str(),
+                  static_cast<unsigned long long>(threads), done.load(), bad.load(), thrown.load(), first_error.c_str());
+      std::fflush(stdout);
+      if (xfer != "off") { total_bad += bad.load() + thrown.load(); }
+      vx_sync(gpus);
+    }
+  }
+  unsetenv("SIRIUS_PROTO_XFER_D2D");
+  CHECK(total_bad == 0);
+}
+
+TEST_CASE("verifier: refused scratch lease on the other leader falls back (VX3)", "[!benchmark][dynamic_filter][vx3]")
+{
+  auto const gpus = std::min<std::size_t>(vx_list("VX_GPUS", {4}).front(), static_cast<std::size_t>(acc::visible_gpus()));
+  REQUIRE(gpus >= 3);
+  acc::fixture fixture({.devices = gpus, .gpu_bytes = std::size_t{4} << 30});
+  auto const in       = vx_make_input(fixture, gpus, 1, 1000000);
+  auto const mask     = (1ull << gpus) - 1;
+  auto const megabytes = vx_list("VX_MB", {57}).front();
+  auto const expected = vx_expected(fixture, in, megabytes, mask);
+  auto const slack    = vx_list("VX_SLACK_MIB", {1}).front() << 20;
+  std::size_t bad = 0;
+  for (auto const& xfer : vx_names("VX_XFER", {"off", "pipe", "star", "exchange"})) {
+    for (int root : {0, static_cast<int>(gpus) - 1}) {
+      for (int blocked = 0; blocked < 2; ++blocked) {
+        setenv("SIRIUS_PROTO_XFER_D2D", xfer.c_str(), 1);
+        vx_sync(gpus);
+        auto const baseline = fixture.allocated_bytes();
+        std::span<op::dynamic_filter_replica_space const> const spaces{fixture.spaces.data(), gpus};
+        auto made = vx_create(spaces, megabytes);
+        REQUIRE(made);
+        for (std::size_t device = 0; device < gpus; ++device) {
+          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
+          auto source = in.batches[device][0]->to_read_only();
+          REQUIRE(made->enqueue_add(sirius::get_cudf_table_view(source), rmm::cuda_device_id{static_cast<int>(device)},
+                                    fixture.task_stream(static_cast<int>(device))));
+          fixture.task_stream(static_cast<int>(device)).sync();
+        }
+        vx_sync(gpus);
+        // Blocked: every GPU other than the root has (almost) nothing left to reserve.
+        std::vector<std::unique_ptr<cucascade::memory::reservation>> holds;
+        std::size_t left_min = ~std::size_t{0};
+        if (blocked != 0) {
+          for (std::size_t device = 0; device < gpus; ++device) {
+            if (static_cast<int>(device) == root) { continue; }
+            auto const room = fixture.reservable(static_cast<int>(device));
+            if (room > slack) { holds.push_back(fixture.gpu(static_cast<int>(device)).make_reservation_or_null(room - slack)); }
+            left_min = std::min(left_min, fixture.reservable(static_cast<int>(device)));
+          }
+        }
+        std::size_t mismatched = 0;
+        acc::builder_access::workspace_observation seen{};
+        bool published_ok = false;
+        std::string error;
+        double us = 0;
+        try {
+          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root}};
+          auto const start = std::chrono::steady_clock::now();
+          auto published = acc::builder_access::finish(*made, rmm::cuda_device_id{root}, fixture.publication_stream(root),
+                                                       fixture.gpu(root).get_default_allocator(), false, &seen);
+          us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+          published_ok = static_cast<bool>(published);
+          if (published) {
+            for (std::size_t key = 0; key < 2; ++key) {
+              for (std::size_t device = 0; device < gpus; ++device) {
+                auto replica = builder::inspect_replica(*published->filters[key], rmm::cuda_device_id{static_cast<int>(device)});
+                if (!replica || replica->bytes != expected[key]) { ++mismatched; }
+              }
+            }
+          }
+        } catch (std::exception const& failure) {
+          error = failure.what();
+        }
+        vx_sync(gpus);
+        made.reset();
+        vx_sync(gpus);
+        std::size_t holds_ok = 0;
+        for (auto const& hold : holds) { holds_ok += hold != nullptr; }
+        holds.clear();
+        auto const after = fixture.allocated_bytes();
+        bool const returned = after == baseline;
+        std::printf("ROW,VX3,gpus=%zu,mb=%llu,xfer=%s,root=%d,blocked=%d,holds=%zu,left_min=%zu,published=%d,mismatched=%zu,"
+                    "host_bytes=%zu,root_scratch=%zu,finish_us=%.0f,storage_returned=%d,error=%s\n",
+                    gpus, static_cast<unsigned long long>(megabytes), xfer.c_str(), root, blocked, holds_ok,
+                    blocked != 0 ? left_min : 0, published_ok ? 1 : 0, mismatched, seen.host_staging_bytes,
+                    seen.device_scratch_bytes, us, returned ? 1 : 0, error.c_str());
+        std::fflush(stdout);
+        bad += (!published_ok || mismatched != 0 || !returned) ? 1 : 0;
+      }
+    }
+  }
+  unsetenv("SIRIUS_PROTO_XFER_D2D");
+  CHECK(bad == 0);
+}
