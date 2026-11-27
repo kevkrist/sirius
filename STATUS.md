@@ -1,3 +1,11 @@
+# STATUS 2026-11-27 UTC (session resumed after NVMe wipe)
+
+- Restored: tip build, SF1000 data, notes, fork branches (no worktrees except those agents recreate).
+- NEW: notes/DESIGN_TRANSFER_PR.md (architect, transfer PR production design; open questions for user inside).
+- RUNNING: workflow df-close-out (eager finish + verify, combined measure + verify, DECISION.md).
+  Script: ~/.claude/projects/-home-ubuntu-sirius/90fe0da0-364a-41dc-b0f4-acbde346fc58/workflows/scripts/df-close-out-wf_a708a68d-82c.js
+- Below: state as of 2026-11-20 (still valid).
+
 # STATUS 2026-11-20 04:10 UTC
 
 Baseline: base 15225 ms, tip (#2570) ~15300-15370 ms, DF off 16627 ms.
