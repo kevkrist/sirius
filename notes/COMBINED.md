@@ -43,3 +43,6 @@ dropped -> 4 kept per process, 8 hot per arm.
   disables what they assert), the other 652 pass.
 - 11-27 18:45: main block started: `bin/abba.sh m1 6 "T S X E SX SE XE SXE" 21 3 7 8 5 10 9 4 12 16 2 22 20 11 17 18 19`
   (progress `$R/runs/combined/m1.progress`, raw `$R/runs/combined/m1_<arm>_{a,b}/`). Then non-DF block `n1` (T, SXE).
+- 11-27 19:26: m1 done for q21 q3 q7 q8 q5 (all rc=0, results identical in all 16 processes per query). Partial table
+  `$R/runs/combined/out/m1_partial.md` (regenerate: `python3 $R/runs/combined/bin/table.py m1`). q21: T 1441.9, S 1137.7,
+  X 1238.3, E 1384.0, SX 1119.0, SE 1076.8, XE 1177.4, SXE 1061.3 ms.
