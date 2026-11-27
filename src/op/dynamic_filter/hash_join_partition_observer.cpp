@@ -17,6 +17,8 @@
 #include "op/dynamic_filter/hash_join_partition_observer.hpp"
 
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
+#include "log/logging.hpp"
+#include "op/dynamic_filter/proto_oneshot.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_partition.hpp"
 
@@ -24,7 +26,7 @@ namespace sirius::op {
 
 hash_join_partition_observer::hash_join_partition_observer(sirius_physical_hash_join& join,
                                                            sirius_physical_partition& input)
-  : _join(join), _certifier(input, join.dynamic_filter_session())
+  : _join(join), _certifier(input, join.dynamic_filter_session()), _input(input)
 {
 }
 
@@ -34,7 +36,20 @@ void hash_join_partition_observer::on_arrival(std::string_view port_id,
   _certifier.on_arrival(port_id, batch);
 }
 
-bool hash_join_partition_observer::before_claim() { return _certifier.decide(); }
+bool hash_join_partition_observer::before_claim()
+{
+  if (_deferred.load(std::memory_order_acquire)) { return true; }
+  if (proto_oneshot_mode() != 0 && _join.dynamic_filter_session().plan().enabled() &&
+      _input.layout() && _join.proto_build_arrives_whole()) {
+    if (!_deferred.exchange(true)) {
+      _certifier.proto_defer();
+      SIRIUS_LOG_INFO("[proto_oneshot] join {} defers construction to the whole-build delivery",
+                      _join.get_operator_id());
+    }
+    return true;
+  }
+  return _certifier.decide();
+}
 
 void hash_join_partition_observer::on_hash_input(cucascade::read_only_data_batch const& batch)
 {
@@ -60,6 +75,7 @@ void hash_join_partition_observer::after_transform(uint64_t id,
 void hash_join_partition_observer::finalize_input()
 {
   auto& session = _join.dynamic_filter_session();
+  if (_deferred.load(std::memory_order_acquire)) { return; }  // the join finalizes the session
   session.finalize_input();
   D_ASSERT(!session.plan().enabled() || session.terminal());
 }
