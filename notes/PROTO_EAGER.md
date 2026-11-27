@@ -260,3 +260,11 @@ TRACE pass of the prototype (`runs/eager/logpass`, eager=1, 22 queries, all rc=0
   Before it: TRACE tip log pass `runs/baseline/logpass` (regenerates df_summary.json for `runs/profile/bin/quent_df.py`).
 - `wt-eager2` recreated from `proto/eager-opt2` fdd2caec + `proto/cucascade-batch-staging.patch` applied in the cucascade
   submodule (uncommitted there, as before); build log `logs/eager2_build_r7.log`.
+- 2026-11-27 19:44 UTC. Build of `wt-eager2` rc=0 (422 s). TRACE tip log pass done (22/22 rc=0, 46 DF-constructing joins;
+  `runs/baseline/logpass/df_summary.json`, tables `df_tables.md`). It took 76 min of wall time: two other agents share the
+  lock. Plan r7 therefore trimmed before it started to 118 processes in 12 holds (`plans/r7.plan`): arms that are the tip
+  code path by construction are not run (g2/k1 where no join has a filter plan: q14 q15; any arm on q1 q4 q6 q13, which
+  have no eager activation: one f1 process each for results and the log check); where every activated join has a filter
+  plan (q11 q17 q19 q20) switch 1 = switch 2, so g2 = f1 and k1 = fk1 by construction.
+  Started 19:44; progress in the task output of `bin/queue_r7.sh` and `runs/eager/logs/r7_q*.out`, per-process rc in
+  `runs/eager/r7_*/status.txt`.
