@@ -28,6 +28,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <ranges>
@@ -164,6 +165,12 @@ struct shadow_judgement {
                                             std::size_t decode_membership_cap) noexcept
 {
   shadow_judgement judgement;
+  // proto/combined measurement switch: SIRIUS_PROTO_SHADOW_OFF=1 judges no key shadowed (tip plan).
+  static const bool proto_shadow_off = [] {
+    auto const* text = std::getenv("SIRIUS_PROTO_SHADOW_OFF");
+    return text != nullptr && text[0] == '1';
+  }();
+  if (proto_shadow_off) { return judgement; }
   if (!judged(candidate)) { return judgement; }
   for (auto const& binding : bindings) {
     if (!statically_selected(candidate, binding.published, decode_membership_cap)) {
