@@ -37,3 +37,9 @@ dropped -> 4 kept per process, 8 hot per arm.
 ## 0. Checkpoint log (chronological; append only)
 
 - 11-27: worktree + branch created, 5 picks clean, switch commit c5aa5bdf, build started (`$R/logs/build_combined.log`).
+- 11-27 18:35: build rc=0. Unit gates (`$R/runs/combined/unit/summary.txt`, `bin/unit.sh`): single-GPU DF 661 cases /
+  143845 assertions passed; `[dynamic_filter][multi_gpu]` 33 cases passed with switches unset, with X=pipe, with X+E;
+  `[xfer_relay],[mbid]` passed. With `SIRIUS_PROTO_SHADOW_OFF=1` the 9 shadow-rule cases fail (expected: the switch
+  disables what they assert), the other 652 pass.
+- 11-27 18:45: main block started: `bin/abba.sh m1 6 "T S X E SX SE XE SXE" 21 3 7 8 5 10 9 4 12 16 2 22 20 11 17 18 19`
+  (progress `$R/runs/combined/m1.progress`, raw `$R/runs/combined/m1_<arm>_{a,b}/`). Then non-DF block `n1` (T, SXE).
