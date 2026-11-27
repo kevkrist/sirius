@@ -1,3 +1,5 @@
+SUPERSEDED 2026-11-27 by PROTO_EAGER.md section 6 (final). Kept as the previous author's draft; placeholders below were never filled here.
+
 ## 6. Throttle, option 2, S6 release condition, contention, final table (re-run 2026-11-19/20 after the wipe)
 
 All raw data of sections 1-5 was lost in the wipe; everything in this section was measured again. Both worktrees were
