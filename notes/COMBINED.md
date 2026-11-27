@@ -51,3 +51,4 @@ dropped -> 4 kept per process, 8 hot per arm.
 - 11-27 20:39: m1 done for 11 queries (21 3 7 8 5 10 9 4 12 16 2); chunk 3 (22 20 11) started, then 17 18 19, then n1.
 - 11-27 21:20: m1 done for 14 queries (+22 20 11); chunk 4 (17 18 19) started.
 - 11-27 22:00: m1 complete (17 DF queries x 8 arms x 2 processes = 272 processes, all rc=0). Table `/opt/dlami/nvme/dfperf/runs/combined/out/m1.md`. q11: 16 different md5 but one sorted-content md5 (730f7529, 936989 lines) = tie order only. n1 (1 6 13 14 15; T O SXE) + o1 (21 3; T O) started.
+- 11-27 22:48: n1 + o1 complete (rc=0 all). Tables `/opt/dlami/nvme/dfperf/runs/combined/out/n1.md`, `/opt/dlami/nvme/dfperf/runs/combined/out/o1.md`. Log pass lp (T S X SXE; DEBUG, 3 iterations) started for the finish-chain residual.
