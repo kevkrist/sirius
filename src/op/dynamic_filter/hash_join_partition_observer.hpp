@@ -19,6 +19,8 @@
 #include "op/dynamic_filter/build_input_certifier.hpp"
 #include "op/partition/partition_input_observer.hpp"
 
+#include <atomic>
+
 namespace sirius::op {
 class sirius_physical_hash_join;
 
@@ -42,5 +44,8 @@ class hash_join_partition_observer final : public partition_input_observer {
  private:
   sirius_physical_hash_join& _join;
   build_input_certifier _certifier;
+  sirius_physical_partition& _input;  // PROTO one-shot
+  std::atomic<bool> _deferred{false};  // PROTO one-shot
+
 };
 }  // namespace sirius::op

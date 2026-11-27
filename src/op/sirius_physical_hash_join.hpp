@@ -413,6 +413,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
 
+  bool _build_arrives_whole = false;  // PROTO one-shot
+
   // Whole-counted BUILD_PROBE and orphan bytes. Relaxed reads may be slightly stale.
   std::atomic<std::size_t> _whole_probe_bytes{0};
 
@@ -532,6 +534,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   dynamic_filter_stats* _dynamic_filter_stats = nullptr;
 
  public:
+  // PROTO one-shot (restored from pr2569)
+  void push_data_batch_partitioned(std::string_view port_id,
+                                   std::shared_ptr<::cucascade::data_batch> batch,
+                                   std::size_t partition_idx) override;
+  void set_build_arrives_whole(bool arrives_whole);
+  [[nodiscard]] bool proto_build_arrives_whole();
+
   [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
   {
     return _dynamic_filter_session.plan();

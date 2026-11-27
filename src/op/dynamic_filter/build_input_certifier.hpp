@@ -106,6 +106,15 @@ class build_input_certifier final {
   build_arrival_ledger _arrival_ledger;
   std::mutex _decision_mutex;
   bool _decided = false;
+ public:
+  // PROTO one-shot: the site constructs nothing; the join constructs from the whole build.
+  void proto_defer() noexcept
+  {
+    std::scoped_lock guard(_decision_mutex);
+    _arrival_ledger.abandon();
+    _decided = true;
+  }
+ private:
   std::atomic<bool> _began{false};  ///< Whether `decide` began the session's attempt
 };
 

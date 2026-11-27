@@ -38,6 +38,9 @@
 #include "expression_evaluator/gpu_expression_translator_internal.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/dynamic_filter/proto_oneshot.hpp"
+
+#include <chrono>
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/key_preparation.hpp"
@@ -2215,6 +2218,41 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                             *input_batches[0].get_memory_space(),
                             stream,
                             batch_telemetry());
+}
+
+// PROTO one-shot (restored from pr2569)
+void sirius_physical_hash_join::set_build_arrives_whole(bool arrives_whole)
+{
+  std::lock_guard<std::mutex> lg(op_state_mutex);
+  _build_arrives_whole = arrives_whole;
+}
+
+bool sirius_physical_hash_join::proto_build_arrives_whole()
+{
+  std::lock_guard<std::mutex> lg(op_state_mutex);
+  return _build_arrives_whole;
+}
+
+void sirius_physical_hash_join::push_data_batch_partitioned(
+  std::string_view port_id,
+  std::shared_ptr<::cucascade::data_batch> batch,
+  std::size_t partition_idx)
+{
+  auto const deposit = [&] {
+    sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
+      port_id, batch, partition_idx);
+  };
+  if (proto_oneshot_mode() != 0 && port_id == "build" && batch && proto_build_arrives_whole()) {
+    auto const t0 = std::chrono::steady_clock::now();
+    _dynamic_filter_session.observe_whole_build(complete_build_delivery{batch}, deposit);
+    SIRIUS_LOG_INFO(
+      "[proto_oneshot] join {} whole-build delivery slot {} observed in {:.3f} ms",
+      get_operator_id(),
+      partition_idx,
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return;
+  }
+  deposit();
 }
 
 void sirius_physical_hash_join::on_finalize_operator()

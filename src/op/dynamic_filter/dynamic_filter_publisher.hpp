@@ -22,7 +22,11 @@
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 
+#include <cudf/table/table_view.hpp>
+
 #include <cuda/stream>
+
+#include <functional>
 
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +36,7 @@
 #include <vector>
 
 namespace cucascade {
+class data_batch;
 class read_only_data_batch;
 }  // namespace cucascade
 
@@ -58,6 +63,20 @@ namespace sirius::op {
  * accumulator storage until `release_retired_storage` can safely free it outside task tracking.
  * Engine task drain precedes session destruction.
  */
+class sirius_physical_hash_join;
+
+// PROTO one-shot (restored from pr2569)
+class complete_build_delivery final {
+ private:
+  friend class sirius_physical_hash_join;
+  friend class dynamic_filter_publication_session;
+  explicit complete_build_delivery(std::shared_ptr<cucascade::data_batch> batch)
+    : _batch(std::move(batch))
+  {
+  }
+  std::shared_ptr<cucascade::data_batch> _batch;
+};
+
 class dynamic_filter_publication_session final {
   struct state;
 
@@ -202,6 +221,10 @@ class dynamic_filter_publication_session final {
    * A running publication may finish; an incomplete accumulation ends without a filter, and an
    * unclaimed pending publication ends as abandoned. Storage release remains separate.
    */
+  // PROTO one-shot (restored from pr2569)
+  void observe_whole_build(complete_build_delivery const& delivery,
+                           std::function<void()> const& deposit);
+
   void finish_input() noexcept;
 
   /**
@@ -214,5 +237,18 @@ class dynamic_filter_publication_session final {
  private:
   std::unique_ptr<state> _state;
 };
+
+// PROTO one-shot (restored from pr2569)
+struct dynamic_filter_publication_outcome : dynamic_filter_stats_snapshot {
+  std::size_t active_targets = 0;
+  std::vector<dynamic_filter_key_outcome> keys;  ///< One per admitted key, by admitted-key index
+};
+
+[[nodiscard]] dynamic_filter_publication_outcome publish_dynamic_filters(
+  dynamic_filter_publish_plan const& plan,
+  cudf::table_view const& build_view,
+  ::cuda::stream_ref stream,
+  std::span<sirius_dynamic_filter_set::producer const> producers,
+  std::function<bool()> const& before_fanout = {});
 
 }  // namespace sirius::op
