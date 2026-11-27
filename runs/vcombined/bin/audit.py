@@ -9,7 +9,9 @@ for d in sorted(glob.glob(f"{base}/{pre}*_[ab]/tpch_*_q*")):
     m = re.search(rf"/{re.escape(pre)}([A-Z]+)_([ab])/tpch_.*_q(\d+)$", d)
     if not m: continue
     arm, half, q = m.group(1), m.group(2), int(m.group(3))
+    if not os.path.exists(f"{d}/csv/runtimes.csv"): print("SKIP incomplete", d); continue
     rows = [r for r in csv.DictReader(open(f"{d}/csv/runtimes.csv")) if r["query"] != "TOTAL"]
+    if len(rows) < 3: print("SKIP incomplete", d); continue
     if (q, arm, half) in ev: half += "2"  # second block of the same query (verifier's repeat)
     n_iter[(q, arm, half)] = len(rows)
     T[q][arm][half] = [float(r["runtime_s"]) * 1000 for r in rows if int(r["iteration"]) >= 2]
