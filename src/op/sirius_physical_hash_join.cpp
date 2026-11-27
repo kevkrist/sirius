@@ -955,7 +955,7 @@ void sirius_physical_hash_join::activate_probe_after_build_partition(
     bool const terminal   = session.terminal();
     if (mode == 1 && !has_plan) { return; }
     if (has_plan && !terminal) {
-      SIRIUS_LOG_ERROR("[eager] join {}: session NOT terminal at build PARTITION finalize; "
+      SIRIUS_LOG_INFO("[eager] join {}: session NOT terminal at build PARTITION finalize; "
                        "probe not activated early",
                        get_operator_id());
       return;
