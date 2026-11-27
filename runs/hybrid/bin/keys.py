@@ -23,6 +23,8 @@ def load(arm, q):
             m = re.search(r"join filters kept (\d+)/(\d+) rows", l)
             if m: cur["lines"]["kept"] += int(m.group(1)); cur["lines"]["of"] += int(m.group(2))
     r = glob.glob(d + f"/sirius/q{q}/result.txt")
+    n = sum(1 for l in open(d + "/csv/runtimes.csv") if l.startswith("sirius,q"))
+    wins = wins[-n:]
     return dict(wins=wins, res=hashlib.md5(open(r[0], "rb").read()).hexdigest()[:8] if r else None)
 print(f"| q | windows ok {A}/{Bb} | errors | result | key lines (sorted, hot windows) | deferred joins ({Bb}) | decode-pushdown kept/of {A} | {Bb} | join: ready ms {A} -> {Bb} |"); print("|---|" + "---|" * 8)
 for q in qs:
