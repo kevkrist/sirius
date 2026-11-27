@@ -508,7 +508,7 @@ TRACE pass of the prototype (`runs/eager/logpass`, eager=1, 22 queries, all rc=0
 - 2026-11-27 21:05 UTC. r7 done: 118 / 118 rc=0 (`runs/eager/r7_*/status.txt`). Checks run (CPU): results 22 / 22 identical
   over 425 files; 0 fallback / error / retry lines; gate log `out/gatelog_r7_f11.md`; Quent visibility
   `out/qdf_r7_{f1,fk1,tip}.md` (0 scan tasks before any publication). Table `out/r7_suite_table.md` (`bin/r7_tables.py`).
-- 2026-11-27 21:30 UTC. Section 6 replaced by the final text (source copy `notes/PROTO_EAGER_sec6_final.md`;
+- 2026-11-27 21:07 UTC. Section 6 replaced by the final text (source copy `notes/PROTO_EAGER_sec6_final.md`;
   `PROTO_EAGER_sec6_template.md` is the previous author's draft, superseded). Nothing pending for this track. Not done,
   out of scope here: independent verification of the prototype, production code (architect -> developer -> reviewer).
   `wt-eager2` (fdd2caec + cuCascade patch applied uncommitted in the submodule) is built; `wt-eager` was not recreated.
