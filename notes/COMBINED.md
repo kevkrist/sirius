@@ -242,7 +242,7 @@ DEBUG logging inflates slightly; the 12 queries with a Bloom. `python3 $R/runs/c
 
 - Finish chain per suite pass: **tip 664 ms -> S 312 -> X 265 -> combined 123 ms** (-81%). Bloom bytes finished: 3188 ->
   1620 MiB (S drops q21 j18 1394 MiB and q8 j41 174 MiB; constructions 32 -> 30).
-- The residual 123 ms is 76 ms/GiB over 1620 MiB (tip: 208 ms/GiB), largest items q7 32 ms (301 MiB), q3 23 ms (338 MiB),
+- The residual 123 ms is 78 ms/GiB over 1620 MiB (tip: 213 ms/GiB), largest items q7 32 ms (301 MiB), q3 23 ms (338 MiB),
   q10 14 ms, q9 11 ms, q21 10 ms. With E on, part of it no longer sits on the critical path (the probe side is already
   scheduled); how much of the 123 ms still reaches the wall was not measured (needs nsys / Quent per site).
 
