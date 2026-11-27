@@ -19,7 +19,7 @@ def cell(arm_tags, q):
         if v and t: return st.median(v) - st.median(t), len(v), max(v) - min(v), tag, st.median(t), max(t) - min(t)
     return None
 cols = [("o1 (sw1)", [("g2", "fs2"), ("g2", "r7")]),
-        ("k1 (sw1)", [("k1", "c4"), ("k1", "r7")]),
+        ("k1 (sw1)", [("k1", "c4"), ("k1", "b2"), ("k1", "r7")]),
         ("f1 11-19", [("f1", "fs2")]),
         ("f1 11-27", [("f1", "r7")]),
         ("fk1 11-27", [("fk1", "r7")]),

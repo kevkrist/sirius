@@ -17,6 +17,15 @@
   the pipelined host bounce is the cross-pair leg / no-P2P fallback.
 - (2026-11-19) Instance auto-stops. Checkpoint incrementally to fork kevkrist/sirius (branches dfperf/*, notes branch dfperf/notes,
   issues allowed). A fresh session must be able to resume from dfperf/notes:RESUME.md alone.
+- (2026-11-27) Transfer PR design answers (DESIGN_TRANSFER_PR.md questions): Q1 CPU OR between islands vs GPU OR: MEASURE in the
+  engine first (step-0 spike decides). Q2 scratch OOM now publishes through host instead of skipping: accepted, CHANGE THE TESTS.
+  Q6 coverage: this 4-GPU box is sufficient for now. Q8: transfer PR LANDS INDEPENDENTLY of S6. Q4 (delete tip serial host loop):
+  user asked what it is; answer pending.
+- (2026-11-27) NEW QUESTION from user (prototype + decide "when the time is right"): #2570 deletes the one-shot (CONCAT-site)
+  construction. Possibly best design = construct at PARTITION for multi-partition builds, ONE-SHOT for single-PARTITION builds,
+  eager scan scheduling after construction in both cases (different eagerness per construction point, keeps one-shot's
+  efficiency + simplicity). At minimum maybe keep the one-shot path with a flag choosing the construction point for
+  single-partition builds. Track: notes/PROTO_HYBRID_ONESHOT.md.
 
 # OPPORTUNITIES: measured, verified opportunity list for the DF stack (#2569 -> #2570), TPC-H SF1000, 4 GPUs
 
