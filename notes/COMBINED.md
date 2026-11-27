@@ -46,3 +46,5 @@ dropped -> 4 kept per process, 8 hot per arm.
 - 11-27 19:26: m1 done for q21 q3 q7 q8 q5 (all rc=0, results identical in all 16 processes per query). Partial table
   `$R/runs/combined/out/m1_partial.md` (regenerate: `python3 $R/runs/combined/bin/table.py m1`). q21: T 1441.9, S 1137.7,
   X 1238.3, E 1384.0, SX 1119.0, SE 1076.8, XE 1177.4, SXE 1061.3 ms.
+- 11-27 19:50: m1 done for q21 q3 q7 q8 q5 q10 q9. The harness kills a background command after 60 min: the block is
+  relaunched in chunks of 4 queries (same tag `m1`, same script; `m1b.log`, then q22 q20 q11 17, then 18 19 + n1).
