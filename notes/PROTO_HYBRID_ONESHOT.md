@@ -80,3 +80,10 @@ Commits: `7d7cdcdb` (one-shot), `618fc1c8` (cherry-pick of `proto/eager-probe`),
   160514096/1927817321 rows in both modes; filter ready j8 17 -> 26 ms, j15 184 -> 273 ms; one-shot wall 14.5 / 48.5 ms.
 - 19:40 queues started: unit gate (`runs/hybrid/unit`), debug pass `lp` (T,H; 22 q), timing `m1` (T H E EH on 15 DF queries,
   T H on 7 controls; 1 warm + 5 hot, first hot dropped, ABBA, one lock hold per half block).
+- 20:44 unit gate done (`runs/hybrid/unit/summary.txt`): switch off 638/638 single-GPU + 31/31 multi-GPU DF cases pass; switch 1:
+  3 cases fail, all assertions about the tip's construction site/counters (`test_physical_partition.cpp:1014` broadcast
+  `accumulations_started`, `test_gpu_execution_dynamic_filter_multi_partition.cpp:306,333`: "a single-partition build constructs
+  its filters at the PARTITION", and the Bloom budget gate `keys_skipped_bloom_size_gate` which the one-shot path does not have).
+- 21:18 debug pass `lp` done (T vs H, 22 queries, `runs/hybrid/out_lp_keys.md`): all windows ok, 0 error lines, results identical
+  on 21 (q11 tie order differs), key lines identical on 21 (q20 j45, a skipped/drained filter, logs no key line in H).
+  Per-query queue was re-batched (`bin/batch.sh`: several queries per lock hold) because the lock has 3 queues.
