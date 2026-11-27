@@ -10,6 +10,7 @@
 #   bs    o1 + CUCASCADE_PROTO_BATCH_STAGING=1 (build move queues the whole table's copies at once)   b0  same, eager off
 #   bsk   bs + scan throttle 1          bf   f1 + batched staging
 #   bs2 / b02 / bs2k / bf2: as bs / b0 / bsk / bf with CUCASCADE_PROTO_BATCH_STAGING=2 (all D2H first, then one H2D train)
+#   fk1   f1 + scan throttle 1 (added 2026-11-27, tag r7)
 #   f1    E2 eager 2, gate 2, admit 16 GiB (S6 shape)   f1k  f1 + scan throttle 2
 tag=$1; iters=$2; qlist=$3; shift 3   # <q> may be a comma list: the same arms for each query, one hold
 B=/opt/dlami/nvme/dfperf/runs/eager/bin; R=/opt/dlami/nvme/dfperf; E2=$R/wt-eager2
@@ -31,6 +32,7 @@ for spec in "$@"; do
     adm)  REPO=$E2 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=1 SIRIUS_EAGER_GATE=2 SIRIUS_EAGER_ADMIT_GIB=1000 $B/one_query.sh $label $q $iters ;;
     f1)   REPO=$E2 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=2 SIRIUS_EAGER_GATE=2 SIRIUS_EAGER_ADMIT_GIB=16 $B/one_query.sh $label $q $iters ;;
     f1k)  REPO=$E2 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=2 SIRIUS_EAGER_GATE=2 SIRIUS_EAGER_ADMIT_GIB=16 SIRIUS_EAGER_SCAN_THROTTLE=2 $B/one_query.sh $label $q $iters ;;
+    fk1)  REPO=$E2 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=2 SIRIUS_EAGER_GATE=2 SIRIUS_EAGER_ADMIT_GIB=16 SIRIUS_EAGER_SCAN_THROTTLE=1 $B/one_query.sh $label $q $iters ;;
     bs)   REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=1 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=1 $B/one_query.sh $label $q $iters ;;
     b0)   REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=1 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=0 $B/one_query.sh $label $q $iters ;;
     bsk)  REPO=$E2 CUCASCADE_PROTO_BATCH_STAGING=1 SIRIUS_DF_DEFER_PUBLISH=0 SIRIUS_EAGER_PROBE=1 SIRIUS_EAGER_SCAN_THROTTLE=1 $B/one_query.sh $label $q $iters ;;

@@ -245,3 +245,18 @@ TRACE pass of the prototype (`runs/eager/logpass`, eager=1, 22 queries, all rc=0
   0.99) are 12 instead of 16, same cause. Applied chunks and survivors are equal.
 - So: same filters built, published and attached; every chunk that probes runs all its probes; the count of *measured*
   chunks moves with scan concurrency. Not a coverage loss.
+
+## CHECKPOINT LOG (chronological; newest last)
+
+- 2026-11-27 (close-out session, new author). Inventory of the 2026-11-19/20 re-run from `runs/eager/*/status.txt`
+  (`bin/checks.sh`): v1 16/16, b2 36/36, c3 16/16, c4 86/86, fs 8/8, fs2 156/156, gt 23/24 processes rc=0 (gt q2: all 6 ran,
+  one g2 dir and its status line lost in the backup). Derived tables survive in `runs/eager/out/` (calc_table.md,
+  suite_table.md, gate_arms.md, gatelog_f1.md). Lost in the wipe: all Quent telemetry, `runs/baseline/logpass/df_summary.json`,
+  result files of q11 q16 q20 (> 512 KiB).
+- Missing for the task questions -> new batch tag `r7` (plan `runs/eager/plans/r7.plan`, 176 processes, queue script
+  `runs/eager/bin/queue_r7.sh`, progress `runs/eager/logs/r7_q*.out`): (1) g2 (option 1, switch 1) and k1 on the 10
+  queries where section 6.5 assumed "g2 = f1"; k1 on q14 q18; (2) new arm `fk1` = f1 + scan throttle K=1 (added to
+  `bin/unit2.sh`) with tip and f1 on all 22 queries; (3) Quent + result files of f1 on all 22 (visibility check, results).
+  Before it: TRACE tip log pass `runs/baseline/logpass` (regenerates df_summary.json for `runs/profile/bin/quent_df.py`).
+- `wt-eager2` recreated from `proto/eager-opt2` fdd2caec + `proto/cucascade-batch-staging.patch` applied in the cucascade
+  submodule (uncommitted there, as before); build log `logs/eager2_build_r7.log`.
