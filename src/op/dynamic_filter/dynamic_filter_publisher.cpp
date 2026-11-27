@@ -1477,7 +1477,6 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
                                      admitted_key,
                                      build_rows,
                                      plan.domain_coverage_threshold(),
-                                     detail::publication_path::ORDINARY,
                                      /*publishable=*/true)) {
         ++outcome.keys_skipped_domain_gate;
         reported.reason = dynamic_filter_key_reason::DOMAIN_GATE;
