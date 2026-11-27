@@ -49,3 +49,4 @@ dropped -> 4 kept per process, 8 hot per arm.
 - 11-27 19:50: m1 done for q21 q3 q7 q8 q5 q10 q9. The harness kills a background command after 60 min: the block is
   relaunched in chunks of 4 queries (same tag `m1`, same script; `m1b.log`, then q22 q20 q11 17, then 18 19 + n1).
 - 11-27 20:39: m1 done for 11 queries (21 3 7 8 5 10 9 4 12 16 2); chunk 3 (22 20 11) started, then 17 18 19, then n1.
+- 11-27 21:20: m1 done for 14 queries (+22 20 11); chunk 4 (17 18 19) started.
