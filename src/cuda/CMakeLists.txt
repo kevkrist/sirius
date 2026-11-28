@@ -7,6 +7,7 @@ target_sources(
           low_cardinality_groupby.cu
           device_copy_batch.cpp
           device_transfer.cpp
+          proto_xfer.cpp
           dynamic_filter_mask_ops.cu
           dynamic_filter_prepared_keys.cu
           bounds_accumulator.cu
