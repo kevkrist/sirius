@@ -2250,6 +2250,16 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
       get_operator_id(),
       partition_idx,
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    // VERIFY (throwaway): eager release right after the one-shot publication instead of waiting
+    // for the last sibling slot's build CONCAT. Switch SIRIUS_VERIFY_EAGER_ONESHOT=1 (needs
+    // SIRIUS_EAGER_PROBE=1).
+    static bool const release_after_oneshot = [] {
+      char const* v = std::getenv("SIRIUS_VERIFY_EAGER_ONESHOT");
+      return v && std::atoi(v) != 0;
+    }();
+    if (release_after_oneshot && _dynamic_filter_session.terminal()) {
+      activate_probe_after_build_partition(nullptr);
+    }
     return;
   }
   deposit();
