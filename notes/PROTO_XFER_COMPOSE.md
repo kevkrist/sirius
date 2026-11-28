@@ -78,6 +78,92 @@ singletons all four <= 60: 42.8-54.3 PASS. Fixed cost 1 MiB <= tip + 0.10 ms: +0
 Memory held (trace line), G = 4, two pair islands, all contributing, 8 MiB chunks: compose pinned 48 MiB, root scratch 16 MiB,
 other leader 16 MiB (lease). pipe: pinned 32 MiB, root 32 MiB, other leader 32 MiB. Tip: 8 / 8 / 0.
 
+### 3.2 Few cores (`taskset`, `mb/mb4_taskset{8,4,2}.log`; ms/GiB, all four, 281 / 1434 MiB)
+
+| cores for the process | off | pipe (GPU OR) | compose (CPU OR, 4 OR threads) |
+|---|---|---|---|
+| 96 (no pin) | 186 / 186 | 52.0 / 51.6 | 52.5 / 51.7 |
+| 8 | 186 / 186 | 52.1 / 51.6 | 52.8 / 52.0 |
+| 4 | 186 / 186 | 52.0 / 51.7 | 52.5 / 51.5 |
+| 2 | 186 / 186 | 52.2 / 51.7 | **95.8 / 87.8** (spread 8-17%) |
+
+CPU OR needs as many free cores as OR threads; with fewer it degrades 1.7-1.85x (still 2x faster than the tip). GPU OR does not care.
+
+## 4. Engine: TPC-H SF1000, 4 GPUs, three arms in ABBA
+
+Arms: tip = binary `$R/repo` (pr2570 ae939824); cpu = spike binary `SIRIUS_PROTO_XFER_D2D=compose`; gpu = spike binary `=pipe`.
+Per query, per block: 6 fresh processes inside one lock hold, 6 iterations each (1 warm + 5 hot, first hot dropped).
+Block `e1` order tip cpu gpu gpu cpu tip; block `e2` mirrored (tip gpu cpu cpu gpu tip). n = 16 hot iterations per arm and query
+(4 processes x 4). Median of the pooled 16. Config untouched. `bin/abba3_block.sh`, `bin/abba3r_q.sh`, `bin/abba3_table.py e1 e2`.
+All 144 processes rc = 0; `result.txt` md5: one distinct value per query over the 12 processes of each query.
+
+| q | tip ms | cpu OR ms | gpu OR ms | cpu - tip | gpu - tip | **cpu - gpu** | process medians tip / cpu / gpu |
+|---|---|---|---|---|---|---|---|
+| 21 | 1445.2 | 1242.1 | 1242.1 | -203.1 | -203.1 | **0.0** | 1444 1446 1444 1445 / 1239 1241 1244 1242 / 1242 1241 1242 1243 |
+| 3 | 659.8 | 622.2 | 621.5 | -37.6 | -38.3 | +0.7 | 662 665 658 662 / 620 625 625 624 / 620 625 625 621 |
+| 7 | 745.6 | 707.0 | 706.9 | -38.6 | -38.7 | +0.1 | 748 744 747 747 / 707 709 710 705 / 705 707 709 706 |
+| 8 | 936.9 | 911.7 | 911.7 | -25.2 | -25.3 | +0.1 | 935 937 937 937 / 910 913 913 909 / 911 912 912 911 |
+| 10 | 853.7 | 821.4 | 824.3 | -32.3 | -29.4 | -3.0 | 839 861 862 846 / 836 814 821 817 / 830 812 824 832 |
+| 9 | 1422.7 | 1398.0 | 1393.0 | -24.6 | -29.7 | +5.1 | 1421 1418 1427 1432 / 1392 1406 1405 1399 / 1390 1390 1402 1391 |
+| 6 (control) | 379.8 | 379.8 | 380.0 | -0.1 | +0.1 | -0.2 | 381 381 380 379 / 380 380 381 379 / 380 380 380 382 |
+| 2 (control) | 149.2 | 146.6 | 146.3 | -2.7 | -2.9 | +0.2 | 150 149 148 150 / 146 146 149 148 / 148 146 147 146 |
+| sum of 8 | 6593 | 6229 | 6226 | **-364** | **-367** | **+3** | |
+
+Per block (sum of 8): e1 cpu -363 / gpu -379 (cpu - gpu +16, from q9 +8.5 and q10 +5.6); e2 cpu -366 / gpu -364 (cpu - gpu -2).
+q10 and q9 are the two noisy queries (process medians of ONE arm differ by 14-24 ms). Largest |cpu - gpu| = 5.1 ms (q9) < the
++-10 ms noise band. **CPU OR and GPU OR tie in the engine.**
+
+### 4.1 DEBUG finish lines (untimed log pass, 3 iterations, same binary, modes off / pipe / compose; `bin/logpass.sh`, `bin/log_table.py`)
+
+Median finish wall of the Bloom finishes >= 16 MiB (3 per mode). "CPU OR" and "wait" = publishing-thread time inside `finish`.
+
+| q | MiB | sources | off ms (ms/GiB) | pipe ms (ms/GiB) | compose ms (ms/GiB) | compose: CPU OR ms / event waits ms | route (compose) |
+|---|---|---|---|---|---|---|---|
+| 21 | 1394 | 3 | 261.1 (192) | 76.2 (56) | 74.8 (55) | 31.1 / 11.6 | CPU OR |
+| 21 | 133 | 3 | 26.1 (201) | 8.58 (66) | 8.55 (66) | 3.1 / 1.1 | CPU OR |
+| 3 | 280 | 3 | 57.0 (208) | 19.9 (73) | 19.7 (72) | 6.8 / 2.1 | CPU OR |
+| 3 | 57 | 0 | 4.08 (73) | 2.94 (53) | 2.93 (52) | - | pass-through |
+| 7 | 278 | 3 | 51.3 (189) | 14.5 (54) | 14.3 (53) | 6.4 / 2.2 | CPU OR |
+| 7 | 23 | 0 | 1.57 (70) | 1.14 (51) | 1.09 (49) | - | pass-through |
+| 8 | 174 | 3 | 35.3 (208) | 12.5 (74) | 12.4 (73) | 4.1 / 1.2 | CPU OR |
+| 8 | 57 | 0 | 4.07 (73) | 2.96 (53) | 2.94 (53) | - | pass-through |
+| 10 | 109 | 3 | 20.4 (191) | 6.05 (57) | 6.26 (59) | 2.7 / 0.9 | CPU OR |
+| 10 | 85 | 3 | 16.1 (194) | 4.97 (60) | 5.14 (62) | 2.0 / 0.7 | CPU OR |
+| 9 | 166 | 3 | 31.7 (196) | 9.73 (60) | 9.81 (61) | 3.7 / 1.4 | CPU OR |
+| 9 | 21 | 2 | 3.52 (174) | 1.49 (74) | 1.67 (83) | 0.5 / 0.3 | CPU OR |
+
+Every multi-GPU Bloom finish took the island route in both modes (no fallback line). Engine finish, all sizes >= 85 MiB:
+tip 189-208 ms/GiB -> 53-74 in both forms; compose - pipe between -1.4 and +0.2 ms per finish.
+Memory in the engine (debug line): compose pinned 48 MiB (pass-through 16), other-leader scratch 16 MiB (pass-through 0);
+pipe pinned 32 MiB, other-leader scratch 32 MiB (also 14 MiB in the single-contributor case).
+
+## 5. Gate (DESIGN_TRANSFER_PR section 12 step 0) and decision
+
+| Gate | Limit | CPU OR (compose) | GPU OR (pipe) |
+|---|---|---|---|
+| MB all four 281 / 1434 MiB | <= 56 ms/GiB | 52.5 / 51.7 PASS | 52.0 / 51.6 |
+| MB all four 57 MiB | <= 62 | 55.5 PASS | 54.9 |
+| MB root only 57-1434 | <= 44 | 39.2-40.8 PASS | 39.2-41.0 |
+| MB one pair / one GPU of the other pair | <= 46 | 40.3-44.2 / 39.3-40.8 PASS | same code |
+| MB forced singletons, all four (row 5, extra) | <= 60 | 42.8-54.3 PASS | not available (K = 2 only) |
+| q21 / q3 / q7 vs tip | <= -190 / -33 / -33 ms | -203 / -38 / -39 PASS | -203 / -38 / -39 |
+| controls q6 / q2 | within +-3 ms | -0.1 / -2.7 PASS | +0.1 / -2.9 |
+| results | identical | PASS | PASS |
+
+**Hard gate: PASS. Decision (Q1): the cross-island OR is done on the CPU.** They tie within noise in the microbench (>= 174 MiB:
+within 2%) and in the engine (+3 ms over 8 queries, n = 16), so the simpler / more robust one wins, and that is the CPU OR:
+- one cross stage for every island count (the GPU exchange exists for 2 islands only; any machine with 3+ islands or no P2P
+  needs the host OR anyway, so GPU OR = two cross stages to write, test and fault-inject);
+- same code is the no-P2P path (measured here: forced singletons through the same functions, 42.8-54.3 ms/GiB, bit identical);
+- no cross scratch: other-leader lease 16 instead of 32 MiB, nothing on a remote GPU in the single-contributor case, and every
+  device-memory refusal stays degradable (the accepted Q2 behaviour).
+What the CPU OR costs (carried into the design): a bounded worker facility; 4-16 MiB arrays with two inputs 35-40% slower than
+GPU OR (<= 0.45 ms each, still faster than the tip); it needs `2 x Kc` free cores (2 cores: 1.8x slower); more OR threads than
+`2 x Kc` make it slower, not faster.
+
+Not measured: 22-query suite for the composed form (8 queries here; the 6 DF queries carry -361 of the -370 gate), nsys,
+link contention, behaviour under S6, any machine other than this one.
+
 ## Checkpoint log
 
 - 01:20 worktree + branch created (submodules: `git -c protocol.file.allow=always submodule update --init --recursive -- cucascade
@@ -86,3 +172,6 @@ other leader 16 MiB (lease). pipe: pinned 32 MiB, root 32 MiB, other leader 32 M
 - 01:48 commit bfbf2a67 (merge lookahead 2, OR threads min(8, 2 x Kc), trace line). Gate bad=0. Final microbench tables (section 3).
 - 01:50 engine ABBA started: `bin/abba3_block.sh e1 6 21 3 7` (labels `e1_{tip,cpu,gpu}{A,B}`); next: `e1 6 8 10 9`, `e1 6 6 2`,
   then `bin/logpass.sh 21 3 7 8 10 9`; tables: `bin/abba3_table.py e1`, `bin/log_table.py 21 3 7 8 10 9`.
+- 02:20 ABBA e1 done (8 queries x 6 processes); 02:43 e2 (mirrored order) done; 02:48 log pass done; taskset microbench done.
+  Tables: sections 3.2, 4, 4.1. Verdict: tie, CPU OR chosen (section 5).
+- next: amend DESIGN_TRANSFER_PR.md ("Step 0 result", sections 2, 3.4, 4, 5, 11, 12, 13), backup.
