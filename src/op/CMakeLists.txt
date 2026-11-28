@@ -73,6 +73,7 @@ target_sources(
           dynamic_filter/static_filter_selection.cpp
           dynamic_filter/build_filter_construction.cpp
           dynamic_filter/detail/restore_scalar.cpp
+          dynamic_filter/detail/union_plan.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
           dynamic_filter/dynamic_filter_key_outcome.cpp
           dynamic_filter/post_unlock_actions.cpp
