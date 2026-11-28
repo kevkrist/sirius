@@ -50,6 +50,11 @@
 - (2026-11-28) User: YES to the three S6 deviations from the issue text in DESIGN_S6_PR.md section 13 (criterion 2: started-scans
   release rule instead of the literal rule; criterion 3: static wakes + hint evaluation instead of a runtime channel
   subscription; criterion 6: real admission rule, untested under memory pressure on this box).
+- (2026-11-28) User: FOLLOW ALL RECOMMENDATIONS of DESIGN_S6_PR.md section 14 (Q1-Q12). In particular: Q1 release joins without a
+  filter plan too (own commit, internal switch back to filter_joins); Q4 the two contract items C1/C2 go INTO #2570 (it is rebased
+  over the transfer PR anyway); Q6 an engine-level memory-pressure run MAY use a dedicated small-memory TEST config (a new file,
+  never specific_config.yaml, no benchmark claims from it); Q7 no throttle; Q8 no timer re-evaluation; Q9 exclusions kept;
+  Q10 internal mode switch only. S6 developer starts when prod/stack-2570-on-xfer (S6's base) exists.
 
 # OPPORTUNITIES: measured, verified opportunity list for the DF stack (#2569 -> #2570), TPC-H SF1000, 4 GPUs
 
