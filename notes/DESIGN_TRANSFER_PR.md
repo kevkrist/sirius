@@ -7,6 +7,10 @@ USER DECISIONS in OPPORTUNITIES.md.
 Reading caveat: the three AgentDocs books were sampled (principle / guideline summaries), not read cover to cover
 (context budget). The four reference engines were not consulted: none has a multi-GPU transfer layer.
 
+**Amended 2026-11-28 after step 0** (measuring spike `proto/xfer-compose`, notes/PROTO_XFER_COMPOSE.md): result and decision in
+section 14; sections 2, 3.4, 4, 5, 6, 10, 11, 12, 13 changed where marked "(step 0)". Q1 is decided: **CPU OR**. The user's
+answers to Q2 / Q4 / Q6 / Q8 are recorded in section 13.
+
 Status of every claim below: **[M]** measured and verified in the notes, **[m]** measured in the standalone
 microbench only, **[D]** design decision of this document (unmeasured), **[?]** open question for a human (section 13).
 
@@ -61,11 +65,11 @@ Degenerate cases fall out of the same code, no branches by machine class:
 | 1 GPU | 1 | none | nothing moves |
 | full P2P | 1 | A + C | today's PEER `chunk_pipeline` (which is deleted; gate: no regression) |
 | no P2P | G singletons | B only | `proto/xfer-host` `host_or` / `fanout` [M 45-58 ms/GiB] |
-| this machine {0,1},{2,3} | 2 | A + B + C | `pairhostor_pipe` with P2P fan-out [m 52-53 ms/GiB]; `proto/xfer-d2d pipe` is the GPU-OR variant of B [M 52] |
+| this machine {0,1},{2,3} | 2 | A + B + C | `proto/xfer-compose` mode `compose` [M 51.7-55.5 ms/GiB, engine tie with `pipe`, section 14]; `proto/xfer-d2d pipe` is the GPU-OR variant of B [M 52] |
 | odd sizes, e.g. {0,1},{2} or {0,1,2},{3} | 2 | A/C only where an island has >= 2 members | same code |
 | zero contributions | any | none | nothing moves (all arrays zero) |
 
-Why the cross stage ORs on the CPU (the one real choice in this design; flagged [?] Q1)
+Why the cross stage ORs on the CPU (the one real choice in this design; Q1, **decided by step 0: CPU OR**, section 14)
 - It is the only cross stage that is flat in `K`: every leader link carries B up and B down whatever `K` is.
   A GPU-side cross OR (the `pipe` exchange, or a star through the root) makes some leader receive `(Kc-1) x B`:
   optimal at `K = 2`, 2x worse at 4 singletons (gpuor 95 vs hostor 45 ms/GiB [M]), worse beyond.
@@ -73,13 +77,14 @@ Why the cross stage ORs on the CPU (the one real choice in this design; flagged 
 - It needs **no device scratch for the cross stage**. Device scratch remains only for stage A. That removes the
   remote cross-scratch lease of `pipe` (32 MiB on a GPU the task does not run on) and makes every device-memory
   refusal degradable without losing the filter (section 6).
-- At `K = 2` it ties with the GPU exchange on this machine [m]: `pairhostor_pipe` 52-53 vs `c2` 52 ms/GiB at
-  >= 281 MiB (same port load: each leader 2 x B in, 2 x B out).
+- At `K = 2` it ties with the GPU exchange on this machine, in the microbench (51.7-53.4 vs 51.6-52.5 ms/GiB at >= 174 MiB)
+  and in the engine (+3 ms over 8 queries, n = 16 per arm) [M, step 0] (same port load: each leader 2 x B in, 2 x B out).
 - Cost: a bounded CPU worker facility and per-chunk host waits on the publishing thread when `Kc >= 2`
   (section 5.4). Verified workable in the engine by `proto/xfer-host` (suite -394 ms [M]), better under link
   contention than serial legs (x2.1 vs x4.3 [M]).
-- **Not measured: the composition** (P2P merge + 2-input host OR + P2P fan-out) inside the engine. Step 0 of the
-  plan (section 12) is a measuring spike with a hard gate before any production code.
+- The composition (P2P merge + 2-input host OR + P2P fan-out) is measured inside the engine: hard gate passed (step 0,
+  section 14). Two rules came out of it and are now part of the design: stage A is enqueued ahead of the host loop
+  (section 5) and a chunk OR uses `min(8, 2 x Kc)` threads, never more (section 3.4).
 
 Design principles applied: one deep module with a one-call interface (complexity pulled down; `finish_impl` shrinks
 to validation + one call); policy (plan: who leads, what degrades) separated from mechanism (executor: streams,
@@ -218,12 +223,19 @@ class host_or_workers;   // models host_or_executor
 Requirements on `host_or_workers` (the prototype's private pool is not acceptable as is):
 1. Engine-lifetime owner next to the runtime stream pools (`sirius_memory_reservation_manager`), reached the same way
    `runtime_stream_pool::acquire` is; no function-local static threads.
-2. Bounded: `T` workers, compile-time default 8 [M: W=2 / 8 threads equals W=4 / 16 in TPC-H], capped at
-   `hardware_concurrency / 4`, minimum 1 (the calling thread always takes a part). No config knob in this PR [?] Q3.
+2. Bounded: `T` workers, compile-time default 8, capped at `hardware_concurrency / 4`, minimum 1 (the calling thread
+   always takes a part). **One chunk job is split into `min(T, 2 x Kc)` parts, not `T`** (step 0) [M]: with two inputs
+   3-4 threads are the best point (50.7-52.8 ms/GiB at >= 281 MiB), 8 cost 5-11%, 12 cost 10-47%; with four inputs 6-8
+   are best and 4 cost 23%. With 8 threads the OR itself is 2x faster than with 4 and the finish is still slower, so the rule is about
+   not disturbing the transfers, not about OR speed. Cause not isolated (the prototype's helpers spin 500 us between
+   jobs): the developer repeats this sweep with the production workers (step 2) and keeps the rule only if it still
+   holds. No config knob in this PR [?] Q3.
 3. No thread spins while no `unite` is active. Spin-then-park inside an active job is allowed and must be bounded.
 4. Concurrent publications share the workers per chunk job; a publication is never queued behind another one's
    whole finish (the prototype serialised whole jobs under one mutex).
 5. NUMA: out of scope (single-node machine); the slots come from the root's host space as today.
+6. (step 0) The OR needs its parts' worth of free cores: process pinned to 2 cores -> 88-96 ms/GiB instead of 52 (4 or 8
+   cores: no loss) [M]. Still 2x the tip; accepted, stated in the PR.
 
 ---
 
@@ -236,11 +248,12 @@ Per array of B bytes, chunk c = `chunk_bytes` (2-8 MiB), W = window depth (chunk
 | Device scratch, root leader | `min(2, chunks) x |sources of root island| x c` from the task reservation (`root_scratch`). Always <= `publication_scratch_bytes` (`2 x (G-1)` slots), which stays unchanged as the task's upper bound | during `unite` |
 | Device scratch, other leader | `min(2, chunks) x |sources| x c`, zero when the leader is the island's only contributor; leased with `scoped_replica_reservation::try_acquire` on that GPU at prepare time | during `unite` |
 | Pinned host window | `Kc >= 2`: `(Kc + 1) x W x c` (inputs + one OR output per chunk in flight); `Kc == 1`: `1 x W x c`; no cross stage: 0. From the existing fixed-block HOST pool, 1 MiB blocks, one `device_copy_batch` per leg (as today) | during `unite` |
-| Streams | per leader with sources: one ingress stream (the root uses the publication stream); per leader that uploads: one upload stream. Leased from `runtime_stream_pool` (no `cudaStreamCreate` per finish) | during `unite` |
-| CPU | <= `T` workers + the publishing thread, only while `Kc >= 2` | per chunk |
+| Streams | per leader with sources: one ingress stream `I`; per input leader: one download stream `X` (step 0: as measured; not the partial stream); per leader that uploads: one upload stream `U`. Leased from `runtime_stream_pool` (no `cudaStreamCreate` per finish) | during `unite` |
+| CPU | `min(T, 2 x Kc)` threads including the publishing thread, only while `Kc >= 2` | per chunk |
 
 This machine, G = 4, islands {0,1},{2,3}, all contributing, 8 MiB chunks: root scratch 16 MiB, other leader 16 MiB,
-pinned 48 MiB (tip: 8 MiB scratch, 8 MiB pinned; `pipe`: 32 / 32 / 32 MiB [M]). No P2P, G = 4: 0 device scratch,
+pinned 48 MiB [M, step 0, engine debug line] (tip: 8 MiB scratch, 8 MiB pinned; `pipe`: 32 / 32 / 32 MiB [M]).
+Single contributor: pinned 16 MiB, no scratch anywhere [M]. No P2P, G = 4: 0 device scratch,
 80 MiB pinned. Full P2P: the tip's PEER numbers, no pinned memory.
 
 Byte flow, G = 4, two pair islands, all contributing: P2P 2 x B (merge) + 2 x B (fan-out); host 2 x B up + 2 x B
@@ -256,7 +269,7 @@ no device scratch.
 ## 5. Streams and event ordering
 
 Notation: `P(m)` = member m's partial stream (exists today; orders every use and free of m's arrays). Per island with
-leader L: `I(L)` ingress stream, `U(L)` upload stream. Chunks are numbered globally across arrays; `p = k mod 2`
+leader L: `I(L)` ingress stream, `X(L)` download stream (input leaders), `U(L)` upload stream. Chunks are numbered globally across arrays; `p = k mod 2`
 (scratch parity), `w = k mod W` (window slot). `cudaStreamWaitEvent` binds to the most recent `cudaEventRecord` at
 call time, so an event object is re-recorded per chunk and every wait on it is enqueued before its next record.
 
@@ -264,13 +277,23 @@ Once, before the first chunk
 - every member: record `ready(m)` on `P(m)` (all inserts and the zero fill precede it; pre: every `enqueue_add`
   returned).
 
-Per chunk k (enqueue order = this order)
+Enqueue schedule (step 0; this is what was measured, and the lookahead is worth 5-10% [M]). Only the host OR blocks
+the publishing thread, so everything else is enqueued ahead of it:
+- `Kc >= 2`: before the host OR of chunk k, the downloads of chunks `<= k + W - 1` and the merges of chunks
+  `<= k + W + 1` are enqueued (merges run 2 chunks ahead of the downloads). The bound 2 is exact: download j must be
+  enqueued after merge j and before merge j + 2, because it waits on `merged[j mod 2]`, which merge j + 2 re-records.
+  Coupling the merge to the host loop (merge k + 2 enqueued after the OR of chunk k) fails the microbench gate
+  (55-63 instead of 52-55 ms/GiB).
+- `Kc <= 1`: nothing blocks; chunks are enqueued one after the other in the order below.
+
+Per chunk k (dependencies; enqueue order within one chunk = this order)
 1. **Merge** (island with sources): `I(L)` waits `ready(s)` of each source (first use) and `merged[p]` of chunk k-2
    (scratch slot reuse); peer-copies each source chunk into `scratch[p][i]`; records `ingress_done[p]`.
    `P(L)` waits `ingress_done[p]`; runs the OR kernel into L's chunk; records `merged[p]`.
-2. **Download** (input leaders, cross stage only): on `P(L)`, i.e. after step 1's OR by stream order; first waits the
-   `up_done` events of the chunk k-W uploads that read slot w (only in pass-through, where uploads read the input
-   slot); batch copy chunk -> input slot `in[L][w]`; records `down_done[L][w]`.
+2. **Download** (input leaders, cross stage only): on `X(L)` (step 0: a stream of its own, so the leader's next merge
+   OR is not queued behind a download); `X(L)` waits `ready(L)` once, then per chunk `merged[p]` (leader with
+   sources) and, in pass-through only, the `up_done` events of the chunk k-W uploads that read slot w; batch copy
+   chunk -> input slot `in[L][w]`; records `down_done[L][w]`.
 3. **Host OR** (`Kc >= 2`): the publishing thread `cudaEventSynchronize`s `down_done[.][w]` of chunk k and the
    `up_done` events of chunk k-W (they read output slot `out[w]`), then ORs the `Kc` input slots into `out[w]` through
    the executor. `Kc == 1`: nothing here; the upload source is the single input slot and step 4 waits `down_done`
@@ -281,10 +304,10 @@ Per chunk k (enqueue order = this order)
    For a leader that does not upload, `settled(L)` is `merged[p]` (has sources) or `ready(L)`.
 5. **Fan-out**: each non-leader m: `P(m)` waits `settled(L)`; peer-copies L's chunk into m's chunk.
 
-Final: host-synchronize every `I`, every `U`, the publication stream, then every `P` (one wait each; the prototype
+Final: host-synchronize every `I`, every `X`, every `U`, the publication stream, then every `P` (one wait each; the prototype
 measured 19 per finish against 1932 at tip [M]). Only then are slots, scratch and stream leases released.
 
-Why separate streams: a leader's two host-link directions overlap (download on `P`, upload on `U`), an upload held by
+Why separate streams: a leader's two host-link directions overlap (download on `X`, upload on `U`), an upload held by
 an event never blocks that GPU's downloads, and ingress overlaps the previous chunk's OR. This is the event graph of
 both verified prototypes (VERIFY_PROTO_XFER_D2D section 5, VERIFY_PROTO_XFER_HOST 5.1: no ordering hole found [M]).
 
@@ -323,8 +346,9 @@ Rules that make the failure paths simple
   still use its memory. This removes by construction the verified defect of `~island_reduce` (window of island 0
   released before island 1's streams were drained) and the reliance on an outer join for the fan-out copies.
 - Degradation is plan refinement, not a second code path: after `split`, the same executor runs.
-- The tip's serial HOST loop is **deleted**, not kept as a floor [?] Q4. Its only merit was a 1-chunk pinned floor.
-- Device-memory refusal never loses the filter any more. This is a behaviour change [?] Q2: on a full-P2P machine
+- The tip's serial HOST loop is **deleted**, not kept as a floor (Q4: user agrees). Its only merit was a 1-chunk pinned floor.
+- Device-memory refusal never loses the filter any more. This is a behaviour change (Q2: accepted by the user, the tests
+  of 10.2 change): on a full-P2P machine
   under GPU memory pressure the Publishing Task now spends a host bounce where the tip gave the filter up at once.
 
 ---
@@ -381,7 +405,7 @@ Rules that make the failure paths simple
 
 Fixtures: 4 GPUs on this machine; forced topologies through `island_override` (refinements only):
 `{0,1},{2,3}` (real), `{0},{1},{2},{3}`, `{0,1},{2},{3}`, `{0},{1},{2,3}`, 3 GPUs `{0,1},{2}` and `{0},{2,3}`,
-2 GPUs `{0,1}` and `{0},{1}`, 1 GPU. Not formable here: an island of 3 or more [?] Q6.
+2 GPUs `{0,1}` and `{0},{1}`, 1 GPU. Not formable here: an island of 3 or more (Q6: user accepts this box as sufficient).
 
 ### 10.1 New tests
 
@@ -409,7 +433,7 @@ Fixtures: 4 GPUs on this machine; forced topologies through `island_override` (r
 | `HOST scratch uses the unused task reservation and returns its excess` (`:2182`, assert `:2208`) | the HOST route takes 1 chunk of device scratch from the task reservation | the invariant moves to where scratch still exists: rename to "merge scratch uses the unused task reservation and returns its excess", run on a topology whose root island has a source; add: all-singleton route takes zero device scratch |
 | `optional publication scratch OOM deposits without rescheduling the PARTITION task` (`test_in_task_publication.cpp:852`, assert `:895`) | exactly one device-scratch request | with a P2P root island: one request, refused -> still deposits without rescheduling AND the filter is published through the host (`degraded == 1`); with singletons: zero requests |
 | `publication scratch allocation failure retires ordinary-pool partials` (`:921`, assert `:953`) | failing scratch allocator -> `finish` returns no publication | scratch failure now publishes (assert that); keep the retirement coverage by exhausting the pinned window instead (the one remaining refusal) -> no publication, partials retired |
-| `a tracked task thread admits a merge scratch larger than its reservation as its task would` (5th failure, `hostor` arm) | `accumulations_skipped_admission == 1` after a refused PEER scratch | `skipped_admission == 0`, `degraded == 1`, filter published. Decided by Q2 |
+| `a tracked task thread admits a merge scratch larger than its reservation as its task would` (5th failure, `hostor` arm) | `accumulations_skipped_admission == 1` after a refused PEER scratch | `skipped_admission == 0`, `degraded == 1`, filter published (Q2 accepted) |
 | `HOST publication submits every target upload before waiting for any` (`test_dynamic_filter_accumulation_fault.cpp:177`) | exactly 1 submission during an injected delay (the tip loop's order) | replace by the pipeline property: while chunk k's upload on one leader is delayed, the downloads of chunk k+1 and the other leaders' uploads of chunk k are submitted (`submissions_during_delay >=` that count) |
 | `HOST exhaustion refuses preparation without changing any partial` (`:232`) | 1-chunk window refused -> refusal | two steps: W = 2 refused -> publishes at W = 1; minimum refused -> refusal, partials unchanged |
 
@@ -427,22 +451,26 @@ Microbench (lifecycle MB4, builder-level `finish`, median of 5 after 1 warm-up)
 
 | Gate | Pass |
 |---|---|
-| G = 4, all four contributing, 281 and 1434 MiB | <= 56 ms/GiB (`pipe` 52 [M], `hostor` 45-47 [M], tip 186) |
-| G = 4, all four, 57 MiB | <= 62 ms/GiB (`pipe` 56) |
-| G = 4, root only (S = 0), 57-1434 MiB | <= 44 ms/GiB (`pipe` 39-41, tip 61) |
-| G = 4, one pair / one GPU of the other pair | <= 46 ms/GiB (`pipe` 40-45) |
-| G = 4, forced all singletons, all four | <= 60 ms/GiB (`hostor` 45-58) |
+| G = 4, all four contributing, 281 and 1434 MiB | <= 56 ms/GiB (step 0 spike 52.5 / 51.7 [M], `pipe` 52 [M], tip 186) |
+| G = 4, all four, 57 MiB | <= 62 ms/GiB (spike 55.5, `pipe` 55-56) |
+| G = 4, root only (S = 0), 57-1434 MiB | <= 44 ms/GiB (spike 39-41, tip 61) |
+| G = 4, one pair / one GPU of the other pair | <= 46 ms/GiB (spike 40-44) |
+| G = 4, GPUs 0+2 (two inputs, no merge), 174-1434 MiB | <= 46 ms/GiB (spike 42.7-44.4; 57 MiB: <= 52, spike 48.9) |
+| G = 4, forced all singletons, all four | <= 60 ms/GiB (spike 42.8-54.3, `hostor` 45-58) |
+| G = 4, all four, 4 and 16 MiB (step 0) | <= 0.60 / 1.65 ms (spike 0.53 / 1.51; `pipe` 0.39 / 1.06; tip 0.87 / 3.37). The CPU OR's known weak spot; must stay under the tip |
+| OR thread sweep 2 / 4 / 8 at Kc = 2 and 4 / 8 at Kc = 4 (step 0) | the `min(T, 2 x Kc)` point is within 3% of the best point of the sweep |
 | G = 2 on the P2P pair {0,1} (full-P2P stand-in) | within 2% of tip (5.57 / 28.4 ms at 281 / 1434 MiB) |
 | Fixed cost, 1 MiB, root only and all four | <= tip + 0.10 ms (stream leases instead of creates) |
 | Contention: second process saturating the links | degradation factor <= 2.5 (hostor x2.1, tip x4.3) |
-| Small host: process pinned to 8 cores (`taskset`), all four, 1434 MiB | report; fail if slower than tip |
+| Small host: process pinned to 8 and to 4 cores (`taskset`), all four, 281 / 1434 MiB | within 3% of the unpinned run (spike: 52.0-52.8 at 8, 51.5-52.5 at 4). Pinned to 2 cores: report (spike 88-96); fail if slower than tip |
 
 Engine (TPC-H SF1000, 4 GPUs; ABBA, 4 fresh processes per query, 1 warm + 5 hot, first hot dropped, n = 8 per arm)
 
 | Gate | Pass |
 |---|---|
-| Suite vs `pr2570` tip | <= -370 ms (-2.4%) (both prototypes: -370..-410 [M]) |
-| q21 / q3 / q7 | <= -190 / -33 / -33 ms |
+| Suite vs `pr2570` tip | <= -370 ms (-2.4%) (both prototypes: -370..-410 [M]; step 0 spike: -364 on the 8 queries it ran) |
+| q21 / q3 / q7 | <= -190 / -33 / -33 ms (spike -203 / -38 / -39) |
+| q8 / q10 / q9 | <= -18 / -20 / -15 ms (spike -25 / -32 / -25; q10 and q9 are noisy, n >= 16) |
 | Controls q6, q2, q15, q17, q19, q20 | within +-3 ms |
 | No query slower than tip beyond its same-arm spread | required |
 | Results | `result.txt` md5 identical for 22 queries (q11: sorted content) |
@@ -458,14 +486,16 @@ behaviour under eager scans (S6) and a concurrent CONCAT move.
 
 Branch from `pr2570` tip; nothing is pushed to sirius-db; no PR is opened.
 
-0. **Composition spike (measure first, throwaway branch `proto/xfer-compose`).** Take `proto/xfer-d2d`, replace
+0. **DONE 2026-11-28, gate PASSED, Q1 = CPU OR (section 14).** Composition spike (throwaway branch `proto/xfer-compose`, bfbf2a67; it is a
+   reference for the event graph, not code to copy: private thread pool, raw streams, no failure paths). Was: take `proto/xfer-d2d`, replace
    stage B of `island_reduce` by `proto/xfer-host`'s `host_or` / `fanout` over the island leaders (section 3 seam of
    both notes). Run the microbench gates of section 11 (rows 1-4) and ABBA on q21, q3, q7.
    **Pass -> continue. Fail (worse than `pipe` by more than the gate) -> stop and escalate Q1** (the alternative is a
    GPU-OR cross stage for `Kc <= 2` plus host OR beyond, i.e. two cross stages).
 1. `peer_islands` + unit tests. No behaviour change.
 2. `host_or` kernel + `host_or_workers` + unit tests (bit identity against a scalar reference, sizes with ragged
-   tails; worker lifecycle; concurrent jobs). No caller yet.
+   tails; worker lifecycle; concurrent jobs). No caller yet. In step 8, repeat the OR thread sweep of PROTO_XFER_COMPOSE 3.1 with
+   these workers and confirm the `min(T, 2 x Kc)` rule (section 3.4 item 2).
 3. `union_plan` + exhaustive property tests (GPU-free).
 4. `union_transfer`, stage A + C only (one island), with `unite`'s final interface. Switch `finish_impl` to it for
    the one-island case and delete `chunk_pipeline`. Gate: I10 test, G = 2 microbench within 2%, full 4-GPU suite
@@ -483,33 +513,95 @@ commit. Estimated shape: about +1100 / -450 lines of source, +900 of tests.
 
 ---
 
-## 13. Open questions (need a human decision)
+## 13. Questions: decided, and still open
 
-- **Q1 (largest). Where is the cross-island OR done?** This design: on the CPU for every `Kc >= 2` (one mechanism,
-  flat in `K`, no cross scratch). The user's lead prototype (`pipe`) ORs on the two leaders' GPUs (no CPU threads, no
-  host waits, measured in the engine, but `K = 2` only and 32 MiB scratch on the other leader). They tie on this
-  machine in the microbench; the composed CPU-OR form is not measured in the engine (step 0 measures it). Is a CPU OR
-  between islands acceptable under the "D2D in pairs preferred over all-host CPU OR" decision? If not: accept either
-  two cross stages (GPU exchange for `Kc <= 2`, host OR beyond) or a 2x slower no-P2P path.
-- **Q2. Device-scratch refusal now publishes through the host instead of skipping the filter** (also on full-P2P
-  machines under memory pressure). Recommended: accept (a filter instead of none; bounded pinned use). Five tests pin
-  the old behaviour.
-- **Q3. CPU worker budget and owner.** Proposed: 8 workers (cap `cores / 4`), owned by the memory reservation manager,
-  no config knob. On a host with few cores the workers compete with pipeline threads; only a `taskset` emulation can
-  be measured here. Knob or no knob? Different owner (an existing engine pool)?
-- **Q4. Delete the tip's serial HOST loop?** Recommended: yes (no dead mode). Cost: under pinned-pool exhaustion the
-  filter is skipped at 16-40 MiB of free pinned memory instead of 8 MiB.
-- **Q5. Pinned window accounting.** The tip takes its window from the fixed-block HOST pool without a reservation;
-  this design keeps that (bounded, transient: 48 MiB here, 80 MiB at 4 singletons, `(G + 1) x 16 MiB` worst case).
-  Should it be charged to a host reservation? That needs a host reservation passed into `finish` (publisher change,
-  touches #2570 code).
-- **Q6. Coverage of machines we do not have.** Islands of >= 3 GPUs (full P2P at G >= 3), real no-P2P with one uplink
-  per GPU, > 2 real islands: logic is tested by forced refinements and by the pure plan tests, never by hardware here.
-  Is a run on a full-P2P machine required before merge?
+### 13.1 Decided (2026-11-27 user answers; Q1 closed by step 0 on 2026-11-28)
+
+- **Q1. Where is the cross-island OR done?** User: "measure in the engine first". Measured (section 14): CPU OR and GPU OR
+  tie in the microbench and in the engine. **Decision: CPU OR for every `Kc >= 2`** (one mechanism, flat in `K`, no cross
+  scratch, same code as the no-P2P path). The GPU exchange of `pipe` is not built. D2D stays inside the pairs (stages A
+  and C), which is the user's 2026-11-19 direction; only the cross-pair OR is on the CPU.
+- **Q2. Device-scratch refusal publishes through the host instead of skipping the filter.** User: accepted; **change the
+  tests** (section 10.2, five tests).
+- **Q4. Delete the tip's serial HOST loop.** User: delete it. Cost stated: under pinned-pool exhaustion the filter is
+  skipped at 16-40 MiB of free pinned memory instead of 8 MiB.
+- **Q6. Coverage of machines we do not have.** User: this 4-GPU box is sufficient for now. Islands of >= 3 GPUs, real
+  no-P2P with one uplink per GPU and > 2 real islands are covered by forced refinements and the pure plan tests only;
+  state that in the PR. No full-P2P run is required before merge.
+- **Q8. Behaviour under eager scans (S6).** User: the transfer PR **lands independently** of S6. No combined gate.
+
+### 13.2 Still open (unanswered; the design proceeds on the recommendation, each is reversible)
+
+- **Q3. CPU worker budget and owner.** Proceeding with: `T` = 8 workers (cap `cores / 4`), `min(T, 2 x Kc)` parts per
+  chunk (step 0), owned by the memory reservation manager, no config knob. Step 0 adds a fact: the finish needs
+  `2 x Kc` free cores (4 here) or it slows down up to 1.8x (2 cores), and extra threads hurt. Knob or no knob?
+  Different owner (an existing engine pool)?
+- **Q5. Pinned window accounting.** Proceeding with: keep the tip's behaviour (window taken from the fixed-block HOST
+  pool without a reservation; bounded, transient: 48 MiB here, 80 MiB at 4 singletons, `(G + 1) x 16 MiB` worst case).
+  Charging it to a host reservation needs a reservation passed into `finish` (publisher change, touches #2570 code).
 - **Q7. Replica relay / stage-once replica copies / batched exact-key gather** are left out (no measured TPC-H effect,
-  <= 0.4 ms per filter). They were listed under the transfer PR bucket in the user decisions. Confirm leaving them
-  out, or ask for a follow-up commit.
-- **Q8. Behaviour under eager scans (S6)** is unmeasured for any transfer scheme: the finish occupies both pair
-  uplinks for 50-80 ms on q21. Gate the transfer PR on a combined run with S6, or land independently?
-- **Q9. Non-transitive access graphs.** Greedy clique cover is legal but not minimal. Accept (no known machine), or
-  require a minimum clique cover (exponential in general, trivial at G <= 8)?
+  <= 0.4 ms per filter). Proceeding with: not in this PR. Confirm, or ask for a follow-up commit.
+- **Q9. Non-transitive access graphs.** Proceeding with: greedy clique cover (legal, not necessarily minimal; no known
+  machine). Alternative: minimum clique cover (exponential in general, trivial at G <= 8).
+
+---
+
+## 14. Step 0 result (2026-11-28; full tables in notes/PROTO_XFER_COMPOSE.md)
+
+Spike: branch `proto/xfer-compose` (bfbf2a67, worktree `$R/wt-xfer-compose`), one binary, `SIRIUS_PROTO_XFER_D2D=`
+`compose` (this design: P2P merge -> host stage with CPU OR -> P2P fan-out) or `pipe` (GPU OR on the two leaders,
+`proto/xfer-d2d` unchanged) or unset (tip loop). Runs `$R/runs/xfer_compose`. Config untouched, all under the lock.
+
+Correctness: bit identity against the tip loop, 832 cases (4 GPUs, two 3-GPU topologies, 4 GPUs forced singletons),
+0 mismatches. TPC-H `result.txt` md5 identical across the three arms for the 8 queries (12 processes each).
+
+Microbench, builder-level `finish`, G = 4, root GPU 0, ms/GiB at 57 / 174 / 281 / 1434 MiB:
+
+| batches on | tip loop | GPU OR (`pipe`) | CPU OR (`compose`) | CPU OR, forced singletons |
+|---|---|---|---|---|
+| all four (`Kc` = 2) | 188 / 186 / 186 / 186 | 54.9 / 52.5 / 52.0 / 51.6 | 55.5 / 53.4 / 52.5 / 51.7 | 54.3 / 46.6 / 45.0 / 42.8 |
+| GPUs 0+2 (`Kc` = 2, no merge) | 104 / 103 / 103 / 103 | 44.8 / 43.4 / 43.3 / 43.0 | 48.9 / 44.4 / 43.7 / 42.7 | 48.9 / 42.7 / 41.3 / 39.7 |
+| pair 0-1, root only, GPU 2 only (`Kc` = 1) | 104 / 61 / 104 | 40.3-44.6 / 39.2-41.0 / 39.3-41.0 | same event graph, same numbers | 42.8-53.4 / 38.7-43.2 / 38.7-43.4 |
+
+Small arrays, all four, 4 / 16 MiB: tip 0.87 / 3.37 ms, GPU OR 0.39 / 1.06, CPU OR 0.53 / 1.51.
+
+Engine, TPC-H SF1000, 4 GPUs, three arms, two mirrored ABBA blocks, n = 16 hot iterations per arm and query, ms:
+
+| q | tip | CPU OR | GPU OR | CPU OR - tip | GPU OR - tip | CPU - GPU |
+|---|---|---|---|---|---|---|
+| 21 | 1445.2 | 1242.1 | 1242.1 | -203.1 | -203.1 | 0.0 |
+| 3 | 659.8 | 622.2 | 621.5 | -37.6 | -38.3 | +0.7 |
+| 7 | 745.6 | 707.0 | 706.9 | -38.6 | -38.7 | +0.1 |
+| 8 | 936.9 | 911.7 | 911.7 | -25.2 | -25.3 | +0.1 |
+| 10 | 853.7 | 821.4 | 824.3 | -32.3 | -29.4 | -3.0 |
+| 9 | 1422.7 | 1398.0 | 1393.0 | -24.6 | -29.7 | +5.1 |
+| 6 (control) | 379.8 | 379.8 | 380.0 | -0.1 | +0.1 | -0.2 |
+| 2 (control) | 149.2 | 146.6 | 146.3 | -2.7 | -2.9 | +0.2 |
+| sum | 6593 | 6229 | 6226 | **-364** | **-367** | **+3** |
+
+Engine DEBUG finish lines (same binary, three modes): q21 1394 MiB 261 -> 76.2 (GPU OR) / 74.8 ms (CPU OR), i.e.
+192 -> 56 / 55 ms/GiB; q3 280 MiB 57.0 -> 19.9 / 19.7; q7 278 MiB 51.3 -> 14.5 / 14.3; q8 174 MiB 35.3 -> 12.5 / 12.4;
+q10 109 MiB 20.4 -> 6.05 / 6.26; q9 166 MiB 31.7 -> 9.73 / 9.81. Publishing-thread time inside the CPU-OR finish of
+q21: 31 ms OR + 12 ms event waits of 75 ms.
+
+Hard gate of step 0: microbench rows 1-4 pass (and row 5), q21 / q3 / q7 pass, controls within +-3 ms. **PASS.**
+
+Decision: **CPU OR** (tie within noise; it is the simpler and more robust of the two: one cross stage for any island
+count, the same code is the no-P2P path, no cross scratch on a remote GPU, every device-memory refusal degradable).
+GPU OR would add a second cross stage for 2 islands on top of the host OR that 3+ islands and no-P2P machines need
+anyway.
+
+What step 0 changed in this document
+1. Stage A must be enqueued ahead of the host loop (section 5, "Enqueue schedule"): worth 5-10%, the first cut failed
+   the gate without it.
+2. Downloads run on a stream of their own `X(L)`, not on `P(L)` (sections 4, 5): this is the measured form.
+3. OR parts per chunk = `min(T, 2 x Kc)` (section 3.4): more threads make the finish slower (8 instead of 4 at
+   `Kc` = 2: +5-11%; 12: +10-47%).
+4. New gates (section 11): small arrays (4 / 16 MiB), two inputs without merge, thread-rule check, 4- and 8-core pin.
+5. Known limits, accepted: 4-16 MiB two-input arrays 35-40% slower than a GPU OR would be (<= 0.45 ms each); with fewer
+   free cores than OR parts the finish degrades (2 cores: 88-96 ms/GiB).
+
+Not measured in step 0: the other 14 queries, nsys, link contention with a second process, behaviour under S6, forced
+3-island topologies in the engine. On this machine the all-singleton form (no P2P used at all) is faster in the
+microbench than the island form (42.8 vs 51.7 ms/GiB at 1434 MiB, all four); known since PROTO_XFER_HOST, the user's
+2026-11-19 direction (D2D inside pairs) stands and the design follows it.

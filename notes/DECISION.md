@@ -163,3 +163,6 @@ the tests; Q4 delete the tip's serial host loop; Q6 this box is enough; Q8 land 
 ## Checkpoint log
 
 - 2026-11-28 01:17 UTC: file written from the notes listed at the top. No GPU work. STATUS.md rewritten, backup run.
+- 2026-11-28 03:00 transfer step 0 done (`notes/PROTO_XFER_COMPOSE.md`, branch `proto/xfer-compose` bfbf2a67): CPU OR and GPU OR tie
+  (engine: -364 vs -367 ms on q21 q3 q7 q8 q10 q9 q6 q2, n = 16 per arm; microbench 51.7-55.5 vs 51.6-54.9 ms/GiB). Gate passed,
+  Q1 = CPU OR; `notes/DESIGN_TRANSFER_PR.md` amended (section 14). Next: transfer PR production code from design step 1.

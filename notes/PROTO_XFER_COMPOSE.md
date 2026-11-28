@@ -174,4 +174,5 @@ link contention, behaviour under S6, any machine other than this one.
   then `bin/logpass.sh 21 3 7 8 10 9`; tables: `bin/abba3_table.py e1`, `bin/log_table.py 21 3 7 8 10 9`.
 - 02:20 ABBA e1 done (8 queries x 6 processes); 02:43 e2 (mirrored order) done; 02:48 log pass done; taskset microbench done.
   Tables: sections 3.2, 4, 4.1. Verdict: tie, CPU OR chosen (section 5).
-- next: amend DESIGN_TRANSFER_PR.md ("Step 0 result", sections 2, 3.4, 4, 5, 11, 12, 13), backup.
+- 03:00 DESIGN_TRANSFER_PR.md amended (new section 14 "Step 0 result"; sections 2, 3.4, 4, 5, 6, 10, 11, 12, 13). Step 0 complete.
+  Next (not this task): developer starts at design step 1 (`peer_islands`); open for the user: Q3, Q5, Q7, Q9.
