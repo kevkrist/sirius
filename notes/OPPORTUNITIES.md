@@ -47,6 +47,9 @@
   Orchestrator note: hybrid-full measurement got a duplicate agent (SendMessage to a workflow agent resumed a second copy);
   the copy was told to stop. Extra arms X / HX (transfer on, eager off) requested in runs/hybridfull/EXTRA_ARMS_REQUEST.md -
   check HYBRID_FULL.md covers them, else run them afterwards. Do not SendMessage running workflow agents again.
+- (2026-11-28) User: YES to the three S6 deviations from the issue text in DESIGN_S6_PR.md section 13 (criterion 2: started-scans
+  release rule instead of the literal rule; criterion 3: static wakes + hint evaluation instead of a runtime channel
+  subscription; criterion 6: real admission rule, untested under memory pressure on this box).
 
 # OPPORTUNITIES: measured, verified opportunity list for the DF stack (#2569 -> #2570), TPC-H SF1000, 4 GPUs
 
