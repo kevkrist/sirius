@@ -30,6 +30,7 @@
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policy.cuh>
 #include <cuco/bloom_filter_ref.cuh>
+#include <cuda/accumulation_cuda.cuh>
 #include <cuda/dynamic_filter_fused_probe.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/cstddef>
@@ -186,33 +187,9 @@ using raw_bloom_ref = cuco::bloom_filter_ref<Key,
                                              ::cuda::thread_scope_device,
                                              cuco::bloom_filter_policy<Key>>;
 
-/**
- * @brief Throws `detail::accumulation_cuda_error` for a failed CUDA call after clearing the error.
- *
- * @param status The result of the CUDA call
- * @param call The name of the CUDA call, used in the error message
- * @param kernel_launch Whether @p status comes from a kernel launch
- * @throws detail::accumulation_cuda_error if @p status is not `cudaSuccess`
- */
-void check_cuda(cudaError_t status, char const* call, bool kernel_launch = false)
-{
-  if (status == cudaSuccess) { return; }
-  (void)cudaGetLastError();
-  throw detail::accumulation_cuda_error{status, kernel_launch, call};
-}
-
-using cucascade::cuda::cuda_event;
-
-/**
- * @brief Creates a timing-free event on @p device, restoring the current device afterwards.
- *
- * @param device The GPU the event belongs to
- */
-[[nodiscard]] cuda_event make_event_on(int device)
-{
-  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
-  return cuda_event{};
-}
+using detail::check_cuda;
+using detail::cuda_event;
+using detail::make_event_on;
 
 /**
  * @brief One published replica of an accumulated key: the array and the partial stream that frees
