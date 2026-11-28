@@ -290,13 +290,77 @@ DEBUG logging inflates slightly; the 12 queries with a Bloom. `python3 $R/runs/c
 - 11-27 23:25: log pass complete (48 processes rc=0), `out/finish.md`. Sections 2-9 written. ALL DONE. Branch `proto/combined` head c5aa5bdf (worktree `$R/wt-combined`, built).
 
 <!-- VERIFICATION-BEGIN -->
-## 10. Verification (independent verifier, 2026-11-27/28) — IN PROGRESS, interim checkpoint
+## 10. Verification (independent verifier, 2026-11-27 23:25 -> 11-28 01:10 UTC)
 
-Raw data `$R/runs/vcombined/<arm>_<a|b>/`, scripts `$R/runs/vcombined/bin/{one.sh,abba.sh,audit.py}`, progress
-`$R/runs/vcombined/{status.txt,progress.txt}`. Regenerate every table: `python3 $R/runs/vcombined/bin/audit.py $R/runs/vcombined ""`
-(author's blocks: `audit.py $R/runs/combined m1_` / `n1_` / `o1_`). `wt-combined` not modified.
+**Verdict: CONFIRMED, with the combined gain about 5% optimistic.** Every table in sections 3-7 recomputes exactly from
+the raw run dirs; branch content, switches, results hold. My own ABBA on the 7 largest DF queries gives 94% of the
+author's gain on the same queries (-657 vs -701 ms). Corrected suite figure: **-786 ms (-5.1%)**, range -786..-830
+(-5.1..-5.4%); the 44 ms gap is beyond the 20-30 ms suite repeat noise only marginally and has one sign on all 6 queries.
 
-- 00:10 interim (q21 q3 q8 done, q6 half): branch content, switch evidence, result identity, author's tables all CONFIRMED
-  from raw data; own ABBA so far q21 SXE -375 (author -381), q8 -74 (-77), q3 -72 (-86), O vs T q3 +2.5. Remaining queued:
-  q6 b, q7 q10 q9 q2 (T SXE), q13 (T O). Final text replaces this block.
+Raw data `$R/runs/vcombined/<arm>_<a|b>/` (56 processes, all rc=0, env per process in `q<N>.env.txt`), Quent
+`$R/telemetry/vcombined_<arm>_<half>/`, scripts `$R/runs/vcombined/bin/{one.sh,abba.sh,audit.py}`, table
+`$R/runs/vcombined/out/audit.md`. Regenerate: `python3 $R/runs/vcombined/bin/audit.py $R/runs/vcombined ""`; author's blocks:
+`audit.py $R/runs/combined m1_` (or `n1_`, `o1_`). `wt-combined` not modified (clean, c5aa5bdf); config md5 unchanged.
+
+### 10.1 Checks that needed no new run
+
+| claim | check | result |
+|---|---|---|
+| branch = shadow + 4 xfer + 1 eager + switch | `git patch-id --stable` of each pick against its source commit; cd89bbc8 ancestor of HEAD | 5/5 patch-ids equal (09a04c32=ede040e3, c15b053e=4a205119, a6b8c1da=e3e5d0f7, b7d0eb81=bc7cf1ff, f05cfd12=e013f8d0); sources are the tips of proto/xfer-d2d and proto/eager-probe; c5aa5bdf = 7 lines, one file |
+| the measured binary has the three pieces | env-name strings in `build/release/libsirius.so.0.0.0` (built 18:32, after the 18:25 switch commit) | combined: all 3 present; tip (`$R/repo`, ae939824): none |
+| switches on in the TIMED arms (not only the log pass) | INFO lines in the log of each of the 272 m1 processes: `[eager] join`, count of `constructed filters published (Bloom`, its `N ms after the final contribution` | eager lines > 0 in exactly the arms with E (0 in T S X SX, every query); Bloom publishes q21 2 -> 1 and q8 2 -> 1 in exactly the arms with S; finish ms drops in exactly the arms with X (q21 342 -> 140, q3 61 -> 23, q7 68 -> 31; S+X q21 9). No violation in 272 processes |
+| log pass evidence | grep of `lp_*` | T 0/0/0, S skip 6, X island 57, SXE eager 93 / skip 6 / island 51: as written |
+| results identical, 22 queries | own md5 of every `result.txt` (m1 272 + n1 30 + o1 8 = 310 processes), 17 DF + q1 q6 q13 q14 q15 | 21 queries: one md5 across all arms. q11: 16 md5, one sorted-content md5, 936989 rows, value column non-increasing in tip and SXE files, 924394 distinct values = tie order only. 0 error / fallback lines. Results are compared to the tip only (not to DuckDB CPU) |
+| sections 3-6 arithmetic | recomputed medians, deltas, overlaps from raw `runtimes.csv` | all cells identical; sums -363 -398 -288 -549 -640 -697 -830. Alternative estimator (mean of the two process medians): -358 -399 -296 -548 -646 -693 -824 |
+| unit gates | read `$R/runs/combined/unit/summary.txt` only; NOT rerun | matches the text (661 / 33 x3 / 2 pass; shadow-off 652 + 9 failed) |
+
+### 10.2 Own ABBA (fresh process per arm per pass, 1 warm + 5 hot, first hot dropped, 8 hot per arm; q10 two blocks = 16)
+
+| q | arms | T | SXE | delta mine | per pass | delta author (m1) | results |
+|---|---|---|---|---|---|---|---|
+| 21 | T S X SX SXE | 1437.5 | 1062.9 | -374.6 | -383 / -379 | -380.6 | identical |
+| 3 | T O SXE | 658.5 | 586.9 | **-71.6** | -76 / -71 | -85.5 | identical |
+| 8 | T S X SX SXE | 934.6 | 860.4 | -74.3 | -81 / -68 | -77.0 | identical |
+| 7 | T SXE | 744.3 | 686.7 | -57.7 | -56 / -60 | -61.7 | identical |
+| 10 | T SXE, SXE T | 842.1 | 817.3 | -24.8 | -17 / -26 / -30 / -30 | -28.5 | identical |
+| 9 | T SXE | 1422.0 | 1393.7 | **-28.3** | -21 / -39 | -42.2 | identical |
+| 2 | T SXE | 147.7 | 122.1 | -25.6 | -25 / -26 | -25.3 | identical |
+| 6 (control, no DF) | T O SXE | 379.9 | 379.9 | -0.0 | +1 / -1 | +1.0 | identical |
+| **7 DF queries** | | | | **-656.9** | | **-700.8** | |
+
+Other arms: q21 S 1139.5 (-298.0), X 1246.0 (-191.5), SX 1118.0 (-319.5); q8 S 900.1 (-34.5), X 911.8 (-22.9),
+SX 898.8 (-35.8). All-off binary O against tip: q3 +2.5, q6 +0.3, q13 +11.2 (+10 / +12).
+Switch evidence in my own runs: same pattern as 10.1 (q21 eager 0/0/0/0/4, Bloom publishes 2/1/2/1/1, finish 341/26/140/9/9 ms
+for T/S/X/SX/SXE).
+
+### 10.3 Corrections
+
+1. **Suite gain: -786 ms (-5.1%), not -830 (-5.4%)**, when the 7 re-measured queries replace the author's cells
+   (-830 + 44); 14482 -> 14526 ms; against base on the reference scale -639 ms (-4.2%) instead of -683. The shortfall is
+   q3 14 ms, q9 14, q21 6, q7 4, q10 4, q8 3: the author's block sits at the favourable end on q3 and q9. Read q3 as
+   -72..-86 and q9 as -28..-42. Both runs agree on q21 (-375..-381), q8, q7, q2.
+2. Binary neutrality: the all-off binary's q3 -7.3 ms (o1) does NOT reproduce (+2.5 here); q13 changes sign (-24 author,
+   +11 here). So the combined binary with everything off = tip within noise, and counting the non-DF queries as 0 is right;
+   the "-868 with the measured n1 arm" row of section 5 should be ignored.
+3. Overlap wording (author's summary: "219 ms lost, all S-X"): the S-X pair overlap is 212 ms (q21 185 + q8 23 = 208);
+   the three-way 219 is that plus S-E +11, X-E -11, three-way term +7, all noise level. My rerun: q21 S-X overlap
+   **170 ms** (177 with the other estimator; author 185), q8 **22 ms** (author 23). Mechanism consistent with the finish
+   figures: q21 finish 341 ms; S removes 315, X removes 201, both remove 332, so 184 of the two is the same time.
+4. Section 6 "of X's 398 ms, 190 survive with S present; of S's 363, 133 survive with X present": those are the marginals
+   with BOTH other pieces present. With only the other one present: X on top of S = 186 (-363 -> -549), S on top of X =
+   151 (-398 -> -549). E on top of S+X: 281 (my q21 + q8: 55 + 38.5 = 94 vs author 58 + 39 = 97).
+5. "Order-independent floor 604 ms" is the sum of the three last-in marginals, not a floor of the combined gain (that is
+   -786..-830); the remaining ~200 ms is the shared S-X credit.
+
+### 10.4 Limits of this verification
+
+- One ABBA block per query (two for q10), n = 8 hot per arm, heavy lock contention (passes of a query 5-12 min apart;
+  tip drift between passes up to 14 ms on q9, 11 on q21). 10 of 17 DF queries and the E-only / SE / XE arms were not
+  re-measured; unit tests not rerun; results not compared against DuckDB CPU.
+
+### 10.5 Checkpoint log (verifier)
+
+- 11-27 23:25: static checks done (patch-ids, binary strings, 310-process md5 + switch audit). ABBA started.
+- 11-28 00:10: q21 q3 q8 done, interim block written, backup run.
+- 11-28 01:10: all 56 processes rc=0 (q21 q8 q3 q6 q7 q10 q9 q2 q13 + q10 repeat). Section final. Backup run.
 <!-- VERIFICATION-END -->
