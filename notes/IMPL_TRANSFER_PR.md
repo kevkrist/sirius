@@ -125,3 +125,52 @@ retires partials).
 - Rebase replay (conflict list): $R/notes/xfer_rebase/replay_rebase.sh + replay.log.
 - Run dir $R/runs/xfer_fin (bin/abba_q.sh, one_query.sh, table.py as in runs/xfer_main). DF queries: 2 3 4 5 7 8 9 10 11 12 16 17 18 19 20 21 22; non-DF 1 6 13 14 15.
 - NEXT: builds A-D, unit gates on B and D (+ 2569 head), pre-commit on B, measurement (a) B vs A, (b) D vs C, 22-query identity, tables below.
+
+## 5. Rebasing the construction stack (#2569, #2570) over the transfer PR -- reproducible recipe (2026-11-28)
+
+Inputs: `X` = transfer PR head (`prod/xfer-main`), `M` = its base (origin/main `f1595eb3`), `S9` / `S0` = the #2569 / #2570 heads rebased on `M`
+without the transfer PR (`prod/ctl-stack-2569-on-main`, `prod/ctl-stack-2570-on-main`; rebasing apply/2569 08963d79 and apply/2570 317e0cfc from
+c4fa3638 onto main has 5 conflicts of its own, all main drift, listed in "Checkpoint log 2"). Result: `prod/stack-2569-on-xfer`, `prod/stack-2570-on-xfer`.
+
+```bash
+git rebase --onto prod/xfer-main origin/main prod/ctl-stack-2570-on-main     # 25 picks, 9 stop with conflicts (list below)
+# at each stop: take every conflicted file from the commit with the SAME SUBJECT on prod/stack-2570-on-xfer, then continue
+git checkout <same-subject commit of prod/stack-2570-on-xfer> -- $(git diff --name-only --diff-filter=U); git rebase --continue
+# afterwards cherry-pick the two adaptation commits (or fold them as their messages say):
+#   "refactor(dynamic-filter): carry the Bloom publication route through construction"   (F1, after the last #2569 commit)
+#   "test(dynamic-filter): keep the union transfer test and counters on unified construction" (F2, after the last #2570 commit)
+git diff prod/stack-2570-on-xfer            # must be empty; same check for the #2569 head against prod/stack-2569-on-xfer
+```
+The replay of exactly this (script + log: `$R/notes/xfer_rebase/replay_rebase.sh`, `replay.log`) reproduces the tested trees.
+
+Textual conflicts (stack commit subject -> files -> resolution):
+
+| # | Stack commit | Conflicted files | Resolution |
+|---|---|---|---|
+| 1 | extract build-input certification | `cmake/sirius-test-sources.cmake`, `src/op/CMakeLists.txt` | both sides add list entries: keep both (union) |
+| 2 | accumulate Bloom filters for every key type | `src/cuda/sirius_dynamic_bloom_filter.cu` | keep the transfer PR's `finish_impl` (validate, request, `unite`); the stack's per-key array sizes feed one `union_shape` per key; the stack's copy of the old chunk pipeline / HOST loop is dropped |
+| 3 | stage exact keys and per-batch bounds | `src/cuda/sirius_dynamic_bloom_filter.cu` | includes: both; `create()`: the stack's `lease_partials` first, then the transfer PR's `peer_islands` |
+| 4 | unify doc comments and UPPER_CASE enumerators | `src/cuda/accumulation_partial.cuh` | stack text; the helpers stay in `accumulation_cuda.cuh` (see S2) |
+| 5 | construct at every build PARTITION | `src/op/dynamic_filter/dynamic_filter_publisher.cpp` | the stack's publisher body with the transfer PR's fields (`publication_route`, `bloom_degraded`) instead of `published_filters::transport` |
+| 6 | delete the one-shot deposit path | `detail/accumulated_bloom_builder.hpp`, `test_dynamic_filter_accumulation.cpp`, `test_dynamic_filter_accumulation_fault.cpp` | transfer PR's interface and tests, with the stack's deletions and its tag rename `[multi_partition]` -> `[construction]` |
+| 7 | document unified construction | `docs/super-sirius/dynamic-filters.md` | stack text + the transfer PR's transport / workspace paragraphs |
+| 8 | unify doc comments in unified construction | `detail/accumulated_bloom_builder.hpp` | stack doc style on the transfer PR's `try_create` / `finish` text |
+| 9 | document shadowed keys | `docs/super-sirius/dynamic-filters.md` | as 7 |
+
+Changes git does not flag (no conflict, but needed; they are in the same-subject commits or in F1 / F2):
+
+| # | Where | Change | Why |
+|---|---|---|---|
+| S1 | F1: `build_filter_construction.{hpp,cpp}` | report `publication_route` + `bloom_degraded` instead of the deleted `publication_transport` | the stack adds a second reader of the publication result |
+| S2 | "stage exact keys": `src/cuda/accumulation_partial.cuh` | include `accumulation_cuda.cuh` instead of defining `check_cuda` / `cuda_event` / `make_event_on` | the transfer PR moved them to a shared header (else: redefinition) |
+| S3 | F1 + F2: `test_dynamic_filter_union_transfer.cpp` | builder made with per-key block counts (`builder_type::key{..., blocks[i]}`), shapes of different size per key restored, tags `[construction]` | on main all keys share one geometry; #2569 sizes each key; #2570 renames the tag |
+| S4 | F1 + F2: `dynamic_filter_stats.hpp` | counter prose keeps `accumulation_publications_degraded` and the new meaning of `..._host_staged`; F2 adds the counter to the construction list | the stack rewrites the same paragraph |
+| S5 | F1: `sirius_dynamic_bloom_filter.cu` (one orphan comment), `accumulated_bloom_builder.hpp` (`publication_scratch_bytes` doc: bound per key group) | text only | |
+
+History caveat: the same-subject commits were grafted by tree, so between "extract build-input certification" and F1 (stats prose) and between
+"delete the one-shot deposit path" and F2 (union test) the tree carries the control stack's version of those two files; only the two heads are
+built and tested. Fold F1 / F2 as their messages say when the real PR branches are rebased.
+
+Check "stack-on-transfer minus control stack = transfer PR + the rows above": `git diff --stat prod/ctl-stack-2570-on-main prod/stack-2570-on-xfer`
+= the 28 files of `git diff --stat origin/main prod/xfer-main` (same new files, byte-identical except the union test, S3) + `accumulation_partial.cuh` (S2)
++ `build_filter_construction.{hpp,cpp}` (S1); 3370 insertions / 728 deletions against the transfer PR's 3379 / 723.

@@ -18,7 +18,7 @@ extra=""; [ "${NSYS:-0}" = 1 ] && extra="--precmd nsys --query-timeout 3600"
 pixi run python test/tpch_performance/performance_test.py \
   --input $DATA --scale-factor $SF --data-source parquet --engine gpu \
   --config $SIRIUS_CONFIG_FILE --iterations $iters --queries $q \
-  --pin host --pin-compression \
+  --pin host \
   --compression-plan-dir /home/ubuntu/sirius/src/compression/simpatico_codegen/plans/tpch_sf1000 \
   $extra --output $out --name q$q > $out/q$q.stdout 2>&1
 rc=$?
