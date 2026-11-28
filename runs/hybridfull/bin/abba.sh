@@ -8,4 +8,3 @@ for q in "$@"; do
   flock $R/machine.lock bash -c "for a in $rev; do $B/arm.sh \$a ${tag}_\${a}_b $q $iters; done"
   echo "q$q done $(date +%T)" >> $R/runs/hybridfull/$tag.progress
 done
-echo ALLDONE >> $R/runs/hybridfull/$tag.progress
