@@ -1,0 +1,1158 @@
+[2026-11-28 16:44:05.591] [info] [sirius_context.cpp:369] QueryBegin: instance=0x7c855558c140 connection=1 query=13 SQL: select sum(l.l_extendedprice) / 7.0 as avg_yearly from lineitem l, part p where p.p_partkey = l.l_partkey and p.p_brand = 'Brand#13' and p.p_container = 'JUMBO CAN' and l.l_quantity < ( select 0.2 * avg(l2.l_quantity) from lineitem l2 where l2.l_partkey = p.p_partkey )
+[2026-11-28 16:44:05.603] [debug] [sirius_optimizer_extension.cpp:288] Gave 3 Parquet scans their footer statistics
+[2026-11-28 16:44:05.628] [info] [sirius_plan_delim_aggregate_reuse.cpp:364] [sirius_plan_delim_aggregate_reuse] Computed 1 subquery aggregate(s) from the delim CTE's outer rows instead of rescanning the subquery's tables
+[2026-11-28 16:44:05.629] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:05.629] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: AGGREGATE
+[2026-11-28 16:44:05.629] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: CTE
+[2026-11-28 16:44:05.629] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:05.629] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:05.629] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: COMPARISON_JOIN
+[2026-11-28 16:44:05.629] [debug] [sirius_plan_comparison_join.cpp:211] [join] column 'p_partkey' proven distinct by the pinned table
+[2026-11-28 16:44:05.629] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: GET
+[2026-11-28 16:44:05.630] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: GET
+[2026-11-28 16:44:05.630] [info] [sirius_plan_comparison_join.cpp:840] [sirius_plan_comparison_join] Wired hash join with 1 dynamic-filter probe target(s) (1 scan-bound, 0 join-edge; evidence=filtered; build est 39999993 rows).
+[2026-11-28 16:44:05.630] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:05.630] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:05.630] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: COMPARISON_JOIN
+[2026-11-28 16:44:05.630] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: CTE_SCAN
+[2026-11-28 16:44:05.630] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:05.630] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: AGGREGATE
+[2026-11-28 16:44:05.630] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: CTE_SCAN
+[2026-11-28 16:44:05.630] [info] [sirius_plan_comparison_join.cpp:854] [sirius_plan_comparison_join] Not wiring dynamic filter(s): build side carries no filter, opaque-build or semi-join evidence (build est 599933022 rows).
+[2026-11-28 16:44:05.630] [debug] [scan_plan.cpp:511] [scan_plan] built plan: 3 data col(s), 0 partition col(s), 3 output entries
+[2026-11-28 16:44:05.630] [debug] [scan_plan.cpp:511] [scan_plan] built plan: 3 data col(s), 0 partition col(s), 1 output entries
+[2026-11-28 16:44:05.630] [debug] [scan_plan.cpp:511] [scan_plan] built plan: 3 data col(s), 0 partition col(s), 3 output entries
+[2026-11-28 16:44:05.630] [debug] [scan_plan.cpp:511] [scan_plan] built plan: 3 data col(s), 0 partition col(s), 1 output entries
+[2026-11-28 16:44:05.630] [debug] [scan_utils.cpp:123] TABLE_SCAN filter: column_index=1, primary_idx=3, type=VARCHAR, filter_type=9, batch_column_index=1
+[2026-11-28 16:44:05.630] [debug] [scan_utils.cpp:123] TABLE_SCAN filter: column_index=2, primary_idx=6, type=VARCHAR, filter_type=9, batch_column_index=2
+[2026-11-28 16:44:05.630] [debug] [scan_utils.cpp:123] TABLE_SCAN filter: column_index=1, primary_idx=3, type=VARCHAR, filter_type=9, batch_column_index=1
+[2026-11-28 16:44:05.630] [debug] [scan_utils.cpp:123] TABLE_SCAN filter: column_index=2, primary_idx=6, type=VARCHAR, filter_type=9, batch_column_index=2
+[2026-11-28 16:44:05.630] [debug] [scan_filter_analysis.cpp:436] TABLE_SCAN filter analysis: filter on column_index=1 is not fully an AND-tree of numeric constant comparisons — the scan's own filter is still required
+[2026-11-28 16:44:05.630] [debug] [scan_filter_analysis.cpp:436] TABLE_SCAN filter analysis: filter on column_index=2 is not fully an AND-tree of numeric constant comparisons — the scan's own filter is still required
+[2026-11-28 16:44:05.630] [debug] [scan_filter_analysis.cpp:503] TABLE_SCAN filter analysis: 0 range(s), 2 equality set(s), ranges_cover_whole_filter=false
+[2026-11-28 16:44:05.630] [info] [sirius_context.cpp:2311] Transparent execution: Sirius physical plan generated successfully
+[2026-11-28 16:44:05.630] [info] [sirius_context.cpp:2349] Transparent execution: physical plan replaced with GPU operator
+[2026-11-28 16:44:05.630] [info] [physical_sirius_execution.cpp:260] Transparent GPU execution: executing query
+[2026-11-28 16:44:05.630] [info] [sirius_context.cpp:794] [window] begin instance=0x7c855558c140 connection=1 window=4 query=13 outcome=-
+[2026-11-28 16:44:05.630] [info] [sirius_context.cpp:292] [host_pool] HOST:0 QueryBegin instance=0x7c855558c140 connection=1 window=4 query=13 allocated=79474720768 bytes peak=79474720768 bytes free_blocks=434
+[2026-11-28 16:44:05.630] [info] [sirius_context.cpp:307] [gpu_pool] GPU:0 QueryBegin instance=0x7c855558c140 connection=1 window=4 query=13 allocated=0 bytes peak=7855823228 bytes reserved=0 bytes
+[2026-11-28 16:44:05.630] [info] [sirius_context.cpp:307] [gpu_pool] GPU:1 QueryBegin instance=0x7c855558c140 connection=1 window=4 query=13 allocated=0 bytes peak=5391726592 bytes reserved=0 bytes
+[2026-11-28 16:44:05.630] [info] [sirius_context.cpp:307] [gpu_pool] GPU:2 QueryBegin instance=0x7c855558c140 connection=1 window=4 query=13 allocated=0 bytes peak=5391679488 bytes reserved=0 bytes
+[2026-11-28 16:44:05.630] [info] [sirius_context.cpp:307] [gpu_pool] GPU:3 QueryBegin instance=0x7c855558c140 connection=1 window=4 query=13 allocated=0 bytes peak=7993790368 bytes reserved=0 bytes
+[2026-11-28 16:44:05.630] [info] [sirius_context.cpp:605] QueryBegin: transparent_execution
+[2026-11-28 16:44:05.630] [info] [physical_sirius_execution.cpp:355] Transparent execution: reusing finalize-validated Sirius plan
+[2026-11-28 16:44:05.630] [debug] [sirius_engine.cpp:239] Initializing sirius_engine
+[2026-11-28 16:44:05.630] [info] [sirius_engine.cpp:385] [gpu_alloc] query allocated 4 GPU(s): [0, 1, 2, 3]
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline RESULT_COLLECTOR
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink RESULT_COLLECTOR
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline RESULT_COLLECTOR
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink MERGE_AGGREGATE
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline MERGE_AGGREGATE
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink UNGROUPED_AGGREGATE
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline UNGROUPED_AGGREGATE
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink CTE
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline CTE
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline HASH_JOIN
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink CONCAT
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline CONCAT
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PARTITION
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PARTITION
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink GPU_SCAN
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline GPU_SCAN
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink CONCAT
+[2026-11-28 16:44:05.630] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline CONCAT
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PARTITION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PARTITION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink DYNAMIC_FILTER
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline DYNAMIC_FILTER
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline GPU_SCAN
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline HASH_JOIN
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink CONCAT
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline CONCAT
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PARTITION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PARTITION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PROJECTION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline MERGE_GROUP_BY
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PARTITION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PARTITION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink HASH_GROUP_BY
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline HASH_GROUP_BY
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:212] Setting pipeline source CTE_SCAN
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink CONCAT
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline CONCAT
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PARTITION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PARTITION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PROJECTION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline.cpp:212] Setting pipeline source CTE_SCAN
+[2026-11-28 16:44:05.631] [debug] [sirius_pipeline_converter.cpp:164] Total meta pipelines 18
+[2026-11-28 16:44:05.631] [debug] [sirius_engine.cpp:433] total_pipelines = 19
+[2026-11-28 16:44:05.631] [info] [sirius_engine.cpp:437] Query Plan:
+=== Pipeline Overview ===
+Pipeline #0: GPU_SCAN (id=0)
+  Output: -> PARTITION [port: default, barrier: FULL]
+Pipeline #1: PARTITION (id=1)
+  Input: <- Pipeline #0 [on: PARTITION (id=1), port: default, barrier: FULL]
+  Dependencies: Pipeline #0
+  Output: -> CONCAT [port: default, barrier: PARTIAL]
+Pipeline #2: CONCAT (id=2)
+  Input: <- Pipeline #1 [on: CONCAT (id=2), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #1
+  Output: -> HASH_JOIN [port: build, barrier: PARTIAL]
+Pipeline #3: GPU_SCAN (id=3) -> DYNAMIC_FILTER (id=4)
+  Output: -> PARTITION [port: default, barrier: PARTIAL]
+Pipeline #4: PARTITION (id=5)
+  Input: <- Pipeline #3 [on: PARTITION (id=5), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #3
+  Output: -> CONCAT [port: default, barrier: PARTIAL]
+Pipeline #5: CONCAT (id=6)
+  Input: <- Pipeline #4 [on: CONCAT (id=6), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #4
+  Output: -> HASH_JOIN [port: default, barrier: PARTIAL]
+Pipeline #6: HASH_JOIN (id=7) -> PROJECTION (id=8) -> PROJECTION (id=9) -> CTE (id=10)
+  Input: <- Pipeline #2 [on: HASH_JOIN (id=7), port: build, barrier: PARTIAL]
+  Input: <- Pipeline #5 [on: HASH_JOIN (id=7), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #2, Pipeline #5
+  Output: -> PROJECTION [port: default, barrier: FULL]
+  Output: -> PROJECTION [port: default, barrier: FULL]
+Pipeline #7: PROJECTION (id=11) -> HASH_GROUP_BY (id=12)
+  Input: <- Pipeline #6 [on: PROJECTION (id=11), port: default, barrier: FULL]
+  Dependencies: Pipeline #6
+  Output: -> PARTITION [port: default, barrier: FULL]
+Pipeline #8: PARTITION (id=13)
+  Input: <- Pipeline #7 [on: PARTITION (id=13), port: default, barrier: FULL]
+  Dependencies: Pipeline #7
+  Output: -> MERGE_GROUP_BY [port: default, barrier: FULL]
+Pipeline #9: MERGE_GROUP_BY (id=14) -> PROJECTION (id=15)
+  Input: <- Pipeline #8 [on: MERGE_GROUP_BY (id=14), port: default, barrier: FULL]
+  Dependencies: Pipeline #8
+  Output: -> PARTITION [port: default, barrier: FULL]
+Pipeline #10: PARTITION (id=16)
+  Input: <- Pipeline #9 [on: PARTITION (id=16), port: default, barrier: FULL]
+  Dependencies: Pipeline #9
+  Output: -> CONCAT [port: default, barrier: PARTIAL]
+Pipeline #11: CONCAT (id=17)
+  Input: <- Pipeline #10 [on: CONCAT (id=17), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #10
+  Output: -> HASH_JOIN [port: build, barrier: PARTIAL]
+Pipeline #12: PROJECTION (id=18)
+  Input: <- Pipeline #6 [on: PROJECTION (id=18), port: default, barrier: FULL]
+  Dependencies: Pipeline #6
+  Output: -> PARTITION [port: default, barrier: PARTIAL]
+Pipeline #13: PARTITION (id=19)
+  Input: <- Pipeline #12 [on: PARTITION (id=19), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #12
+  Output: -> CONCAT [port: default, barrier: PARTIAL]
+Pipeline #14: CONCAT (id=20)
+  Input: <- Pipeline #13 [on: CONCAT (id=20), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #13
+  Output: -> HASH_JOIN [port: default, barrier: PARTIAL]
+Pipeline #15: HASH_JOIN (id=21) -> PROJECTION (id=22) -> UNGROUPED_AGGREGATE (id=23)
+  Input: <- Pipeline #11 [on: HASH_JOIN (id=21), port: build, barrier: PARTIAL]
+  Input: <- Pipeline #14 [on: HASH_JOIN (id=21), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #11, Pipeline #14
+  Output: -> MERGE_AGGREGATE [port: default, barrier: FULL]
+Pipeline #16: MERGE_AGGREGATE (id=24)
+  Input: <- Pipeline #15 [on: MERGE_AGGREGATE (id=24), port: default, barrier: FULL]
+  Dependencies: Pipeline #15
+  Output: -> PROJECTION [port: default, barrier: FULL]
+Pipeline #17: PROJECTION (id=25) -> RESULT_COLLECTOR (id=26)
+  Input: <- Pipeline #16 [on: PROJECTION (id=25), port: default, barrier: FULL]
+  Dependencies: Pipeline #16
+
+=== Query Plan DAG ===
+┌─────────────────────────────┐                                                              
+│ Pipeline #17                │                                                              
+│ RESULT_COLLECTOR (id=26)    │                                                              
+│ PROJECTION (id=25)          │                                                              
+│ Input(#16): FULL            │                                                              
+└──────────────┬──────────────┘                                                              
+               │                                                                             
+┌─────────────────────────────┐                                                              
+│ Pipeline #16                │                                                              
+│ MERGE_AGGREGATE (id=24)     │                                                              
+│ Input(#15): FULL            │                                                              
+└──────────────┬──────────────┘                                                              
+               │                                                                             
+┌─────────────────────────────┐                                                              
+│ Pipeline #15                │                                                              
+│ UNGROUPED_AGGREGATE (id=23) │                                                              
+│ PROJECTION (id=22)          │                                                              
+│ HASH_JOIN (id=21)           │                                                              
+│   type: INNER               │                                                              
+│ Input(#11): PARTIAL         │                                                              
+│ Input(#14): PARTIAL         │                                                              
+└──────────────┬──────────────┘                                                              
+               ┌─────────────────────────────────────────────────────────────┐               
+               │                                                             │               
+┌─────────────────────────────┐                               ┌─────────────────────────────┐
+│ Pipeline #11                │                               │ Pipeline #14                │
+│ CONCAT (id=17)              │                               │ CONCAT (id=20)              │
+│ Input(#10): PARTIAL         │                               │ Input(#13): PARTIAL         │
+└──────────────┬──────────────┘                               └──────────────┬──────────────┘
+               │                                                             │               
+┌─────────────────────────────┐                               ┌─────────────────────────────┐
+│ Pipeline #10                │                               │ Pipeline #13                │
+│ PARTITION (id=16)           │                               │ PARTITION (id=19)           │
+│ Input(#9): FULL             │                               │ Input(#12): PARTIAL         │
+└──────────────┬──────────────┘                               └──────────────┬──────────────┘
+               │                                                             │               
+┌─────────────────────────────┐                               ┌─────────────────────────────┐
+│ Pipeline #9                 │                               │ Pipeline #12                │
+│ PROJECTION (id=15)          │                               │ PROJECTION (id=18)          │
+│ MERGE_GROUP_BY (id=14)      │                               │ Input(#6): FULL             │
+│ Input(#8): FULL             │                               │                             │
+└──────────────┬──────────────┘                               └──────────────┬──────────────┘
+               │                                                             │               
+┌─────────────────────────────┐                               ┌─────────────────────────────┐
+│ Pipeline #8                 │                               │ (-> Pipeline #6)            │
+│ PARTITION (id=13)           │                               │                             │
+│ Input(#7): FULL             │                               │                             │
+└──────────────┬──────────────┘                               └──────────────┬──────────────┘
+               │                                                                             
+┌─────────────────────────────┐                                                              
+│ Pipeline #7                 │                                                              
+│ HASH_GROUP_BY (id=12)       │                                                              
+│ PROJECTION (id=11)          │                                                              
+│ Input(#6): FULL             │                                                              
+└──────────────┬──────────────┘                                                              
+               │                                                                             
+┌─────────────────────────────┐                                                              
+│ Pipeline #6                 │                                                              
+│ CTE (id=10)                 │                                                              
+│ PROJECTION (id=9)           │                                                              
+│ PROJECTION (id=8)           │                                                              
+│ HASH_JOIN (id=7)            │                                                              
+│   type: INNER               │                                                              
+│ Input(#2): PARTIAL          │                                                              
+│ Input(#5): PARTIAL          │                                                              
+└──────────────┬──────────────┘                                                              
+               ┌──────────────────────────────┐                                              
+               │                              │                                              
+┌─────────────────────────────┐┌─────────────────────────────┐                               
+│ Pipeline #2                 ││ Pipeline #5                 │                               
+│ CONCAT (id=2)               ││ CONCAT (id=6)               │                               
+│ Input(#1): PARTIAL          ││ Input(#4): PARTIAL          │                               
+└──────────────┬──────────────┘└──────────────┬──────────────┘                               
+               │                              │                                              
+┌─────────────────────────────┐┌─────────────────────────────┐                               
+│ Pipeline #1                 ││ Pipeline #4                 │                               
+│ PARTITION (id=1)            ││ PARTITION (id=5)            │                               
+│ Input(#0): FULL             ││ Input(#3): PARTIAL          │                               
+└──────────────┬──────────────┘└──────────────┬──────────────┘                               
+               │                              │                                              
+┌─────────────────────────────┐┌─────────────────────────────┐                               
+│ Pipeline #0                 ││ Pipeline #3                 │                               
+│ GPU_SCAN (id=0)             ││ DYNAMIC_FILTER (id=4)       │                               
+│                             ││ GPU_SCAN (id=3)             │                               
+└─────────────────────────────┘└─────────────────────────────┘                               
+
+[2026-11-28 16:44:05.631] [info] [sirius_engine.cpp:262] query 4 telemetry_query=01a2230ae27e72a6993a8d0bcaa98655
+[2026-11-28 16:44:05.631] [info] [sirius_scan_manager.cpp:1648] [sirius_scan_manager] cache summary: fs_cache: global[reads=17532 hits=0 h2d=0 miss=60825 evictions=0] last_cycle[reads=17532 hits=0 h2d=0 miss=60825 evictions=0]
+[2026-11-28 16:44:05.631] [debug] [sirius_scan_manager.cpp:4399] [sirius_scan_manager] zone-map pruning for pinned entry 'part': nothing pruned (2 chunks served)
+[2026-11-28 16:44:05.631] [info] [sirius_scan_manager.cpp:4511] [sirius_scan_manager] assigned pinned entry 'part' to operator '0'
+[2026-11-28 16:44:05.631] [debug] [sirius_scan_manager.cpp:4399] [sirius_scan_manager] zone-map pruning for pinned entry 'lineitem': nothing pruned (31 chunks served)
+[2026-11-28 16:44:05.631] [info] [sirius_scan_manager.cpp:4511] [sirius_scan_manager] assigned pinned entry 'lineitem' to operator '3'
+[2026-11-28 16:44:05.631] [info] [sirius_scan_manager.cpp:947] [late-mat] operator 0: not deferring — the pinned entry is not device-resident
+[2026-11-28 16:44:05.631] [info] [sirius_scan_manager.cpp:947] [late-mat] operator 3: not deferring — the pinned entry is not device-resident
+[2026-11-28 16:44:05.631] [debug] [sirius_scan_manager.cpp:2123] [decompression-pushdown] entry 'part': consumer=0x0 request: 3 slot(s), covers_whole_filter=false
+[2026-11-28 16:44:05.631] [debug] [sirius_scan_manager.cpp:2123] [decompression-pushdown] entry 'lineitem': consumer=0x5e3413249dc0 request: 0 slot(s), covers_whole_filter=false
+[2026-11-28 16:44:05.631] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:05.632] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:05.635] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=3 request_empty=false
+[2026-11-28 16:44:05.635] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=2 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:05.635] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=STRING route=3 comparable_lane=false range_requested=false range=[0, 0]
+[2026-11-28 16:44:05.635] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=STRING route=3 comparable_lane=false range_requested=false range=[0, 0]
+[2026-11-28 16:44:05.635] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:05.635] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: equality(c1) equality(c2)
+[2026-11-28 16:44:05.638] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=3 request_empty=false
+[2026-11-28 16:44:05.638] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=2 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:05.638] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=STRING route=3 comparable_lane=false range_requested=false range=[0, 0]
+[2026-11-28 16:44:05.638] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=STRING route=3 comparable_lane=false range_requested=false range=[0, 0]
+[2026-11-28 16:44:05.638] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:05.638] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: equality(c1) equality(c2)
+[2026-11-28 16:44:05.654] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=0): ranges=0 equalities=2 join_filters=0 survivors=57923/57843160 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:05.654] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=57923 → GPU device=1
+[2026-11-28 16:44:05.654] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=0): ranges=0 equalities=2 join_filters=0 survivors=142662/142156840 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:05.654] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=142662 → GPU device=0
+[2026-11-28 16:44:05.654] [debug] [sirius_physical_hash_join.cpp:988] sirius_physical_hash_join id 7 partition strategy: 4 partitions (4 GPUs), build side 802340 bytes, 200585 rows, estimated hash table 3209360 bytes. Join Type: INNER. Join Mode: BUILD_PROBE  [broadcast]. build_card_est 39999993 probe_card_est 5999330220 placement [0->0, 1->1, 2->2, 3->3]
+[2026-11-28 16:44:05.654] [debug] [partition_exchange.cpp:118] partition_exchange resolved 2 inputs on sizing input 0: 4 partitions, mode broadcast, sized from 802340 bytes and 200585 rows, placement [0->0, 1->1, 2->2, 3->3]
+[2026-11-28 16:44:05.654] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:05.654] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:05.655] [debug] [dynamic_filter_publisher.cpp:140] [dynamic_filter_domain] path=ordinary condition=0 rows=200585 domain=200000000 provenance=pinned_parquet_exact eligible=1 threshold=0.9 decision=keep
+[2026-11-28 16:44:05.655] [debug] [sirius_dynamic_in_list_filter.cu:212] [sirius_dynamic_in_list_filter] built set: 200585 keys, bucket_size=4, capacity_factor=4, capacity=802340 slots (3209360 bytes).
+[2026-11-28 16:44:05.655] [debug] [dynamic_filter_publisher.cpp:1333] [publish_dynamic_filters] dynamic filter key 0: build_rows=200585 (valid=200585) zone_map=no membership: in_list_set=1604680B bloom=401184B L2=134217728B inlist_max_l2_fraction=0.125 -> in_list
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:05.655] [debug] [sirius_dynamic_in_list_filter.cu:326] [sirius_dynamic_in_list_filter] queued 3209392-byte replica GPU 0 -> GPU 1.
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:05.655] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:05.655] [debug] [sirius_dynamic_in_list_filter.cu:326] [sirius_dynamic_in_list_filter] queued 3209392-byte replica GPU 0 -> GPU 2.
+[2026-11-28 16:44:05.674] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.674] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.674] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.675] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.713] [debug] [sirius_dynamic_in_list_filter.cu:326] [sirius_dynamic_in_list_filter] queued 3209392-byte replica GPU 0 -> GPU 3.
+[2026-11-28 16:44:05.713] [info] [dynamic_filter_publisher.cpp:1383] [publish_dynamic_filters] dynamic-filter publication: pushed 1 dynamic filter(s) across 1 active target(s) of 1 wired target(s) (200585 build rows, 1 bound keys of 1 admitted).
+[2026-11-28 16:44:05.731] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.731] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.732] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.733] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.788] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.788] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.789] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.789] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.833] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195750694 → GPU device=1
+[2026-11-28 16:44:05.833] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195749643 → GPU device=0
+[2026-11-28 16:44:05.834] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195738413 → GPU device=1
+[2026-11-28 16:44:05.835] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195760220 → GPU device=0
+[2026-11-28 16:44:05.835] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195754596 → GPU device=1
+[2026-11-28 16:44:05.836] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195749181 → GPU device=0
+[2026-11-28 16:44:05.868] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.868] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.873] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195715178 → GPU device=2
+[2026-11-28 16:44:05.873] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195768867 → GPU device=3
+[2026-11-28 16:44:05.874] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195764565 → GPU device=3
+[2026-11-28 16:44:05.874] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195730130 → GPU device=2
+[2026-11-28 16:44:05.875] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195737624 → GPU device=3
+[2026-11-28 16:44:05.875] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195742965 → GPU device=2
+[2026-11-28 16:44:05.875] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:05.875] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:05.877] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:05.877] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:05.877] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:05.877] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:05.877] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:05.887] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195751913 → GPU device=1
+[2026-11-28 16:44:05.887] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:05.887] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:05.887] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:05.887] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195744742 → GPU device=3
+[2026-11-28 16:44:05.888] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195745186 → GPU device=2
+[2026-11-28 16:44:05.888] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:05.888] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:05.888] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:05.890] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:05.896] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:05.899] [debug] [compressed_scan.cpp:542] [decompression-pushdown] join filters kept 195678/195741638 rows (1 of 1 probe(s) ran, complete=true)
+[2026-11-28 16:44:05.899] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195678/195741638 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:05.899] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195678 → GPU device=0
+[2026-11-28 16:44:05.899] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:05.903] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:05.903] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:05.903] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:05.903] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:05.904] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:05.904] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:05.904] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:05.904] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:05.905] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:05.909] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:05.915] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:05.924] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:05.962] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:05.967] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:05.970] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:05.981] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.000] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.000] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.000] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.000] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.000] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.000] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.000] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.000] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.000] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.000] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.008] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.016] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196170/195736826 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.016] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196170 → GPU device=0
+[2026-11-28 16:44:06.016] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196829/195764771 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.016] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196829 → GPU device=0
+[2026-11-28 16:44:06.017] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.017] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.023] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.023] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.023] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.023] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.023] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.023] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.024] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.038] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.047] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195780/195729730 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.047] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195780 → GPU device=1
+[2026-11-28 16:44:06.047] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196511/195741104 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.047] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196511 → GPU device=1
+[2026-11-28 16:44:06.048] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.048] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.048] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.048] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.048] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.048] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.048] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.048] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196518/195744518 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.062] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196518 → GPU device=1
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.062] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.063] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.064] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196297/195752441 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.064] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196297 → GPU device=0
+[2026-11-28 16:44:06.064] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.077] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.083] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=127847/127674443 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.083] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=127847 → GPU device=0
+[2026-11-28 16:44:06.083] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.102] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.102] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.102] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.102] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.102] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.102] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.115] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.115] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.115] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.115] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.115] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.115] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.127] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196152/195740033 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.127] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196152 → GPU device=3
+[2026-11-28 16:44:06.127] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196190/195718318 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.127] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196190 → GPU device=3
+[2026-11-28 16:44:06.127] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195921/195757957 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.127] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195921 → GPU device=3
+[2026-11-28 16:44:06.127] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196389/195741740 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.127] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196389 → GPU device=3
+[2026-11-28 16:44:06.127] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.127] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.127] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.127] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.134] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195866/195729728 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.134] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195866 → GPU device=2
+[2026-11-28 16:44:06.134] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196057/195728987 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.134] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195900/195744547 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.134] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196057 → GPU device=2
+[2026-11-28 16:44:06.134] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195900 → GPU device=2
+[2026-11-28 16:44:06.134] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195935/195739011 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.134] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195935 → GPU device=2
+[2026-11-28 16:44:06.134] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.135] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.135] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.135] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.139] [warning] [sirius_physical_hash_join.cpp:1271] In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable partition (build/probe already drained) in operator 7
+[2026-11-28 16:44:06.139] [warning] [sirius_physical_hash_join.cpp:1271] In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable partition (build/probe already drained) in operator 7
+[2026-11-28 16:44:06.139] [warning] [sirius_physical_hash_join.cpp:1271] In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable partition (build/probe already drained) in operator 7
+[2026-11-28 16:44:06.145] [debug] [sirius_physical_hash_join.cpp:2370] sirius_physical_hash_join id 7: using distinct_hash_join (BUILD_PROBE, proven unique)
+[2026-11-28 16:44:06.145] [debug] [sirius_physical_hash_join.cpp:2370] sirius_physical_hash_join id 7: using distinct_hash_join (BUILD_PROBE, proven unique)
+[2026-11-28 16:44:06.145] [debug] [sirius_physical_hash_join.cpp:2370] sirius_physical_hash_join id 7: using distinct_hash_join (BUILD_PROBE, proven unique)
+[2026-11-28 16:44:06.145] [debug] [sirius_physical_hash_join.cpp:2370] sirius_physical_hash_join id 7: using distinct_hash_join (BUILD_PROBE, proven unique)
+[2026-11-28 16:44:06.146] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.146] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.146] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.146] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.146] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.146] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.146] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.146] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.146] [debug] [gpu_aggregate_impl.cpp:420] local_grouped_agg: sorted-key check rows=1374095 sorted=false
+[2026-11-28 16:44:06.146] [debug] [gpu_aggregate_impl.cpp:420] local_grouped_agg: sorted-key check rows=1569065 sorted=false
+[2026-11-28 16:44:06.146] [debug] [gpu_aggregate_impl.cpp:420] local_grouped_agg: sorted-key check rows=1570062 sorted=false
+[2026-11-28 16:44:06.146] [debug] [gpu_aggregate_impl.cpp:420] local_grouped_agg: sorted-key check rows=1500674 sorted=false
+[2026-11-28 16:44:06.163] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'HASH_GROUP_BY' (id=12) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.164] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'HASH_GROUP_BY' (id=12) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.164] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'HASH_GROUP_BY' (id=12) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.164] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'HASH_GROUP_BY' (id=12) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.164] [debug] [partition_exchange.cpp:118] partition_exchange resolved 1 inputs on sizing input 0: 1 partitions, mode hash, sized from 22461544 bytes and 802198 rows, placement [0->?]
+[2026-11-28 16:44:06.164] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.164] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.164] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.164] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.164] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'PARTITION' (id=13) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.164] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'PARTITION' (id=13) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.164] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'PARTITION' (id=13) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.164] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'PARTITION' (id=13) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.164] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=4 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.177] [debug] [gpu_merge_impl.cpp:407] merge_grouped_agg: sorted-key check tried=true rows=802198 batches=4 sorted=false
+[2026-11-28 16:44:06.183] [debug] [sirius_physical_hash_join.cpp:988] sirius_physical_hash_join id 21 partition strategy: 1 partitions (4 GPUs), build side 2407020 bytes, 200585 rows, estimated hash table 3209360 bytes. Join Type: INNER. Join Mode: MIXED_JOIN . build_card_est 599933022 probe_card_est 1199865834 placement [0->?]
+[2026-11-28 16:44:06.183] [debug] [partition_exchange.cpp:118] partition_exchange resolved 2 inputs on sizing input 0: 1 partitions, mode hash, sized from 2407020 bytes and 200585 rows, placement [0->?]
+[2026-11-28 16:44:06.183] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.183] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.184] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.184] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.184] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.184] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.184] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=4 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.189] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.212] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.212] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.214] [info] [readahead_scan_manager.cpp:159] [readahead] issued=0[prefetched=0 wait_for_prefetch=0] skipped=0[memory_pressure=0 fell_behind=0 nothing_to_issue=0] candidates=0[dropped_expired=0 dropped_fell_behind=0] operators_drained=2 pacing[memory_retries=0 idle_polls=1 gate_timeouts=0] executor_reads=0[borrowed=0]
+[2026-11-28 16:44:06.214] [info] [sirius_context.cpp:659] QueryEnd
+[2026-11-28 16:44:06.214] [info] [readahead_scan_manager.cpp:159] [readahead] issued=0[prefetched=0 wait_for_prefetch=0] skipped=0[memory_pressure=0 fell_behind=0 nothing_to_issue=0] candidates=0[dropped_expired=0 dropped_fell_behind=0] operators_drained=2 pacing[memory_retries=0 idle_polls=1 gate_timeouts=0] executor_reads=0[borrowed=0]
+[2026-11-28 16:44:06.214] [info] [sirius_context.cpp:292] [host_pool] HOST:0 QueryEnd instance=0x7c855558c140 connection=1 window=4 query=13 allocated=79474720768 bytes peak=79487303680 bytes free_blocks=434
+[2026-11-28 16:44:06.214] [info] [sirius_context.cpp:307] [gpu_pool] GPU:0 QueryEnd instance=0x7c855558c140 connection=1 window=4 query=13 allocated=0 bytes peak=43970571141 bytes reserved=0 bytes
+[2026-11-28 16:44:06.214] [info] [sirius_context.cpp:307] [gpu_pool] GPU:1 QueryEnd instance=0x7c855558c140 connection=1 window=4 query=13 allocated=0 bytes peak=43970286655 bytes reserved=0 bytes
+[2026-11-28 16:44:06.214] [info] [sirius_context.cpp:307] [gpu_pool] GPU:2 QueryEnd instance=0x7c855558c140 connection=1 window=4 query=13 allocated=0 bytes peak=43966796758 bytes reserved=0 bytes
+[2026-11-28 16:44:06.214] [info] [sirius_context.cpp:307] [gpu_pool] GPU:3 QueryEnd instance=0x7c855558c140 connection=1 window=4 query=13 allocated=0 bytes peak=43971420194 bytes reserved=0 bytes
+[2026-11-28 16:44:06.214] [info] [sirius_context.cpp:794] [window] end instance=0x7c855558c140 connection=1 window=4 query=13 outcome=ok
+[2026-11-28 16:44:06.214] [info] [physical_sirius_execution.cpp:613] Transparent GPU execution: query completed
+[2026-11-28 16:44:06.216] [info] [sirius_context.cpp:369] QueryBegin: instance=0x7c855558c140 connection=1 query=14 SQL: SET gpu_execution = true;
+[2026-11-28 16:44:06.216] [debug] [sirius_extension.cpp:3032] Updated gpu_execution to true
+[2026-11-28 16:44:06.217] [info] [sirius_context.cpp:369] QueryBegin: instance=0x7c855558c140 connection=1 query=15 SQL: select sum(l.l_extendedprice) / 7.0 as avg_yearly from lineitem l, part p where p.p_partkey = l.l_partkey and p.p_brand = 'Brand#13' and p.p_container = 'JUMBO CAN' and l.l_quantity < ( select 0.2 * avg(l2.l_quantity) from lineitem l2 where l2.l_partkey = p.p_partkey )
+[2026-11-28 16:44:06.225] [debug] [sirius_optimizer_extension.cpp:288] Gave 3 Parquet scans their footer statistics
+[2026-11-28 16:44:06.227] [info] [sirius_plan_delim_aggregate_reuse.cpp:364] [sirius_plan_delim_aggregate_reuse] Computed 1 subquery aggregate(s) from the delim CTE's outer rows instead of rescanning the subquery's tables
+[2026-11-28 16:44:06.227] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:06.227] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: AGGREGATE
+[2026-11-28 16:44:06.227] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: CTE
+[2026-11-28 16:44:06.227] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:06.227] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:06.227] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: COMPARISON_JOIN
+[2026-11-28 16:44:06.227] [debug] [sirius_plan_comparison_join.cpp:211] [join] column 'p_partkey' proven distinct by the pinned table
+[2026-11-28 16:44:06.227] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: GET
+[2026-11-28 16:44:06.228] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: GET
+[2026-11-28 16:44:06.228] [info] [sirius_plan_comparison_join.cpp:840] [sirius_plan_comparison_join] Wired hash join with 1 dynamic-filter probe target(s) (1 scan-bound, 0 join-edge; evidence=filtered; build est 39999993 rows).
+[2026-11-28 16:44:06.228] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: COMPARISON_JOIN
+[2026-11-28 16:44:06.228] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: CTE_SCAN
+[2026-11-28 16:44:06.228] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: AGGREGATE
+[2026-11-28 16:44:06.228] [debug] [sirius_physical_plan_generator.cpp:2584] Creating sirius physical plan for logical operator type: CTE_SCAN
+[2026-11-28 16:44:06.228] [info] [sirius_plan_comparison_join.cpp:854] [sirius_plan_comparison_join] Not wiring dynamic filter(s): build side carries no filter, opaque-build or semi-join evidence (build est 599933022 rows).
+[2026-11-28 16:44:06.228] [debug] [scan_plan.cpp:511] [scan_plan] built plan: 3 data col(s), 0 partition col(s), 3 output entries
+[2026-11-28 16:44:06.228] [debug] [scan_plan.cpp:511] [scan_plan] built plan: 3 data col(s), 0 partition col(s), 1 output entries
+[2026-11-28 16:44:06.228] [debug] [scan_plan.cpp:511] [scan_plan] built plan: 3 data col(s), 0 partition col(s), 3 output entries
+[2026-11-28 16:44:06.228] [debug] [scan_plan.cpp:511] [scan_plan] built plan: 3 data col(s), 0 partition col(s), 1 output entries
+[2026-11-28 16:44:06.228] [debug] [scan_utils.cpp:123] TABLE_SCAN filter: column_index=1, primary_idx=3, type=VARCHAR, filter_type=9, batch_column_index=1
+[2026-11-28 16:44:06.228] [debug] [scan_utils.cpp:123] TABLE_SCAN filter: column_index=2, primary_idx=6, type=VARCHAR, filter_type=9, batch_column_index=2
+[2026-11-28 16:44:06.228] [debug] [scan_utils.cpp:123] TABLE_SCAN filter: column_index=1, primary_idx=3, type=VARCHAR, filter_type=9, batch_column_index=1
+[2026-11-28 16:44:06.228] [debug] [scan_utils.cpp:123] TABLE_SCAN filter: column_index=2, primary_idx=6, type=VARCHAR, filter_type=9, batch_column_index=2
+[2026-11-28 16:44:06.228] [debug] [scan_filter_analysis.cpp:436] TABLE_SCAN filter analysis: filter on column_index=1 is not fully an AND-tree of numeric constant comparisons — the scan's own filter is still required
+[2026-11-28 16:44:06.228] [debug] [scan_filter_analysis.cpp:436] TABLE_SCAN filter analysis: filter on column_index=2 is not fully an AND-tree of numeric constant comparisons — the scan's own filter is still required
+[2026-11-28 16:44:06.228] [debug] [scan_filter_analysis.cpp:503] TABLE_SCAN filter analysis: 0 range(s), 2 equality set(s), ranges_cover_whole_filter=false
+[2026-11-28 16:44:06.228] [info] [sirius_context.cpp:2311] Transparent execution: Sirius physical plan generated successfully
+[2026-11-28 16:44:06.228] [info] [sirius_context.cpp:2349] Transparent execution: physical plan replaced with GPU operator
+[2026-11-28 16:44:06.228] [info] [physical_sirius_execution.cpp:260] Transparent GPU execution: executing query
+[2026-11-28 16:44:06.228] [info] [sirius_context.cpp:794] [window] begin instance=0x7c855558c140 connection=1 window=6 query=15 outcome=-
+[2026-11-28 16:44:06.228] [info] [sirius_context.cpp:292] [host_pool] HOST:0 QueryBegin instance=0x7c855558c140 connection=1 window=6 query=15 allocated=79474720768 bytes peak=79487303680 bytes free_blocks=434
+[2026-11-28 16:44:06.228] [info] [sirius_context.cpp:307] [gpu_pool] GPU:0 QueryBegin instance=0x7c855558c140 connection=1 window=6 query=15 allocated=0 bytes peak=43970571141 bytes reserved=0 bytes
+[2026-11-28 16:44:06.228] [info] [sirius_context.cpp:307] [gpu_pool] GPU:1 QueryBegin instance=0x7c855558c140 connection=1 window=6 query=15 allocated=0 bytes peak=43970286655 bytes reserved=0 bytes
+[2026-11-28 16:44:06.228] [info] [sirius_context.cpp:307] [gpu_pool] GPU:2 QueryBegin instance=0x7c855558c140 connection=1 window=6 query=15 allocated=0 bytes peak=43966796758 bytes reserved=0 bytes
+[2026-11-28 16:44:06.228] [info] [sirius_context.cpp:307] [gpu_pool] GPU:3 QueryBegin instance=0x7c855558c140 connection=1 window=6 query=15 allocated=0 bytes peak=43971420194 bytes reserved=0 bytes
+[2026-11-28 16:44:06.228] [info] [sirius_context.cpp:605] QueryBegin: transparent_execution
+[2026-11-28 16:44:06.228] [info] [physical_sirius_execution.cpp:355] Transparent execution: reusing finalize-validated Sirius plan
+[2026-11-28 16:44:06.228] [debug] [sirius_engine.cpp:239] Initializing sirius_engine
+[2026-11-28 16:44:06.228] [info] [sirius_engine.cpp:385] [gpu_alloc] query allocated 4 GPU(s): [0, 1, 2, 3]
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline RESULT_COLLECTOR
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink RESULT_COLLECTOR
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline RESULT_COLLECTOR
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink MERGE_AGGREGATE
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline MERGE_AGGREGATE
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink UNGROUPED_AGGREGATE
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline UNGROUPED_AGGREGATE
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink CTE
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline CTE
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline HASH_JOIN
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink CONCAT
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline CONCAT
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PARTITION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PARTITION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink GPU_SCAN
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline GPU_SCAN
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink CONCAT
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline CONCAT
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PARTITION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PARTITION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink DYNAMIC_FILTER
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline DYNAMIC_FILTER
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline GPU_SCAN
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline HASH_JOIN
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink CONCAT
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline CONCAT
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PARTITION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PARTITION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline MERGE_GROUP_BY
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PARTITION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PARTITION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink HASH_GROUP_BY
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline HASH_GROUP_BY
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:212] Setting pipeline source CTE_SCAN
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink CONCAT
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline CONCAT
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PARTITION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PARTITION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:223] Setting pipeline sink PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:233] Adding operator to pipeline PROJECTION
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline.cpp:212] Setting pipeline source CTE_SCAN
+[2026-11-28 16:44:06.228] [debug] [sirius_pipeline_converter.cpp:164] Total meta pipelines 18
+[2026-11-28 16:44:06.228] [debug] [sirius_engine.cpp:433] total_pipelines = 19
+[2026-11-28 16:44:06.229] [info] [sirius_engine.cpp:437] Query Plan:
+=== Pipeline Overview ===
+Pipeline #0: GPU_SCAN (id=0)
+  Output: -> PARTITION [port: default, barrier: FULL]
+Pipeline #1: PARTITION (id=1)
+  Input: <- Pipeline #0 [on: PARTITION (id=1), port: default, barrier: FULL]
+  Dependencies: Pipeline #0
+  Output: -> CONCAT [port: default, barrier: PARTIAL]
+Pipeline #2: CONCAT (id=2)
+  Input: <- Pipeline #1 [on: CONCAT (id=2), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #1
+  Output: -> HASH_JOIN [port: build, barrier: PARTIAL]
+Pipeline #3: GPU_SCAN (id=3) -> DYNAMIC_FILTER (id=4)
+  Output: -> PARTITION [port: default, barrier: PARTIAL]
+Pipeline #4: PARTITION (id=5)
+  Input: <- Pipeline #3 [on: PARTITION (id=5), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #3
+  Output: -> CONCAT [port: default, barrier: PARTIAL]
+Pipeline #5: CONCAT (id=6)
+  Input: <- Pipeline #4 [on: CONCAT (id=6), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #4
+  Output: -> HASH_JOIN [port: default, barrier: PARTIAL]
+Pipeline #6: HASH_JOIN (id=7) -> PROJECTION (id=8) -> PROJECTION (id=9) -> CTE (id=10)
+  Input: <- Pipeline #2 [on: HASH_JOIN (id=7), port: build, barrier: PARTIAL]
+  Input: <- Pipeline #5 [on: HASH_JOIN (id=7), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #2, Pipeline #5
+  Output: -> PROJECTION [port: default, barrier: FULL]
+  Output: -> PROJECTION [port: default, barrier: FULL]
+Pipeline #7: PROJECTION (id=11) -> HASH_GROUP_BY (id=12)
+  Input: <- Pipeline #6 [on: PROJECTION (id=11), port: default, barrier: FULL]
+  Dependencies: Pipeline #6
+  Output: -> PARTITION [port: default, barrier: FULL]
+Pipeline #8: PARTITION (id=13)
+  Input: <- Pipeline #7 [on: PARTITION (id=13), port: default, barrier: FULL]
+  Dependencies: Pipeline #7
+  Output: -> MERGE_GROUP_BY [port: default, barrier: FULL]
+Pipeline #9: MERGE_GROUP_BY (id=14) -> PROJECTION (id=15)
+  Input: <- Pipeline #8 [on: MERGE_GROUP_BY (id=14), port: default, barrier: FULL]
+  Dependencies: Pipeline #8
+  Output: -> PARTITION [port: default, barrier: FULL]
+Pipeline #10: PARTITION (id=16)
+  Input: <- Pipeline #9 [on: PARTITION (id=16), port: default, barrier: FULL]
+  Dependencies: Pipeline #9
+  Output: -> CONCAT [port: default, barrier: PARTIAL]
+Pipeline #11: CONCAT (id=17)
+  Input: <- Pipeline #10 [on: CONCAT (id=17), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #10
+  Output: -> HASH_JOIN [port: build, barrier: PARTIAL]
+Pipeline #12: PROJECTION (id=18)
+  Input: <- Pipeline #6 [on: PROJECTION (id=18), port: default, barrier: FULL]
+  Dependencies: Pipeline #6
+  Output: -> PARTITION [port: default, barrier: PARTIAL]
+Pipeline #13: PARTITION (id=19)
+  Input: <- Pipeline #12 [on: PARTITION (id=19), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #12
+  Output: -> CONCAT [port: default, barrier: PARTIAL]
+Pipeline #14: CONCAT (id=20)
+  Input: <- Pipeline #13 [on: CONCAT (id=20), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #13
+  Output: -> HASH_JOIN [port: default, barrier: PARTIAL]
+Pipeline #15: HASH_JOIN (id=21) -> PROJECTION (id=22) -> UNGROUPED_AGGREGATE (id=23)
+  Input: <- Pipeline #11 [on: HASH_JOIN (id=21), port: build, barrier: PARTIAL]
+  Input: <- Pipeline #14 [on: HASH_JOIN (id=21), port: default, barrier: PARTIAL]
+  Dependencies: Pipeline #11, Pipeline #14
+  Output: -> MERGE_AGGREGATE [port: default, barrier: FULL]
+Pipeline #16: MERGE_AGGREGATE (id=24)
+  Input: <- Pipeline #15 [on: MERGE_AGGREGATE (id=24), port: default, barrier: FULL]
+  Dependencies: Pipeline #15
+  Output: -> PROJECTION [port: default, barrier: FULL]
+Pipeline #17: PROJECTION (id=25) -> RESULT_COLLECTOR (id=26)
+  Input: <- Pipeline #16 [on: PROJECTION (id=25), port: default, barrier: FULL]
+  Dependencies: Pipeline #16
+
+=== Query Plan DAG ===
+┌─────────────────────────────┐                                                              
+│ Pipeline #17                │                                                              
+│ RESULT_COLLECTOR (id=26)    │                                                              
+│ PROJECTION (id=25)          │                                                              
+│ Input(#16): FULL            │                                                              
+└──────────────┬──────────────┘                                                              
+               │                                                                             
+┌─────────────────────────────┐                                                              
+│ Pipeline #16                │                                                              
+│ MERGE_AGGREGATE (id=24)     │                                                              
+│ Input(#15): FULL            │                                                              
+└──────────────┬──────────────┘                                                              
+               │                                                                             
+┌─────────────────────────────┐                                                              
+│ Pipeline #15                │                                                              
+│ UNGROUPED_AGGREGATE (id=23) │                                                              
+│ PROJECTION (id=22)          │                                                              
+│ HASH_JOIN (id=21)           │                                                              
+│   type: INNER               │                                                              
+│ Input(#11): PARTIAL         │                                                              
+│ Input(#14): PARTIAL         │                                                              
+└──────────────┬──────────────┘                                                              
+               ┌─────────────────────────────────────────────────────────────┐               
+               │                                                             │               
+┌─────────────────────────────┐                               ┌─────────────────────────────┐
+│ Pipeline #11                │                               │ Pipeline #14                │
+│ CONCAT (id=17)              │                               │ CONCAT (id=20)              │
+│ Input(#10): PARTIAL         │                               │ Input(#13): PARTIAL         │
+└──────────────┬──────────────┘                               └──────────────┬──────────────┘
+               │                                                             │               
+┌─────────────────────────────┐                               ┌─────────────────────────────┐
+│ Pipeline #10                │                               │ Pipeline #13                │
+│ PARTITION (id=16)           │                               │ PARTITION (id=19)           │
+│ Input(#9): FULL             │                               │ Input(#12): PARTIAL         │
+└──────────────┬──────────────┘                               └──────────────┬──────────────┘
+               │                                                             │               
+┌─────────────────────────────┐                               ┌─────────────────────────────┐
+│ Pipeline #9                 │                               │ Pipeline #12                │
+│ PROJECTION (id=15)          │                               │ PROJECTION (id=18)          │
+│ MERGE_GROUP_BY (id=14)      │                               │ Input(#6): FULL             │
+│ Input(#8): FULL             │                               │                             │
+└──────────────┬──────────────┘                               └──────────────┬──────────────┘
+               │                                                             │               
+┌─────────────────────────────┐                               ┌─────────────────────────────┐
+│ Pipeline #8                 │                               │ (-> Pipeline #6)            │
+│ PARTITION (id=13)           │                               │                             │
+│ Input(#7): FULL             │                               │                             │
+└──────────────┬──────────────┘                               └──────────────┬──────────────┘
+               │                                                                             
+┌─────────────────────────────┐                                                              
+│ Pipeline #7                 │                                                              
+│ HASH_GROUP_BY (id=12)       │                                                              
+│ PROJECTION (id=11)          │                                                              
+│ Input(#6): FULL             │                                                              
+└──────────────┬──────────────┘                                                              
+               │                                                                             
+┌─────────────────────────────┐                                                              
+│ Pipeline #6                 │                                                              
+│ CTE (id=10)                 │                                                              
+│ PROJECTION (id=9)           │                                                              
+│ PROJECTION (id=8)           │                                                              
+│ HASH_JOIN (id=7)            │                                                              
+│   type: INNER               │                                                              
+│ Input(#2): PARTIAL          │                                                              
+│ Input(#5): PARTIAL          │                                                              
+└──────────────┬──────────────┘                                                              
+               ┌──────────────────────────────┐                                              
+               │                              │                                              
+┌─────────────────────────────┐┌─────────────────────────────┐                               
+│ Pipeline #2                 ││ Pipeline #5                 │                               
+│ CONCAT (id=2)               ││ CONCAT (id=6)               │                               
+│ Input(#1): PARTIAL          ││ Input(#4): PARTIAL          │                               
+└──────────────┬──────────────┘└──────────────┬──────────────┘                               
+               │                              │                                              
+┌─────────────────────────────┐┌─────────────────────────────┐                               
+│ Pipeline #1                 ││ Pipeline #4                 │                               
+│ PARTITION (id=1)            ││ PARTITION (id=5)            │                               
+│ Input(#0): FULL             ││ Input(#3): PARTIAL          │                               
+└──────────────┬──────────────┘└──────────────┬──────────────┘                               
+               │                              │                                              
+┌─────────────────────────────┐┌─────────────────────────────┐                               
+│ Pipeline #0                 ││ Pipeline #3                 │                               
+│ GPU_SCAN (id=0)             ││ DYNAMIC_FILTER (id=4)       │                               
+│                             ││ GPU_SCAN (id=3)             │                               
+└─────────────────────────────┘└─────────────────────────────┘                               
+
+[2026-11-28 16:44:06.229] [info] [sirius_engine.cpp:262] query 6 telemetry_query=01a2230ae4d474bca8e380a5b40e017d
+[2026-11-28 16:44:06.229] [info] [sirius_scan_manager.cpp:1648] [sirius_scan_manager] cache summary: fs_cache: global[reads=17532 hits=0 h2d=0 miss=60825 evictions=0] last_cycle[reads=0 hits=0 h2d=0 miss=0 evictions=0]
+[2026-11-28 16:44:06.229] [debug] [sirius_scan_manager.cpp:4399] [sirius_scan_manager] zone-map pruning for pinned entry 'part': nothing pruned (2 chunks served)
+[2026-11-28 16:44:06.229] [info] [sirius_scan_manager.cpp:4511] [sirius_scan_manager] assigned pinned entry 'part' to operator '0'
+[2026-11-28 16:44:06.229] [debug] [sirius_scan_manager.cpp:4399] [sirius_scan_manager] zone-map pruning for pinned entry 'lineitem': nothing pruned (31 chunks served)
+[2026-11-28 16:44:06.229] [info] [sirius_scan_manager.cpp:4511] [sirius_scan_manager] assigned pinned entry 'lineitem' to operator '3'
+[2026-11-28 16:44:06.229] [info] [sirius_scan_manager.cpp:947] [late-mat] operator 0: not deferring — the pinned entry is not device-resident
+[2026-11-28 16:44:06.229] [info] [sirius_scan_manager.cpp:947] [late-mat] operator 3: not deferring — the pinned entry is not device-resident
+[2026-11-28 16:44:06.229] [debug] [sirius_scan_manager.cpp:2123] [decompression-pushdown] entry 'part': consumer=0x0 request: 3 slot(s), covers_whole_filter=false
+[2026-11-28 16:44:06.229] [debug] [sirius_scan_manager.cpp:2123] [decompression-pushdown] entry 'lineitem': consumer=0x5e341324fbd0 request: 0 slot(s), covers_whole_filter=false
+[2026-11-28 16:44:06.229] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:06.229] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:06.231] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=3 request_empty=false
+[2026-11-28 16:44:06.231] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=2 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.231] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=STRING route=3 comparable_lane=false range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.231] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=STRING route=3 comparable_lane=false range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.231] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.231] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: equality(c1) equality(c2)
+[2026-11-28 16:44:06.233] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=3 request_empty=false
+[2026-11-28 16:44:06.234] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=2 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.234] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=STRING route=3 comparable_lane=false range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.234] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=STRING route=3 comparable_lane=false range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.234] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.234] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: equality(c1) equality(c2)
+[2026-11-28 16:44:06.236] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=0): ranges=0 equalities=2 join_filters=0 survivors=142662/142156840 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.236] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=142662 → GPU device=1
+[2026-11-28 16:44:06.237] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=0): ranges=0 equalities=2 join_filters=0 survivors=57923/57843160 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.237] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=57923 → GPU device=2
+[2026-11-28 16:44:06.237] [debug] [sirius_physical_hash_join.cpp:988] sirius_physical_hash_join id 7 partition strategy: 4 partitions (4 GPUs), build side 802340 bytes, 200585 rows, estimated hash table 3209360 bytes. Join Type: INNER. Join Mode: BUILD_PROBE  [broadcast]. build_card_est 39999993 probe_card_est 5999330220 placement [0->0, 1->1, 2->2, 3->3]
+[2026-11-28 16:44:06.237] [debug] [partition_exchange.cpp:118] partition_exchange resolved 2 inputs on sizing input 0: 4 partitions, mode broadcast, sized from 802340 bytes and 200585 rows, placement [0->0, 1->1, 2->2, 3->3]
+[2026-11-28 16:44:06.237] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.237] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.238] [debug] [dynamic_filter_publisher.cpp:140] [dynamic_filter_domain] path=ordinary condition=0 rows=200585 domain=200000000 provenance=pinned_parquet_exact eligible=1 threshold=0.9 decision=keep
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:06.238] [debug] [sirius_dynamic_in_list_filter.cu:212] [sirius_dynamic_in_list_filter] built set: 200585 keys, bucket_size=4, capacity_factor=4, capacity=802340 slots (3209360 bytes).
+[2026-11-28 16:44:06.238] [debug] [dynamic_filter_publisher.cpp:1333] [publish_dynamic_filters] dynamic filter key 0: build_rows=200585 (valid=200585) zone_map=no membership: in_list_set=1604680B bloom=401184B L2=134217728B inlist_max_l2_fraction=0.125 -> in_list
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:06.238] [debug] [sirius_dynamic_in_list_filter.cu:326] [sirius_dynamic_in_list_filter] queued 3209392-byte replica GPU 0 -> GPU 1.
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=2
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=3
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=0
+[2026-11-28 16:44:06.238] [debug] [task_creator.cpp:832] Task Creator: cached-scan locality tier=1 device_id=0 preferred_device=1
+[2026-11-28 16:44:06.238] [debug] [sirius_dynamic_in_list_filter.cu:326] [sirius_dynamic_in_list_filter] queued 3209392-byte replica GPU 0 -> GPU 2.
+[2026-11-28 16:44:06.257] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.257] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.257] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.257] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.314] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.314] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.314] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.315] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.357] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195744742 → GPU device=0
+[2026-11-28 16:44:06.358] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.358] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195764565 → GPU device=0
+[2026-11-28 16:44:06.359] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.371] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.371] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.372] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.372] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.410] [debug] [sirius_dynamic_in_list_filter.cu:326] [sirius_dynamic_in_list_filter] queued 3209392-byte replica GPU 0 -> GPU 3.
+[2026-11-28 16:44:06.410] [info] [dynamic_filter_publisher.cpp:1383] [publish_dynamic_filters] dynamic-filter publication: pushed 1 dynamic filter(s) across 1 active target(s) of 1 wired target(s) (200585 build rows, 1 bound keys of 1 admitted).
+[2026-11-28 16:44:06.412] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195749643 → GPU device=1
+[2026-11-28 16:44:06.413] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195750694 → GPU device=2
+[2026-11-28 16:44:06.414] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195715178 → GPU device=3
+[2026-11-28 16:44:06.416] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195741638 → GPU device=1
+[2026-11-28 16:44:06.417] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195751913 → GPU device=2
+[2026-11-28 16:44:06.417] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195730130 → GPU device=3
+[2026-11-28 16:44:06.418] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195760220 → GPU device=1
+[2026-11-28 16:44:06.418] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195742965 → GPU device=3
+[2026-11-28 16:44:06.418] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195738413 → GPU device=2
+[2026-11-28 16:44:06.427] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.427] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.427] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.427] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.427] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.428] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.428] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.428] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.428] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.429] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.429] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.429] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.429] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.470] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195749181 → GPU device=1
+[2026-11-28 16:44:06.470] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195745186 → GPU device=3
+[2026-11-28 16:44:06.470] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195754596 → GPU device=2
+[2026-11-28 16:44:06.486] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=true
+[2026-11-28 16:44:06.486] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.486] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.486] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.531] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195737624 → GPU device=0
+[2026-11-28 16:44:06.531] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195768867 → GPU device=0
+[2026-11-28 16:44:06.532] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195718318 → GPU device=0
+[2026-11-28 16:44:06.542] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.542] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.542] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.542] [warning] [sirius_physical_hash_join.cpp:1271] In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable partition (build/probe already drained) in operator 7
+[2026-11-28 16:44:06.542] [debug] [sirius_physical_hash_join.cpp:2370] sirius_physical_hash_join id 7: using distinct_hash_join (BUILD_PROBE, proven unique)
+[2026-11-28 16:44:06.543] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.543] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.543] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.544] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.544] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.544] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.544] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.544] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.544] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.581] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.581] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.581] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.581] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.581] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.581] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.581] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.581] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.581] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.581] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.582] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.586] [debug] [compressed_scan.cpp:542] [decompression-pushdown] join filters kept 196389/195741740 rows (1 of 1 probe(s) ran, complete=true)
+[2026-11-28 16:44:06.586] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196389/195741740 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.586] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196389 → GPU device=0
+[2026-11-28 16:44:06.593] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.593] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.593] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196057/195728987 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.593] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196057 → GPU device=3
+[2026-11-28 16:44:06.593] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195866/195729728 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.593] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195866 → GPU device=3
+[2026-11-28 16:44:06.593] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196297/195752441 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.593] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.593] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196297 → GPU device=1
+[2026-11-28 16:44:06.594] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196170/195736826 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.594] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196170 → GPU device=1
+[2026-11-28 16:44:06.594] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196518/195744518 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.594] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.594] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196518 → GPU device=2
+[2026-11-28 16:44:06.594] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.594] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195780/195729730 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.594] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195780 → GPU device=2
+[2026-11-28 16:44:06.594] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.595] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.595] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.595] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.596] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.596] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.596] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.596] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.596] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.596] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.601] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.639] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.639] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.639] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.639] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.639] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.639] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.639] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.639] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.639] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.639] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.640] [warning] [sirius_physical_hash_join.cpp:1271] In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable partition (build/probe already drained) in operator 7
+[2026-11-28 16:44:06.640] [warning] [sirius_physical_hash_join.cpp:1271] In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable partition (build/probe already drained) in operator 7
+[2026-11-28 16:44:06.643] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196511/195741104 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.643] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196511 → GPU device=2
+[2026-11-28 16:44:06.643] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196829/195764771 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.643] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196829 → GPU device=1
+[2026-11-28 16:44:06.643] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195900/195744547 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.643] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195900 → GPU device=3
+[2026-11-28 16:44:06.643] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.644] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.644] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.648] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.648] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=196152/195740033 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.648] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=196152 → GPU device=0
+[2026-11-28 16:44:06.648] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.650] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.650] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.650] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.650] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.650] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.650] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.658] [debug] [compressed_scan.cpp:747] [decompression-pushdown] chunk: columns=3 equalities=0 request_empty=false
+[2026-11-28 16:44:06.658] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[0] physical=0 dtype=INT32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.658] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[1] physical=1 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.658] [debug] [compressed_scan.cpp:184] [decompression-pushdown] config col[2] physical=2 dtype=DECIMAL32 route=1 comparable_lane=true range_requested=false range=[0, 0]
+[2026-11-28 16:44:06.658] [debug] [compressed_scan.cpp:257] [decompression-pushdown] config ENABLED: 0 row-selecting range column(s), external_sources=true, 3/3 column(s) decode compacted, covers_whole_filter=false
+[2026-11-28 16:44:06.658] [debug] [compressed_scan.cpp:466] [decompression-pushdown] wave-1 sources, ascending expected keep: join(c0,rank 0)
+[2026-11-28 16:44:06.675] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195935/195739011 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.675] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195935 → GPU device=3
+[2026-11-28 16:44:06.675] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.679] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=127847/127674443 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.679] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=127847 → GPU device=1
+[2026-11-28 16:44:06.679] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.692] [debug] [compressed_scan.cpp:551] [decompression-pushdown] decode APPLIED (status=1 generation=1): ranges=0 equalities=0 join_filters=1 survivors=195921/195757957 column(s)=3 covers_whole_filter=false row_filtered=false selection_unprofitable=false filter_only_columns_dropped=false
+[2026-11-28 16:44:06.692] [debug] [compression_converters.cpp:130] [compression_converters] decompressed cols=3 rows=195921 → GPU device=0
+[2026-11-28 16:44:06.692] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.693] [warning] [sirius_physical_hash_join.cpp:1271] In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable partition (build/probe already drained) in operator 7
+[2026-11-28 16:44:06.693] [warning] [sirius_physical_hash_join.cpp:1271] In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable partition (build/probe already drained) in operator 7
+[2026-11-28 16:44:06.693] [warning] [sirius_physical_hash_join.cpp:1271] In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: no schedulable partition (build/probe already drained) in operator 7
+[2026-11-28 16:44:06.693] [debug] [sirius_physical_hash_join.cpp:2370] sirius_physical_hash_join id 7: using distinct_hash_join (BUILD_PROBE, proven unique)
+[2026-11-28 16:44:06.693] [debug] [sirius_physical_hash_join.cpp:2370] sirius_physical_hash_join id 7: using distinct_hash_join (BUILD_PROBE, proven unique)
+[2026-11-28 16:44:06.693] [debug] [sirius_physical_hash_join.cpp:2370] sirius_physical_hash_join id 7: using distinct_hash_join (BUILD_PROBE, proven unique)
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.693] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.693] [debug] [gpu_aggregate_impl.cpp:420] local_grouped_agg: sorted-key check rows=196711 sorted=false
+[2026-11-28 16:44:06.693] [debug] [gpu_aggregate_impl.cpp:420] local_grouped_agg: sorted-key check rows=1500674 sorted=false
+[2026-11-28 16:44:06.693] [debug] [gpu_aggregate_impl.cpp:420] local_grouped_agg: sorted-key check rows=196182 sorted=false
+[2026-11-28 16:44:06.693] [debug] [gpu_aggregate_impl.cpp:420] local_grouped_agg: sorted-key check rows=1177169 sorted=false
+[2026-11-28 16:44:06.693] [debug] [gpu_aggregate_impl.cpp:420] local_grouped_agg: sorted-key check rows=1374095 sorted=false
+[2026-11-28 16:44:06.693] [debug] [gpu_aggregate_impl.cpp:420] local_grouped_agg: sorted-key check rows=1569065 sorted=false
+[2026-11-28 16:44:06.694] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'HASH_GROUP_BY' (id=12) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'HASH_GROUP_BY' (id=12) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'HASH_GROUP_BY' (id=12) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'HASH_GROUP_BY' (id=12) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'HASH_GROUP_BY' (id=12) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'HASH_GROUP_BY' (id=12) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [debug] [partition_exchange.cpp:118] partition_exchange resolved 1 inputs on sizing input 0: 1 partitions, mode hash, sized from 29657488 bytes and 1059196 rows, placement [0->?]
+[2026-11-28 16:44:06.695] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.695] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.695] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.695] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.695] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.695] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'PARTITION' (id=13) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'PARTITION' (id=13) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'PARTITION' (id=13) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'PARTITION' (id=13) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'PARTITION' (id=13) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [warning] [gpu_pipeline_task.cpp:84] gpu_pipeline_task: operator 'PARTITION' (id=13) output batch 0 column count mismatch: got 3, expected 2
+[2026-11-28 16:44:06.695] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=4 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.698] [debug] [gpu_merge_impl.cpp:407] merge_grouped_agg: sorted-key check tried=true rows=1059196 batches=6 sorted=false
+[2026-11-28 16:44:06.700] [debug] [sirius_physical_hash_join.cpp:988] sirius_physical_hash_join id 21 partition strategy: 1 partitions (4 GPUs), build side 2407020 bytes, 200585 rows, estimated hash table 3209360 bytes. Join Type: INNER. Join Mode: MIXED_JOIN . build_card_est 599933022 probe_card_est 1199865834 placement [0->?]
+[2026-11-28 16:44:06.700] [debug] [partition_exchange.cpp:118] partition_exchange resolved 2 inputs on sizing input 0: 1 partitions, mode hash, sized from 2407020 bytes and 200585 rows, placement [0->?]
+[2026-11-28 16:44:06.700] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.700] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.700] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.700] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=1
+[2026-11-28 16:44:06.700] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=3
+[2026-11-28 16:44:06.700] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=2
+[2026-11-28 16:44:06.700] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.700] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.700] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=4 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.706] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.712] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.712] [debug] [task_creator.cpp:791] Task Creator: locality score gpu_sources=1 host_sources=0 preferred_device=0
+[2026-11-28 16:44:06.713] [info] [readahead_scan_manager.cpp:159] [readahead] issued=0[prefetched=0 wait_for_prefetch=0] skipped=0[memory_pressure=0 fell_behind=0 nothing_to_issue=0] candidates=0[dropped_expired=0 dropped_fell_behind=0] operators_drained=2 pacing[memory_retries=0 idle_polls=1 gate_timeouts=0] executor_reads=0[borrowed=0]
+[2026-11-28 16:44:06.713] [info] [sirius_context.cpp:659] QueryEnd
+[2026-11-28 16:44:06.713] [info] [readahead_scan_manager.cpp:159] [readahead] issued=0[prefetched=0 wait_for_prefetch=0] skipped=0[memory_pressure=0 fell_behind=0 nothing_to_issue=0] candidates=0[dropped_expired=0 dropped_fell_behind=0] operators_drained=2 pacing[memory_retries=0 idle_polls=1 gate_timeouts=0] executor_reads=0[borrowed=0]
+[2026-11-28 16:44:06.713] [info] [sirius_context.cpp:292] [host_pool] HOST:0 QueryEnd instance=0x7c855558c140 connection=1 window=6 query=15 allocated=79474720768 bytes peak=79487303680 bytes free_blocks=434
+[2026-11-28 16:44:06.713] [info] [sirius_context.cpp:307] [gpu_pool] GPU:0 QueryEnd instance=0x7c855558c140 connection=1 window=6 query=15 allocated=0 bytes peak=43970571141 bytes reserved=0 bytes
+[2026-11-28 16:44:06.713] [info] [sirius_context.cpp:307] [gpu_pool] GPU:1 QueryEnd instance=0x7c855558c140 connection=1 window=6 query=15 allocated=0 bytes peak=43970571141 bytes reserved=0 bytes
+[2026-11-28 16:44:06.713] [info] [sirius_context.cpp:307] [gpu_pool] GPU:2 QueryEnd instance=0x7c855558c140 connection=1 window=6 query=15 allocated=0 bytes peak=43970286911 bytes reserved=0 bytes
+[2026-11-28 16:44:06.713] [info] [sirius_context.cpp:307] [gpu_pool] GPU:3 QueryEnd instance=0x7c855558c140 connection=1 window=6 query=15 allocated=0 bytes peak=43971420194 bytes reserved=0 bytes
+[2026-11-28 16:44:06.713] [info] [sirius_context.cpp:794] [window] end instance=0x7c855558c140 connection=1 window=6 query=15 outcome=ok
+[2026-11-28 16:44:06.713] [info] [physical_sirius_execution.cpp:613] Transparent GPU execution: query completed
+[2026-11-28 16:44:06.715] [info] [sirius_context.cpp:369] QueryBegin: instance=0x7c855558c140 connection=1 query=16 SQL: CALL unpin_table('lineitem')
+[2026-11-28 16:44:06.716] [info] [sirius_context.cpp:369] QueryBegin: instance=0x7c855558c140 connection=1 query=17 SQL: CALL unpin_table('part')
+[2026-11-28 16:44:06.716] [info] [sirius_context.cpp:2611] Connection closed.
+[2026-11-28 16:44:06.723] [info] [task_scheduler.cpp:324] Task queue interrupted, exiting management event loop.
+[2026-11-28 16:44:06.723] [info] [gpu_pipeline_executor.cpp:143] GPU Pipeline Executor: task queue interrupted, stopping publisher loop
+[2026-11-28 16:44:06.723] [info] [gpu_pipeline_executor.cpp:143] GPU Pipeline Executor: task queue interrupted, stopping publisher loop
+[2026-11-28 16:44:06.724] [info] [gpu_pipeline_executor.cpp:143] GPU Pipeline Executor: task queue interrupted, stopping publisher loop
+[2026-11-28 16:44:06.725] [info] [gpu_pipeline_executor.cpp:143] GPU Pipeline Executor: task queue interrupted, stopping publisher loop
+[2026-11-28 16:44:06.727] [info] [sirius_scan_manager.cpp:1526] [sirius_scan_manager] cache summary: fs_cache: global[reads=17532 hits=0 h2d=0 miss=60825 evictions=0] last_cycle[reads=0 hits=0 h2d=0 miss=0 evictions=0]
