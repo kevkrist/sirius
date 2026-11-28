@@ -162,4 +162,4 @@ the tests; Q4 delete the tip's serial host loop; Q6 this box is enough; Q8 land 
 
 ## Checkpoint log
 
-- 2026-11-28 01:30 UTC: file written from the notes listed at the top. No GPU work. STATUS.md rewritten, backup run.
+- 2026-11-28 01:17 UTC: file written from the notes listed at the top. No GPU work. STATUS.md rewritten, backup run.
