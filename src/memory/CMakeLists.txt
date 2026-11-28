@@ -1,4 +1,4 @@
 target_sources(
   sirius_objects
-  PRIVATE defragmenter_oom_policy.cpp peer_islands.cpp pool_peer_access.cpp
-          sirius_memory_reservation_manager.cpp)
+  PRIVATE defragmenter_oom_policy.cpp host_or.cpp peer_islands.cpp
+          pool_peer_access.cpp sirius_memory_reservation_manager.cpp)
