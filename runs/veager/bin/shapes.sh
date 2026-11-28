@@ -7,7 +7,7 @@ export PIXI_CACHE_DIR=$R/cache/pixi RATTLER_CACHE_DIR=$R/cache/rattler SCCACHE_D
 export SIMPATICO_JIT_CACHE_DIR=$R/cache/simpatico_jit TMPDIR=$R/tmp
 export SIRIUS_CONFIG_FILE=/home/ubuntu/sirius/specific_config.yaml
 export DATA=$R/data/tpch_parquet_sf1000
-V=$R/runs/veager; out=$V/shapes/$arm; mkdir -p $out/log
+V=$R/runs/veager; out=$V/shapes/$arm${SUFFIX:-}; mkdir -p $out/log
 export SIRIUS_LOG_DIR=$out/log SIRIUS_LOG_LEVEL=${SIRIUS_LOG_LEVEL:-debug}
 TEL=/home/ubuntu/sirius/results/telemetry
 before=$(mktemp); ls -1 $TEL | sort > $before
@@ -25,8 +25,8 @@ esac
 cd $REPO
 pixi run python $V/bin/shapes.py $out/results.jsonl ${TIMEOUT:-240} $extra "$@" > $out/stdout.txt 2>&1
 rc=$?
-mkdir -p $R/telemetry/veager_shapes_$arm
-ls -1 $TEL | sort | comm -13 $before - | while read d; do mv $TEL/$d $R/telemetry/veager_shapes_$arm/; done
+mkdir -p $R/telemetry/veager_shapes_$arm${SUFFIX:-}
+ls -1 $TEL | sort | comm -13 $before - | while read d; do mv $TEL/$d $R/telemetry/veager_shapes_$arm${SUFFIX:-}/; done
 rm -f $before
 echo "arm=$arm rc=$rc $(date +%T)" >> $out/status.txt
 exit $rc

@@ -94,7 +94,7 @@ for name, sql in SHAPES:
     for it in range(1 if cpu else 2):
         run(name, sql, it)
 
-if not cpu and (not only or "interrupt" in only):
+if not cpu and "nointerrupt" not in sys.argv and (not only or "interrupt" in only):
     for delay in (0.03, 0.08, 0.15, 0.25, 0.4):
         for nm in ("selective", "nofilter_plan", "stacked4"):
             sql = dict(SHAPES)[nm]
