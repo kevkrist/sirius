@@ -1,0 +1,7 @@
+| q | windows | DF keys tip / arm | key set equal | kept-line classes (N of M ran, complete) equal; line counts tip / arm | kept X/Y tip | kept X/Y arm | DYNAMIC_FILTER rows in/out equal | rows PRODUCED by every operator equal (inputs of CONCAT are logged per task and vary) | filtered scan pipelines whose first task precedes a later publication (tip / arm) | min gap last publication -> first task of a filtered scan started after it, ms (tip / arm) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2 | ok / ok | 6 / 6 | True | True [(('1', '1', 'true'), 1), (('1', '2', 'false'), 4)] / [(('1', '1', 'true'), 1), (('1', '2', 'false'), 4)] | 5199351/810000000 | 5199351/810000000 | True (5 ops) | True | 5 / 5 | 1 / 1 |
+| 7 | ok / ok | 5 / 5 | True | True [(('1', '1', 'true'), 18), (('1', '2', 'false'), 5)] / [(('1', '1', 'true'), 16), (('1', '2', 'false'), 5)] | 182211392/2254690081 | 176265017/2180355995 | True (4 ops) | True | 3 / 3 | 13 / 13 |
+| 8 | ok / ok | 5 / 5 | True | True [(('1', '1', 'true'), 8), (('1', '2', 'false'), 50)] / [(('1', '1', 'true'), 8), (('1', '2', 'false'), 50)] | 161578660/6605705240 | 161578660/6605705240 | True (4 ops) | True | 3 / 3 | 0 / 1 |
+| 21 | ok / ok | 4 / 4 | True | True [(('1', '1', 'true'), 17), (('1', '2', 'false'), 31)] / [(('1', '1', 'true'), 13), (('1', '2', 'false'), 31)] | 423297173/9124908864 | 377538900/8346164232 | True (3 ops) | True | 2 / 2 | 15 / 16 |
+queries with any difference: 0
