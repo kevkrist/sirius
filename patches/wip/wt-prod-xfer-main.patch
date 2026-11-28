@@ -1,4 +1,66 @@
 # HEAD 965818157cafde785900c1643e8e54aedfbf10de branch prod/xfer-main
+diff --git a/src/cuda/sirius_dynamic_bloom_filter.cu b/src/cuda/sirius_dynamic_bloom_filter.cu
+index 5b438107..c94a3e7a 100644
+--- a/src/cuda/sirius_dynamic_bloom_filter.cu
++++ b/src/cuda/sirius_dynamic_bloom_filter.cu
+@@ -30,6 +30,7 @@
+ #include <cuco/bloom_filter.cuh>
+ #include <cuco/bloom_filter_policy.cuh>
+ #include <cuco/bloom_filter_ref.cuh>
++#include <cuda/accumulation_cuda.cuh>
+ #include <cuda/dynamic_filter_fused_probe.cuh>
+ #include <cuda/sirius_rmm_cuco_allocator.cuh>
+ #include <cuda/std/cstddef>
+@@ -190,33 +191,9 @@ using raw_bloom_ref = cuco::bloom_filter_ref<Key,
+                                              ::cuda::thread_scope_device,
+                                              cuco::bloom_filter_policy<Key>>;
+ 
+-/**
+- * @brief Throws `detail::accumulation_cuda_error` for a failed CUDA call after clearing the error.
+- *
+- * @param status The result of the CUDA call
+- * @param call The name of the CUDA call, used in the error message
+- * @param kernel_launch Whether @p status comes from a kernel launch
+- * @throws detail::accumulation_cuda_error if @p status is not `cudaSuccess`
+- */
+-void check_cuda(cudaError_t status, char const* call, bool kernel_launch = false)
+-{
+-  if (status == cudaSuccess) { return; }
+-  (void)cudaGetLastError();
+-  throw detail::accumulation_cuda_error{status, kernel_launch, call};
+-}
+-
+-using cucascade::cuda::cuda_event;
+-
+-/**
+- * @brief Creates a timing-free event on @p device, restoring the current device afterwards.
+- *
+- * @param device The GPU the event belongs to
+- */
+-[[nodiscard]] cuda_event make_event_on(int device)
+-{
+-  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+-  return cuda_event{};
+-}
++using detail::check_cuda;
++using detail::cuda_event;
++using detail::make_event_on;
+ 
+ /**
+  * @brief One published replica of an accumulated key: the array and the partial stream that frees
+diff --git a/src/cuda/union_transfer.cu b/src/cuda/union_transfer.cu
+index ea33f397..c45f5e84 100644
+--- a/src/cuda/union_transfer.cu
++++ b/src/cuda/union_transfer.cu
+@@ -22,7 +22,7 @@
+ #include <rmm/device_buffer.hpp>
+ #include <rmm/error.hpp>
+ 
+-#include <cuda/accumulation_partial.cuh>
++#include <cuda/accumulation_cuda.cuh>
+ #include <cuda/utility>
+ 
+ #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 diff --git a/src/memory/pool_peer_access.hpp b/src/memory/pool_peer_access.hpp
 index 03e91dcf..4441ba62 100644
 --- a/src/memory/pool_peer_access.hpp
@@ -14,10 +76,18 @@ index 03e91dcf..4441ba62 100644
   * @throw std::invalid_argument if the space is not GPU-tier, lacks its adaptor, or a device ID is
   * invalid
 diff --git a/test/cpp/operator/test_dynamic_filter_union_transfer.cpp b/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
-index 42c911b4..19ed4b0a 100644
+index 42c911b4..5e4943bc 100644
 --- a/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
 +++ b/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
-@@ -481,19 +481,19 @@ TEST_CASE("concurrent publications share the host OR workers and stay exact",
+@@ -16,6 +16,7 @@
+ 
+ #include "dynamic_filter_accumulation_test_utils.hpp"
+ #include "memory/peer_islands.hpp"
++#include "op/dynamic_filter/bloom_sizing.hpp"
+ #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
+ #include "op/dynamic_filter/detail/union_plan.hpp"
+ #include "op/dynamic_filter/detail/union_transfer.hpp"
+@@ -481,19 +482,19 @@ TEST_CASE("concurrent publications share the host OR workers and stay exact",
    REQUIRE(fixture.allocated_bytes() == baseline);
  }
  
@@ -46,7 +116,7 @@ index 42c911b4..19ed4b0a 100644
        for (bool const separate : {false, true}) {
          std::vector<double> times;
          for (int round = 0; round < 6; ++round) {
-@@ -520,11 +520,10 @@ TEST_CASE("time of accumulated publication by array size, contribution and group
+@@ -520,11 +521,10 @@ TEST_CASE("time of accumulated publication by array size, contribution and group
          }
          std::ranges::sort(times);
          auto const median = times[times.size() / 2];
@@ -61,7 +131,7 @@ index 42c911b4..19ed4b0a 100644
                      separate ? "separate" : "real",
                      median,
                      median * 1024 / megabytes);
-@@ -532,3 +531,18 @@ TEST_CASE("time of accumulated publication by array size, contribution and group
+@@ -532,3 +532,18 @@ TEST_CASE("time of accumulated publication by array size, contribution and group
      }
    }
  }
@@ -80,3 +150,67 @@ index 42c911b4..19ed4b0a 100644
 +  if (lacks_gpus(2)) { return; }
 +  print_finish_times(2, {1, 281, 1434});
 +}
+diff --git a/src/cuda/accumulation_cuda.cuh b/src/cuda/accumulation_cuda.cuh
+new file mode 100644
+index 00000000..bedd01e0
+--- /dev/null
++++ b/src/cuda/accumulation_cuda.cuh
+@@ -0,0 +1,58 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * @file accumulation_cuda.cuh
++ * @brief CUDA status and event helpers shared by the build-filter accumulation sources: `sirius_dynamic_bloom_filter.cu` and `union_transfer.cu`.
++ */
++
++#pragma once
++
++#include <rmm/cuda_device.hpp>
++
++#include <cuda_runtime_api.h>
++
++#include <cucascade/cuda/event.hpp>
++#include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
++
++namespace sirius::op::detail {
++
++using cucascade::cuda::cuda_event;
++
++/**
++ * @brief Throws `accumulation_cuda_error` for a failed CUDA call after clearing the error.
++ *
++ * @param status The result of the CUDA call
++ * @param call The name of the CUDA call, used in the error message
++ * @param kernel_launch Whether `status` comes from a kernel launch
++ */
++inline void check_cuda(cudaError_t status, char const* call, bool kernel_launch = false)
++{
++  if (status == cudaSuccess) { return; }
++  (void)cudaGetLastError();
++  throw accumulation_cuda_error{status, kernel_launch, call};
++}
++
++/**
++ * @brief Creates a timing-free event on `device`, restoring the current device afterwards.
++ */
++[[nodiscard]] inline cuda_event make_event_on(int device)
++{
++  rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
++  return cuda_event{};
++}
++
++}  // namespace sirius::op::detail
