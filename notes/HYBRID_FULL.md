@@ -7,3 +7,4 @@
 ## Checkpoint log
 - 04:47 build ok (interrupted run's uncommitted edits compiled unchanged; its "build failed" was only an interrupted ninja).
   Committed 905b9ade. Unit gate + q5 debug smoke of all arms queued.
+- 06:05 unit gate done (expected by-design failures only), smoke ok, m1 chunk 1 done (q3 5 8), chunk 2 running
