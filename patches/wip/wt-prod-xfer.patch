@@ -1,46 +1,1341 @@
 # HEAD ae9398248fe209626119633c6318c3106a2c9289 branch prod/xfer
-diff --git a/experimental/doris/doris b/experimental/doris/doris
-index ad35a140..3933c9d6 160000
---- a/experimental/doris/doris
-+++ b/experimental/doris/doris
-@@ -1 +1 @@
--Subproject commit ad35a140c7fd0b842f18c23300bac581f7d04326
-+Subproject commit 3933c9d672f3dc172c4bf618e6d31ec09c141e31-dirty
-diff --git a/experimental/starrocks/brpc b/experimental/starrocks/brpc
-index 7daed0be..e20a3e0e 160000
---- a/experimental/starrocks/brpc
-+++ b/experimental/starrocks/brpc
-@@ -1 +1 @@
--Subproject commit 7daed0be6bf1f4d64b25554c72de7d9319a35dd7
-+Subproject commit e20a3e0e25685e22bb4ee21383b7ebd25701482c-dirty
-diff --git a/experimental/starrocks/starrocks b/experimental/starrocks/starrocks
-index 8a8e1864..5951a71b 160000
---- a/experimental/starrocks/starrocks
-+++ b/experimental/starrocks/starrocks
-@@ -1 +1 @@
--Subproject commit 8a8e18642450fba09149c8a3f149abefa043c2b7
-+Subproject commit 5951a71ba6e242e640cce6b2e86caa493c4430a9-dirty
-diff --git a/sirius-duckdb/duckdb b/sirius-duckdb/duckdb
---- a/sirius-duckdb/duckdb
-+++ b/sirius-duckdb/duckdb
-@@ -1 +1 @@
--Subproject commit d54cbbe3df17e8e5ce68312f483b4155836112aa
-+Subproject commit d54cbbe3df17e8e5ce68312f483b4155836112aa-dirty
-diff --git a/sirius-duckdb/extension-ci-tools b/sirius-duckdb/extension-ci-tools
---- a/sirius-duckdb/extension-ci-tools
-+++ b/sirius-duckdb/extension-ci-tools
-@@ -1 +1 @@
--Subproject commit 55e9f697b4fb70f357cc1bd4d1893cbf217ee359
-+Subproject commit 55e9f697b4fb70f357cc1bd4d1893cbf217ee359-dirty
-diff --git a/sirius-duckdb/vcpkg b/sirius-duckdb/vcpkg
---- a/sirius-duckdb/vcpkg
-+++ b/sirius-duckdb/vcpkg
-@@ -1 +1 @@
--Subproject commit cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
-+Subproject commit cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3-dirty
-diff --git a/substrait b/substrait
---- a/substrait
-+++ b/substrait
-@@ -1 +1 @@
--Subproject commit 922489d3c8c77140b189ad3847554de141378b04
-+Subproject commit 922489d3c8c77140b189ad3847554de141378b04-dirty
+diff --git a/cmake/sirius-test-sources.cmake b/cmake/sirius-test-sources.cmake
+index 12a8f946..ac97ba92 100644
+--- a/cmake/sirius-test-sources.cmake
++++ b/cmake/sirius-test-sources.cmake
+@@ -40,6 +40,8 @@ set(TEST_SOURCES
+     test/cpp/config/test_topology_config.cpp
+     test/cpp/creator/test_task_creator_query_state.cpp
+     test/cpp/creator/test_task_creator_schedule_validation.cpp
++    test/cpp/memory/test_host_or.cpp
++    test/cpp/memory/test_peer_islands.cpp
+     test/cpp/memory/test_pool_peer_access.cpp
+     test/cpp/memory/test_device_transfer.cpp
+     test/cpp/downgrade/test_downgrade_acquisition_failure.cpp
+@@ -297,6 +299,7 @@ set(TEST_SOURCES
+     test/cpp/operator/test_complete_build_inventory.cpp
+     test/cpp/operator/test_build_input_certification.cpp
+     test/cpp/operator/test_dynamic_filter_construction_plan.cpp
++    test/cpp/operator/test_dynamic_filter_union_plan.cpp
+     test/cpp/operator/test_physical_build_filter.cpp
+     test/cpp/operator/test_dynamic_filter_accumulation.cpp
+     test/cpp/operator/test_accumulated_bloom_key_types.cpp
+diff --git a/src/memory/CMakeLists.txt b/src/memory/CMakeLists.txt
+index c93b83ec..efb9480f 100644
+--- a/src/memory/CMakeLists.txt
++++ b/src/memory/CMakeLists.txt
+@@ -1,3 +1,4 @@
+ target_sources(
+-  sirius_objects PRIVATE defragmenter_oom_policy.cpp pool_peer_access.cpp
+-                         sirius_memory_reservation_manager.cpp)
++  sirius_objects
++  PRIVATE defragmenter_oom_policy.cpp host_or.cpp peer_islands.cpp
++          pool_peer_access.cpp sirius_memory_reservation_manager.cpp)
+diff --git a/src/op/CMakeLists.txt b/src/op/CMakeLists.txt
+index a0958228..545f6661 100644
+--- a/src/op/CMakeLists.txt
++++ b/src/op/CMakeLists.txt
+@@ -72,6 +72,7 @@ target_sources(
+           dynamic_filter/construction_plan.cpp
+           dynamic_filter/build_filter_construction.cpp
+           dynamic_filter/detail/restore_scalar.cpp
++          dynamic_filter/detail/union_plan.cpp
+           dynamic_filter/dynamic_filter_publisher.cpp
+           dynamic_filter/dynamic_filter_key_outcome.cpp
+           dynamic_filter/post_unlock_actions.cpp
+diff --git a/src/memory/host_or.cpp b/src/memory/host_or.cpp
+new file mode 100644
+index 00000000..cc3c32af
+--- /dev/null
++++ b/src/memory/host_or.cpp
+@@ -0,0 +1,221 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "memory/host_or.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <thread>
++
++#if defined(__x86_64__)
++#include <immintrin.h>
++#endif
++
++namespace sirius::memory {
++
++namespace {
++
++void or_bytes(std::span<std::span<std::byte const> const> inputs,
++              std::byte* out,
++              std::size_t first,
++              std::size_t last) noexcept
++{
++  for (auto index = first; index < last; ++index) {
++    auto value = inputs.front()[index];
++    for (auto const& input : inputs.subspan(1)) {
++      value |= input[index];
++    }
++    out[index] = value;
++  }
++}
++
++void or_words(std::span<std::span<std::byte const> const> inputs, std::span<std::byte> out) noexcept
++{
++  auto const whole = out.size() - out.size() % sizeof(std::uint64_t);
++  for (std::size_t index = 0; index < whole; index += sizeof(std::uint64_t)) {
++    std::uint64_t value = 0;
++    for (auto const& input : inputs) {
++      std::uint64_t word;
++      std::memcpy(&word, input.data() + index, sizeof(word));
++      value |= word;
++    }
++    std::memcpy(out.data() + index, &value, sizeof(value));
++  }
++  or_bytes(inputs, out.data(), whole, out.size());
++}
++
++#if defined(__x86_64__)
++constexpr std::size_t vector_bytes = 64;
++
++__attribute__((target("avx512f"))) void or_avx512(
++  std::span<std::span<std::byte const> const> inputs, std::span<std::byte> out) noexcept
++{
++  // Non-temporal stores need an aligned destination.
++  auto const address = reinterpret_cast<std::uintptr_t>(out.data());
++  auto const head    = std::min(out.size(), (vector_bytes - address % vector_bytes) % vector_bytes);
++  auto const whole   = head + (out.size() - head) / vector_bytes * vector_bytes;
++  or_bytes(inputs, out.data(), 0, head);
++  for (auto index = head; index < whole; index += vector_bytes) {
++    auto value = _mm512_loadu_si512(inputs.front().data() + index);
++    for (auto const& input : inputs.subspan(1)) {
++      value = _mm512_or_si512(value, _mm512_loadu_si512(input.data() + index));
++    }
++    _mm512_stream_si512(reinterpret_cast<__m512i*>(out.data() + index), value);
++  }
++  // Order the non-temporal stores before whatever reads the output next.
++  _mm_sfence();
++  or_bytes(inputs, out.data(), whole, out.size());
++}
++#endif
++
++void pause() noexcept
++{
++#if defined(__x86_64__)
++  _mm_pause();
++#else
++  std::this_thread::yield();
++#endif
++}
++
++}  // namespace
++
++void host_or(std::span<std::span<std::byte const> const> inputs, std::span<std::byte> out) noexcept
++{
++#if defined(__x86_64__)
++  static bool const avx512 = __builtin_cpu_supports("avx512f");
++  if (avx512) { return or_avx512(inputs, out); }
++#endif
++  or_words(inputs, out);
++}
++
++unsigned host_or_workers::thread_budget(unsigned hardware_threads) noexcept
++{
++  return std::clamp(hardware_threads / 4, 1U, 8U);
++}
++
++std::shared_ptr<host_or_workers> host_or_workers::shared()
++{
++  static std::mutex mutex;
++  static std::weak_ptr<host_or_workers> live;
++  std::lock_guard lock{mutex};
++  auto workers = live.lock();
++  if (!workers) {
++    workers = std::make_shared<host_or_workers>(thread_budget(std::thread::hardware_concurrency()));
++    live    = workers;
++  }
++  return workers;
++}
++
++host_or_workers::host_or_workers(unsigned threads) : _open_count{0}
++{
++  _helpers.reserve(std::max(threads, 1U) - 1);
++  try {
++    for (unsigned helper = 1; helper < threads; ++helper) {
++      _helpers.emplace_back([this] { help(); });
++    }
++  } catch (...) {
++    // A thread that cannot start leaves fewer helpers, not a failed engine.
++  }
++}
++
++host_or_workers::~host_or_workers()
++{
++  {
++    std::lock_guard lock{_mutex};
++    _stop = true;
++  }
++  _wake.notify_all();
++  for (auto& helper : _helpers) {
++    helper.join();
++  }
++}
++
++void host_or_workers::work(job& current) noexcept
++{
++  for (auto part = current.next.fetch_add(1, std::memory_order_relaxed); part < current.parts;
++       part      = current.next.fetch_add(1, std::memory_order_relaxed)) {
++    current.invoke(current.context, part);
++  }
++}
++
++void host_or_workers::run_job(unsigned parts, part_function invoke, void* context) noexcept
++{
++  job current{invoke, context, parts, 0};
++  auto const helpers = std::min<std::size_t>(parts == 0 ? 0 : parts - 1, _helpers.size());
++  if (helpers != 0) {
++    current.wanted = static_cast<unsigned>(helpers);
++    {
++      std::lock_guard lock{_mutex};
++      _open.push_back(&current);
++      _open_count.store(static_cast<unsigned>(_open.size()), std::memory_order_release);
++    }
++    if (helpers == 1) {
++      _wake.notify_one();
++    } else {
++      _wake.notify_all();
++    }
++  }
++  work(current);
++  if (helpers == 0) { return; }
++  {
++    // After this no helper can join; the ones that did are counted in `inside`.
++    std::lock_guard lock{_mutex};
++    std::erase(_open, &current);
++    _open_count.store(static_cast<unsigned>(_open.size()), std::memory_order_release);
++  }
++  // Helpers finish their last part about when this thread finishes its own.
++  for (unsigned spins = 0; current.inside.load(std::memory_order_acquire) != 0; ++spins) {
++    if (spins < 4096) {
++      pause();
++    } else {
++      std::this_thread::yield();
++    }
++  }
++}
++
++void host_or_workers::help()
++{
++  using clock = std::chrono::steady_clock;
++  std::unique_lock lock{_mutex};
++  for (;;) {
++    _wake.wait(lock, [this] { return _stop || !_open.empty(); });
++    if (_stop) { return; }
++    for (;;) {
++      // Holding the mutex: join the oldest open job.
++      auto* const current = _open.front();
++      current->inside.fetch_add(1, std::memory_order_relaxed);
++      if (--current->wanted == 0) {
++        _open.erase(_open.begin());
++        _open_count.store(static_cast<unsigned>(_open.size()), std::memory_order_release);
++      }
++      lock.unlock();
++      work(*current);
++      // The submitter may destroy the job as soon as this count drops: do not touch it afterwards.
++      current->inside.fetch_sub(1, std::memory_order_release);
++      auto const deadline = clock::now() + spin_window;
++      while (_open_count.load(std::memory_order_acquire) == 0 && clock::now() < deadline) {
++        pause();
++      }
++      lock.lock();
++      if (_stop || _open.empty()) { break; }
++    }
++    if (_stop) { return; }
++  }
++}
++
++}  // namespace sirius::memory
+diff --git a/src/memory/host_or.hpp b/src/memory/host_or.hpp
+new file mode 100644
+index 00000000..4889cbef
+--- /dev/null
++++ b/src/memory/host_or.hpp
+@@ -0,0 +1,177 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * @file host_or.hpp
++ * @brief Bitwise OR of host byte ranges, and the worker threads that split one OR over several
++ * cores.
++ *
++ * `sirius::op::detail::unite` combines the chunks that several GPUs staged in pinned host memory
++ * with `host_or`. It splits each chunk into parts and hands them to a `host_or_executor`: in the
++ * engine a `host_or_workers` shared by every publication, in tests an `inline_host_or_executor`.
++ */
++
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <concepts>
++#include <condition_variable>
++#include <cstddef>
++#include <memory>
++#include <mutex>
++#include <span>
++#include <thread>
++#include <type_traits>
++#include <vector>
++
++namespace sirius::memory {
++
++/**
++ * @brief Writes the bitwise OR of @p inputs to @p out.
++ *
++ * Uses AVX-512 with non-temporal stores when the CPU has it, so the output does not pass through
++ * the cache on its way to the next device copy; otherwise ORs 8 bytes at a time. Never allocates.
++ *
++ * @pre @p inputs is not empty, every input holds at least `out.size()` bytes, and @p out overlaps
++ * no input
++ * @param inputs The ranges to combine; only the first `out.size()` bytes of each are read
++ * @param out The range that receives the union
++ */
++void host_or(std::span<std::span<std::byte const> const> inputs, std::span<std::byte> out) noexcept;
++
++/**
++ * @brief Something that runs the parts of one split job, possibly on several threads.
++ *
++ * `run(parts, body)` calls `body(i)` exactly once for each `i` in `[0, parts)` and returns after
++ * every call returned. `max_parts()` is the largest split worth asking for.
++ */
++template <class Executor>
++concept host_or_executor = requires(Executor& executor, void (*body)(unsigned) noexcept) {
++  { executor.max_parts() } noexcept -> std::convertible_to<unsigned>;
++  { executor.run(2U, body) } noexcept;
++};
++
++/**
++ * @brief Runs every part on the calling thread.
++ */
++class inline_host_or_executor {
++ public:
++  [[nodiscard]] unsigned max_parts() const noexcept { return 1; }
++
++  template <std::invocable<unsigned> Body>
++  void run(unsigned parts, Body&& body) noexcept
++  {
++    for (unsigned part = 0; part < parts; ++part) {
++      body(part);
++    }
++  }
++};
++
++/**
++ * @brief A fixed set of helper threads that run the parts of split jobs together with the threads
++ * that submit them.
++ *
++ * The submitting thread always works on its own job and takes every part no helper has started, so
++ * a job never waits for a helper: with all helpers busy on other jobs it simply runs on its
++ * submitter. Jobs from different threads share the helpers part by part.
++ *
++ * A helper sleeps while there are no jobs. After finishing a part it keeps polling for the next job
++ * for `spin_window` before it sleeps again, because the jobs of one publication follow each other
++ * faster than a sleeping thread wakes up.
++ */
++class host_or_workers {
++ public:
++  /// How long a helper polls for another job after its last one
++  static constexpr std::chrono::microseconds spin_window{500};
++
++  /**
++   * @brief Threads one job may use, the submitter included, on a machine with
++   * @p hardware_threads: a quarter of them, at least 1 and at most 8.
++   */
++  [[nodiscard]] static unsigned thread_budget(unsigned hardware_threads) noexcept;
++
++  /**
++   * @brief The process-wide workers, sized by `thread_budget` of this machine.
++   *
++   * They live while any returned pointer does: `sirius_memory_reservation_manager` keeps one for
++   * the engine's lifetime, so the threads are started once. A caller without a live manager gets
++   * workers of its own that stop when it releases them.
++   */
++  [[nodiscard]] static std::shared_ptr<host_or_workers> shared();
++
++  /**
++   * @brief Starts `threads - 1` helpers.
++   *
++   * @param threads Threads one job may use, the submitter included; at least 1
++   */
++  explicit host_or_workers(unsigned threads);
++
++  /// Stops and joins the helpers. No job may be running.
++  ~host_or_workers();
++
++  host_or_workers(host_or_workers const&)            = delete;
++  host_or_workers& operator=(host_or_workers const&) = delete;
++
++  [[nodiscard]] unsigned max_parts() const noexcept
++  {
++    return static_cast<unsigned>(_helpers.size()) + 1;
++  }
++
++  /**
++   * @brief Calls `body(i)` once for each `i` in `[0, parts)`, on this thread and on idle helpers,
++   * and returns when all calls returned. Thread-safe.
++   *
++   * @param parts Number of parts; more than `max_parts()` is allowed and uses no extra thread
++   * @param body Called concurrently with distinct arguments; must not throw
++   */
++  template <std::invocable<unsigned> Body>
++  void run(unsigned parts, Body&& body) noexcept
++  {
++    run_job(
++      parts,
++      [](void* context, unsigned part) noexcept {
++        (*static_cast<std::remove_reference_t<Body>*>(context))(part);
++      },
++      std::addressof(body));
++  }
++
++ private:
++  using part_function = void (*)(void* context, unsigned part) noexcept;
++
++  /// One submitted job; lives on its submitter's stack until no helper is inside it.
++  struct job {
++    part_function invoke;
++    void* context;
++    unsigned parts;
++    unsigned wanted;                  ///< Helpers still to join; guarded by `_mutex`
++    std::atomic<unsigned> next{0};    ///< The next part nobody has started
++    std::atomic<unsigned> inside{0};  ///< Helpers that joined and have not left
++  };
++
++  void run_job(unsigned parts, part_function invoke, void* context) noexcept;
++  void help();
++  static void work(job& current) noexcept;
++
++  std::mutex _mutex;
++  std::condition_variable _wake;
++  std::vector<job*> _open;            ///< Jobs that still want helpers; guarded by `_mutex`
++  std::atomic<unsigned> _open_count;  ///< `_open.size()`, readable without the mutex
++  bool _stop = false;                 ///< Guarded by `_mutex`
++  std::vector<std::thread> _helpers;
++};
++
++}  // namespace sirius::memory
+diff --git a/src/memory/peer_islands.cpp b/src/memory/peer_islands.cpp
+new file mode 100644
+index 00000000..af7b6f89
+--- /dev/null
++++ b/src/memory/peer_islands.cpp
+@@ -0,0 +1,71 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "memory/peer_islands.hpp"
++
++#include "memory/pool_peer_access.hpp"
++
++#include <cucascade/memory/memory_space.hpp>
++
++#include <algorithm>
++#include <limits>
++#include <memory>
++#include <stdexcept>
++
++namespace sirius::memory {
++
++std::vector<std::uint8_t> islands_from_access(std::size_t count, std::span<bool const> access)
++{
++  if (count > std::numeric_limits<std::uint8_t>::max() || access.size() != count * count) {
++    throw std::invalid_argument{"[islands_from_access] the access matrix does not match the count"};
++  }
++  auto const mutual = [&](std::size_t left, std::size_t right) {
++    return access[left * count + right] && access[right * count + left];
++  };
++  std::vector<std::uint8_t> ids(count);
++  std::uint8_t islands = 0;
++  for (std::size_t device = 0; device < count; ++device) {
++    std::uint8_t island = 0;
++    for (; island < islands; ++island) {
++      bool fits = true;
++      for (std::size_t member = 0; member < device && fits; ++member) {
++        fits = ids[member] != island || mutual(member, device);
++      }
++      if (fits) { break; }
++    }
++    ids[device] = island;
++    islands     = std::max<std::uint8_t>(islands, island + 1);
++  }
++  return ids;
++}
++
++std::vector<std::uint8_t> peer_islands(
++  std::span<cucascade::memory::memory_space const* const> spaces)
++{
++  auto const count = spaces.size();
++  // std::vector<bool> has no contiguous storage to view.
++  auto const access = std::make_unique<bool[]>(count * count);
++  for (std::size_t owner = 0; owner < count; ++owner) {
++    for (std::size_t accessor = 0; accessor < count; ++accessor) {
++      access[owner * count + accessor] =
++        owner == accessor ||
++        try_grant_pool_access(*spaces[owner], spaces[accessor]->get_device_id());
++    }
++  }
++  return islands_from_access(count, std::span<bool const>{access.get(), count * count});
++}
++
++}  // namespace sirius::memory
+diff --git a/src/memory/peer_islands.hpp b/src/memory/peer_islands.hpp
+new file mode 100644
+index 00000000..e034efee
+--- /dev/null
++++ b/src/memory/peer_islands.hpp
+@@ -0,0 +1,59 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <vector>
++
++namespace cucascade::memory {
++class memory_space;
++}
++
++namespace sirius::memory {
++
++/**
++ * @brief Groups @p count devices into islands: sets in which every two members can copy directly
++ * between each other's allocation pools.
++ *
++ * A device joins the first island all of whose members it has access with in both directions, else
++ * it opens a new one; devices are visited in index order. Every island is therefore legal for peer
++ * copies. When access is not transitive (A-B and B-C but not A-C) the grouping is legal but may use
++ * more islands than necessary, which costs transfer speed only.
++ *
++ * @param count Number of devices
++ * @param access Row-major `count x count` matrix; `access[owner * count + accessor]` is whether
++ * `accessor` can read and write `owner`'s pool. The diagonal is ignored
++ * @return One island id per device; ids are dense and numbered in order of first appearance
++ */
++[[nodiscard]] std::vector<std::uint8_t> islands_from_access(std::size_t count,
++                                                            std::span<bool const> access);
++
++/**
++ * @brief The islands of @p spaces, from `try_grant_pool_access` between every two of them.
++ *
++ * Nothing is cached: each call asks for every grant again.
++ *
++ * @throw Whatever `try_grant_pool_access` throws
++ * @param spaces GPU spaces on distinct devices
++ * @return One island id per space, as `islands_from_access` numbers them
++ */
++[[nodiscard]] std::vector<std::uint8_t> peer_islands(
++  std::span<cucascade::memory::memory_space const* const> spaces);
++
++}  // namespace sirius::memory
+diff --git a/src/op/dynamic_filter/detail/union_plan.cpp b/src/op/dynamic_filter/detail/union_plan.cpp
+new file mode 100644
+index 00000000..8b5d81d5
+--- /dev/null
++++ b/src/op/dynamic_filter/detail/union_plan.cpp
+@@ -0,0 +1,109 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "op/dynamic_filter/detail/union_plan.hpp"
++
++#include <algorithm>
++#include <cstddef>
++#include <limits>
++#include <stdexcept>
++
++namespace sirius::op::detail {
++
++union_plan union_plan::make(std::span<std::uint8_t const> island_ids,
++                            std::span<bool const> contributed,
++                            std::size_t root)
++{
++  auto const members = island_ids.size();
++  if (members == 0 || members != contributed.size() || root >= members ||
++      members > std::numeric_limits<std::uint8_t>::max()) {
++    throw std::invalid_argument{"[union_plan::make] inconsistent members"};
++  }
++  union_plan plan;
++  auto const add_island = [&](std::uint8_t id, std::size_t leader) {
++    island entry{static_cast<std::uint8_t>(leader), contributed[leader], {}, {}};
++    for (std::size_t member = 0; member < members; ++member) {
++      if (island_ids[member] != id || member == leader) { continue; }
++      entry.others.push_back(static_cast<std::uint8_t>(member));
++      if (contributed[member]) { entry.sources.push_back(static_cast<std::uint8_t>(member)); }
++    }
++    plan.islands.push_back(std::move(entry));
++  };
++  add_island(island_ids[root], root);
++  for (std::size_t first = 0; first < members; ++first) {
++    auto const id = island_ids[first];
++    // An island is added at its first member.
++    if (id == island_ids[root] || std::ranges::find(island_ids.first(first), id) !=
++                                    island_ids.begin() + static_cast<std::ptrdiff_t>(first)) {
++      continue;
++    }
++    auto leader = first;
++    for (auto member = first; member < members; ++member) {
++      if (island_ids[member] == id && contributed[member]) {
++        leader = member;
++        break;
++      }
++    }
++    add_island(id, leader);
++  }
++  return plan;
++}
++
++union_plan union_plan::split(std::size_t index) const
++{
++  union_plan plan;
++  plan.islands.reserve(islands.size() + islands[index].others.size());
++  for (std::size_t position = 0; position < islands.size(); ++position) {
++    auto const& entry = islands[position];
++    if (position != index) {
++      plan.islands.push_back(entry);
++      continue;
++    }
++    plan.islands.push_back({entry.leader, entry.leader_contributes, {}, {}});
++    for (auto const member : entry.others) {
++      plan.islands.push_back(
++        {member, std::ranges::find(entry.sources, member) != entry.sources.end(), {}, {}});
++    }
++  }
++  return plan;
++}
++
++std::size_t union_plan::inputs() const noexcept
++{
++  return static_cast<std::size_t>(
++    std::ranges::count_if(islands, [](island const& entry) { return entry.contributes(); }));
++}
++
++bool union_plan::crosses_host() const noexcept { return islands.size() >= 2 && inputs() >= 1; }
++
++bool union_plan::moves_nothing() const noexcept
++{
++  return inputs() == 0 || (islands.size() == 1 && islands.front().others.empty());
++}
++
++bool union_plan::uploads(island const& entry) const noexcept
++{
++  return crosses_host() && (inputs() >= 2 || !entry.contributes());
++}
++
++std::size_t union_plan::host_slots() const noexcept
++{
++  if (!crosses_host()) { return 0; }
++  auto const count = inputs();
++  return count >= 2 ? count + 1 : 1;
++}
++
++}  // namespace sirius::op::detail
+diff --git a/src/op/dynamic_filter/detail/union_plan.hpp b/src/op/dynamic_filter/detail/union_plan.hpp
+new file mode 100644
+index 00000000..f3d2259c
+--- /dev/null
++++ b/src/op/dynamic_filter/detail/union_plan.hpp
+@@ -0,0 +1,117 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * @file union_plan.hpp
++ * @brief Who does what when `unite` makes equally shaped arrays on several GPUs equal to their
++ * bitwise OR.
++ *
++ * Vocabulary, shared with `union_transfer.hpp`:
++ * - A member is one GPU's copy of the arrays, named by its index in the request.
++ * - An island is a set of members that can copy directly between each other (see
++ *   `sirius::memory::peer_islands`).
++ * - Each island has one leader, the only member that exchanges data with the host.
++ * - A member contributes if its arrays may hold set bits; the arrays of the others are all zero. An
++ *   island contributes if any member does, and its leader is then an input of the host stage.
++ *
++ * A plan only assigns roles. It is plain host data without any GPU state, fixed before the first
++ * transfer is submitted.
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <vector>
++
++namespace sirius::op::detail {
++
++/**
++ * @brief The roles of every member in one `unite` call.
++ */
++struct union_plan {
++  /**
++   * @brief One island's roles.
++   */
++  struct island {
++    std::uint8_t leader;                ///< The member that exchanges data with the host
++    bool leader_contributes;            ///< Whether the leader's own arrays may hold set bits
++    std::vector<std::uint8_t> sources;  ///< Contributing members other than the leader
++    std::vector<std::uint8_t> others;   ///< Every member other than the leader, in member order
++
++    [[nodiscard]] bool contributes() const noexcept
++    {
++      return leader_contributes || !sources.empty();
++    }
++  };
++
++  std::vector<island> islands;  ///< The root's island first, the rest by their first member
++
++  /**
++   * @brief Assigns the roles.
++   *
++   * The root leads its island. Any other island is led by its first contributing member, or by its
++   * first member when none contributes, so that a contributing island never copies its leader's
++   * data in from elsewhere.
++   *
++   * @throw std::invalid_argument if the spans differ in size, are empty, hold more than 255
++   * members, or @p root is not a member
++   * @param island_ids One island id per member; members with equal ids form an island
++   * @param contributed Whether each member contributes
++   * @param root The member whose island comes first and which leads it
++   */
++  [[nodiscard]] static union_plan make(std::span<std::uint8_t const> island_ids,
++                                       std::span<bool const> contributed,
++                                       std::size_t root);
++
++  /**
++   * @brief This plan with island @p index replaced by one island per member, so that none of
++   * them needs device scratch. The other islands are unchanged.
++   *
++   * @pre `index < islands.size()`
++   */
++  [[nodiscard]] union_plan split(std::size_t index) const;
++
++  /// Number of contributing islands: the inputs of the host stage
++  [[nodiscard]] std::size_t inputs() const noexcept;
++
++  /// Whether leaders exchange data through the host: several islands and something to move
++  [[nodiscard]] bool crosses_host() const noexcept;
++
++  /// Whether no data moves at all: nothing was contributed, or there is one member
++  [[nodiscard]] bool moves_nothing() const noexcept;
++
++  /**
++   * @brief Whether the leader of @p entry receives the union from the host: every leader when the
++   * host combines several inputs, every leader but the single input otherwise.
++   */
++  [[nodiscard]] bool uploads(island const& entry) const noexcept;
++
++  /**
++   * @brief Pinned chunk slots held per chunk in flight: one per input, plus one for the combined
++   * chunk when there are several inputs. Zero without a host stage.
++   */
++  [[nodiscard]] std::size_t host_slots() const noexcept;
++
++  /// Device scratch chunk slots the leader of @p entry holds per chunk in flight
++  [[nodiscard]] static std::size_t merge_slots(island const& entry) noexcept
++  {
++    return entry.sources.size();
++  }
++};
++
++}  // namespace sirius::op::detail
+diff --git a/test/cpp/memory/test_host_or.cpp b/test/cpp/memory/test_host_or.cpp
+new file mode 100644
+index 00000000..057731ce
+--- /dev/null
++++ b/test/cpp/memory/test_host_or.cpp
+@@ -0,0 +1,149 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "catch.hpp"
++#include "memory/host_or.hpp"
++
++#include <algorithm>
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <random>
++#include <span>
++#include <thread>
++#include <vector>
++
++namespace {
++using sirius::memory::host_or;
++using sirius::memory::host_or_workers;
++using sirius::memory::inline_host_or_executor;
++
++static_assert(sirius::memory::host_or_executor<host_or_workers>);
++static_assert(sirius::memory::host_or_executor<inline_host_or_executor>);
++
++std::vector<std::byte> random_bytes(std::size_t size, std::uint32_t seed)
++{
++  std::mt19937 engine{seed};
++  std::vector<std::byte> bytes(size);
++  for (auto& value : bytes) {
++    value = static_cast<std::byte>(engine() & 0xFF);
++  }
++  return bytes;
++}
++}  // namespace
++
++TEST_CASE("host_or equals a byte-wise OR for every size, alignment and input count", "[host_or]")
++{
++  constexpr std::size_t guard = 96;
++  auto const size =
++    GENERATE(std::size_t{0}, 1, 7, 8, 63, 64, 65, 96, 127, 128, 1000, 4096, 4097, 262147);
++  auto const input_count = GENERATE(std::size_t{1}, 2, 3, 5);
++  auto const shift       = GENERATE(std::size_t{0}, 1, 31, 63);
++
++  std::vector<std::vector<std::byte>> sources;
++  std::vector<std::span<std::byte const>> inputs;
++  for (std::size_t index = 0; index < input_count; ++index) {
++    // Inputs start at their own odd offsets and are longer than the output.
++    sources.push_back(
++      random_bytes(size + index + 3, static_cast<std::uint32_t>(17 * index + size)));
++    inputs.emplace_back(sources.back().data() + index, size + 3);
++  }
++  std::vector<std::byte> expected(size);
++  for (std::size_t index = 0; index < size; ++index) {
++    for (auto const& input : inputs) {
++      expected[index] |= input[index];
++    }
++  }
++  // Bytes around the output must stay untouched.
++  std::vector<std::byte> storage(guard + shift + size + guard, std::byte{0xA5});
++  std::span<std::byte> const out{storage.data() + guard + shift, size};
++  host_or(inputs, out);
++  CHECK(std::ranges::equal(out, expected));
++  CHECK(std::ranges::all_of(std::span{storage}.first(guard + shift),
++                            [](std::byte value) { return value == std::byte{0xA5}; }));
++  CHECK(std::ranges::all_of(std::span{storage}.last(guard),
++                            [](std::byte value) { return value == std::byte{0xA5}; }));
++}
++
++TEST_CASE("host_or_workers budgets a quarter of the hardware threads, between 1 and 8", "[host_or]")
++{
++  CHECK(host_or_workers::thread_budget(0) == 1);
++  CHECK(host_or_workers::thread_budget(2) == 1);
++  CHECK(host_or_workers::thread_budget(8) == 2);
++  CHECK(host_or_workers::thread_budget(16) == 4);
++  CHECK(host_or_workers::thread_budget(32) == 8);
++  CHECK(host_or_workers::thread_budget(96) == 8);
++}
++
++TEST_CASE("host_or_workers runs every part exactly once", "[host_or]")
++{
++  auto const threads = GENERATE(1U, 2U, 8U);
++  host_or_workers workers{threads};
++  CHECK(workers.max_parts() == threads);
++  for (unsigned parts : {0U, 1U, 2U, 5U, 8U, 33U}) {
++    std::vector<std::atomic<int>> calls(parts);
++    for (int round = 0; round < 200; ++round) {
++      workers.run(parts, [&](unsigned part) noexcept { calls[part].fetch_add(1); });
++    }
++    CHECK(std::ranges::all_of(calls, [](auto const& count) { return count.load() == 200; }));
++  }
++}
++
++TEST_CASE("host_or_workers shares its helpers between concurrent submitters", "[host_or]")
++{
++  constexpr unsigned submitters = 12;
++  constexpr unsigned parts      = 6;
++  constexpr int rounds          = 300;
++  host_or_workers workers{4};
++  std::vector<std::atomic<int>> calls(submitters * parts);
++  {
++    std::vector<std::jthread> threads;
++    for (unsigned submitter = 0; submitter < submitters; ++submitter) {
++      threads.emplace_back([&, submitter] {
++        for (int round = 0; round < rounds; ++round) {
++          workers.run(
++            parts, [&](unsigned part) noexcept { calls[submitter * parts + part].fetch_add(1); });
++        }
++      });
++    }
++  }
++  CHECK(std::ranges::all_of(calls, [](auto const& count) { return count.load() == rounds; }));
++}
++
++TEST_CASE("host_or_workers::shared hands out one instance while it is held", "[host_or]")
++{
++  auto first        = host_or_workers::shared();
++  auto const second = host_or_workers::shared();
++  CHECK(first == second);
++  CHECK(first->max_parts() == host_or_workers::thread_budget(std::thread::hardware_concurrency()));
++  std::atomic<int> calls{0};
++  first->run(first->max_parts(), [&](unsigned) noexcept { calls.fetch_add(1); });
++  CHECK(calls.load() == static_cast<int>(first->max_parts()));
++}
++
++TEST_CASE("inline_host_or_executor runs every part on the calling thread", "[host_or]")
++{
++  inline_host_or_executor executor;
++  CHECK(executor.max_parts() == 1);
++  std::vector<unsigned> order;
++  auto const caller = std::this_thread::get_id();
++  executor.run(3, [&](unsigned part) noexcept {
++    CHECK(std::this_thread::get_id() == caller);
++    order.push_back(part);
++  });
++  CHECK(order == std::vector<unsigned>{0, 1, 2});
++}
+diff --git a/test/cpp/memory/test_peer_islands.cpp b/test/cpp/memory/test_peer_islands.cpp
+new file mode 100644
+index 00000000..4b3258a8
+--- /dev/null
++++ b/test/cpp/memory/test_peer_islands.cpp
+@@ -0,0 +1,102 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "catch.hpp"
++#include "memory/peer_islands.hpp"
++#include "memory/pool_peer_access.hpp"
++#include "operator/operator_test_utils.hpp"
++#include "utils/sirius_test_env.hpp"
++
++#include <cuda_runtime_api.h>
++
++#include <cucascade/memory/memory_space.hpp>
++
++#include <cstddef>
++#include <cstdint>
++#include <initializer_list>
++#include <memory>
++#include <stdexcept>
++#include <utility>
++#include <vector>
++
++namespace {
++using sirius::memory::islands_from_access;
++
++/// The islands of `count` devices in which exactly the `linked` pairs have access both ways.
++std::vector<std::uint8_t> islands_of(std::size_t count,
++                                     std::initializer_list<std::pair<int, int>> linked)
++{
++  auto const access = std::make_unique<bool[]>(count * count);
++  for (auto const [left, right] : linked) {
++    access[left * count + right] = true;
++    access[right * count + left] = true;
++  }
++  return islands_from_access(count, {access.get(), count * count});
++}
++}  // namespace
++
++TEST_CASE("islands_from_access groups devices with mutual access", "[peer_islands]")
++{
++  using ids = std::vector<std::uint8_t>;
++  CHECK(islands_of(0, {}).empty());
++  CHECK(islands_of(1, {}) == ids{0});
++  CHECK(islands_of(4, {}) == ids{0, 1, 2, 3});
++  CHECK(islands_of(4, {{0, 1}, {2, 3}}) == ids{0, 0, 1, 1});
++  CHECK(islands_of(4, {{0, 2}, {1, 3}}) == ids{0, 1, 0, 1});
++  CHECK(islands_of(3, {{0, 1}}) == ids{0, 0, 1});
++  CHECK(islands_of(3, {{1, 2}}) == ids{0, 1, 1});
++  CHECK(islands_of(4, {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}}) == ids{0, 0, 0, 0});
++  // Not transitive: 0-1 and 1-2 without 0-2. Device 2 may not join {0, 1}.
++  CHECK(islands_of(3, {{0, 1}, {1, 2}}) == ids{0, 0, 1});
++  // A chain 0-1-2-3 is covered by its first and last link.
++  CHECK(islands_of(4, {{0, 1}, {1, 2}, {2, 3}}) == ids{0, 0, 1, 1});
++}
++
++TEST_CASE("islands_from_access requires access in both directions", "[peer_islands]")
++{
++  std::size_t const count = 2;
++  bool access[4]          = {false, true, false, false};
++  CHECK(islands_from_access(count, access) == std::vector<std::uint8_t>{0, 1});
++  access[2] = true;
++  CHECK(islands_from_access(count, access) == std::vector<std::uint8_t>{0, 0});
++  CHECK_THROWS_AS(islands_from_access(3, access), std::invalid_argument);
++}
++
++TEST_CASE("peer_islands agrees with the pool grants of the visible GPUs",
++          "[peer_islands][multi_gpu]")
++{
++  int devices = 0;
++  REQUIRE(cudaGetDeviceCount(&devices) == cudaSuccess);
++  if (devices < 2) { return; }
++  auto manager = sirius::test::operator_utils::initialize_memory_manager(devices);
++  std::vector<cucascade::memory::memory_space const*> spaces;
++  for (int device = 0; device < devices; ++device) {
++    spaces.push_back(manager->get_memory_space(cucascade::memory::Tier::GPU, device));
++  }
++  auto const ids = sirius::memory::peer_islands(spaces);
++  REQUIRE(ids.size() == spaces.size());
++  CHECK(ids.front() == 0);
++  for (std::size_t left = 0; left < spaces.size(); ++left) {
++    for (std::size_t right = left + 1; right < spaces.size(); ++right) {
++      auto const mutual =
++        sirius::memory::try_grant_pool_access(*spaces[left], spaces[right]->get_device_id()) &&
++        sirius::memory::try_grant_pool_access(*spaces[right], spaces[left]->get_device_id());
++      // Members of one island always have mutual access.
++      if (ids[left] == ids[right]) { CHECK(mutual); }
++    }
++  }
++  CHECK(sirius::memory::peer_islands(spaces) == ids);
++}
+diff --git a/test/cpp/operator/test_dynamic_filter_union_plan.cpp b/test/cpp/operator/test_dynamic_filter_union_plan.cpp
+new file mode 100644
+index 00000000..fc6cf11d
+--- /dev/null
++++ b/test/cpp/operator/test_dynamic_filter_union_plan.cpp
+@@ -0,0 +1,237 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "catch.hpp"
++#include "op/dynamic_filter/detail/union_plan.hpp"
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <stdexcept>
++#include <vector>
++
++namespace {
++using sirius::op::detail::union_plan;
++
++constexpr std::size_t max_members = 8;
++
++struct plan_case {
++  std::array<std::uint8_t, max_members> ids;
++  std::array<bool, max_members> contributed;
++  std::size_t members;
++  std::size_t root;
++};
++
++/// Calls `visit` for every grouping of up to `max_members` members into islands, every set of
++/// contributing members and every root.
++template <class Visit>
++void for_each_case(Visit&& visit)
++{
++  for (std::size_t members = 1; members <= max_members; ++members) {
++    // Restricted growth strings enumerate each set partition once.
++    std::array<std::uint8_t, max_members> ids{};
++    for (;;) {
++      for (unsigned mask = 0; mask < (1U << members); ++mask) {
++        plan_case current{ids, {}, members, 0};
++        for (std::size_t member = 0; member < members; ++member) {
++          current.contributed[member] = (mask >> member & 1U) != 0;
++        }
++        for (current.root = 0; current.root < members; ++current.root) {
++          visit(current);
++        }
++      }
++      auto position = members;
++      while (position-- > 1) {
++        auto const limit = *std::max_element(ids.begin(), ids.begin() + position) + 1;
++        if (ids[position] < limit) {
++          ++ids[position];
++          std::fill(ids.begin() + position + 1, ids.begin() + members, std::uint8_t{0});
++          break;
++        }
++      }
++      if (position == 0 || members == 1) { break; }
++    }
++  }
++}
++
++/// The members of `entry`, leader first.
++std::vector<std::uint8_t> members_of(union_plan::island const& entry)
++{
++  std::vector<std::uint8_t> members{entry.leader};
++  members.insert(members.end(), entry.others.begin(), entry.others.end());
++  return members;
++}
++
++/// Counts the roles of `plan` that break a rule `union_plan::make` documents.
++std::size_t violations(plan_case const& input, union_plan const& plan)
++{
++  std::size_t broken = 0;
++  auto const expect  = [&](bool holds) { broken += holds ? 0 : 1; };
++  std::array<int, max_members> seen{};
++  std::size_t contributing_islands = 0;
++  for (std::size_t position = 0; position < plan.islands.size(); ++position) {
++    auto const& entry              = plan.islands[position];
++    auto const id                  = input.ids[entry.leader];
++    bool any                       = false;
++    std::size_t first              = input.members;
++    std::size_t first_contributing = input.members;
++    for (std::size_t member = 0; member < input.members; ++member) {
++      if (input.ids[member] != id) { continue; }
++      first = std::min(first, member);
++      if (input.contributed[member]) {
++        first_contributing = std::min(first_contributing, member);
++        any                = true;
++      }
++    }
++    contributing_islands += any ? 1 : 0;
++    expect(entry.contributes() == any);
++    expect(entry.leader_contributes == input.contributed[entry.leader]);
++    if (position == 0) {
++      expect(entry.leader == input.root);
++    } else {
++      expect(id != input.ids[input.root]);
++      expect(entry.leader == (any ? first_contributing : first));
++    }
++    expect(std::ranges::is_sorted(entry.others));
++    expect(std::ranges::is_sorted(entry.sources));
++    for (auto const member : members_of(entry)) {
++      ++seen[member];
++      expect(input.ids[member] == id);
++    }
++    for (auto const member : entry.others) {
++      auto const is_source = std::ranges::find(entry.sources, member) != entry.sources.end();
++      expect(member != entry.leader);
++      expect(is_source == input.contributed[member]);
++    }
++    expect(union_plan::merge_slots(entry) == entry.sources.size());
++  }
++  for (std::size_t member = 0; member < max_members; ++member) {
++    expect(seen[member] == (member < input.members ? 1 : 0));
++  }
++  auto const distinct = static_cast<std::size_t>(
++                          *std::max_element(input.ids.begin(), input.ids.begin() + input.members)) +
++                        1;
++  expect(plan.islands.size() == distinct);
++  expect(plan.inputs() == contributing_islands);
++  expect(plan.crosses_host() == (distinct >= 2 && contributing_islands >= 1));
++  expect(plan.moves_nothing() == (contributing_islands == 0 || input.members == 1));
++  expect(plan.host_slots() == (!plan.crosses_host()        ? 0
++                               : contributing_islands >= 2 ? contributing_islands + 1
++                                                           : 1));
++  for (auto const& entry : plan.islands) {
++    expect(plan.uploads(entry) ==
++           (plan.crosses_host() && (contributing_islands >= 2 || !entry.contributes())));
++  }
++  return broken;
++}
++}  // namespace
++
++TEST_CASE("union_plan assigns every member one role under the leader rule",
++          "[dynamic_filter][union_plan]")
++{
++  std::size_t cases  = 0;
++  std::size_t broken = 0;
++  for_each_case([&](plan_case const& input) {
++    ++cases;
++    auto const plan = union_plan::make(
++      {input.ids.data(), input.members}, {input.contributed.data(), input.members}, input.root);
++    broken += violations(input, plan);
++  });
++  // Bell numbers 1, 2, 5, 15, 52, 203, 877, 4140, times contribution masks and roots.
++  CHECK(cases == 1 * 2 * 1 + 2 * 4 * 2 + 5 * 8 * 3 + 15 * 16 * 4 + 52 * 32 * 5 + 203 * 64 * 6 +
++                   877 * 128 * 7 + 4140 * 256 * 8);
++  CHECK(broken == 0);
++}
++
++TEST_CASE("union_plan::split turns one island into single-member islands and keeps the others",
++          "[dynamic_filter][union_plan]")
++{
++  std::size_t broken = 0;
++  auto const expect  = [&](bool holds) { broken += holds ? 0 : 1; };
++  auto const same    = [](union_plan::island const& left, union_plan::island const& right) {
++    return left.leader == right.leader && left.leader_contributes == right.leader_contributes &&
++           left.sources == right.sources && left.others == right.others;
++  };
++  for_each_case([&](plan_case const& input) {
++    // Splitting is exercised up to 6 members; larger cases add no new shape.
++    if (input.members > 6) { return; }
++    auto const plan = union_plan::make(
++      {input.ids.data(), input.members}, {input.contributed.data(), input.members}, input.root);
++    for (std::size_t index = 0; index < plan.islands.size(); ++index) {
++      auto const pieces  = members_of(plan.islands[index]);
++      auto const divided = plan.split(index);
++      expect(divided.islands.size() == plan.islands.size() + pieces.size() - 1);
++      if (divided.islands.size() != plan.islands.size() + pieces.size() - 1) { continue; }
++      for (std::size_t position = 0; position < index; ++position) {
++        expect(same(divided.islands[position], plan.islands[position]));
++      }
++      for (std::size_t piece = 0; piece < pieces.size(); ++piece) {
++        auto const& single = divided.islands[index + piece];
++        expect(single.leader == pieces[piece]);
++        expect(single.leader_contributes == input.contributed[pieces[piece]]);
++        expect(single.sources.empty() && single.others.empty());
++      }
++      for (std::size_t position = index + 1; position < plan.islands.size(); ++position) {
++        expect(same(divided.islands[position + pieces.size() - 1], plan.islands[position]));
++      }
++      expect(divided.islands.front().leader == input.root);
++    }
++  });
++  CHECK(broken == 0);
++}
++
++TEST_CASE("union_plan::make rejects inconsistent members", "[dynamic_filter][union_plan]")
++{
++  std::array<std::uint8_t, 2> const ids{0, 1};
++  std::array<bool, 2> const contributed{true, false};
++  CHECK_THROWS_AS(union_plan::make(ids, contributed, 2), std::invalid_argument);
++  CHECK_THROWS_AS(union_plan::make(ids, std::span{contributed}.first(1), 0), std::invalid_argument);
++  CHECK_THROWS_AS(union_plan::make({}, {}, 0), std::invalid_argument);
++}
++
++TEST_CASE("union_plan sizes the workspace of the measured machine shapes",
++          "[dynamic_filter][union_plan]")
++{
++  std::array<bool, 4> const all{true, true, true, true};
++  std::array<bool, 4> const root_only{true, false, false, false};
++  std::array<std::uint8_t, 4> const pairs{0, 0, 1, 1};
++  std::array<std::uint8_t, 4> const singles{0, 1, 2, 3};
++  std::array<std::uint8_t, 4> const full{0, 0, 0, 0};
++
++  auto plan = union_plan::make(pairs, all, 0);
++  CHECK(plan.inputs() == 2);
++  CHECK(plan.host_slots() == 3);
++  CHECK(union_plan::merge_slots(plan.islands[0]) == 1);
++  CHECK(union_plan::merge_slots(plan.islands[1]) == 1);
++
++  plan = union_plan::make(pairs, root_only, 0);
++  CHECK(plan.inputs() == 1);
++  CHECK(plan.host_slots() == 1);
++  CHECK(union_plan::merge_slots(plan.islands[0]) == 0);
++  CHECK_FALSE(plan.uploads(plan.islands[0]));
++  CHECK(plan.uploads(plan.islands[1]));
++
++  plan = union_plan::make(singles, all, 0);
++  CHECK(plan.inputs() == 4);
++  CHECK(plan.host_slots() == 5);
++
++  plan = union_plan::make(full, all, 2);
++  CHECK_FALSE(plan.crosses_host());
++  CHECK(plan.host_slots() == 0);
++  CHECK(union_plan::merge_slots(plan.islands[0]) == 3);
++  CHECK(plan.islands[0].leader == 2);
++}
