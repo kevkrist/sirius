@@ -12,6 +12,7 @@ target_sources(
           bounds_accumulator.cu
           exact_key_stager.cu
           dynamic_filter_replica_transfer.cu
+          union_transfer.cu
           sirius_dynamic_bloom_filter.cu
           sirius_dynamic_in_list_filter.cu
           sirius_dynamic_small_in_list_filter.cu
