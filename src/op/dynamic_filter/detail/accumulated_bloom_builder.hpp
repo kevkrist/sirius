@@ -19,6 +19,7 @@
 #include "helper/cuda_launch_error.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
+#include "op/dynamic_filter/detail/union_transfer.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 #include "sirius/exception.hpp"
 
@@ -184,8 +185,11 @@ class accumulated_bloom_builder final {
    *
    * Each GPU's arrays are allocated under their own lease, attached to a new exclusive stream of
    * that GPU and sized to the exact allocation charge. The calling thread must hold no allocation
-   * tracker for those GPUs; a tracked caller is refused like missing capacity.
+   * tracker for those GPUs; a tracked caller is refused like missing capacity. The GPUs are grouped
+   * by mutual pool access (`sirius::memory::peer_islands`) once, here; `finish` copies device to
+   * device inside those groups.
    *
+   * @throw cucascade::cuda_error if a pool access query fails
    * @param keys The active keys, in publication order
    * @param geometry The shared array geometry
    * @param targets The replica GPUs; each distinct GPU receives one partial
@@ -228,30 +232,41 @@ class accumulated_bloom_builder final {
   /**
    * @brief How `finish` moved partials and the union between GPUs.
    */
-  enum class publication_transport : std::uint8_t {
-    PEER_COPY,   ///< `cudaMemcpyPeerAsync`; every replica pool grants every other replica GPU
-    HOST_STAGED  ///< Bounded pinned HOST staging, when a grant is unavailable or direct scratch
-                 ///< is refused
+  enum class publication_route : std::uint8_t {
+    NONE,           ///< Nothing moved: one GPU, or no contribution
+    PEER,           ///< Device-to-device copies only; every GPU reaches every other
+    PEER_AND_HOST,  ///< Device-to-device copies inside groups, pinned HOST memory between them
+    HOST            ///< Pinned HOST memory only
   };
 
   /**
    * @brief A completed publication.
    */
   struct publication {
-    /// One ready filter per key; borrows owners the builder retains until its destruction
+    /**
+     * @brief One ready filter per key; borrows owners the builder retains until its destruction.
+     */
     std::span<std::shared_ptr<sirius_dynamic_bloom_filter> const> filters;
-    publication_transport transport;  ///< The transport that produced every replica
+    /**
+     * @brief How the union reached every replica.
+     */
+    publication_route route;
+    /**
+     * @brief Whether refused workspace made `finish` use the host where it would have copied
+     * between devices, or fewer chunks in flight.
+     */
+    bool degraded;
   };
 
   /**
-   * @brief Reduces every contributed partial into @p root's, overwrites every other partial with
-   * the union, and waits for every replica on the host.
+   * @brief Makes every partial the union of all partials (`unite`) and waits for every replica on
+   * the host.
    *
-   * Uses peer copies when every replica pool grants every other replica GPU and direct scratch is
-   * admitted; otherwise stages through the root's HOST space. The transport is chosen before any
-   * transfer is submitted and never changes afterwards. The builder retains every completed filter
-   * owner; channels may share them. Scratch uses @p scratch_mr only during this call and is freed
-   * after every submitted transfer has retired.
+   * Copies device to device inside every group of GPUs whose pools grant each other, and through
+   * pinned memory of the root's HOST space, where the host ORs the groups' chunks, between groups.
+   * Refused device scratch moves a group to the host instead of failing. The builder retains every
+   * completed filter owner; channels may share them. Scratch uses @p scratch_mr only during this
+   * call and is freed after every submitted transfer has retired.
    *
    * @pre Every `enqueue_add` returned; this is the only `finish` call; the caller is the only user
    *      of the builder
@@ -260,8 +275,8 @@ class accumulated_bloom_builder final {
    * @param root The reducing GPU, current on the calling thread
    * @param stream The publication stream of @p root
    * @param scratch_mr Resource borrowing the task's reservation
-   * @return The published filters, or no value when @p root holds no partial or publication
-   *         workspace allocation is refused
+   * @return The published filters, or no value when @p root holds no partial or the pinned HOST
+   *         workspace is refused
    */
   [[nodiscard]] std::optional<publication> finish(rmm::cuda_device_id root,
                                                   ::cuda::stream_ref stream,
@@ -325,26 +340,24 @@ class accumulated_bloom_builder final {
     sirius_dynamic_bloom_filter const& filter, rmm::cuda_device_id device);
 
  private:
-  /**
-   * @brief Successfully acquired workspace charges for one finish attempt, retained after cleanup.
-   */
-  struct workspace_observation {
-    std::size_t device_scratch_bytes{};  ///< Aligned device allocation charge
-    std::size_t host_staging_bytes{};    ///< Physical fixed-block HOST allocation charge
-  };
-
   friend struct accumulated_bloom_test_access;
 
   /**
-   * @brief `finish`, optionally forcing HOST staging and reporting the workspace it acquired.
+   * @brief `finish` with its policy injected; tests reach it through
+   * `accumulated_bloom_test_access`.
    *
-   * Tests reach it through `accumulated_bloom_test_access`; production calls `finish`.
+   * @throw accumulation_invariant_error if @p islands joins GPUs without mutual pool access
+   * @param islands One island id per replica GPU, dividing the builder's own islands further
+   * (single-GPU islands make a machine without peer access); empty for the builder's own
+   * @param or_runner Runs the host ORs
+   * @param report Receives the workspace `unite` held, when not null
    */
   [[nodiscard]] std::optional<publication> finish_impl(rmm::cuda_device_id root,
                                                        ::cuda::stream_ref stream,
                                                        rmm::device_async_resource_ref scratch_mr,
-                                                       bool force_host,
-                                                       workspace_observation* observation);
+                                                       std::span<std::uint8_t const> islands,
+                                                       union_or_runner or_runner,
+                                                       union_report* report);
 
   struct impl;
   explicit accumulated_bloom_builder(std::unique_ptr<impl> state) noexcept;
