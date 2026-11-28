@@ -288,3 +288,15 @@ DEBUG logging inflates slightly; the 12 queries with a Bloom. `python3 $R/runs/c
 - 11-27 22:00: m1 complete (17 DF queries x 8 arms x 2 processes = 272 processes, all rc=0). Table `/opt/dlami/nvme/dfperf/runs/combined/out/m1.md`. q11: 16 different md5 but one sorted-content md5 (730f7529, 936989 lines) = tie order only. n1 (1 6 13 14 15; T O SXE) + o1 (21 3; T O) started.
 - 11-27 22:48: n1 + o1 complete (rc=0 all). Tables `/opt/dlami/nvme/dfperf/runs/combined/out/n1.md`, `/opt/dlami/nvme/dfperf/runs/combined/out/o1.md`. Log pass lp (T S X SXE; DEBUG, 3 iterations) started for the finish-chain residual.
 - 11-27 23:25: log pass complete (48 processes rc=0), `out/finish.md`. Sections 2-9 written. ALL DONE. Branch `proto/combined` head c5aa5bdf (worktree `$R/wt-combined`, built).
+
+<!-- VERIFICATION-BEGIN -->
+## 10. Verification (independent verifier, 2026-11-27/28) — IN PROGRESS, interim checkpoint
+
+Raw data `$R/runs/vcombined/<arm>_<a|b>/`, scripts `$R/runs/vcombined/bin/{one.sh,abba.sh,audit.py}`, progress
+`$R/runs/vcombined/{status.txt,progress.txt}`. Regenerate every table: `python3 $R/runs/vcombined/bin/audit.py $R/runs/vcombined ""`
+(author's blocks: `audit.py $R/runs/combined m1_` / `n1_` / `o1_`). `wt-combined` not modified.
+
+- 00:10 interim (q21 q3 q8 done, q6 half): branch content, switch evidence, result identity, author's tables all CONFIRMED
+  from raw data; own ABBA so far q21 SXE -375 (author -381), q8 -74 (-77), q3 -72 (-86), O vs T q3 +2.5. Remaining queued:
+  q6 b, q7 q10 q9 q2 (T SXE), q13 (T O). Final text replaces this block.
+<!-- VERIFICATION-END -->
