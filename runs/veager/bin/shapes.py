@@ -74,7 +74,7 @@ if not cpu:
     con.execute(f"LOAD '{pt.EXTENSION_PATH}'")
 for stmt in pt._build_views_sql(os.environ["DATA"], None).split(";\n"):
     if stmt.strip(): con.execute(stmt)
-con.execute("SET gpu_execution = %s" % ("false" if cpu else "true"))
+if not cpu: con.execute("SET gpu_execution = true")
 
 def run(name, sql, it):
     state["name"], state["t0"] = name, time.time()
