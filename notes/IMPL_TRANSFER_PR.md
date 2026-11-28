@@ -76,3 +76,26 @@ retires partials).
 - 04:00 commits rewritten by autosquash: 17333840, e80d9298, 4e6b4d1c, 786778a7, 498fe2fc. Hidden bench: sirius_unittest "[union_transfer_bench]".
 - 04:05 OR-parts / spin sweep done (hack patch $R/tmp/xfer_sweep_hack.patch, not committed); rule min(T, 2 x Kc) and 500 us spin kept. Binary rebuilt = HEAD.
 - NEXT: engine ABBA (runs/xfer_prod, bin/abba_q.sh <tag> tppt|pttp 6 q...; table: bin/table.py e1 e2), 22-query identity, docs, final notes.
+
+## Checkpoint log 2 (main-based delivery, 2026-11-28; user: PR is standalone on origin/main)
+- origin/main fetched = a94d5c4b (80 commits after c4fa3638, the stack's base). main needs pixi >= 0.84.2: $R/pixi-new/pixi (0.85.0), used by $R/tmp/wt_build.sh <worktree> [target].
+- wt-main (detached origin/main) = baseline build for measurement 1. wt-prod-xfer-main = branch prod/xfer-main.
+- prod/xfer WIP committed as ed3a54b8 (bench split, pool_peer_access doc).
+- cherry-picked onto main: peer_islands, host_or, union_plan, unite (cmake conflicts only). Switch commit 498fe2fc: conflicts resolved in
+  bloom .cu (geometry -> union_shape per key), builder hpp (keep supports/geometry), publisher (published_filters->route/degraded), stats, tests
+  (tags [construction] -> [multi_partition] on main). NOT yet built / committed.
+- Plan: ctl/stack-2569-on-main, ctl/stack-2570-on-main (stack rebased on origin/main, control for measurement 2), then rebase those onto prod/xfer-main.
+- ctl/stack-2569-on-main, ctl/stack-2570-on-main (worktree $R/wt-stack) = apply/2569 / apply/2570 rebased on origin/main a94d5c4b. NOT built yet.
+  Conflicts (main drift, not transfer): (1) c4b4e135 sirius_plan_comparison_join.cpp: keep main's RIGHT_SEMI/ANTI kept-build block + signature line;
+  (2) 828c353d same file: discovery_runs = build_evidence && spaces (main dropped the LOGICAL_COMPARISON_JOIN test, commit drops the right-family gate);
+  (3) 75d55790 retire option: ported to main's typed config (src/config/options/operator.hpp: option deleted, removed(...) entry added; sirius_config.cpp mapping;
+  test_config_create / test_config_operator_options / valid_every_key.yaml / configuration.md; test_context indices 22-25 -> 21-24; sip test line);
+  (4) 4f1a9575 configuration.md paragraph: stack text; (5) 1d976a61 removal message moved to operator.hpp + operator_options test, test_config.cpp includes.
+- prod/xfer-main now = origin/main + 6 picks (1af0e6e1 islands, 62e6dee3 host_or, 8a659907 plan, 4b5b6b45 unite, 18d0a2e8 switch, 96581815 docs) + UNCOMMITTED
+  WIP from ed3a54b8 (bench split, pool_peer_access doc). Main adaptations: test_dynamic_filter_union_transfer.cpp uses uniform geometry (geometry_of(blocks, keys);
+  "different sizes per key" shapes made equal per key: restore the prod/xfer version when #2569 brings per-key blocks); docs applied to main's paragraphs.
+  Build of wt-prod-xfer-main queued (log $R/logs/build_wt-prod-xfer-main.log). git rerere enabled in the repo.
+- Run scripts: $R/runs/xfer_main/bin/abba_q.sh <tag> <armA>=<wt> <armB>=<wt> abba|baab <iters> q...; table.py <armA> <armB> <tag...>.
+- NEXT: fix compile errors, unit tests ([dynamic_filter],[peer_islands],[host_or],[union_plan],[in_task_publication],[pool_peer_access]; sirius_cuda_fault_test),
+  pre-commit, squash WIP into switch commit; rebase ctl/stack-* onto prod/xfer-main -> prod/stack-2569-on-xfer / prod/stack-2570-on-xfer (worktree wt-stack-xfer);
+  builds: wt-main (A), wt-prod-xfer-main (B), wt-stack (C = ctl/stack-2570-on-main), wt-stack-xfer (D); measure B vs A and D vs C.
