@@ -44,6 +44,15 @@ SHAPES = [
  ("bushy", "select count(*) from (select o_custkey, o_orderkey from orders join customer on o_custkey = c_custkey where c_mktsegment = 'BUILDING' and o_orderdate < date '1992-04-01') a join (select ps_suppkey from partsupp join supplier on ps_suppkey = s_suppkey where s_nationkey = 7 and ps_availqty < 20) b on a.o_custkey = b.ps_suppkey"),
  ("ineq_residual", "select count(*) from orders join customer on o_custkey = c_custkey and o_totalprice > c_acctbal * 50 where c_mktsegment = 'BUILDING' and o_orderdate < date '1993-01-01'"),
  ("agg_build", "select count(*) from orders join (select c_nationkey nk, max(c_custkey) mk from customer group by c_nationkey) t on o_custkey = mk"),
+ ("corr_scalar_delim", "select count(*) from supplier s where s_acctbal > (select avg(c_acctbal) from customer c where c.c_nationkey = s.s_nationkey and c.c_mktsegment = 'BUILDING')"),
+ ("corr_exists_ineq", "select count(*) from supplier s where exists (select 1 from customer c where c.c_custkey = s.s_suppkey and c.c_acctbal > s.s_acctbal)"),
+ ("corr_agg_join", "select count(*) from orders o, customer c where o.o_custkey = c.c_custkey and c.c_mktsegment = 'BUILDING' and o.o_orderdate < date '1992-03-01' and o.o_totalprice > (select avg(o2.o_totalprice) from orders o2 where o2.o_custkey = o.o_custkey and o2.o_orderdate < date '1992-03-01')"),
+ ("star4", "select count(*), sum(ps_supplycost) from partsupp, part, supplier, nation, region where ps_partkey = p_partkey and ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_regionkey = r_regionkey and p_container = 'SM BOX' and r_name = 'EUROPE' and s_acctbal > 0"),
+ ("topn_join", "select o_orderkey, o_totalprice from orders join customer on o_custkey = c_custkey where c_mktsegment = 'BUILDING' and c_acctbal > 9990 order by o_totalprice desc, o_orderkey limit 20"),
+ ("window_probe", "select count(*), sum(rn) from (select o_custkey, row_number() over (partition by o_custkey order by o_orderkey) rn from orders where o_orderdate < date '1992-02-01') w join customer on o_custkey = c_custkey where c_mktsegment = 'BUILDING'"),
+ ("two_keys", "select count(*) from partsupp ps1 join partsupp ps2 on ps1.ps_partkey = ps2.ps_partkey and ps1.ps_suppkey = ps2.ps_suppkey where ps2.ps_availqty < 10"),
+ ("null_keys_left_chain", "select count(*), count(c_custkey), count(n_nationkey) from supplier left join customer on s_suppkey = c_custkey and c_acctbal < 0 left join nation on c_nationkey = n_nationkey and n_regionkey = 1"),
+ ("string_key", "select count(*) from customer c join (select c_name nm from customer where c_acctbal > 9995) t on c.c_name = t.nm"),
 ]
 REF = ("selective", dict(SHAPES)["selective"])
 
@@ -86,8 +95,8 @@ for name, sql in SHAPES:
         run(name, sql, it)
 
 if not cpu and (not only or "interrupt" in only):
-    for delay in (0.05, 0.25, 0.6, 1.2):
-        for nm in ("selective", "multi_filter_scan"):
+    for delay in (0.03, 0.08, 0.15, 0.25, 0.4):
+        for nm in ("selective", "nofilter_plan", "stacked4"):
             sql = dict(SHAPES)[nm]
             state["name"], state["t0"] = f"interrupt_{nm}_{delay}", time.time()
             timer = threading.Timer(delay, con.interrupt); timer.start()
