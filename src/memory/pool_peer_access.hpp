@@ -35,8 +35,7 @@ namespace sirius::memory {
  *
  * Only the ordinary RMM async allocation domain qualifies. The borrowed space must outlive
  * transfers using its allocations. No handle or capability is cached; callers must coordinate later
- * permission changes. Manager initialization, replica transfer, and the choice of
- * accumulated-filter publication transport (peer copy or HOST staging) share this policy.
+ * permission changes. Manager initialization, replica transfer, and the grouping of GPUs for accumulated-filter publication (`peer_islands`) share this policy.
  *
  * @throw std::invalid_argument if the space is not GPU-tier, lacks its adaptor, or a device ID is
  * invalid

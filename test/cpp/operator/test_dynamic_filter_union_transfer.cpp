@@ -479,19 +479,19 @@ TEST_CASE("concurrent publications share the host OR workers and stay exact",
   REQUIRE(fixture.allocated_bytes() == baseline);
 }
 
-// Not a test: prints the time of `finish` for the array sizes and contributions of the transfer
-// benchmarks. Run alone on an idle machine: sirius_unittest "[union_transfer_bench]".
-TEST_CASE("time of accumulated publication by array size, contribution and grouping",
-          "[.][union_transfer_bench][multi_gpu]")
+namespace {
+/// Prints the median time of `finish` over five publications for each size, contribution and
+/// grouping on the first `devices` GPUs.
+void print_finish_times(std::size_t devices, std::vector<int> const& megabyte_sizes)
 {
-  auto const devices = std::min<std::size_t>(4, static_cast<std::size_t>(acc::visible_gpus()));
-  if (lacks_gpus(2)) { return; }
   acc::fixture fixture({.devices = devices, .gpu_bytes = std::size_t{8} << 30});
   unsigned const all = (1U << devices) - 1;
-  std::printf("| MiB | contributing | grouping | median ms | ms/GiB |\n|---|---|---|---|---|\n");
-  for (auto const megabytes : {4, 16, 57, 174, 281, 1434}) {
+  std::vector<unsigned> masks{all, 0b0001U};
+  if (devices >= 3) { masks.insert(masks.begin() + 1, 0b0101U); }
+  std::printf("| GPUs | MiB | contributing | grouping | median ms | ms/GiB |\n|---|---|---|---|---|---|\n");
+  for (auto const megabytes : megabyte_sizes) {
     std::vector<std::size_t> const blocks{megabytes * acc::mib / op::bloom_bytes_per_block};
-    for (auto const mask : {all, 0b0101U & all, 0b0001U}) {
+    for (auto const mask : masks) {
       for (bool const separate : {false, true}) {
         std::vector<double> times;
         for (int round = 0; round < 6; ++round) {
@@ -518,15 +518,29 @@ TEST_CASE("time of accumulated publication by array size, contribution and group
         }
         std::ranges::sort(times);
         auto const median = times[times.size() / 2];
-        std::printf("| %d | %s | %s | %.2f | %.1f |\n",
+        std::printf("| %zu | %d | %s | %s | %.2f | %.1f |\n",
+                    devices,
                     megabytes,
-                    mask == all  ? "all"
-                    : mask == 1U ? "root"
-                                 : "GPUs 0+2",
+                    mask == all ? "all" : mask == 1U ? "root" : "GPUs 0+2",
                     separate ? "separate" : "real",
                     median,
                     median * 1024 / megabytes);
       }
     }
   }
+}
+}  // namespace
+
+// Not tests: they print the time of `finish` for the array sizes and contributions of the transfer
+// benchmarks. Run alone on an idle machine: sirius_unittest "[union_transfer_bench]".
+TEST_CASE("time of accumulated publication on four GPUs", "[.][union_transfer_bench][multi_gpu]")
+{
+  if (lacks_gpus(4)) { return; }
+  print_finish_times(4, {1, 4, 16, 57, 174, 281, 1434});
+}
+
+TEST_CASE("time of accumulated publication on two GPUs", "[.][union_transfer_bench][multi_gpu]")
+{
+  if (lacks_gpus(2)) { return; }
+  print_finish_times(2, {1, 281, 1434});
 }
