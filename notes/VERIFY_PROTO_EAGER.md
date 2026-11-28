@@ -19,3 +19,9 @@ STATUS: IN PROGRESS - see the checkpoint log at the end for what is done and wha
   (-497.2, -596.7, -511.5) -> `out/recalc_r7.md`. Memory table from the author's r7 Quent: `out/mem_r7.md`.
   t1 so far: q18 f1 -87.7, q9 f1 -87.1 / fk1 -116.1 (reproduce). lp: q3 q8 q9 q2 q7 q21 f1 vs tip log pass: same filter keys,
   same rows out of every scan / DYNAMIC_FILTER operator.
+- 2026-11-28 00:19 UTC. Interim (tables regenerate with `python3 bin/times.py t1`, `python3 bin/times.py t2 tip off`,
+  `python3 bin/shapes_cmp.py tip f1 fk1`): t1 f1 vs tip q3 -46.6, q5 -48.8, q9 -87.1, q14 -52.1, q18 -87.7, q21 -52.5
+  (sum -375, author -366 on the same six); fk1 q3 -65.4, q9 -116.1. Binary control t2 (`wt-eager2`, eager off): q9 -9.8,
+  q18 +3.4 (noise). Shapes (37 shapes x 2 + 15 interrupts): tip / f1 / fk1 rc=0, results f1 = fk1 = tip on all, 0 HANG,
+  13 interrupts each then 16/16 correct follow-up queries. Still queued: t1 q8 q4 q19 q10; lp q14 q15 q22 + g1 pass;
+  t2 q14 q3 q21; t3 (g1 vs o1 on q2 q7); shapes s2g1, s2g0, cpu.
