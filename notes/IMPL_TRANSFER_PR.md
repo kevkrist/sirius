@@ -178,3 +178,21 @@ Check "stack-on-transfer minus control stack = transfer PR + the rows above": `g
 Checkpoint (log 3 cont.): builds A-D + wt-s2569 (2569-on-xfer head) rc=0; unit gates green on wt-xfer, wt-stack, wt-s2569 ($R/logs/tests.txt); pre-commit clean on
 prod/xfer-main. main's performance_test.py dropped `--pin-compression` (config + `--compression-plan-dir` enable it): the earlier m1_*/id1_* runs of runs/xfer_main
 all failed with rc=2 for that reason and measured nothing. Measurement (a) = runs/xfer_fin a1_*, (b) = b1_* (running), debug/identity pass = id_* (to run).
+
+## 6. Measurements of the final branches (2026-11-28, one session, runs/xfer_fin)
+
+Protocol: fresh process per query, 6 iterations (1 warm + 5 hot, first hot dropped -> 4 kept), order A B B A inside one lock hold per query, pooled median of 8 hot iterations per arm, ms. Config untouched. Noise +-3% / +-10 ms.
+
+### 6.1 (a) standalone PR: origin/main f1595eb3 (A) vs prod/xfer-main 8c99539f (B), block a1
+
+| q | n A/B | A | B | B-A | process medians A / B | spread A / B | result |
+|---|---|---|---|---|---|---|---|
+| 2 | 8/8 | 157.8 | 157.0 | -0.8 | 159 157 / 158 156 | 55 / 3 | same |
+| 3 | 8/8 | 606.3 | 604.4 | -1.9 | 601 618 / 604 613 | 86 / 84 | same |
+| 6 | 8/8 | 377.7 | 378.0 | +0.4 | 378 378 / 378 378 | 1 / 2 | same |
+| 7 | 8/8 | 740.7 | 705.4 | -35.3 | 741 742 / 710 704 | 10 / 13 | same |
+| 8 | 8/8 | 898.1 | 898.6 | +0.5 | 896 899 / 898 900 | 15 / 24 | same |
+| 9 | 8/8 | 1417.6 | 1415.5 | -2.1 | 1416 1418 / 1412 1436 | 50 / 59 | same |
+| 10 | 8/8 | 901.5 | 881.5 | -20.0 | 904 900 / 885 882 | 13 / 15 | same |
+| 21 | 8/8 | 1432.3 | 1245.3 | -187.0 | 1429 1434 / 1245 1244 | 2039 / 35 | same |
+| sum | | 6532 | 6286 | -246 | | | |
