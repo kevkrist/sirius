@@ -174,3 +174,7 @@ built and tested. Fold F1 / F2 as their messages say when the real PR branches a
 Check "stack-on-transfer minus control stack = transfer PR + the rows above": `git diff --stat prod/ctl-stack-2570-on-main prod/stack-2570-on-xfer`
 = the 28 files of `git diff --stat origin/main prod/xfer-main` (same new files, byte-identical except the union test, S3) + `accumulation_partial.cuh` (S2)
 + `build_filter_construction.{hpp,cpp}` (S1); 3370 insertions / 728 deletions against the transfer PR's 3379 / 723.
+
+Checkpoint (log 3 cont.): builds A-D + wt-s2569 (2569-on-xfer head) rc=0; unit gates green on wt-xfer, wt-stack, wt-s2569 ($R/logs/tests.txt); pre-commit clean on
+prod/xfer-main. main's performance_test.py dropped `--pin-compression` (config + `--compression-plan-dir` enable it): the earlier m1_*/id1_* runs of runs/xfer_main
+all failed with rc=2 for that reason and measured nothing. Measurement (a) = runs/xfer_fin a1_*, (b) = b1_* (running), debug/identity pass = id_* (to run).
