@@ -84,8 +84,8 @@ retires partials).
 - cherry-picked onto main: peer_islands, host_or, union_plan, unite (cmake conflicts only). Switch commit 498fe2fc: conflicts resolved in
   bloom .cu (geometry -> union_shape per key), builder hpp (keep supports/geometry), publisher (published_filters->route/degraded), stats, tests
   (tags [construction] -> [multi_partition] on main). NOT yet built / committed.
-- Plan: ctl/stack-2569-on-main, ctl/stack-2570-on-main (stack rebased on origin/main, control for measurement 2), then rebase those onto prod/xfer-main.
-- ctl/stack-2569-on-main, ctl/stack-2570-on-main (worktree $R/wt-stack) = apply/2569 / apply/2570 rebased on origin/main a94d5c4b. NOT built yet.
+- Plan: prod/ctl-stack-2569-on-main, prod/ctl-stack-2570-on-main (stack rebased on origin/main, control for measurement 2), then rebase those onto prod/xfer-main.
+- prod/ctl-stack-2569-on-main, prod/ctl-stack-2570-on-main (worktree $R/wt-stack) = apply/2569 / apply/2570 rebased on origin/main a94d5c4b. NOT built yet.
   Conflicts (main drift, not transfer): (1) c4b4e135 sirius_plan_comparison_join.cpp: keep main's RIGHT_SEMI/ANTI kept-build block + signature line;
   (2) 828c353d same file: discovery_runs = build_evidence && spaces (main dropped the LOGICAL_COMPARISON_JOIN test, commit drops the right-family gate);
   (3) 75d55790 retire option: ported to main's typed config (src/config/options/operator.hpp: option deleted, removed(...) entry added; sirius_config.cpp mapping;
@@ -97,5 +97,5 @@ retires partials).
   Build of wt-prod-xfer-main queued (log $R/logs/build_wt-prod-xfer-main.log). git rerere enabled in the repo.
 - Run scripts: $R/runs/xfer_main/bin/abba_q.sh <tag> <armA>=<wt> <armB>=<wt> abba|baab <iters> q...; table.py <armA> <armB> <tag...>.
 - NEXT: fix compile errors, unit tests ([dynamic_filter],[peer_islands],[host_or],[union_plan],[in_task_publication],[pool_peer_access]; sirius_cuda_fault_test),
-  pre-commit, squash WIP into switch commit; rebase ctl/stack-* onto prod/xfer-main -> prod/stack-2569-on-xfer / prod/stack-2570-on-xfer (worktree wt-stack-xfer);
-  builds: wt-main (A), wt-prod-xfer-main (B), wt-stack (C = ctl/stack-2570-on-main), wt-stack-xfer (D); measure B vs A and D vs C.
+  pre-commit, squash WIP into switch commit; rebase prod/ctl-stack-* onto prod/xfer-main -> prod/stack-2569-on-xfer / prod/stack-2570-on-xfer (worktree wt-stack-xfer);
+  builds: wt-main (A), wt-prod-xfer-main (B), wt-stack (C = prod/ctl-stack-2570-on-main), wt-stack-xfer (D); measure B vs A and D vs C.
