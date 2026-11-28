@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "cuda/device_copy_batch.hpp"
-#include "memory/pool_peer_access.hpp"
+#include "memory/host_or.hpp"
+#include "memory/peer_islands.hpp"
 #include "memory/runtime_stream_pool.hpp"
 
 #include <cudf/table/table_view.hpp>
@@ -47,6 +47,7 @@
 #include <log/logging.hpp>
 #include <op/dynamic_filter/bloom_sizing.hpp>
 #include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
+#include <op/dynamic_filter/detail/union_transfer.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
 #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
@@ -57,11 +58,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -300,59 +304,6 @@ void add_accumulated_keys(rmm::device_buffer& bits,
     throw detail::accumulation_invariant_error{
       "[accumulated_bloom_builder] a contribution's key column is not a carrier of its key"};
   }
-}
-
-// ORs the scratch slot of every source into the root chunk. Slot i of the buffer holds source i's
-// copy of the chunk.
-__global__ void or_bloom_chunk(uint4* destination,
-                               uint4 const* scratch,
-                               std::size_t slot_stride,
-                               int source_count,
-                               std::size_t count)
-{
-  auto const stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
-  for (auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < count;
-       index += stride) {
-    uint4 value = destination[index];
-    for (int source = 0; source < source_count; ++source) {
-      uint4 const slot = scratch[static_cast<std::size_t>(source) * slot_stride + index];
-      value.x |= slot.x;
-      value.y |= slot.y;
-      value.z |= slot.z;
-      value.w |= slot.w;
-    }
-    destination[index] = value;
-  }
-}
-
-/**
- * @brief Launches `or_bloom_chunk` over one chunk of @p bytes, a whole number of 16-byte words.
- *
- * @param root_chunk The chunk of the root's array that receives the union
- * @param scratch The first source slot; slot i starts at `i * slot_bytes`
- * @param slot_bytes Distance between source slots
- * @param sources Number of filled source slots
- * @param bytes Bytes of the chunk to reduce
- * @param stream The root partial's stream
- */
-void enqueue_or_chunk(std::byte* root_chunk,
-                      std::byte const* scratch,
-                      std::size_t slot_bytes,
-                      std::size_t sources,
-                      std::size_t bytes,
-                      cudaStream_t stream)
-{
-  constexpr unsigned threads = 256;
-  auto const words           = bytes / sizeof(uint4);
-  auto const blocks =
-    static_cast<unsigned>(std::min<std::size_t>(::cuda::ceil_div(words, threads), 4096));
-  check_cuda(cudaGetLastError(), "pending CUDA error before or_bloom_chunk");
-  or_bloom_chunk<<<blocks, threads, 0, stream>>>(reinterpret_cast<uint4*>(root_chunk),
-                                                 reinterpret_cast<uint4 const*>(scratch),
-                                                 slot_bytes / sizeof(uint4),
-                                                 static_cast<int>(sources),
-                                                 words);
-  check_cuda(cudaGetLastError(), "or_bloom_chunk", true);
 }
 
 }  // namespace
@@ -756,211 +707,7 @@ struct accumulated_bloom_builder::impl {
   std::atomic<bool> leak_storage{false};
   std::vector<std::unique_ptr<partial>> partials;  // Destroyed before leak_storage.
   std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> filters;
-
-  class chunk_pipeline;
-};
-
-/**
- * @brief Enqueues the reduction and replication of one publication, then waits for it once.
- *
- * Sources are the non-root partials with at least one contribution; targets are every non-root
- * partial. Each chunk is copied from every source into one of two scratch buffers on the
- * publication stream, ORed into the root's array on the root partial's stream (merge), and copied
- * from the root into every target on the target's stream (egress). Without sources the root's array
- * is already the union and only egress runs.
- */
-class accumulated_bloom_builder::impl::chunk_pipeline final {
- public:
-  /**
-   * @brief Creates the pipeline's events; enqueues nothing.
-   *
-   * @param owner The builder state whose arrays are published
-   * @param root The reducing partial; its GPU is the current device
-   * @param sources The non-root partials that received contributions; must outlive the pipeline
-   * @param targets Every non-root partial; must outlive the pipeline
-   * @param stream The publication stream of the root GPU
-   * @param scratch One buffer per chunk parity in use (at most two), each of `sources.size()` chunk
-   * slots; null when there are no sources
-   */
-  chunk_pipeline(impl const& owner,
-                 partial& root,
-                 std::span<partial* const> sources,
-                 std::span<partial* const> targets,
-                 ::cuda::stream_ref stream,
-                 std::byte* scratch)
-    : _owner{owner},
-      _chunk_slot{owner.max_chunk_bytes()},
-      _root{root},
-      _sources{sources},
-      _targets{targets},
-      _stream{stream},
-      _scratch{scratch},
-      _slot_bytes{_sources.size() * _chunk_slot},
-      _ingress_done{make_event_on(root.device_id), make_event_on(root.device_id)},
-      _merged{make_event_on(root.device_id), make_event_on(root.device_id)},
-      _root_done{make_event_on(root.device_id)}
-  {
-    _source_ready.reserve(sources.size());
-    _target_done.reserve(targets.size());
-    for (auto* source : sources) {
-      _source_ready.push_back(make_event_on(source->device_id));
-    }
-    for (auto* target : targets) {
-      _target_done.push_back(make_event_on(target->device_id));
-    }
-  }
-
-  /**
-   * @brief Orders the first reads of every partial after all of its inserts.
-   *
-   * Every contribution is folded into its partial's stream. The publication stream waits for each
-   * source's stream before ingress; without sources, every target waits for the root's stream
-   * before egress. With sources, the merge on the root's stream already follows the root's inserts.
-   */
-  void order_after_inserts()
-  {
-    for (std::size_t index = 0; index < _sources.size(); ++index) {
-      auto const& ready = _source_ready[index];
-      record(ready, *_sources[index]);
-      check_cuda(cudaStreamWaitEvent(_stream.get(), ready.get(), 0),
-                 "cudaStreamWaitEvent(source ready)");
-    }
-    if (!_sources.empty()) { return; }
-    record(_root_done, _root);
-    for (auto* target : _targets) {
-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{target->device_id}};
-      check_cuda(cudaStreamWaitEvent(target->stream->value(), _root_done.get(), 0),
-                 "cudaStreamWaitEvent(root ready)");
-    }
-  }
-
-  /**
-   * @brief Enqueues ingress, merge and egress of one chunk.
-   *
-   * @param key_index The key whose array the chunk belongs to
-   * @param offset The chunk's byte offset in that array, a multiple of the chunk size
-   */
-  void enqueue_chunk(std::size_t key_index, std::size_t offset)
-  {
-    auto const& shape      = _owner.shapes[key_index];
-    auto const bytes       = std::min(shape.chunk_bytes, shape.raw_bytes - offset);
-    auto const buffer      = _sequence % 2;
-    auto* const root_chunk = static_cast<std::byte*>(_root.arrays[key_index]->data()) + offset;
-    if (!_sources.empty()) {
-      enqueue_ingress(key_index, offset, bytes, buffer);
-      enqueue_merge(root_chunk, bytes, buffer);
-    }
-    enqueue_egress(key_index, offset, bytes, buffer, root_chunk);
-    ++_sequence;
-  }
-
-  /**
-   * @brief Makes the publication stream wait for every replica and waits for it on the host.
-   *
-   * This is the publication's only host wait; filters become visible only after it.
-   */
-  void wait_until_replicas_ready()
-  {
-    for (std::size_t index = 0; index < _targets.size(); ++index) {
-      auto const& ready = _target_done[index];
-      record(ready, *_targets[index]);
-      check_cuda(cudaStreamWaitEvent(_stream.get(), ready.get(), 0),
-                 "cudaStreamWaitEvent(replica ready)");
-    }
-    record(_root_done, _root);
-    check_cuda(cudaStreamWaitEvent(_stream.get(), _root_done.get(), 0),
-               "cudaStreamWaitEvent(root done)");
-    nvtx_scoped_range wait_range{"dynfilter::accum::late_wait"};
-    check_cuda(cudaStreamSynchronize(_stream.get()), "cudaStreamSynchronize(publication)");
-  }
-
- private:
-  /**
-   * @brief Records @p event, created on @p owner's GPU, on @p owner's stream.
-   */
-  static void record(cuda_event const& event, partial const& owner)
-  {
-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{owner.device_id}};
-    check_cuda(cudaEventRecord(event.get(), owner.stream->value()), "cudaEventRecord(partial)");
-  }
-
-  void enqueue_ingress(std::size_t key_index,
-                       std::size_t offset,
-                       std::size_t bytes,
-                       std::size_t buffer)
-  {
-    if (_sequence >= 2) {
-      // The merge of chunk (sequence - 2) read this buffer.
-      check_cuda(cudaStreamWaitEvent(_stream.get(), _merged[buffer].get(), 0),
-                 "cudaStreamWaitEvent(scratch reuse)");
-    }
-    auto* const slots = _scratch + buffer * _slot_bytes;
-    for (std::size_t index = 0; index < _sources.size(); ++index) {
-      auto const* source = _sources[index];
-      auto const status  = cudaMemcpyPeerAsync(
-        slots + index * _chunk_slot,
-        _root.device_id,
-        static_cast<std::byte const*>(source->arrays[key_index]->data()) + offset,
-        source->device_id,
-        bytes,
-        _stream.get());
-      check_cuda(status, "cudaMemcpyPeerAsync(ingress)");
-    }
-    check_cuda(cudaEventRecord(_ingress_done[buffer].get(), _stream.get()),
-               "cudaEventRecord(ingress)");
-  }
-
-  void enqueue_merge(std::byte* root_chunk, std::size_t bytes, std::size_t buffer)
-  {
-    auto const root_stream = _root.stream->value();
-    check_cuda(cudaStreamWaitEvent(root_stream, _ingress_done[buffer].get(), 0),
-               "cudaStreamWaitEvent(ingress)");
-    enqueue_or_chunk(root_chunk,
-                     _scratch + buffer * _slot_bytes,
-                     _chunk_slot,
-                     _sources.size(),
-                     bytes,
-                     root_stream);
-    check_cuda(cudaEventRecord(_merged[buffer].get(), root_stream), "cudaEventRecord(merged)");
-  }
-
-  void enqueue_egress(std::size_t key_index,
-                      std::size_t offset,
-                      std::size_t bytes,
-                      std::size_t buffer,
-                      std::byte const* root_chunk)
-  {
-    for (auto* target : _targets) {
-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{target->device_id}};
-      if (!_sources.empty()) {
-        check_cuda(cudaStreamWaitEvent(target->stream->value(), _merged[buffer].get(), 0),
-                   "cudaStreamWaitEvent(egress)");
-      }
-      auto const status =
-        cudaMemcpyPeerAsync(static_cast<std::byte*>(target->arrays[key_index]->data()) + offset,
-                            target->device_id,
-                            root_chunk,
-                            _root.device_id,
-                            bytes,
-                            target->stream->value());
-      check_cuda(status, "cudaMemcpyPeerAsync(egress)");
-    }
-  }
-
-  impl const& _owner;
-  std::size_t _chunk_slot;  // Bytes of one source's slot: the largest chunk of any key
-  partial& _root;
-  std::span<partial* const> _sources;
-  std::span<partial* const> _targets;
-  ::cuda::stream_ref _stream;
-  std::byte* _scratch;
-  std::size_t _slot_bytes;
-  std::array<cuda_event, 2> _ingress_done;  // Per scratch buffer: its ingress landed
-  std::array<cuda_event, 2> _merged;        // Per scratch buffer: its merge finished
-  cuda_event _root_done;                    // The root partial's work is complete
-  std::vector<cuda_event> _source_ready;    // Per source: its inserts are complete
-  std::vector<cuda_event> _target_done;     // Per target: its egress landed
-  std::size_t _sequence = 0;                // Global chunk index over (key, offset)
+  std::vector<std::uint8_t> islands;  // Per partial: its group of GPUs with mutual pool access
 };
 
 //===----------------------------------------------------------------------===//
@@ -1042,7 +789,6 @@ std::size_t accumulated_bloom_builder::publication_scratch_bytes(std::span<key c
     chunk_slot       = std::max(chunk_slot, chunk);
     chunks += ::cuda::ceil_div(raw_bytes, chunk);
   }
-  // The direct transport's bound, which also covers the HOST-staged transport's single slot.
   auto const slots = std::min<std::size_t>(2, chunks) * (replicas - 1);
   return chunk_slot > maximum / slots ? maximum
                                       : tracked_replica_allocation_bytes(slots * chunk_slot);
@@ -1059,6 +805,12 @@ std::optional<accumulated_bloom_builder> accumulated_bloom_builder::create(
   auto partials = lease_partials(targets, array_bytes, /*zero_fill=*/true, state->leak_storage);
   if (!partials) { return std::nullopt; }
   state->partials = std::move(*partials);
+  std::vector<cucascade::memory::memory_space const*> spaces;
+  spaces.reserve(state->partials.size());
+  for (auto const& entry : state->partials) {
+    spaces.push_back(entry->space);
+  }
+  state->islands = sirius::memory::peer_islands(spaces);
   return accumulated_bloom_builder{std::move(state)};
 }
 
@@ -1124,24 +876,20 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref scratch_mr)
 {
-  return finish_impl(root_device, stream, scratch_mr, false, nullptr);
+  auto const workers = sirius::memory::host_or_workers::shared();
+  return finish_impl(root_device, stream, scratch_mr, {}, union_or_runner::of(*workers), nullptr);
 }
 
 std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder::finish_impl(
   rmm::cuda_device_id root_device,
   ::cuda::stream_ref stream,
   rmm::device_async_resource_ref scratch_mr,
-  bool force_host,
-  workspace_observation* observation)
+  std::span<std::uint8_t const> islands,
+  union_or_runner or_runner,
+  union_report* report)
 {
   nvtx_scoped_range range{"dynfilter::accum::finish"};
-  if (observation) { *observation = {}; }
-  auto const multiply = [](std::size_t left, std::size_t right) {
-    if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right) {
-      throw accumulation_invariant_error{"accumulated publication byte count overflow"};
-    }
-    return left * right;
-  };
+  if (report) { *report = {}; }
   check_cuda(cudaGetLastError(), "pending CUDA error before accumulated publication");
   int current_device = -1;
   check_cuda(cudaGetDevice(&current_device), "cudaGetDevice(publication)");
@@ -1153,207 +901,90 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
     stream,
     root_device,
     "[accumulated_bloom_builder::finish] the publication stream belongs to another GPU");
-  auto* root = _impl->find(root_device.value());
+  auto const* const root = _impl->find(root_device.value());
   if (root == nullptr) { return std::nullopt; }
-  std::vector<impl::partial*> sources;
-  std::vector<impl::partial*> targets;
-  std::vector<cucascade::memory::memory_space const*> spaces;
-  std::vector<::cuda::stream_ref> joined;
-  sources.reserve(_impl->partials.size());
-  targets.reserve(_impl->partials.size());
-  spaces.reserve(_impl->partials.size());
-  joined.reserve(1 + _impl->partials.size());
-  joined.push_back(stream);
-  for (auto const& entry : _impl->partials) {
-    spaces.push_back(entry->space);
-    joined.push_back(entry->stream_ref());
-    if (entry.get() == root) { continue; }
-    targets.push_back(entry.get());
-    if (entry->contributed.load(std::memory_order_relaxed)) { sources.push_back(entry.get()); }
-  }
-  auto const& shapes     = _impl->shapes;
-  auto const chunk_slot  = _impl->max_chunk_bytes();
-  std::size_t all_bytes  = 0;
-  std::size_t all_chunks = 0;
-  for (auto const& shape : shapes) {
-    all_bytes += shape.raw_bytes;
-    all_chunks += shape.chunks();
-  }
-  rmm::cuda_set_device_raii root_guard{root_device};
-  std::unique_ptr<rmm::device_buffer> scratch;
-  cucascade::memory::fixed_multiple_blocks_allocation staging;
-  std::unique_ptr<impl::chunk_pipeline> pipeline;
-  sirius::cuda::device_copy_batch copies;
-  bool prepared  = false;
-  auto transport = publication_transport::HOST_STAGED;
-  try {
-    auto const execute = [&] {
-      bool direct = !force_host && !sirius::memory::find_pair_without_pool_access(spaces);
-      auto const allocate_scratch = [&](std::size_t bytes) {
-        if (bytes >
-            std::numeric_limits<std::size_t>::max() - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1)) {
-          throw accumulation_invariant_error{"accumulated publication scratch alignment overflow"};
-        }
-        if (bytes != 0) {
-          scratch = std::make_unique<rmm::device_buffer>(bytes, stream, scratch_mr);
-          if (observation) {
-            observation->device_scratch_bytes = tracked_replica_allocation_bytes(bytes);
-          }
-        }
-      };
-      if (direct) {
-        auto const scratch_bytes =
-          multiply(multiply(std::min<std::size_t>(2, all_chunks), sources.size()), chunk_slot);
-        try {
-          allocate_scratch(scratch_bytes);
-        } catch (rmm::out_of_memory const&) {
-          // Only preparation can switch transports; retire any allocation-stream work first.
-          check_cuda(cudaStreamSynchronize(stream.get()),
-                     "cudaStreamSynchronize(direct preparation)");
-          direct = false;
-        }
+  auto const& partials = _impl->partials;
+  if (islands.empty()) {
+    islands = _impl->islands;
+  } else {
+    // Peer copies are legal only inside the real islands, so a caller may only divide them.
+    bool divides = islands.size() == partials.size();
+    for (std::size_t left = 0; divides && left < islands.size(); ++left) {
+      for (std::size_t right = left + 1; right < islands.size(); ++right) {
+        divides = divides && (islands[left] != islands[right] ||
+                              _impl->islands[left] == _impl->islands[right]);
       }
-      if (!direct) {
-        allocate_scratch(sources.empty() ? 0 : chunk_slot);
-        if (!targets.empty()) {
-          auto* host = root->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
-          if (host == nullptr || host->get_block_size() == 0) {
-            throw accumulation_invariant_error{
-              "accumulated publication requires fixed HOST blocks"};
-          }
-          auto const block_size = host->get_block_size();
-          auto const blocks     = chunk_slot / block_size + (chunk_slot % block_size != 0);
-          staging               = host->allocate_multiple_blocks(chunk_slot);
-          if (observation) { observation->host_staging_bytes = staging->size_bytes(); }
-          // The HOST copy loop walks up to one largest chunk of this window.
-          if (staging->size_bytes() < chunk_slot) {
-            throw accumulation_invariant_error{
-              "accumulated publication HOST window is smaller than a chunk"};
-          }
-          copies.reserve(blocks);
-        }
-      } else {
-        pipeline = std::make_unique<impl::chunk_pipeline>(
-          *_impl,
-          *root,
-          sources,
-          targets,
-          stream,
-          scratch ? static_cast<std::byte*>(scratch->data()) : nullptr);
-      }
-      prepared = true;
-      if (direct) {
-        transport = publication_transport::PEER_COPY;
-        pipeline->order_after_inserts();
-        for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
-          auto const& shape = shapes[key_index];
-          for (std::size_t offset = 0; offset < shape.raw_bytes; offset += shape.chunk_bytes) {
-            pipeline->enqueue_chunk(key_index, offset);
-          }
-        }
-        pipeline->wait_until_replicas_ready();
-      } else {
-        // The root's task stream owns scratch allocation; all other root work follows this join.
-        check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(staged allocation)");
-        auto const submit =
-          [&](impl::partial& owner, std::byte* device_bytes, std::size_t bytes, bool to_host) {
-            rmm::cuda_set_device_raii guard{rmm::cuda_device_id{owner.device_id}};
-            copies.clear();
-            std::size_t offset = 0;
-            for (std::size_t index = 0; offset < bytes; ++index) {
-              auto block       = staging->at(index);
-              auto const count = std::min(block.size(), bytes - offset);
-              if (to_host) {
-                copies.add(block.data(), device_bytes + offset, count);
-              } else {
-                copies.add(device_bytes + offset, block.data(), count);
-              }
-              offset += count;
-            }
-            auto const status = copies.enqueue(owner.stream_ref());
-            check_cuda(status, "device_copy_batch::enqueue(accumulated staging)");
-          };
-        auto const wait = [](impl::partial const& owner) {
-          check_cuda(cudaStreamSynchronize(owner.stream->value()),
-                     "cudaStreamSynchronize(accumulated staging)");
-        };
-        auto const stage =
-          [&](impl::partial& owner, std::byte* device_bytes, std::size_t bytes, bool to_host) {
-            submit(owner, device_bytes, bytes, to_host);
-            wait(owner);
-          };
-        for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
-          auto const& shape = shapes[key_index];
-          for (std::size_t offset = 0; offset < shape.raw_bytes; offset += shape.chunk_bytes) {
-            auto const bytes = std::min(shape.chunk_bytes, shape.raw_bytes - offset);
-            auto* root_chunk = static_cast<std::byte*>(root->arrays[key_index]->data()) + offset;
-            for (auto* source : sources) {
-              stage(*source,
-                    static_cast<std::byte*>(source->arrays[key_index]->data()) + offset,
-                    bytes,
-                    true);
-              stage(*root, static_cast<std::byte*>(scratch->data()), bytes, false);
-              // No wait follows the merge: the next write to scratch and the copy out of
-              // `root_chunk` run after it on the root stream.
-              enqueue_or_chunk(root_chunk,
-                               static_cast<std::byte const*>(scratch->data()),
-                               chunk_slot,
-                               1,
-                               bytes,
-                               root->stream->value());
-            }
-            if (!targets.empty()) {
-              stage(*root, root_chunk, bytes, true);
-              // Every upload only reads the merged chunk in the window, so all of them run
-              // together; the window is refilled only after the last one retires.
-              for (auto* target : targets) {
-                submit(*target,
-                       static_cast<std::byte*>(target->arrays[key_index]->data()) + offset,
-                       bytes,
-                       false);
-              }
-              for (auto const* target : targets) {
-                wait(*target);
-              }
-            }
-          }
-        }
-        for (auto const partial_stream : joined) {
-          check_cuda(cudaStreamSynchronize(partial_stream.get()),
-                     "cudaStreamSynchronize(staged publication)");
-        }
-      }
-    };
-    execute();
-  } catch (...) {
-    try {
-      join_on_failure(joined, [] { throw; });
-    } catch (unjoined_gpu_work const&) {
-      // As in `enqueue_add`: never free storage that unfinished GPU work may still touch. Task
-      // teardown detaches its tracker without freeing the scratch.
-      _impl->leak_storage.store(true);
-      (void)staging.release();
-      (void)scratch.release();
-      throw;
-    } catch (std::bad_alloc const&) {
-      if (prepared) { throw; }
-      return std::nullopt;
+    }
+    if (!divides) {
+      throw accumulation_invariant_error(
+        "[accumulated_bloom_builder::finish] the islands join GPUs without mutual pool access");
     }
   }
-  scratch.reset();
-  staging.reset();
+  std::vector<union_shape> shapes;
+  std::vector<std::byte*> arrays;
+  std::vector<union_member> members;
+  shapes.reserve(_impl->shapes.size());
+  arrays.reserve(_impl->shapes.size() * partials.size());
+  members.reserve(partials.size());
+  std::size_t all_bytes = 0;
+  for (auto const& shape : _impl->shapes) {
+    shapes.push_back({shape.raw_bytes, shape.chunk_bytes});
+    all_bytes += shape.raw_bytes;
+  }
+  std::size_t root_index = 0;
+  for (std::size_t index = 0; index < partials.size(); ++index) {
+    auto const& entry = *partials[index];
+    if (&entry == root) { root_index = index; }
+    for (auto const& array : entry.arrays) {
+      arrays.push_back(array ? static_cast<std::byte*>(array->data()) : nullptr);
+    }
+    members.push_back({entry.space,
+                       entry.stream_ref(),
+                       std::span{arrays}.last(entry.arrays.size()),
+                       entry.contributed.load(std::memory_order_relaxed)});
+  }
+  std::optional<union_report> united;
+  auto const started = std::chrono::steady_clock::now();
+  try {
+    united = unite({members,
+                    islands,
+                    shapes,
+                    root_index,
+                    stream,
+                    scratch_mr,
+                    root->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>()},
+                   or_runner);
+  } catch (unjoined_gpu_work const&) {
+    // As in `enqueue_add`: never free storage that unfinished GPU work may still touch.
+    _impl->leak_storage.store(true);
+    throw;
+  }
+  if (!united) { return std::nullopt; }
+  auto const route =
+    united->host_inputs == 0
+      ? (united->peer_copies ? publication_route::PEER : publication_route::NONE)
+      : (united->peer_copies ? publication_route::PEER_AND_HOST : publication_route::HOST);
   SIRIUS_LOG_DEBUG(
-    "[accumulated_bloom_builder::finish] root GPU {} reduced and replicated {} key(s), {} bytes in "
-    "all, "
-    "through {}: {} contributing source(s), {} target(s).",
+    "[accumulated_bloom_builder::finish] root GPU {} united {} key(s), {} bytes per GPU, on {} "
+    "GPU(s) in {:.3f} ms: {} island(s), {} through the host ({:.3f} ms in host ORs, {:.3f} ms "
+    "waiting for their inputs), {} chunk(s) in flight, {} pinned bytes, {} device scratch bytes{}.",
     root->device_id,
     _impl->keys.size(),
     all_bytes,
-    transport == publication_transport::PEER_COPY ? "peer copies" : "HOST staging",
-    sources.size(),
-    targets.size());
+    partials.size(),
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
+    united->islands,
+    united->host_inputs,
+    united->host_or_ms,
+    united->host_wait_ms,
+    united->window_chunks,
+    united->host_window_bytes,
+    std::reduce(united->device_scratch_bytes.begin(), united->device_scratch_bytes.end()),
+    united->degraded ? ", degraded" : "");
+  auto const degraded = united->degraded;
+  if (report) { *report = std::move(*united); }
   make_filters(root->device_id);
-  return publication{{_impl->filters}, transport};
+  return publication{{_impl->filters}, route, degraded};
 }
 
 void accumulated_bloom_builder::make_filters(int root_device)

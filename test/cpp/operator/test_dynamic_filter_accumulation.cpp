@@ -837,9 +837,7 @@ TEST_CASE(
     REQUIRE(counters.accumulation_publications_finished == 1);
     fixture.require_members({first, second});
   }
-  SECTION(
-    "under a limit policy that refuses the excess the publication is skipped before anything is "
-    "enqueued")
+  SECTION("under a limit policy that refuses the excess the publication goes through the host")
   {
     auto refusing_task =
       op::detail::scoped_replica_reservation::try_acquire(fixture.gpu(0), mib, stream);
@@ -852,14 +850,14 @@ TEST_CASE(
     REQUIRE(allocator.get_allocated_bytes(stream) == live);
     REQUIRE(allocator.get_peak_allocated_bytes(stream) == peak);
     auto const counters = fixture.stats.snapshot();
-    REQUIRE(counters.accumulations_skipped_admission == 1);
+    REQUIRE(counters.accumulations_skipped_admission == 0);
     REQUIRE(counters.accumulations_skipped_error == 0);
-    REQUIRE(counters.accumulation_publications_finished == 0);
-    REQUIRE(counters.filters_pushed == 0);
-    REQUIRE(fixture.channel->snapshot().terminal());
-    REQUIRE(fixture.channel->snapshot().empty());
-    // The partials stay retired while this thread tracks the root's allocator.
-    REQUIRE(fixture.allocated_bytes()[0] > baseline[0] + mib);
+    REQUIRE(counters.accumulation_publications_finished == 1);
+    REQUIRE(counters.accumulation_publications_host_staged == 1);
+    REQUIRE(counters.accumulation_publications_degraded == 1);
+    // Probing allocates on the task stream, beyond what the refusing reservation admits.
+    refusing_task.reset();
+    fixture.require_members({first, second});
   }
   // Once the task's reservation is gone, the untracked settle leaves only what the channel owns.
   fixture.session->finish_input();
@@ -2075,87 +2073,7 @@ TEST_CASE("cached fusion finds device-local replicas when a second GPU applies",
   REQUIRE(counts == expected);
 }
 
-TEST_CASE("accumulated publication matches the complete partial union and bounded workspace",
-          "[dynamic_filter][construction][accumulation_workspace][multi_gpu]")
-{
-  if (!sirius::test::has_gpus(2)) { return; }
-  using transport       = op::detail::accumulated_bloom_builder::publication_transport;
-  bool const force_host = GENERATE(true, false);
-  auto const root       = GENERATE(0, 1, 2, 3);
-  bool const root_adds  = GENERATE(false, true);
-  bool const others_add = GENERATE(false, true);
-  auto const keys       = GENERATE(std::size_t{1}, std::size_t{2});
-  auto const visible    = std::min(acc::visible_gpus(), 4);
-  if (root >= visible) { return; }
-  auto const devices = static_cast<std::size_t>(visible);
-  CAPTURE(force_host, root, root_adds, others_add, keys, devices);
-  acc::fixture fixture({.devices = devices});
-  if (!force_host && !acc::has_pool_access(fixture.spaces)) { return; }
-  // Three chunks per key, including an aligned short tail; key 1 starts on the other half.
-  auto const geometry = acc::bloom_geometry(2'097'153, keys);
-  REQUIRE(geometry.chunks_per_key() == 3);
-  auto builder = acc::make_builder(fixture, geometry, keys);
-  // Every contributing GPU inserts its own rows, so each source sets bits the others do not.
-  std::vector<acc::batch_ptr> batches;
-  std::size_t sources = 0;
-  for (int device = 0; device < visible; ++device) {
-    if (device == root ? !root_adds : !others_add) { continue; }
-    batches.push_back(fixture.make_batch(device, std::int64_t{1000} * device, 100));
-    acc::add_to_builder(builder, fixture, batches.back());
-    sources += device == root ? 0 : 1;
-  }
-  auto const expected = acc::partial_union(builder, keys, devices);
-  auto* host          = fixture.spaces[static_cast<std::size_t>(root)]
-                 .get_host_staging_space()
-                 .get_memory_resource_of<cucascade::memory::Tier::HOST>();
-  REQUIRE(host);
-  auto const host_before = host->get_total_allocated_bytes();
-  auto const baseline    = fixture.allocated_bytes();
-  acc::builder_access::workspace_observation workspace;
-  std::optional<op::detail::accumulated_bloom_builder::publication> published;
-  {
-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{root}};
-    published = acc::builder_access::finish(builder,
-                                            rmm::cuda_device_id{root},
-                                            fixture.publication_stream(root),
-                                            fixture.gpu(root).get_default_allocator(),
-                                            force_host,
-                                            &workspace);
-  }
-  REQUIRE(published);
-  REQUIRE(published->transport == (force_host ? transport::HOST_STAGED : transport::PEER_COPY));
-  acc::require_exact_union(published->filters, expected, devices);
-  auto const scratch = sources == 0 ? 0
-                       : force_host ? geometry.chunk_bytes
-                                    : acc::merge_scratch_bytes(geometry, keys, sources);
-  REQUIRE(workspace.device_scratch_bytes == op::detail::tracked_replica_allocation_bytes(scratch));
-  if (force_host) {
-    auto const block = host->get_block_size();
-    REQUIRE(workspace.host_staging_bytes == ((geometry.chunk_bytes + block - 1) / block) * block);
-  } else {
-    REQUIRE(workspace.host_staging_bytes == 0);
-  }
-  REQUIRE(host->get_total_allocated_bytes() == host_before);
-  REQUIRE(fixture.allocated_bytes() == baseline);
-  // Every replica answers for every contributed row, probed on the GPU that holds the row.
-  for (auto const& batch : batches) {
-    auto const source = batch->to_read_only();
-    auto const device = source.get_memory_space()->get_device_id();
-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
-    for (std::size_t key = 0; key < keys; ++key) {
-      auto const mask = acc::probe_membership(
-        *published->filters[key],
-        sirius::get_cudf_table_view(source).column(static_cast<cudf::size_type>(key)),
-        device,
-        fixture.publication_stream(device),
-        fixture.gpu(device).get_default_allocator());
-      REQUIRE(mask);
-      REQUIRE(std::ranges::all_of(*mask, [](bool present) { return present; }));
-    }
-  }
-}
-
-TEST_CASE("local-only HOST publication allocates no transfer workspace",
+TEST_CASE("local-only publication moves nothing and allocates no transfer workspace",
           "[dynamic_filter][construction][accumulation_workspace]")
 {
   acc::fixture fixture;
@@ -2164,26 +2082,28 @@ TEST_CASE("local-only HOST publication allocates no transfer workspace",
   auto batch          = fixture.make_batch(0, 0, 64);
   acc::add_to_builder(builder, fixture, batch);
   auto const expected = acc::partial_union(builder, 2, 1);
-  acc::builder_access::workspace_observation workspace{1, 1};
+  op::detail::union_report workspace;
   auto result = acc::builder_access::finish(builder,
                                             rmm::cuda_device_id{0},
                                             fixture.publication_stream(0),
                                             fixture.gpu(0).get_default_allocator(),
-                                            true,
-                                            &workspace);
+                                            {.report = &workspace});
   REQUIRE(result);
-  REQUIRE(result->transport ==
-          op::detail::accumulated_bloom_builder::publication_transport::HOST_STAGED);
+  REQUIRE(result->route == op::detail::accumulated_bloom_builder::publication_route::NONE);
+  REQUIRE_FALSE(result->degraded);
   acc::require_exact_union(result->filters, expected, 1);
-  REQUIRE(workspace.host_staging_bytes == 0);
-  REQUIRE(workspace.device_scratch_bytes == 0);
+  REQUIRE(workspace.host_window_bytes == 0);
+  REQUIRE(workspace.device_scratch_bytes == std::vector<std::size_t>{0});
 }
 
-TEST_CASE("HOST scratch uses the unused task reservation and returns its excess",
+TEST_CASE("merge scratch uses the unused task reservation and returns its excess",
           "[dynamic_filter][construction][accumulation_workspace][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
+  bool const separate = GENERATE(false, true);
+  CAPTURE(separate);
   acc::fixture fixture({.devices = 2});
+  if (!separate && !acc::has_pool_access(fixture.spaces)) { return; }
   auto const geometry = acc::bloom_geometry(8000);
   auto builder        = acc::make_builder(fixture, geometry);
   auto batch          = fixture.make_batch(1, 0, 100);
@@ -2192,22 +2112,27 @@ TEST_CASE("HOST scratch uses the unused task reservation and returns its excess"
   auto const before   = fixture.allocated_bytes();
   auto const stream   = fixture.publication_stream(0);
   auto& allocator     = fixture.allocator(0);
-  acc::builder_access::workspace_observation workspace;
+  op::detail::union_report workspace;
   {
     acc::task_reservation task{fixture.gpu(0), mib, stream};
     rmm::device_buffer live{mib - 256, stream, fixture.gpu(0).get_default_allocator()};
     auto const tracked  = allocator.get_allocated_bytes(stream);
     auto const reserved = allocator.get_total_reserved_bytes();
-    auto filters        = acc::builder_access::finish(builder,
-                                               rmm::cuda_device_id{0},
-                                               stream,
-                                               fixture.gpu(0).get_default_allocator(),
-                                               true,
-                                               &workspace);
+    auto filters =
+      acc::builder_access::finish(builder,
+                                  rmm::cuda_device_id{0},
+                                  stream,
+                                  fixture.gpu(0).get_default_allocator(),
+                                  {.islands = separate ? std::span{acc::separate_gpus}.first(2)
+                                                       : std::span<std::uint8_t const>{},
+                                   .report  = &workspace});
     REQUIRE(filters);
-    REQUIRE(workspace.device_scratch_bytes ==
-            op::detail::tracked_replica_allocation_bytes(geometry.chunk_bytes));
-    REQUIRE(allocator.get_peak_allocated_bytes(stream) == tracked + workspace.device_scratch_bytes);
+    // GPUs in one island merge through the root's scratch; separate GPUs take no device scratch.
+    auto const scratch =
+      separate ? 0
+               : op::detail::tracked_replica_allocation_bytes(acc::merge_scratch_bytes(geometry));
+    REQUIRE(workspace.device_scratch_bytes == std::vector<std::size_t>{scratch, 0});
+    REQUIRE(allocator.get_peak_allocated_bytes(stream) == tracked + scratch);
     REQUIRE(allocator.get_allocated_bytes(stream) == tracked);
     REQUIRE(allocator.get_total_reserved_bytes() == reserved);
     REQUIRE(fixture.allocated_bytes()[0] == before[0] + mib);
@@ -2215,7 +2140,8 @@ TEST_CASE("HOST scratch uses the unused task reservation and returns its excess"
                    .get_host_staging_space()
                    .get_memory_resource_of<cucascade::memory::Tier::HOST>();
     REQUIRE(geometry.chunk_bytes < host->get_block_size());
-    REQUIRE(workspace.host_staging_bytes == host->get_block_size());
+    // One contributing GPU is passed through the host: one block for each of the two chunks.
+    REQUIRE(workspace.host_window_bytes == (separate ? 2 * host->get_block_size() : 0));
     acc::require_exact_union(filters->filters, expected, 2);
   }
   REQUIRE(fixture.allocated_bytes() == before);

@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "memory/host_or.hpp"
 #include "memory/runtime_stream_pool.hpp"
 
 #include <cuda/memory_resource>
@@ -24,6 +25,7 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -54,6 +56,8 @@ class sirius_memory_reservation_manager : public cucascade::memory::memory_reser
 
  private:
   std::vector<runtime_stream_pool::registration> runtime_stream_pools_;
+  // Keeps the process-wide host OR helper threads running while a manager exists.
+  std::shared_ptr<host_or_workers> host_or_workers_ = host_or_workers::shared();
   void restore_device_resources() noexcept;
 
   struct device_resource_registration {
