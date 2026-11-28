@@ -26,6 +26,12 @@
   eager scan scheduling after construction in both cases (different eagerness per construction point, keeps one-shot's
   efficiency + simplicity). At minimum maybe keep the one-shot path with a flag choosing the construction point for
   single-partition builds. Track: notes/PROTO_HYBRID_ONESHOT.md.
+- (2026-11-28) User: APPLY SHADOW RULE TO THE PRs -> DONE. sirius-db stacked/df/05b-construction (#2569) a2d6bd5a -> 08963d79
+  (fast-forward, +5 commits); stacked/df/05b-switch (#2570) ae939824 -> 317e0cfc (force-push: 7 PR commits rebased + 4).
+  Same trees as reviewed prod/shadow-2569 8e049ef7 / prod/shadow-2570 cd89bbc8, author identity fixed (local apply/2569, apply/2570).
+  Old heads kept on fork: dfperf/backup/pr2569-a2d6bd5a, dfperf/backup/pr2570-ae939824. "tip" in older notes = ae939824 (pre-shadow).
+  Later PR-bound branches (prod/xfer, S6) must be rebased onto 317e0cfc before they are proposed.
+- (2026-11-28) Transfer design Q3/Q5/Q7/Q9: proceed with the architect's recommendations.
 
 # OPPORTUNITIES: measured, verified opportunity list for the DF stack (#2569 -> #2570), TPC-H SF1000, 4 GPUs
 
