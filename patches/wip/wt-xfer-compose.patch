@@ -1,0 +1,59 @@
+# HEAD 2c817a03a907a197f9a77e59ab7dc0fd3589a679 branch proto/xfer-compose
+diff --git a/src/cuda/sirius_dynamic_bloom_filter.cu b/src/cuda/sirius_dynamic_bloom_filter.cu
+index 3450e4d3..ed350506 100644
+--- a/src/cuda/sirius_dynamic_bloom_filter.cu
++++ b/src/cuda/sirius_dynamic_bloom_filter.cu
+@@ -60,6 +60,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstdlib>
+ #include <exception>
+ #include <limits>
+@@ -1308,13 +1309,24 @@ class accumulated_bloom_builder::impl::island_reduce final {
+     if (_compose && _contributing != 0) {
+       // SPIKE: stages A and B-download run W = 2 chunks ahead of the host OR of chunk `sequence`.
+       std::size_t queued = 0;
++      std::size_t merged = 0;
++      // SIRIUS_PROTO_XFER_MERGE_AHEAD (default 2): merges enqueued ahead of the downloads. A
++      // download binds to its merge's event, so at most one scratch-parity cycle (2) is legal.
++      auto const* text       = std::getenv("SIRIUS_PROTO_XFER_MERGE_AHEAD");
++      auto const merge_ahead = text != nullptr && *text == '0' ? std::size_t{0} : std::size_t{2};
+       for (std::size_t sequence = 0; sequence < _chunks.size(); ++sequence) {
+         // Pass-through enqueues in chunk order (pure event ordering, as "pipe").
+         auto const ahead = _contributing >= 2 ? parities() : std::size_t{1};
+         for (; queued < std::min(sequence + ahead, _chunks.size()); ++queued) {
+-          enqueue_merge(queued);
++          if (merged == queued) { enqueue_merge(merged++); }
+           hostor_download(queued);
+         }
++        // The merge of chunk (queued + 1) may be enqueued once download (queued - 1) is: its
++        // event record replaces the one download (queued - 1) already bound to.
++        for (; _contributing >= 2 && merged < std::min(queued + merge_ahead, _chunks.size());
++             ++merged) {
++          enqueue_merge(merged);
++        }
+         hostor_cross(sequence);
+         enqueue_fan_out(_chunks[sequence]);
+       }
+@@ -2020,6 +2032,19 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
+             island_or_ms   = reduce.host_or_ms();
+             island_wait_ms = reduce.host_wait_ms();
+             island_host    = reduce.host_bytes();
++            if (auto const* trace = std::getenv("SIRIUS_PROTO_XFER_TRACE");
++                trace != nullptr && *trace == '1') {
++              std::fprintf(stderr,
++                           "XFERTRACE,route=%s,bytes=%zu,host_or_ms=%.3f,host_wait_ms=%.3f,"
++                           "host_window_bytes=%zu,root_scratch=%zu,remote_scratch=%zu\n",
++                           island_route,
++                           all_bytes,
++                           island_or_ms,
++                           island_wait_ms,
++                           island_host,
++                           reduce.root_scratch_bytes(),
++                           island_scratch);
++            }
+             return;
+           }
+           scratch.reset();
