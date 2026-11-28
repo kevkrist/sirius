@@ -67,8 +67,10 @@ namespace sirius::op {
  * - `accumulation_storage_leaks`: an attempt whose storage was deliberately leaked because GPU work
  *   might still use it after a failed host join; it also counts in `accumulations_skipped_error`.
  * - `accumulation_publications_finished`: a fan-out that pushed at least one filter.
- * - `accumulation_publications_host_staged`: such a fan-out whose replicas were staged through HOST
- *   memory instead of copied between GPU pools.
+ * - `accumulation_publications_host_staged`: such a fan-out whose Bloom arrays crossed pinned HOST
+ *   memory between GPUs that cannot copy to each other directly.
+ * - `accumulation_publications_degraded`: such a fan-out whose Bloom transfer was refused workspace
+ *   and used the host in place of device-to-device copies, or fewer chunks in flight.
  * - `accumulation_publication_latency_ns`: one nanosecond from the Publishing Task's last
  *   Contribution to the first push, summed over every attempt that published a filter.
  * - `keys_skipped_bloom_size_gate`: a planned Bloom key whose membership was dropped because the
