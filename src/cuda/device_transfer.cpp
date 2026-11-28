@@ -29,6 +29,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <optional>
 #include <stdexcept>
@@ -80,7 +81,36 @@ cudaError_t drain(::cuda::stream_ref stream, rmm::cuda_device_id device) noexcep
   return status;
 }
 
+// PROTOTYPE (hybrid-full, arm EHX*): pipelined host hop for the one-shot replica fan-out.
+thread_local int proto_fast_hop_depth = 0;
+
+bool proto_fast_hop_enabled() noexcept
+{
+  static bool const on = [] {
+    char const* v = std::getenv("SIRIUS_PROTO_ONESHOT_FASTREP");
+    return v != nullptr && std::atoi(v) != 0;
+  }();
+  return on;
+}
+
+struct proto_event_set {
+  std::vector<cudaEvent_t> events;
+  ~proto_event_set()
+  {
+    for (auto e : events) { (void)cudaEventDestroy(e); }
+  }
+};
+
 }  // namespace
+
+proto_pipelined_host_hop_scope::proto_pipelined_host_hop_scope() noexcept
+{
+  if (proto_fast_hop_enabled()) { ++proto_fast_hop_depth; }
+}
+proto_pipelined_host_hop_scope::~proto_pipelined_host_hop_scope()
+{
+  if (proto_fast_hop_enabled()) { --proto_fast_hop_depth; }
+}
 
 device_transfer_route enqueue_device_copy(std::span<std::byte> destination,
                                           rmm::cuda_device_id destination_device,
@@ -167,6 +197,60 @@ device_transfer_route enqueue_device_copy(std::span<std::byte> destination,
   bool destination_pending = false;
   try {
     wait_for_source(ready, source_stream);
+    if (proto_fast_hop_depth > 0) {
+      // PROTOTYPE: per ~8 MiB group, download on the source stream, upload on the destination stream
+      // behind the group's event; the upload of group k overlaps the download of group k+1. One wait
+      // per stream at the end (the copy is still complete on return, as the relay requires).
+      constexpr std::size_t group_bytes = std::size_t{8} << 20;
+      proto_event_set done;
+      source_pending      = true;
+      destination_pending = true;
+      for (std::size_t first = 0; first < sizes.size();) {
+        std::size_t last = first, bytes = 0;
+        while (last < sizes.size() && bytes < group_bytes) { bytes += sizes[last++]; }
+        {
+          rmm::cuda_set_device_raii guard{source_device};
+          for (std::size_t i = first; i < last; ++i) {
+            CUCASCADE_CUDA_TRY(cudaMemcpyAsync(d2h_destinations[i],
+                                               d2h_sources[i],
+                                               sizes[i],
+                                               cudaMemcpyDeviceToHost,
+                                               source_stream.get()));
+          }
+          cudaEvent_t event{};
+          CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+          done.events.push_back(event);
+          CUCASCADE_CUDA_TRY(cudaEventRecord(event, source_stream.get()));
+        }
+        {
+          rmm::cuda_set_device_raii guard{destination_device};
+          CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(destination_stream.get(), done.events.back(), 0));
+          for (std::size_t i = first; i < last; ++i) {
+            CUCASCADE_CUDA_TRY(cudaMemcpyAsync(h2d_destinations[i],
+                                               h2d_sources[i],
+                                               sizes[i],
+                                               cudaMemcpyHostToDevice,
+                                               destination_stream.get()));
+          }
+        }
+        first = last;
+      }
+      {
+        rmm::cuda_set_device_raii guard{source_device};
+        CUCASCADE_CUDA_TRY(cudaStreamSynchronize(source_stream.get()));
+        source_pending = false;
+      }
+      {
+        rmm::cuda_set_device_raii guard{destination_device};
+        CUCASCADE_CUDA_TRY(cudaStreamSynchronize(destination_stream.get()));
+        destination_pending = false;
+      }
+      SIRIUS_LOG_DEBUG("[enqueue_device_copy] PROTO pipelined host hop GPU {} -> GPU {}, {} bytes",
+                       source_device.value(),
+                       destination_device.value(),
+                       source.size());
+      return device_transfer_route::host_staging;
+    }
     {
       rmm::cuda_set_device_raii guard{source_device};
       source_pending = true;

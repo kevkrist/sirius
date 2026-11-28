@@ -279,6 +279,30 @@ bool is_shadowed(key_plan const& key,
   return judge_shadow(key.candidate, bindings, decode_membership_cap).shadowed;
 }
 
+bool proto_oneshot_shadowed(dynamic_filter_publish_plan::admitted_key const& key,
+                            membership_filter_kind kind,
+                            std::size_t valid_rows,
+                            std::span<binding_facts const> bindings,
+                            std::size_t decode_membership_cap)
+{
+  static_filter_facts candidate;
+  candidate.kind = kind;
+  if (kind == membership_filter_kind::none) { return false; }
+  if (kind != membership_filter_kind::bloom) { candidate.keys = valid_rows; }
+  candidate.estimated_keep  = key.estimated_keep(valid_rows);
+  candidate.estimate_proven = candidate.estimated_keep && key.domain_gate_eligible();
+  if (!judged(candidate)) { return false; }
+  auto const judgement = judge_shadow(candidate, bindings, decode_membership_cap);
+  log_shadow_judgement("oneshot",
+                       key.planner_condition_index,
+                       candidate,
+                       valid_rows,
+                       bindings.size(),
+                       judgement,
+                       judgement.shadowed ? "skip" : "build");
+  return judgement.shadowed;
+}
+
 bool construction_shadowed(construction_plan const& planned,
                            std::span<std::vector<binding_facts> const> bindings,
                            std::size_t decode_membership_cap)

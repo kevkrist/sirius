@@ -74,4 +74,13 @@ enum class device_transfer_policy { automatic, force_host_staging };
   cucascade::memory::memory_space const* host_staging_space,
   device_transfer_policy policy = device_transfer_policy::automatic);
 
+/// PROTOTYPE (hybrid-full, arm EHX*): while alive on this thread and SIRIUS_PROTO_ONESHOT_FASTREP=1,
+/// HOST-staged copies overlap download and upload per 8 MiB group.
+struct proto_pipelined_host_hop_scope {
+  proto_pipelined_host_hop_scope() noexcept;
+  ~proto_pipelined_host_hop_scope();
+  proto_pipelined_host_hop_scope(proto_pipelined_host_hop_scope const&)            = delete;
+  proto_pipelined_host_hop_scope& operator=(proto_pipelined_host_hop_scope const&) = delete;
+};
+
 }  // namespace sirius::memory

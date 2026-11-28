@@ -17,6 +17,7 @@
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 
 #include "log/logging.hpp"
+#include "memory/device_transfer.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/dynamic_filter/bloom_sizing.hpp"
 #include "op/dynamic_filter/build_filter_construction.hpp"
@@ -1491,6 +1492,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   bool merge_started = false;
 
   try {
+    // PROTOTYPE (hybrid-full): what the Channels already hold, for the one-shot shadow judgement.
+    auto proto_bindings = binding_facts_of(plan);
+    read_published_filters(plan, proto_bindings);
     for (std::size_t admitted_key_index = 0; admitted_key_index < admitted_keys.size();
          ++admitted_key_index) {
       if (probe_types[admitted_key_index].empty()) { continue; }
@@ -1621,7 +1625,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       }
 
       bool const in_list = fits_rep && !policy.bloom_only;
-      auto const chosen  = choose_membership_filter(
+      auto chosen        = choose_membership_filter(
         {.build_rows               = valid_rows,
           .l2_cache_bytes           = l2_bytes,
           .estimated_hash_set_bytes = set_bytes,
@@ -1632,6 +1636,16 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
             in_list && sirius::op::sirius_dynamic_in_list_filter::supports(col),
           .supports_bloom =
             fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
+
+      // PROTOTYPE (hybrid-full): the shadow rule at the one-shot site (the membership is dropped,
+      // the zone map stays, as in plan_construction).
+      bool const proto_shadowed =
+        proto_oneshot_shadowed(admitted_key,
+                               chosen,
+                               valid_rows,
+                               proto_bindings[admitted_key_index],
+                               plan.decode_membership_cap());
+      if (proto_shadowed) { chosen = membership_filter_kind::none; }
 
       char const* choice = "none";
       switch (chosen) {
@@ -1667,7 +1681,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       }
       if (filters.membership) { filters.membership_kind = chosen; }
       // A filter no binding could receive is reported as absent, with the reason it is.
-      if (!filters.membership ||
+      if (proto_shadowed) {
+        reported.reason = dynamic_filter_key_reason::SHADOWED;
+      } else if (!filters.membership ||
           !membership_reaches_a_binding(plan, admitted_key_index, filters.membership_domain)) {
         if (filters.membership) {
           reported.reason = dynamic_filter_key_reason::UNREADABLE_PROBE;
@@ -1680,8 +1696,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       }
       if (filters.membership) {
         ++outcome.membership_filters_built;
-        if (auto const selectivity = estimated_selectivity_of(admitted_key, valid_rows)) {
-          filters.membership->set_estimated_selectivity(*selectivity);
+        // PROTOTYPE (hybrid-full): shadow-era API; same Proven Estimate rule as the PARTITION path.
+        if (auto const selectivity = admitted_key.estimated_keep(valid_rows)) {
+          filters.membership->set_estimated_selectivity(
+            *selectivity, admitted_key.domain_gate_eligible() && plan.cross_rank_merge() == nullptr);
         }
       }
       if (filters.zone_map) { ++outcome.zone_map_filters_built; }
@@ -1711,6 +1729,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       stream.sync();
 
       nvtx_scoped_range replicate_range{"dynfilter::replicate_devices"};
+      // PROTOTYPE (hybrid-full): EHX* pipelined host hop + replication time in the debug log.
+      sirius::memory::proto_pipelined_host_hop_scope proto_fast_hop;
+      auto const proto_replicate_start = std::chrono::steady_clock::now();
       auto replicate = [&plan](std::shared_ptr<sirius_dynamic_filter> const& filter) {
         if (!filter) { return; }
         auto* replicable = dynamic_cast<sirius_device_replicable*>(filter.get());
@@ -1727,6 +1748,11 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       for (auto const& filters : per_key) {
         replicate(filters.membership);
       }
+      SIRIUS_LOG_DEBUG("[proto_oneshot] replicated to {} spaces in {:.2f} ms",
+                       plan.replica_spaces().size(),
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                 proto_replicate_start)
+                         .count());
     }
 
     // Permission to publish is granted by before_fanout(). This allows the caller to cancel

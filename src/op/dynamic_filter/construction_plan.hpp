@@ -167,6 +167,14 @@ struct key_plan {
                                std::span<binding_facts const> bindings,
                                std::size_t decode_membership_cap) noexcept;
 
+/// PROTOTYPE (hybrid-full): the same shadow judgement for a key the one-shot path is about to build
+/// (kind and valid rows are known exactly there). Logs a `[dynamic_filter_shadow] at=oneshot` line.
+[[nodiscard]] bool proto_oneshot_shadowed(dynamic_filter_publish_plan::admitted_key const& key,
+                                          membership_filter_kind kind,
+                                          std::size_t valid_rows,
+                                          std::span<binding_facts const> bindings,
+                                          std::size_t decode_membership_cap);
+
 /**
  * @brief The plan for every admitted key with a binding
  *
