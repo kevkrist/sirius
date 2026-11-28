@@ -37,6 +37,12 @@
   after one-shot publication (author's +84 ms "forfeit" was a prototype artifact); ~100 ms WORSE with S6 + transfer PR
   (cross-experiment estimate, not measured in one binary). Cost of keeping it: ~670 src + ~450 test lines + a second transfer path.
   Recommendation stands (PARTITION-only) but it rests on the transfer PR landing. User decision pending.
+- (2026-11-28) User: the TRANSFER PR IS STANDALONE AND LANDS BEFORE #2570 (base origin/main; supersedes "stacked on #2570").
+  Step-0 spike result: CPU OR between islands (tie with GPU OR, simpler). Production branch prod/xfer-main; rebased stack proof
+  prod/stack-2569-on-xfer, prod/stack-2570-on-xfer. Consequence for the hybrid one-shot question: the state when #2570 lands is
+  "transfer on, eager off" -> being measured (HYBRID_FULL.md, arms X vs H+X).
+- (2026-11-28) S6 production design written: DESIGN_S6_PR.md (pull/level-triggered release; open questions inside). Not yet shown
+  to the user in detail; no S6 production code yet.
 
 # OPPORTUNITIES: measured, verified opportunity list for the DF stack (#2569 -> #2570), TPC-H SF1000, 4 GPUs
 
