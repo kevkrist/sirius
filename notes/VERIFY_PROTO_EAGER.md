@@ -51,8 +51,8 @@ Plans `runs/veager/plans/t{1,2,3}.plan`, table script `bin/times.py <tag> [arms]
 - Sum of the 7 largest contributors (q3 q5 q8 q9 q14 q18 q21): f1 **-419.7 ms**; the author has -401.7 (11-27) and -417.4
   (11-19) on the same seven. Every query agrees within 9 ms. Controls: q4 (no activation) +0.2, q19 (activation, no slack)
   -0.6, q10 (author's worst cell, +2.0 / -9.5) -10.0 with per-process -0.7 / -13.5: noise, no regression.
-- The 11 queries not re-timed carry -85 ms of the author's -497; extrapolating my seven with them unchanged gives about
-  -505 ms (-3.3% of 15290). Not re-measured: the 22-query sum in one session (exists only for 11-19).
+- The 11 other activated queries carry -95 ms of the author's -497; my seven plus those unchanged give about
+  -515 ms (-3.4% of 15290). Not re-measured: the 22-query sum in one session (exists only for 11-19).
 - Throttle (fk1 - f1, same holds): q3 -18.8, q8 -31.7, q9 -29.0 = -79.5 ms. The unthrottled f1 has the bimodal iteration at
   q8 (spread 67 ms) and fk1 does not (4 ms).
 - Recomputation of the author's raw data with my script (`out/recalc_r7.md`): r7 f1 -497.2, fk1 -596.7 (18 queries), fs2 f1
@@ -141,7 +141,7 @@ worst fk12: batch 14.2 GiB, batch+resv 28.9 GiB at q9
 - Resident batches: equal except **q18 +2.1 GiB (17.5 -> 19.6, max 21.0)** and q9 -3.4 GiB (f1) / equal (fk1); q3 q5 q8
   +0.1..0.2. Author's r7 telemetry gives the same picture on all 18 queries (`out/mem_r7.md`).
 - Batches + task reservations: lower with eager scans at q3 q5 q8 q9 q14 q21 (-5..-10 GiB; fewer scan tasks hold a
-  reservation at the same time while the build move occupies a thread), +2.6..3.3 GiB at q18. Highest f1 value 58.7 GiB
+  reservation at the same time while the build move occupies a thread), +2.3..2.6 GiB at q18. Highest f1 value 58.7 GiB
   (q18), tip 56.0.
 - Logs: 0 OOM / retry / downgrade lines in any process.
 - So: no memory problem on this machine, and the cost is confined to the join without a filter that buffers a large probe
@@ -239,6 +239,6 @@ for TPC-H (campaign-wide open item; done here for the 37 shapes only), unit test
   q18 +3.4 (noise). Shapes (37 shapes x 2 + 15 interrupts): tip / f1 / fk1 rc=0, results f1 = fk1 = tip on all, 0 HANG,
   13 interrupts each then 16/16 correct follow-up queries. Still queued: t1 q8 q4 q19 q10; lp q14 q15 q22 + g1 pass;
   t2 q14 q3 q21; t3 (g1 vs o1 on q2 q7); shapes s2g1, s2g0, cpu.
-- 2026-11-28 01:10 UTC. All queued runs done (t1 44, t2 20, t3 12, lp 22 processes; shapes tip / f1 / fk1 / s2g1 / s2g0 / cpu
+- 2026-11-28 01:10 UTC. All queued runs done (t1 46, t2 20, t3 12, lp 22 processes; shapes tip / f1 / fk1 / s2g1 / s2g0 / cpu
   + TRACE tip / f1 / s2g0; all rc=0; the first cpu attempt failed on a script error and was rerun). Tables written to
   `runs/veager/out/`. Document finalized (sections 0-7). Nothing pending for this verification.
