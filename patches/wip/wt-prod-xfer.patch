@@ -1,54 +1,920 @@
-# HEAD ae9398248fe209626119633c6318c3106a2c9289 branch prod/xfer
-diff --git a/cmake/sirius-test-sources.cmake b/cmake/sirius-test-sources.cmake
-index 12a8f946..ac97ba92 100644
---- a/cmake/sirius-test-sources.cmake
-+++ b/cmake/sirius-test-sources.cmake
-@@ -40,6 +40,8 @@ set(TEST_SOURCES
-     test/cpp/config/test_topology_config.cpp
-     test/cpp/creator/test_task_creator_query_state.cpp
-     test/cpp/creator/test_task_creator_schedule_validation.cpp
-+    test/cpp/memory/test_host_or.cpp
-+    test/cpp/memory/test_peer_islands.cpp
-     test/cpp/memory/test_pool_peer_access.cpp
-     test/cpp/memory/test_device_transfer.cpp
-     test/cpp/downgrade/test_downgrade_acquisition_failure.cpp
-@@ -297,6 +299,7 @@ set(TEST_SOURCES
-     test/cpp/operator/test_complete_build_inventory.cpp
-     test/cpp/operator/test_build_input_certification.cpp
-     test/cpp/operator/test_dynamic_filter_construction_plan.cpp
-+    test/cpp/operator/test_dynamic_filter_union_plan.cpp
-     test/cpp/operator/test_physical_build_filter.cpp
-     test/cpp/operator/test_dynamic_filter_accumulation.cpp
-     test/cpp/operator/test_accumulated_bloom_key_types.cpp
-diff --git a/src/memory/CMakeLists.txt b/src/memory/CMakeLists.txt
-index c93b83ec..efb9480f 100644
---- a/src/memory/CMakeLists.txt
-+++ b/src/memory/CMakeLists.txt
-@@ -1,3 +1,4 @@
- target_sources(
--  sirius_objects PRIVATE defragmenter_oom_policy.cpp pool_peer_access.cpp
--                         sirius_memory_reservation_manager.cpp)
-+  sirius_objects
-+  PRIVATE defragmenter_oom_policy.cpp host_or.cpp peer_islands.cpp
-+          pool_peer_access.cpp sirius_memory_reservation_manager.cpp)
-diff --git a/src/op/CMakeLists.txt b/src/op/CMakeLists.txt
-index a0958228..545f6661 100644
---- a/src/op/CMakeLists.txt
-+++ b/src/op/CMakeLists.txt
-@@ -72,6 +72,7 @@ target_sources(
-           dynamic_filter/construction_plan.cpp
-           dynamic_filter/build_filter_construction.cpp
-           dynamic_filter/detail/restore_scalar.cpp
-+          dynamic_filter/detail/union_plan.cpp
-           dynamic_filter/dynamic_filter_publisher.cpp
-           dynamic_filter/dynamic_filter_key_outcome.cpp
-           dynamic_filter/post_unlock_actions.cpp
-diff --git a/src/memory/host_or.cpp b/src/memory/host_or.cpp
+# HEAD e01a623a3ac6064ba3778740a666c437e4eecebd branch prod/xfer
+diff --git a/src/cuda/CMakeLists.txt b/src/cuda/CMakeLists.txt
+index e93f5abc..e577e1a0 100644
+--- a/src/cuda/CMakeLists.txt
++++ b/src/cuda/CMakeLists.txt
+@@ -12,6 +12,7 @@ target_sources(
+           bounds_accumulator.cu
+           exact_key_stager.cu
+           dynamic_filter_replica_transfer.cu
++          union_transfer.cu
+           sirius_dynamic_bloom_filter.cu
+           sirius_dynamic_in_list_filter.cu
+           sirius_dynamic_small_in_list_filter.cu
+diff --git a/src/cuda/sirius_dynamic_bloom_filter.cu b/src/cuda/sirius_dynamic_bloom_filter.cu
+index 0e13451f..65b5ed2e 100644
+--- a/src/cuda/sirius_dynamic_bloom_filter.cu
++++ b/src/cuda/sirius_dynamic_bloom_filter.cu
+@@ -14,8 +14,8 @@
+  * limitations under the License.
+  */
+ 
+-#include "cuda/device_copy_batch.hpp"
+-#include "memory/pool_peer_access.hpp"
++#include "memory/host_or.hpp"
++#include "memory/peer_islands.hpp"
+ #include "memory/runtime_stream_pool.hpp"
+ 
+ #include <cudf/table/table_view.hpp>
+@@ -47,6 +47,7 @@
+ #include <log/logging.hpp>
+ #include <op/dynamic_filter/bloom_sizing.hpp>
+ #include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
++#include <op/dynamic_filter/detail/union_transfer.hpp>
+ #include <op/dynamic_filter/dynamic_filter_device.hpp>
+ #include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
+ #include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
+@@ -57,11 +58,14 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
++#include <cstddef>
+ #include <cstdint>
+ #include <exception>
+ #include <limits>
+ #include <memory>
+ #include <new>
++#include <numeric>
+ #include <optional>
+ #include <span>
+ #include <stdexcept>
+@@ -302,59 +306,6 @@ void add_accumulated_keys(rmm::device_buffer& bits,
+   }
+ }
+ 
+-// ORs the scratch slot of every source into the root chunk. Slot i of the buffer holds source i's
+-// copy of the chunk.
+-__global__ void or_bloom_chunk(uint4* destination,
+-                               uint4 const* scratch,
+-                               std::size_t slot_stride,
+-                               int source_count,
+-                               std::size_t count)
+-{
+-  auto const stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+-  for (auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < count;
+-       index += stride) {
+-    uint4 value = destination[index];
+-    for (int source = 0; source < source_count; ++source) {
+-      uint4 const slot = scratch[static_cast<std::size_t>(source) * slot_stride + index];
+-      value.x |= slot.x;
+-      value.y |= slot.y;
+-      value.z |= slot.z;
+-      value.w |= slot.w;
+-    }
+-    destination[index] = value;
+-  }
+-}
+-
+-/**
+- * @brief Launches `or_bloom_chunk` over one chunk of @p bytes, a whole number of 16-byte words.
+- *
+- * @param root_chunk The chunk of the root's array that receives the union
+- * @param scratch The first source slot; slot i starts at `i * slot_bytes`
+- * @param slot_bytes Distance between source slots
+- * @param sources Number of filled source slots
+- * @param bytes Bytes of the chunk to reduce
+- * @param stream The root partial's stream
+- */
+-void enqueue_or_chunk(std::byte* root_chunk,
+-                      std::byte const* scratch,
+-                      std::size_t slot_bytes,
+-                      std::size_t sources,
+-                      std::size_t bytes,
+-                      cudaStream_t stream)
+-{
+-  constexpr unsigned threads = 256;
+-  auto const words           = bytes / sizeof(uint4);
+-  auto const blocks =
+-    static_cast<unsigned>(std::min<std::size_t>(::cuda::ceil_div(words, threads), 4096));
+-  check_cuda(cudaGetLastError(), "pending CUDA error before or_bloom_chunk");
+-  or_bloom_chunk<<<blocks, threads, 0, stream>>>(reinterpret_cast<uint4*>(root_chunk),
+-                                                 reinterpret_cast<uint4 const*>(scratch),
+-                                                 slot_bytes / sizeof(uint4),
+-                                                 static_cast<int>(sources),
+-                                                 words);
+-  check_cuda(cudaGetLastError(), "or_bloom_chunk", true);
+-}
+-
+ }  // namespace
+ 
+ //===----------------------------------------------------------------------===//
+@@ -756,211 +707,7 @@ struct accumulated_bloom_builder::impl {
+   std::atomic<bool> leak_storage{false};
+   std::vector<std::unique_ptr<partial>> partials;  // Destroyed before leak_storage.
+   std::vector<std::shared_ptr<sirius_dynamic_bloom_filter>> filters;
+-
+-  class chunk_pipeline;
+-};
+-
+-/**
+- * @brief Enqueues the reduction and replication of one publication, then waits for it once.
+- *
+- * Sources are the non-root partials with at least one contribution; targets are every non-root
+- * partial. Each chunk is copied from every source into one of two scratch buffers on the
+- * publication stream, ORed into the root's array on the root partial's stream (merge), and copied
+- * from the root into every target on the target's stream (egress). Without sources the root's array
+- * is already the union and only egress runs.
+- */
+-class accumulated_bloom_builder::impl::chunk_pipeline final {
+- public:
+-  /**
+-   * @brief Creates the pipeline's events; enqueues nothing.
+-   *
+-   * @param owner The builder state whose arrays are published
+-   * @param root The reducing partial; its GPU is the current device
+-   * @param sources The non-root partials that received contributions; must outlive the pipeline
+-   * @param targets Every non-root partial; must outlive the pipeline
+-   * @param stream The publication stream of the root GPU
+-   * @param scratch One buffer per chunk parity in use (at most two), each of `sources.size()` chunk
+-   * slots; null when there are no sources
+-   */
+-  chunk_pipeline(impl const& owner,
+-                 partial& root,
+-                 std::span<partial* const> sources,
+-                 std::span<partial* const> targets,
+-                 ::cuda::stream_ref stream,
+-                 std::byte* scratch)
+-    : _owner{owner},
+-      _chunk_slot{owner.max_chunk_bytes()},
+-      _root{root},
+-      _sources{sources},
+-      _targets{targets},
+-      _stream{stream},
+-      _scratch{scratch},
+-      _slot_bytes{_sources.size() * _chunk_slot},
+-      _ingress_done{make_event_on(root.device_id), make_event_on(root.device_id)},
+-      _merged{make_event_on(root.device_id), make_event_on(root.device_id)},
+-      _root_done{make_event_on(root.device_id)}
+-  {
+-    _source_ready.reserve(sources.size());
+-    _target_done.reserve(targets.size());
+-    for (auto* source : sources) {
+-      _source_ready.push_back(make_event_on(source->device_id));
+-    }
+-    for (auto* target : targets) {
+-      _target_done.push_back(make_event_on(target->device_id));
+-    }
+-  }
+-
+-  /**
+-   * @brief Orders the first reads of every partial after all of its inserts.
+-   *
+-   * Every contribution is folded into its partial's stream. The publication stream waits for each
+-   * source's stream before ingress; without sources, every target waits for the root's stream
+-   * before egress. With sources, the merge on the root's stream already follows the root's inserts.
+-   */
+-  void order_after_inserts()
+-  {
+-    for (std::size_t index = 0; index < _sources.size(); ++index) {
+-      auto const& ready = _source_ready[index];
+-      record(ready, *_sources[index]);
+-      check_cuda(cudaStreamWaitEvent(_stream.get(), ready.get(), 0),
+-                 "cudaStreamWaitEvent(source ready)");
+-    }
+-    if (!_sources.empty()) { return; }
+-    record(_root_done, _root);
+-    for (auto* target : _targets) {
+-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{target->device_id}};
+-      check_cuda(cudaStreamWaitEvent(target->stream->value(), _root_done.get(), 0),
+-                 "cudaStreamWaitEvent(root ready)");
+-    }
+-  }
+-
+-  /**
+-   * @brief Enqueues ingress, merge and egress of one chunk.
+-   *
+-   * @param key_index The key whose array the chunk belongs to
+-   * @param offset The chunk's byte offset in that array, a multiple of the chunk size
+-   */
+-  void enqueue_chunk(std::size_t key_index, std::size_t offset)
+-  {
+-    auto const& shape      = _owner.shapes[key_index];
+-    auto const bytes       = std::min(shape.chunk_bytes, shape.raw_bytes - offset);
+-    auto const buffer      = _sequence % 2;
+-    auto* const root_chunk = static_cast<std::byte*>(_root.arrays[key_index]->data()) + offset;
+-    if (!_sources.empty()) {
+-      enqueue_ingress(key_index, offset, bytes, buffer);
+-      enqueue_merge(root_chunk, bytes, buffer);
+-    }
+-    enqueue_egress(key_index, offset, bytes, buffer, root_chunk);
+-    ++_sequence;
+-  }
+-
+-  /**
+-   * @brief Makes the publication stream wait for every replica and waits for it on the host.
+-   *
+-   * This is the publication's only host wait; filters become visible only after it.
+-   */
+-  void wait_until_replicas_ready()
+-  {
+-    for (std::size_t index = 0; index < _targets.size(); ++index) {
+-      auto const& ready = _target_done[index];
+-      record(ready, *_targets[index]);
+-      check_cuda(cudaStreamWaitEvent(_stream.get(), ready.get(), 0),
+-                 "cudaStreamWaitEvent(replica ready)");
+-    }
+-    record(_root_done, _root);
+-    check_cuda(cudaStreamWaitEvent(_stream.get(), _root_done.get(), 0),
+-               "cudaStreamWaitEvent(root done)");
+-    nvtx_scoped_range wait_range{"dynfilter::accum::late_wait"};
+-    check_cuda(cudaStreamSynchronize(_stream.get()), "cudaStreamSynchronize(publication)");
+-  }
+-
+- private:
+-  /**
+-   * @brief Records @p event, created on @p owner's GPU, on @p owner's stream.
+-   */
+-  static void record(cuda_event const& event, partial const& owner)
+-  {
+-    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{owner.device_id}};
+-    check_cuda(cudaEventRecord(event.get(), owner.stream->value()), "cudaEventRecord(partial)");
+-  }
+-
+-  void enqueue_ingress(std::size_t key_index,
+-                       std::size_t offset,
+-                       std::size_t bytes,
+-                       std::size_t buffer)
+-  {
+-    if (_sequence >= 2) {
+-      // The merge of chunk (sequence - 2) read this buffer.
+-      check_cuda(cudaStreamWaitEvent(_stream.get(), _merged[buffer].get(), 0),
+-                 "cudaStreamWaitEvent(scratch reuse)");
+-    }
+-    auto* const slots = _scratch + buffer * _slot_bytes;
+-    for (std::size_t index = 0; index < _sources.size(); ++index) {
+-      auto const* source = _sources[index];
+-      auto const status  = cudaMemcpyPeerAsync(
+-        slots + index * _chunk_slot,
+-        _root.device_id,
+-        static_cast<std::byte const*>(source->arrays[key_index]->data()) + offset,
+-        source->device_id,
+-        bytes,
+-        _stream.get());
+-      check_cuda(status, "cudaMemcpyPeerAsync(ingress)");
+-    }
+-    check_cuda(cudaEventRecord(_ingress_done[buffer].get(), _stream.get()),
+-               "cudaEventRecord(ingress)");
+-  }
+-
+-  void enqueue_merge(std::byte* root_chunk, std::size_t bytes, std::size_t buffer)
+-  {
+-    auto const root_stream = _root.stream->value();
+-    check_cuda(cudaStreamWaitEvent(root_stream, _ingress_done[buffer].get(), 0),
+-               "cudaStreamWaitEvent(ingress)");
+-    enqueue_or_chunk(root_chunk,
+-                     _scratch + buffer * _slot_bytes,
+-                     _chunk_slot,
+-                     _sources.size(),
+-                     bytes,
+-                     root_stream);
+-    check_cuda(cudaEventRecord(_merged[buffer].get(), root_stream), "cudaEventRecord(merged)");
+-  }
+-
+-  void enqueue_egress(std::size_t key_index,
+-                      std::size_t offset,
+-                      std::size_t bytes,
+-                      std::size_t buffer,
+-                      std::byte const* root_chunk)
+-  {
+-    for (auto* target : _targets) {
+-      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{target->device_id}};
+-      if (!_sources.empty()) {
+-        check_cuda(cudaStreamWaitEvent(target->stream->value(), _merged[buffer].get(), 0),
+-                   "cudaStreamWaitEvent(egress)");
+-      }
+-      auto const status =
+-        cudaMemcpyPeerAsync(static_cast<std::byte*>(target->arrays[key_index]->data()) + offset,
+-                            target->device_id,
+-                            root_chunk,
+-                            _root.device_id,
+-                            bytes,
+-                            target->stream->value());
+-      check_cuda(status, "cudaMemcpyPeerAsync(egress)");
+-    }
+-  }
+-
+-  impl const& _owner;
+-  std::size_t _chunk_slot;  // Bytes of one source's slot: the largest chunk of any key
+-  partial& _root;
+-  std::span<partial* const> _sources;
+-  std::span<partial* const> _targets;
+-  ::cuda::stream_ref _stream;
+-  std::byte* _scratch;
+-  std::size_t _slot_bytes;
+-  std::array<cuda_event, 2> _ingress_done;  // Per scratch buffer: its ingress landed
+-  std::array<cuda_event, 2> _merged;        // Per scratch buffer: its merge finished
+-  cuda_event _root_done;                    // The root partial's work is complete
+-  std::vector<cuda_event> _source_ready;    // Per source: its inserts are complete
+-  std::vector<cuda_event> _target_done;     // Per target: its egress landed
+-  std::size_t _sequence = 0;                // Global chunk index over (key, offset)
++  std::vector<std::uint8_t> islands;  // Per partial: its group of GPUs with mutual pool access
+ };
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1042,7 +789,6 @@ std::size_t accumulated_bloom_builder::publication_scratch_bytes(std::span<key c
+     chunk_slot       = std::max(chunk_slot, chunk);
+     chunks += ::cuda::ceil_div(raw_bytes, chunk);
+   }
+-  // The direct transport's bound, which also covers the HOST-staged transport's single slot.
+   auto const slots = std::min<std::size_t>(2, chunks) * (replicas - 1);
+   return chunk_slot > maximum / slots ? maximum
+                                       : tracked_replica_allocation_bytes(slots * chunk_slot);
+@@ -1059,6 +805,12 @@ std::optional<accumulated_bloom_builder> accumulated_bloom_builder::create(
+   auto partials = lease_partials(targets, array_bytes, /*zero_fill=*/true, state->leak_storage);
+   if (!partials) { return std::nullopt; }
+   state->partials = std::move(*partials);
++  std::vector<cucascade::memory::memory_space const*> spaces;
++  spaces.reserve(state->partials.size());
++  for (auto const& entry : state->partials) {
++    spaces.push_back(entry->space);
++  }
++  state->islands = sirius::memory::peer_islands(spaces);
+   return accumulated_bloom_builder{std::move(state)};
+ }
+ 
+@@ -1124,24 +876,20 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
+   ::cuda::stream_ref stream,
+   rmm::device_async_resource_ref scratch_mr)
+ {
+-  return finish_impl(root_device, stream, scratch_mr, false, nullptr);
++  auto const workers = sirius::memory::host_or_workers::shared();
++  return finish_impl(root_device, stream, scratch_mr, {}, union_or_runner::of(*workers), nullptr);
+ }
+ 
+ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder::finish_impl(
+   rmm::cuda_device_id root_device,
+   ::cuda::stream_ref stream,
+   rmm::device_async_resource_ref scratch_mr,
+-  bool force_host,
+-  workspace_observation* observation)
++  std::span<std::uint8_t const> islands,
++  union_or_runner or_runner,
++  union_report* report)
+ {
+   nvtx_scoped_range range{"dynfilter::accum::finish"};
+-  if (observation) { *observation = {}; }
+-  auto const multiply = [](std::size_t left, std::size_t right) {
+-    if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right) {
+-      throw accumulation_invariant_error{"accumulated publication byte count overflow"};
+-    }
+-    return left * right;
+-  };
++  if (report) { *report = {}; }
+   check_cuda(cudaGetLastError(), "pending CUDA error before accumulated publication");
+   int current_device = -1;
+   check_cuda(cudaGetDevice(&current_device), "cudaGetDevice(publication)");
+@@ -1153,207 +901,88 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
+     stream,
+     root_device,
+     "[accumulated_bloom_builder::finish] the publication stream belongs to another GPU");
+-  auto* root = _impl->find(root_device.value());
++  auto const* const root = _impl->find(root_device.value());
+   if (root == nullptr) { return std::nullopt; }
+-  std::vector<impl::partial*> sources;
+-  std::vector<impl::partial*> targets;
+-  std::vector<cucascade::memory::memory_space const*> spaces;
+-  std::vector<::cuda::stream_ref> joined;
+-  sources.reserve(_impl->partials.size());
+-  targets.reserve(_impl->partials.size());
+-  spaces.reserve(_impl->partials.size());
+-  joined.reserve(1 + _impl->partials.size());
+-  joined.push_back(stream);
+-  for (auto const& entry : _impl->partials) {
+-    spaces.push_back(entry->space);
+-    joined.push_back(entry->stream_ref());
+-    if (entry.get() == root) { continue; }
+-    targets.push_back(entry.get());
+-    if (entry->contributed.load(std::memory_order_relaxed)) { sources.push_back(entry.get()); }
++  auto const& partials = _impl->partials;
++  if (islands.empty()) {
++    islands = _impl->islands;
++  } else {
++    // Peer copies are legal only inside the real islands, so a caller may only divide them.
++    bool divides = islands.size() == partials.size();
++    for (std::size_t left = 0; divides && left < islands.size(); ++left) {
++      for (std::size_t right = left + 1; right < islands.size(); ++right) {
++        divides = divides && (islands[left] != islands[right] ||
++                              _impl->islands[left] == _impl->islands[right]);
++      }
++    }
++    if (!divides) {
++      throw accumulation_invariant_error(
++        "[accumulated_bloom_builder::finish] the islands join GPUs without mutual pool access");
++    }
+   }
+-  auto const& shapes     = _impl->shapes;
+-  auto const chunk_slot  = _impl->max_chunk_bytes();
+-  std::size_t all_bytes  = 0;
+-  std::size_t all_chunks = 0;
+-  for (auto const& shape : shapes) {
++  std::vector<union_shape> shapes;
++  std::vector<std::byte*> arrays;
++  std::vector<union_member> members;
++  shapes.reserve(_impl->shapes.size());
++  arrays.reserve(_impl->shapes.size() * partials.size());
++  members.reserve(partials.size());
++  std::size_t all_bytes = 0;
++  for (auto const& shape : _impl->shapes) {
++    shapes.push_back({shape.raw_bytes, shape.chunk_bytes});
+     all_bytes += shape.raw_bytes;
+-    all_chunks += shape.chunks();
+   }
+-  rmm::cuda_set_device_raii root_guard{root_device};
+-  std::unique_ptr<rmm::device_buffer> scratch;
+-  cucascade::memory::fixed_multiple_blocks_allocation staging;
+-  std::unique_ptr<impl::chunk_pipeline> pipeline;
+-  sirius::cuda::device_copy_batch copies;
+-  bool prepared  = false;
+-  auto transport = publication_transport::HOST_STAGED;
+-  try {
+-    auto const execute = [&] {
+-      bool direct = !force_host && !sirius::memory::find_pair_without_pool_access(spaces);
+-      auto const allocate_scratch = [&](std::size_t bytes) {
+-        if (bytes >
+-            std::numeric_limits<std::size_t>::max() - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1)) {
+-          throw accumulation_invariant_error{"accumulated publication scratch alignment overflow"};
+-        }
+-        if (bytes != 0) {
+-          scratch = std::make_unique<rmm::device_buffer>(bytes, stream, scratch_mr);
+-          if (observation) {
+-            observation->device_scratch_bytes = tracked_replica_allocation_bytes(bytes);
+-          }
+-        }
+-      };
+-      if (direct) {
+-        auto const scratch_bytes =
+-          multiply(multiply(std::min<std::size_t>(2, all_chunks), sources.size()), chunk_slot);
+-        try {
+-          allocate_scratch(scratch_bytes);
+-        } catch (rmm::out_of_memory const&) {
+-          // Only preparation can switch transports; retire any allocation-stream work first.
+-          check_cuda(cudaStreamSynchronize(stream.get()),
+-                     "cudaStreamSynchronize(direct preparation)");
+-          direct = false;
+-        }
+-      }
+-      if (!direct) {
+-        allocate_scratch(sources.empty() ? 0 : chunk_slot);
+-        if (!targets.empty()) {
+-          auto* host = root->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>();
+-          if (host == nullptr || host->get_block_size() == 0) {
+-            throw accumulation_invariant_error{
+-              "accumulated publication requires fixed HOST blocks"};
+-          }
+-          auto const block_size = host->get_block_size();
+-          auto const blocks     = chunk_slot / block_size + (chunk_slot % block_size != 0);
+-          staging               = host->allocate_multiple_blocks(chunk_slot);
+-          if (observation) { observation->host_staging_bytes = staging->size_bytes(); }
+-          // The HOST copy loop walks up to one largest chunk of this window.
+-          if (staging->size_bytes() < chunk_slot) {
+-            throw accumulation_invariant_error{
+-              "accumulated publication HOST window is smaller than a chunk"};
+-          }
+-          copies.reserve(blocks);
+-        }
+-      } else {
+-        pipeline = std::make_unique<impl::chunk_pipeline>(
+-          *_impl,
+-          *root,
+-          sources,
+-          targets,
+-          stream,
+-          scratch ? static_cast<std::byte*>(scratch->data()) : nullptr);
+-      }
+-      prepared = true;
+-      if (direct) {
+-        transport = publication_transport::PEER_COPY;
+-        pipeline->order_after_inserts();
+-        for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
+-          auto const& shape = shapes[key_index];
+-          for (std::size_t offset = 0; offset < shape.raw_bytes; offset += shape.chunk_bytes) {
+-            pipeline->enqueue_chunk(key_index, offset);
+-          }
+-        }
+-        pipeline->wait_until_replicas_ready();
+-      } else {
+-        // The root's task stream owns scratch allocation; all other root work follows this join.
+-        check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(staged allocation)");
+-        auto const submit =
+-          [&](impl::partial& owner, std::byte* device_bytes, std::size_t bytes, bool to_host) {
+-            rmm::cuda_set_device_raii guard{rmm::cuda_device_id{owner.device_id}};
+-            copies.clear();
+-            std::size_t offset = 0;
+-            for (std::size_t index = 0; offset < bytes; ++index) {
+-              auto block       = staging->at(index);
+-              auto const count = std::min(block.size(), bytes - offset);
+-              if (to_host) {
+-                copies.add(block.data(), device_bytes + offset, count);
+-              } else {
+-                copies.add(device_bytes + offset, block.data(), count);
+-              }
+-              offset += count;
+-            }
+-            auto const status = copies.enqueue(owner.stream_ref());
+-            check_cuda(status, "device_copy_batch::enqueue(accumulated staging)");
+-          };
+-        auto const wait = [](impl::partial const& owner) {
+-          check_cuda(cudaStreamSynchronize(owner.stream->value()),
+-                     "cudaStreamSynchronize(accumulated staging)");
+-        };
+-        auto const stage =
+-          [&](impl::partial& owner, std::byte* device_bytes, std::size_t bytes, bool to_host) {
+-            submit(owner, device_bytes, bytes, to_host);
+-            wait(owner);
+-          };
+-        for (std::size_t key_index = 0; key_index < _impl->keys.size(); ++key_index) {
+-          auto const& shape = shapes[key_index];
+-          for (std::size_t offset = 0; offset < shape.raw_bytes; offset += shape.chunk_bytes) {
+-            auto const bytes = std::min(shape.chunk_bytes, shape.raw_bytes - offset);
+-            auto* root_chunk = static_cast<std::byte*>(root->arrays[key_index]->data()) + offset;
+-            for (auto* source : sources) {
+-              stage(*source,
+-                    static_cast<std::byte*>(source->arrays[key_index]->data()) + offset,
+-                    bytes,
+-                    true);
+-              stage(*root, static_cast<std::byte*>(scratch->data()), bytes, false);
+-              // No wait follows the merge: the next write to scratch and the copy out of
+-              // `root_chunk` run after it on the root stream.
+-              enqueue_or_chunk(root_chunk,
+-                               static_cast<std::byte const*>(scratch->data()),
+-                               chunk_slot,
+-                               1,
+-                               bytes,
+-                               root->stream->value());
+-            }
+-            if (!targets.empty()) {
+-              stage(*root, root_chunk, bytes, true);
+-              // Every upload only reads the merged chunk in the window, so all of them run
+-              // together; the window is refilled only after the last one retires.
+-              for (auto* target : targets) {
+-                submit(*target,
+-                       static_cast<std::byte*>(target->arrays[key_index]->data()) + offset,
+-                       bytes,
+-                       false);
+-              }
+-              for (auto const* target : targets) {
+-                wait(*target);
+-              }
+-            }
+-          }
+-        }
+-        for (auto const partial_stream : joined) {
+-          check_cuda(cudaStreamSynchronize(partial_stream.get()),
+-                     "cudaStreamSynchronize(staged publication)");
+-        }
+-      }
+-    };
+-    execute();
+-  } catch (...) {
+-    try {
+-      join_on_failure(joined, [] { throw; });
+-    } catch (unjoined_gpu_work const&) {
+-      // As in `enqueue_add`: never free storage that unfinished GPU work may still touch. Task
+-      // teardown detaches its tracker without freeing the scratch.
+-      _impl->leak_storage.store(true);
+-      (void)staging.release();
+-      (void)scratch.release();
+-      throw;
+-    } catch (std::bad_alloc const&) {
+-      if (prepared) { throw; }
+-      return std::nullopt;
++  std::size_t root_index = 0;
++  for (std::size_t index = 0; index < partials.size(); ++index) {
++    auto const& entry = *partials[index];
++    if (&entry == root) { root_index = index; }
++    for (auto const& array : entry.arrays) {
++      arrays.push_back(array ? static_cast<std::byte*>(array->data()) : nullptr);
+     }
++    members.push_back({entry.space,
++                       entry.stream_ref(),
++                       std::span{arrays}.last(entry.arrays.size()),
++                       entry.contributed.load(std::memory_order_relaxed)});
++  }
++  std::optional<union_report> united;
++  auto const started = std::chrono::steady_clock::now();
++  try {
++    united = unite({members,
++                           islands,
++                           shapes,
++                           root_index,
++                           stream,
++                           scratch_mr,
++                           root->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>()},
++                          or_runner);
++  } catch (unjoined_gpu_work const&) {
++    // As in `enqueue_add`: never free storage that unfinished GPU work may still touch.
++    _impl->leak_storage.store(true);
++    throw;
+   }
+-  scratch.reset();
+-  staging.reset();
++  if (!united) { return std::nullopt; }
++  auto const route = united->host_inputs == 0
++                       ? (united->peer_copies ? publication_route::PEER : publication_route::NONE)
++                       : (united->peer_copies ? publication_route::PEER_AND_HOST
++                                              : publication_route::HOST);
+   SIRIUS_LOG_DEBUG(
+-    "[accumulated_bloom_builder::finish] root GPU {} reduced and replicated {} key(s), {} bytes in "
+-    "all, "
+-    "through {}: {} contributing source(s), {} target(s).",
++    "[accumulated_bloom_builder::finish] root GPU {} united {} key(s), {} bytes per GPU, on {} "
++    "GPU(s) in {:.3f} ms: {} island(s), {} through the host, {} chunk(s) in flight, {} pinned "
++    "bytes, {} device scratch bytes{}.",
+     root->device_id,
+     _impl->keys.size(),
+     all_bytes,
+-    transport == publication_transport::PEER_COPY ? "peer copies" : "HOST staging",
+-    sources.size(),
+-    targets.size());
++    partials.size(),
++    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
++    united->islands,
++    united->host_inputs,
++    united->window_chunks,
++    united->host_window_bytes,
++    std::reduce(united->device_scratch_bytes.begin(), united->device_scratch_bytes.end()),
++    united->degraded ? ", degraded" : "");
++  auto const degraded = united->degraded;
++  if (report) { *report = std::move(*united); }
+   make_filters(root->device_id);
+-  return publication{{_impl->filters}, transport};
++  return publication{{_impl->filters}, route, degraded};
+ }
+ 
+ void accumulated_bloom_builder::make_filters(int root_device)
+diff --git a/src/memory/sirius_memory_reservation_manager.hpp b/src/memory/sirius_memory_reservation_manager.hpp
+index c41c7e67..b2fe35e1 100644
+--- a/src/memory/sirius_memory_reservation_manager.hpp
++++ b/src/memory/sirius_memory_reservation_manager.hpp
+@@ -17,6 +17,7 @@
+ 
+ #pragma once
+ 
++#include "memory/host_or.hpp"
+ #include "memory/runtime_stream_pool.hpp"
+ 
+ #include <cuda/memory_resource>
+@@ -24,6 +25,7 @@
+ #include <cucascade/memory/memory_reservation_manager.hpp>
+ #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
+ 
++#include <memory>
+ #include <optional>
+ #include <vector>
+ 
+@@ -54,6 +56,8 @@ class sirius_memory_reservation_manager : public cucascade::memory::memory_reser
+ 
+  private:
+   std::vector<runtime_stream_pool::registration> runtime_stream_pools_;
++  // Keeps the process-wide host OR helper threads running while a manager exists.
++  std::shared_ptr<host_or_workers> host_or_workers_ = host_or_workers::shared();
+   void restore_device_resources() noexcept;
+ 
+   struct device_resource_registration {
+diff --git a/src/op/dynamic_filter/build_filter_construction.cpp b/src/op/dynamic_filter/build_filter_construction.cpp
+index cf88ca25..ca8ce46f 100644
+--- a/src/op/dynamic_filter/build_filter_construction.cpp
++++ b/src/op/dynamic_filter/build_filter_construction.cpp
+@@ -328,7 +328,8 @@ std::optional<build_filter_construction::constructed_filters> build_filter_const
+   if (_impl->bloom) {
+     blooms = _impl->bloom->finish(device, root.stream, root.scratch);
+     if (!blooms) { return std::nullopt; }
+-    result.transport = blooms->transport;
++    result.route          = blooms->route;
++    result.bloom_degraded = blooms->degraded;
+   }
+   std::optional<detail::exact_key_stager::gathered> staged;
+   if (_impl->stager) {
+diff --git a/src/op/dynamic_filter/build_filter_construction.hpp b/src/op/dynamic_filter/build_filter_construction.hpp
+index f8f369ab..fc436d12 100644
+--- a/src/op/dynamic_filter/build_filter_construction.hpp
++++ b/src/op/dynamic_filter/build_filter_construction.hpp
+@@ -124,8 +124,9 @@ class build_filter_construction final {
+   struct constructed_filters {
+     std::vector<constructed_key> keys;     ///< One per planned key, in plan order
+     dynamic_filter_stats_snapshot counts;  ///< The `filters_skipped_construction_*` counters
+-    std::optional<detail::accumulated_bloom_builder::publication_transport>
+-      transport;  ///< How the Bloom filters reached their replicas, if any key planned one
++    std::optional<detail::accumulated_bloom_builder::publication_route>
++      route;                     ///< How the Bloom filters reached their replicas, if any key planned one
++    bool bloom_degraded = false;  ///< `accumulated_bloom_builder::publication::degraded`
+   };
+ 
+   /**
+diff --git a/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp b/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp
+index f1eceb0d..e02aaa0a 100644
+--- a/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp
++++ b/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp
+@@ -19,6 +19,7 @@
+ #include "helper/cuda_launch_error.hpp"
+ #include "log/logging.hpp"
+ #include "op/dynamic_filter/complete_build_inventory.hpp"
++#include "op/dynamic_filter/detail/union_transfer.hpp"
+ #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
+ #include "sirius/exception.hpp"
+ 
+@@ -178,10 +179,12 @@ class accumulated_bloom_builder final {
+    * (`accumulated_bloom_chunk_bytes`). Each GPU's arrays are allocated under their own lease,
+    * attached to a new exclusive stream of that GPU and sized to the exact allocation charge. The
+    * calling thread must hold no allocation tracker for those GPUs; a tracked caller is refused like
+-   * missing capacity.
++   * missing capacity. The GPUs are grouped by mutual pool access (`sirius::memory::peer_islands`)
++   * once, here; `finish` copies device to device inside those groups.
+    *
+    * @throw accumulation_invariant_error if a key has no blocks, an unsupported type, or sizes that
+    * overflow
++   * @throw cucascade::cuda_error if a pool access query fails
+    * @return The builder, or nullopt iff a lease was refused, after releasing everything built so
+    * far
+    */
+@@ -190,7 +193,8 @@ class accumulated_bloom_builder final {
+ 
+   /**
+    * @brief An upper bound on the task scratch `finish` takes for `keys` (with their blocks set)
+-   * replicated on `replicas` GPUs: the direct merge's chunk slots for every non-root source.
++   * replicated on `replicas` GPUs: the merge's chunk slots when every other GPU is a source in the
++   * root's group.
+    */
+   [[nodiscard]] static std::size_t publication_scratch_bytes(std::span<key const> keys,
+                                                              std::size_t replicas) noexcept;
+@@ -231,30 +235,41 @@ class accumulated_bloom_builder final {
+   /**
+    * @brief How `finish` moved partials and the union between GPUs.
+    */
+-  enum class publication_transport : std::uint8_t {
+-    PEER_COPY,   ///< `cudaMemcpyPeerAsync`; every replica pool grants every other replica GPU
+-    HOST_STAGED  ///< Bounded pinned HOST staging, when a grant is unavailable or direct scratch
+-                 ///< is refused
++  enum class publication_route : std::uint8_t {
++    NONE,           ///< Nothing moved: one GPU, or no contribution
++    PEER,           ///< Device-to-device copies only; every GPU reaches every other
++    PEER_AND_HOST,  ///< Device-to-device copies inside groups, pinned HOST memory between them
++    HOST            ///< Pinned HOST memory only
+   };
+ 
+   /**
+    * @brief A completed publication.
+    */
+   struct publication {
+-    /// One ready filter per key; borrows owners the builder retains until its destruction
++    /**
++     * @brief One ready filter per key; borrows owners the builder retains until its destruction.
++     */
+     std::span<std::shared_ptr<sirius_dynamic_bloom_filter> const> filters;
+-    publication_transport transport;  ///< The transport that produced every replica
++    /**
++     * @brief How the union reached every replica.
++     */
++    publication_route route;
++    /**
++     * @brief Whether refused workspace made `finish` use the host where it would have copied
++     * between devices, or fewer chunks in flight.
++     */
++    bool degraded;
+   };
+ 
+   /**
+-   * @brief Reduces every contributed partial into @p root's, overwrites every other partial with
+-   * the union, and waits for every replica on the host.
++   * @brief Makes every partial the union of all partials (`unite`) and waits for every replica on
++   * the host.
+    *
+-   * Uses peer copies when every replica pool grants every other replica GPU and direct scratch is
+-   * admitted; otherwise stages through the root's HOST space. The transport is chosen before any
+-   * transfer is submitted and never changes afterwards. The builder retains every completed filter
+-   * owner; channels may share them. Scratch uses @p scratch_mr only during this call and is freed
+-   * after every submitted transfer has retired.
++   * Copies device to device inside every group of GPUs whose pools grant each other, and through
++   * pinned memory of the root's HOST space, where the host ORs the groups' chunks, between groups.
++   * Refused device scratch moves a group to the host instead of failing. The builder retains every
++   * completed filter owner; channels may share them. Scratch uses @p scratch_mr only during this
++   * call and is freed after every submitted transfer has retired.
+    *
+    * @pre Every `enqueue_add` returned; this is the only `finish` call; the caller is the only user
+    *      of the builder
+@@ -263,8 +278,8 @@ class accumulated_bloom_builder final {
+    * @param root The reducing GPU, current on the calling thread
+    * @param stream The publication stream of @p root
+    * @param scratch_mr Resource borrowing the task's reservation
+-   * @return The published filters, or no value when @p root holds no partial or publication
+-   *         workspace allocation is refused
++   * @return The published filters, or no value when @p root holds no partial or the pinned HOST
++   *         workspace is refused
+    */
+   [[nodiscard]] std::optional<publication> finish(rmm::cuda_device_id root,
+                                                   ::cuda::stream_ref stream,
+@@ -343,26 +358,24 @@ class accumulated_bloom_builder final {
+     ::cuda::stream_ref stream);
+ 
+  private:
+-  /**
+-   * @brief Successfully acquired workspace charges for one finish attempt, retained after cleanup.
+-   */
+-  struct workspace_observation {
+-    std::size_t device_scratch_bytes{};  ///< Aligned device allocation charge
+-    std::size_t host_staging_bytes{};    ///< Physical fixed-block HOST allocation charge
+-  };
+-
+   friend struct accumulated_bloom_test_access;
+ 
+   /**
+-   * @brief `finish`, optionally forcing HOST staging and reporting the workspace it acquired.
++   * @brief `finish` with its policy injected; tests reach it through
++   * `accumulated_bloom_test_access`.
+    *
+-   * Tests reach it through `accumulated_bloom_test_access`; production calls `finish`.
++   * @throw accumulation_invariant_error if @p islands joins GPUs without mutual pool access
++   * @param islands One island id per replica GPU, dividing the builder's own islands further
++   * (single-GPU islands make a machine without peer access); empty for the builder's own
++   * @param or_runner Runs the host ORs
++   * @param report Receives the workspace `unite` held, when not null
+    */
+   [[nodiscard]] std::optional<publication> finish_impl(rmm::cuda_device_id root,
+                                                        ::cuda::stream_ref stream,
+                                                        rmm::device_async_resource_ref scratch_mr,
+-                                                       bool force_host,
+-                                                       workspace_observation* observation);
++                                                       std::span<std::uint8_t const> islands,
++                                                       union_or_runner or_runner,
++                                                       union_report* report);
+ 
+   struct impl;
+   explicit accumulated_bloom_builder(std::unique_ptr<impl> state) noexcept;
+diff --git a/src/op/dynamic_filter/dynamic_filter_publisher.cpp b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
+index 70412286..a7eb9318 100644
+--- a/src/op/dynamic_filter/dynamic_filter_publisher.cpp
++++ b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
+@@ -641,9 +641,9 @@ struct dynamic_filter_publication_session::state {
+         skip_locked(attempt_counters::skipped_admission);
+         return;
+       }
++      using route = detail::accumulated_bloom_builder::publication_route;
+       bool const host_staged =
+-        constructed->transport ==
+-        detail::accumulated_bloom_builder::publication_transport::HOST_STAGED;
++        constructed->route == route::HOST || constructed->route == route::PEER_AND_HOST;
+       auto const& planned = construction->plan().keys;
+       std::vector<key_filters> per_key(plan.admitted_keys().size());
+       {
+@@ -727,6 +727,8 @@ struct dynamic_filter_publication_session::state {
+       outcome.bindings_skipped_incompatible_probe += counts.incompatible_probes;
+       outcome.accumulation_publications_finished    = published ? 1 : 0;
+       outcome.accumulation_publications_host_staged = published && host_staged ? 1 : 0;
++      outcome.accumulation_publications_degraded =
++        published && constructed->bloom_degraded ? 1 : 0;
+       if (latency) {
+         outcome.accumulation_publication_latency_ns = static_cast<std::uint64_t>(
+           std::chrono::duration_cast<std::chrono::nanoseconds>(*latency).count());
+diff --git a/src/op/dynamic_filter/dynamic_filter_stats.hpp b/src/op/dynamic_filter/dynamic_filter_stats.hpp
+index 1f9ae428..a8a21d05 100644
+--- a/src/op/dynamic_filter/dynamic_filter_stats.hpp
++++ b/src/op/dynamic_filter/dynamic_filter_stats.hpp
+@@ -67,8 +67,10 @@ namespace sirius::op {
+  * - `accumulation_storage_leaks`: an attempt whose storage was deliberately leaked because GPU work
+  *   might still use it after a failed host join; it also counts in `accumulations_skipped_error`.
+  * - `accumulation_publications_finished`: a fan-out that pushed at least one filter.
+- * - `accumulation_publications_host_staged`: such a fan-out whose replicas were staged through HOST
+- *   memory instead of copied between GPU pools.
++ * - `accumulation_publications_host_staged`: such a fan-out whose Bloom arrays crossed pinned HOST
++ *   memory between GPUs that cannot copy to each other directly.
++ * - `accumulation_publications_degraded`: such a fan-out whose Bloom transfer was refused workspace
++ *   and used the host in place of device-to-device copies, or fewer chunks in flight.
+  * - `accumulation_publication_latency_ns`: one nanosecond from the Publishing Task's last
+  *   Contribution to the first push, summed over every attempt that published a filter.
+  * - `keys_skipped_bloom_size_gate`: a planned Bloom key whose membership was dropped because the
+@@ -147,6 +149,7 @@ struct dynamic_filter_counters {
+   Counter accumulation_storage_leaks{};
+   Counter accumulation_publications_finished{};
+   Counter accumulation_publications_host_staged{};
++  Counter accumulation_publications_degraded{};
+   Counter accumulation_publication_latency_ns{};
+   Counter keys_skipped_bloom_size_gate{};
+   Counter keys_sized_on_total_rows{};
+@@ -201,6 +204,7 @@ inline constexpr std::array dynamic_filter_counter_fields{
+   &dynamic_filter_counters<Counter>::accumulation_storage_leaks,
+   &dynamic_filter_counters<Counter>::accumulation_publications_finished,
+   &dynamic_filter_counters<Counter>::accumulation_publications_host_staged,
++  &dynamic_filter_counters<Counter>::accumulation_publications_degraded,
+   &dynamic_filter_counters<Counter>::accumulation_publication_latency_ns,
+   &dynamic_filter_counters<Counter>::keys_skipped_bloom_size_gate,
+   &dynamic_filter_counters<Counter>::keys_sized_on_total_rows,
+diff --git a/src/cuda/union_transfer.cu b/src/cuda/union_transfer.cu
 new file mode 100644
-index 00000000..cc3c32af
+index 00000000..ced92dfc
 --- /dev/null
-+++ b/src/memory/host_or.cpp
-@@ -0,0 +1,221 @@
++++ b/src/cuda/union_transfer.cu
+@@ -0,0 +1,776 @@
 +/*
 + * Copyright 2026, Sirius Contributors.
 + *
@@ -65,217 +931,772 @@ index 00000000..cc3c32af
 + * limitations under the License.
 + */
 +
++#include "cuda/device_copy_batch.hpp"
 +#include "memory/host_or.hpp"
++#include "memory/runtime_stream_pool.hpp"
++
++#include <rmm/cuda_device.hpp>
++#include <rmm/device_buffer.hpp>
++#include <rmm/error.hpp>
++
++#include <cuda/accumulation_partial.cuh>
++#include <cuda/utility>
++
++#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
++#include <cucascade/memory/memory_space.hpp>
++#include <log/logging.hpp>
++#include <op/dynamic_filter/detail/accumulated_bloom_builder.hpp>
++#include <op/dynamic_filter/detail/union_plan.hpp>
++#include <op/dynamic_filter/detail/union_transfer.hpp>
++#include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
++#include <sirius/exception.hpp>
++#include <telemetry/nvtx.hpp>
 +
 +#include <algorithm>
-+#include <chrono>
++#include <array>
 +#include <cstdint>
-+#include <cstring>
-+#include <thread>
++#include <limits>
++#include <memory>
++#include <new>
++#include <optional>
++#include <span>
++#include <utility>
++#include <vector>
 +
-+#if defined(__x86_64__)
-+#include <immintrin.h>
-+#endif
-+
-+namespace sirius::memory {
++namespace sirius::op::detail {
 +
 +namespace {
 +
-+void or_bytes(std::span<std::span<std::byte const> const> inputs,
-+              std::byte* out,
-+              std::size_t first,
-+              std::size_t last) noexcept
++using stream_lease = sirius::memory::runtime_stream_pool::lease;
++
++// ORs the scratch slot of every source into the leader's chunk. Slot i of the scratch holds
++// source i's copy of the chunk.
++__global__ void or_chunk_slots(uint4* destination,
++                               uint4 const* scratch,
++                               std::size_t slot_stride,
++                               int source_count,
++                               std::size_t count)
 +{
-+  for (auto index = first; index < last; ++index) {
-+    auto value = inputs.front()[index];
-+    for (auto const& input : inputs.subspan(1)) {
-+      value |= input[index];
++  auto const stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
++  for (auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < count;
++       index += stride) {
++    uint4 value = destination[index];
++    for (int source = 0; source < source_count; ++source) {
++      uint4 const slot = scratch[static_cast<std::size_t>(source) * slot_stride + index];
++      value.x |= slot.x;
++      value.y |= slot.y;
++      value.z |= slot.z;
++      value.w |= slot.w;
 +    }
-+    out[index] = value;
++    destination[index] = value;
 +  }
 +}
 +
-+void or_words(std::span<std::span<std::byte const> const> inputs, std::span<std::byte> out) noexcept
++/**
++ * @brief Launches `or_chunk_slots` over one chunk of @p bytes, a whole number of 16-byte words.
++ *
++ * @param chunk The leader's chunk, which receives the union
++ * @param scratch The first source slot; slot i starts at `i * slot_bytes`
++ * @param slot_bytes Distance between source slots
++ * @param sources Number of filled source slots
++ * @param bytes Bytes of the chunk
++ * @param stream The leader's stream
++ */
++void enqueue_or_chunk(std::byte* chunk,
++                      std::byte const* scratch,
++                      std::size_t slot_bytes,
++                      std::size_t sources,
++                      std::size_t bytes,
++                      cudaStream_t stream)
 +{
-+  auto const whole = out.size() - out.size() % sizeof(std::uint64_t);
-+  for (std::size_t index = 0; index < whole; index += sizeof(std::uint64_t)) {
-+    std::uint64_t value = 0;
-+    for (auto const& input : inputs) {
-+      std::uint64_t word;
-+      std::memcpy(&word, input.data() + index, sizeof(word));
-+      value |= word;
-+    }
-+    std::memcpy(out.data() + index, &value, sizeof(value));
-+  }
-+  or_bytes(inputs, out.data(), whole, out.size());
++  constexpr unsigned threads = 256;
++  auto const words           = bytes / sizeof(uint4);
++  auto const blocks =
++    static_cast<unsigned>(std::min<std::size_t>(::cuda::ceil_div(words, threads), 4096));
++  check_cuda(cudaGetLastError(), "pending CUDA error before or_chunk_slots");
++  or_chunk_slots<<<blocks, threads, 0, stream>>>(reinterpret_cast<uint4*>(chunk),
++                                                 reinterpret_cast<uint4 const*>(scratch),
++                                                 slot_bytes / sizeof(uint4),
++                                                 static_cast<int>(sources),
++                                                 words);
++  check_cuda(cudaGetLastError(), "or_chunk_slots", true);
 +}
 +
-+#if defined(__x86_64__)
-+constexpr std::size_t vector_bytes = 64;
-+
-+__attribute__((target("avx512f"))) void or_avx512(
-+  std::span<std::span<std::byte const> const> inputs, std::span<std::byte> out) noexcept
++[[nodiscard]] std::size_t multiply(std::size_t left, std::size_t right)
 +{
-+  // Non-temporal stores need an aligned destination.
-+  auto const address = reinterpret_cast<std::uintptr_t>(out.data());
-+  auto const head    = std::min(out.size(), (vector_bytes - address % vector_bytes) % vector_bytes);
-+  auto const whole   = head + (out.size() - head) / vector_bytes * vector_bytes;
-+  or_bytes(inputs, out.data(), 0, head);
-+  for (auto index = head; index < whole; index += vector_bytes) {
-+    auto value = _mm512_loadu_si512(inputs.front().data() + index);
-+    for (auto const& input : inputs.subspan(1)) {
-+      value = _mm512_or_si512(value, _mm512_loadu_si512(input.data() + index));
-+    }
-+    _mm512_stream_si512(reinterpret_cast<__m512i*>(out.data() + index), value);
++  if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right) {
++    throw accumulation_invariant_error{"array union byte count overflow"};
 +  }
-+  // Order the non-temporal stores before whatever reads the output next.
-+  _mm_sfence();
-+  or_bytes(inputs, out.data(), whole, out.size());
++  return left * right;
 +}
-+#endif
 +
-+void pause() noexcept
++/**
++ * @brief An event that is created and destroyed with its GPU current.
++ */
++class device_event {
++ public:
++  explicit device_event(int device) : _device{device}, _event{make_event_on(device)} {}
++
++  ~device_event()
++  {
++    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_device}};
++    _event.reset();
++  }
++
++  device_event(device_event&&) noexcept            = default;
++  device_event& operator=(device_event&&) noexcept = delete;
++
++  [[nodiscard]] cudaEvent_t get() const noexcept { return _event->get(); }
++
++ private:
++  int _device;
++  std::optional<cuda_event> _event;
++};
++
++/// One chunk of one array.
++struct chunk {
++  std::size_t array;
++  std::size_t offset;
++  std::size_t bytes;
++};
++
++/**
++ * @brief One island's workspace: scratch, streams and events, all on its leader's GPU except the
++ * events its sources record.
++ */
++struct island_state {
++  int device;                           // The leader's GPU
++  std::uint8_t leader;                  // Index into the request's members
++  std::vector<std::uint8_t> sources;    // Contributing members other than the leader
++  std::vector<std::uint8_t> others;     // Every member other than the leader
++  bool input   = false;                 // Copies its chunks to the host
++  bool uploads = false;                 // Receives chunks from the host
++  std::size_t input_index = 0;          // Its position among the inputs
++
++  std::optional<stream_lease> ingress_lease;  // Absent for the root, which uses the caller's stream
++  cudaStream_t ingress = nullptr;             // Carries the peer copies into scratch
++  std::optional<stream_lease> download;       // Leader to host
++  std::optional<stream_lease> upload;         // Host to leader
++  std::optional<scoped_replica_reservation> scratch_lease;  // Absent for the root
++  std::unique_ptr<rmm::device_buffer> scratch;  // Up to two buffers of one slot per source
++
++  std::vector<device_event> source_ready;  // Per source: its earlier writes are complete
++  std::optional<device_event> ready;       // The leader's earlier writes are complete
++  std::vector<device_event> ingress_done;  // Per scratch buffer: its peer copies landed
++  std::vector<device_event> merged;        // Per scratch buffer: it was ORed into the leader
++  std::vector<device_event> down_done;     // Per window chunk: the leader's copy is on the host
++  std::vector<device_event> up_done;       // Per window chunk: the host's copy is on the leader
++
++  island_state(int leader_device, union_plan::island const& roles)
++    : device{leader_device}, leader{roles.leader}, sources{roles.sources}, others{roles.others}
++  {
++  }
++
++  island_state(island_state&&) noexcept = default;
++
++  ~island_state()
++  {
++    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
++    scratch.reset();
++    // The reservation is detached only after the scratch it accounts for is freed.
++    scratch_lease.reset();
++    upload.reset();
++    download.reset();
++    ingress_lease.reset();
++  }
++};
++
++/**
++ * @brief One `unite` call: its plan, its workspace, and the order in which transfers are submitted.
++ *
++ * Ordering rules, with chunks numbered over all arrays, `buffer = chunk % 2` and
++ * `slot = chunk % window`:
++ * - A scratch buffer is refilled only after the merge that read it (`merged[buffer]` of two
++ *   chunks earlier).
++ * - A download follows its leader's merge of that chunk, and refills its host slot only after the
++ *   readers of the previous content: the host OR, which finished before the download is submitted,
++ *   or the other leaders' uploads when a single input is passed through (`up_done[slot]`).
++ * - An upload follows the download of the same chunk from its own leader, so a leader's chunk is
++ *   never overwritten before it was read.
++ * - A fan-out copy follows whatever last wrote the leader's chunk.
++ * An event is recorded again for every chunk; each wait on it is submitted before its next record.
++ */
++class union_run {
++ public:
++  union_run(union_request const& request, union_or_runner runner)
++    : _request{request}, _runner{runner}
++  {
++    _report.device_scratch_bytes.assign(request.members.size(), 0);
++    for (std::size_t array = 0; array < request.shapes.size(); ++array) {
++      auto const& shape = request.shapes[array];
++      for (std::size_t offset = 0; offset < shape.bytes; offset += shape.chunk_bytes) {
++        _chunks.push_back({array, offset, std::min(shape.chunk_bytes, shape.bytes - offset)});
++      }
++      _slot_bytes = std::max(_slot_bytes, std::min(shape.chunk_bytes, shape.bytes));
++    }
++  }
++
++  /**
++   * @brief Plans the roles and acquires all workspace; submits nothing.
++   *
++   * @return false iff the smallest pinned window was refused
++   */
++  [[nodiscard]] bool prepare()
++  {
++    auto const members = _request.members.size();
++    // std::vector<bool> has no contiguous storage to view.
++    auto const contributed = std::make_unique<bool[]>(members);
++    std::ranges::transform(_request.members, contributed.get(), &union_member::contributed);
++    auto plan = union_plan::make(_request.island_ids, {contributed.get(), members}, _request.root);
++    _joined.push_back(_request.root_stream);
++    for (auto const& member : _request.members) {
++      _joined.push_back(member.stream);
++    }
++    if (plan.moves_nothing() || _chunks.empty()) {
++      _report.islands = static_cast<std::uint8_t>(plan.islands.size());
++      return true;
++    }
++    for (std::size_t index = 0; index < plan.islands.size(); ++index) {
++      if (plan.islands[index].sources.empty()) {
++        _islands.emplace_back(device_of(plan.islands[index].leader), plan.islands[index]);
++      } else if (!add_merging_island(plan.islands[index])) {
++        // Its members follow as single-member islands, which need no scratch.
++        plan             = plan.split(index);
++        _report.degraded = true;
++        --index;
++      }
++    }
++    _inputs       = plan.inputs();
++    _crosses_host = plan.crosses_host();
++    for (std::size_t index = 0; index < _islands.size(); ++index) {
++      auto& entry       = _islands[index];
++      auto const& roles = plan.islands[index];
++      entry.input       = _crosses_host && roles.contributes();
++      entry.uploads     = plan.uploads(roles);
++      _report.peer_copies = _report.peer_copies || !entry.others.empty();
++    }
++    if (_crosses_host && !acquire_window(plan.host_slots())) { return false; }
++    acquire_streams_and_events();
++    _report.islands       = static_cast<std::uint8_t>(_islands.size());
++    _report.host_inputs   = static_cast<std::uint8_t>(_crosses_host ? _inputs : 0);
++    _report.window_chunks = static_cast<std::uint8_t>(_window);
++    return true;
++  }
++
++  /// Every stream the call may have submitted work to.
++  [[nodiscard]] std::span<::cuda::stream_ref const> streams() const noexcept { return _joined; }
++
++  /// Submits every transfer, running the host ORs in between.
++  void submit()
++  {
++    if (_islands.empty()) { return; }
++    order_after_earlier_writes();
++    auto const count = _chunks.size();
++    if (_crosses_host && _inputs >= 2) {
++      // Only the host OR blocks this thread, so the transfers that feed later ORs are submitted
++      // ahead of it: downloads one window ahead, merges two chunks ahead of the downloads. Merge
++      // (j + 2) records the event download j waits on again, so it may not be submitted earlier.
++      std::size_t downloaded = 0;
++      std::size_t merged     = 0;
++      for (std::size_t sequence = 0; sequence < count; ++sequence) {
++        for (; downloaded < std::min(sequence + _window, count); ++downloaded) {
++          if (merged == downloaded) { submit_merge(merged++); }
++          submit_download(downloaded);
++        }
++        for (; merged < std::min(downloaded + 2, count); ++merged) {
++          submit_merge(merged);
++        }
++        combine_on_host(sequence);
++        submit_upload(sequence);
++        submit_fan_out(sequence);
++      }
++      return;
++    }
++    for (std::size_t sequence = 0; sequence < count; ++sequence) {
++      submit_merge(sequence);
++      if (_crosses_host) {
++        submit_download(sequence);
++        submit_upload(sequence);
++      }
++      submit_fan_out(sequence);
++    }
++  }
++
++  /// Waits on the host for every stream of `streams()`.
++  void wait() const
++  {
++    nvtx_scoped_range wait_range{"dynfilter::accum::late_wait"};
++    for (auto const stream : _joined) {
++      check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(array union)");
++    }
++  }
++
++  [[nodiscard]] union_report take_report() noexcept { return std::move(_report); }
++
++ private:
++  [[nodiscard]] int device_of(std::size_t member) const
++  {
++    return _request.members[member].space->get_device_id();
++  }
++
++  [[nodiscard]] std::byte* chunk_of(std::size_t member, chunk const& piece) const noexcept
++  {
++    return _request.members[member].arrays[piece.array] + piece.offset;
++  }
++
++  [[nodiscard]] cudaStream_t stream_of(std::size_t member) const noexcept
++  {
++    return _request.members[member].stream.get();
++  }
++
++  /**
++   * @brief Adds an island with sources once its merge scratch is acquired: from the caller's
++   * resource for the root, from a reservation in the leader's space otherwise.
++   *
++   * @return false, adding nothing, iff the scratch was refused
++   */
++  [[nodiscard]] bool add_merging_island(union_plan::island const& roles)
++  {
++    auto const buffers = std::min<std::size_t>(2, _chunks.size());
++    auto const bytes   = multiply(multiply(buffers, roles.sources.size()), _slot_bytes);
++    if (bytes > std::numeric_limits<std::size_t>::max() - (rmm::CUDA_ALLOCATION_ALIGNMENT - 1)) {
++      throw accumulation_invariant_error{"array union scratch alignment overflow"};
++    }
++    auto const charge = tracked_replica_allocation_bytes(bytes);
++    island_state entry{device_of(roles.leader), roles};
++    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.device}};
++    bool refused = false;
++    try {
++      if (roles.leader == _request.root) {
++        entry.ingress = _request.root_stream.get();
++        entry.scratch = std::make_unique<rmm::device_buffer>(
++          bytes, _request.root_stream, _request.root_scratch);
++      } else {
++        auto& space = *_request.members[roles.leader].space;
++        entry.ingress_lease.emplace(sirius::memory::runtime_stream_pool::acquire(space));
++        entry.ingress       = entry.ingress_lease->get().get();
++        auto lease = scoped_replica_reservation::try_acquire(
++          space, charge, ::cuda::stream_ref{entry.ingress});
++        if (lease) {
++          entry.scratch_lease.emplace(std::move(*lease));
++          entry.scratch = std::make_unique<rmm::device_buffer>(
++            bytes, ::cuda::stream_ref{entry.ingress}, entry.scratch_lease->allocator());
++        } else {
++          refused = true;
++        }
++      }
++    } catch (rmm::out_of_memory const&) {
++      refused = true;
++    }
++    if (refused) {
++      SIRIUS_LOG_INFO(
++        "[unite] GPU {} refused {} bytes of merge scratch: its island of {} GPUs exchanges through "
++        "the host instead of copying device to device.",
++        entry.device,
++        charge,
++        roles.others.size() + 1);
++      return false;
++    }
++    if (entry.ingress_lease) { _joined.push_back(::cuda::stream_ref{entry.ingress}); }
++    _report.device_scratch_bytes[roles.leader] = charge;
++    _islands.push_back(std::move(entry));
++    return true;
++  }
++
++  /**
++   * @brief Takes the pinned window: @p slots chunk slots for each chunk in flight, two chunks in
++   * flight when the pool allows it, else one.
++   *
++   * @return false iff one chunk in flight was refused too
++   */
++  [[nodiscard]] bool acquire_window(std::size_t slots)
++  {
++    auto* const host = _request.host;
++    if (host == nullptr || host->get_block_size() == 0) {
++      throw accumulation_invariant_error{"an array union across islands requires fixed HOST blocks"};
++    }
++    _block_bytes      = host->get_block_size();
++    _slot_blocks      = ::cuda::ceil_div(_slot_bytes, _block_bytes);
++    _window_slots     = slots;
++    auto const wanted = std::min<std::size_t>(2, _chunks.size());
++    for (_window = wanted; _window != 0; --_window) {
++      auto const bytes = multiply(multiply(multiply(_window, slots), _slot_blocks), _block_bytes);
++      try {
++        _window_blocks = host->allocate_multiple_blocks(bytes);
++      } catch (std::bad_alloc const&) {
++        SIRIUS_LOG_INFO("[unite] the pinned HOST pool refused a window of {} bytes ({} chunk(s) in "
++                        "flight for {} input(s)).",
++                        bytes,
++                        _window,
++                        _inputs);
++        continue;
++      }
++      if (_window_blocks->size_bytes() < bytes) {
++        throw accumulation_invariant_error{"the array union's HOST window is smaller than asked"};
++      }
++      _report.host_window_bytes = _window_blocks->size_bytes();
++      _report.degraded          = _report.degraded || _window != wanted;
++      _copies.reserve(_slot_blocks);
++      if (_inputs >= 2) {
++        _parts = static_cast<unsigned>(
++          std::clamp<std::size_t>(std::min<std::size_t>(_runner.max_parts, 2 * _inputs),
++                                  1,
++                                  std::max<std::size_t>(1, _slot_bytes / minimum_part_bytes)));
++        _or_inputs.resize(_parts * _inputs);
++      }
++      return true;
++    }
++    return false;
++  }
++
++  void acquire_streams_and_events()
++  {
++    auto const buffers = std::min<std::size_t>(2, _chunks.size());
++    std::size_t inputs = 0;
++    for (auto& entry : _islands) {
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.device}};
++      auto const& space = *_request.members[entry.leader].space;
++      for (auto const source : entry.sources) {
++        entry.source_ready.emplace_back(device_of(source));
++      }
++      if (!entry.sources.empty()) {
++        for (std::size_t buffer = 0; buffer < buffers; ++buffer) {
++          entry.ingress_done.emplace_back(entry.device);
++          entry.merged.emplace_back(entry.device);
++        }
++      }
++      entry.ready.emplace(entry.device);
++      if (entry.input) {
++        entry.input_index = inputs++;
++        entry.download.emplace(sirius::memory::runtime_stream_pool::acquire(space));
++        _joined.push_back(entry.download->get());
++      }
++      if (entry.uploads) {
++        entry.upload.emplace(sirius::memory::runtime_stream_pool::acquire(space));
++        _joined.push_back(entry.upload->get());
++      }
++      for (std::size_t slot = 0; slot < _window; ++slot) {
++        if (entry.input) { entry.down_done.emplace_back(entry.device); }
++        if (entry.uploads) { entry.up_done.emplace_back(entry.device); }
++      }
++    }
++  }
++
++  /// Orders the first read or overwrite of every array after the writes its stream already holds.
++  void order_after_earlier_writes()
++  {
++    for (auto& entry : _islands) {
++      for (std::size_t index = 0; index < entry.sources.size(); ++index) {
++        auto const source = entry.sources[index];
++        {
++          rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_of(source)}};
++          check_cuda(cudaEventRecord(entry.source_ready[index].get(), stream_of(source)),
++                     "cudaEventRecord(source ready)");
++        }
++        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.device}};
++        check_cuda(cudaStreamWaitEvent(entry.ingress, entry.source_ready[index].get(), 0),
++                   "cudaStreamWaitEvent(source ready)");
++      }
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.device}};
++      check_cuda(cudaEventRecord(entry.ready->get(), stream_of(entry.leader)),
++                 "cudaEventRecord(leader ready)");
++      if (entry.input) {
++        check_cuda(cudaStreamWaitEvent(entry.download->get().get(), entry.ready->get(), 0),
++                   "cudaStreamWaitEvent(leader ready)");
++      }
++      if (entry.uploads) {
++        check_cuda(cudaStreamWaitEvent(entry.upload->get().get(), entry.ready->get(), 0),
++                   "cudaStreamWaitEvent(leader ready)");
++      }
++      if (entry.uploads || !entry.sources.empty()) { continue; }
++      // Nothing writes this leader's chunks any more: its members wait for it once.
++      for (auto const member : entry.others) {
++        rmm::cuda_set_device_raii member_guard{rmm::cuda_device_id{device_of(member)}};
++        check_cuda(cudaStreamWaitEvent(stream_of(member), entry.ready->get(), 0),
++                   "cudaStreamWaitEvent(leader ready)");
++      }
++    }
++  }
++
++  /// Merge: peer copies of every source's chunk into scratch, then their OR into the leader's.
++  void submit_merge(std::size_t sequence)
++  {
++    auto const& piece = _chunks[sequence];
++    auto const buffer = sequence % 2;
++    for (auto& entry : _islands) {
++      if (entry.sources.empty()) { continue; }
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.device}};
++      if (sequence >= 2) {
++        check_cuda(cudaStreamWaitEvent(entry.ingress, entry.merged[buffer].get(), 0),
++                   "cudaStreamWaitEvent(scratch reuse)");
++      }
++      auto* const slots = static_cast<std::byte*>(entry.scratch->data()) +
++                          buffer * entry.sources.size() * _slot_bytes;
++      for (std::size_t index = 0; index < entry.sources.size(); ++index) {
++        auto const source = entry.sources[index];
++        check_cuda(cudaMemcpyPeerAsync(slots + index * _slot_bytes,
++                                       entry.device,
++                                       chunk_of(source, piece),
++                                       device_of(source),
++                                       piece.bytes,
++                                       entry.ingress),
++                   "cudaMemcpyPeerAsync(ingress)");
++      }
++      check_cuda(cudaEventRecord(entry.ingress_done[buffer].get(), entry.ingress),
++                 "cudaEventRecord(ingress)");
++      auto const leader_stream = stream_of(entry.leader);
++      check_cuda(cudaStreamWaitEvent(leader_stream, entry.ingress_done[buffer].get(), 0),
++                 "cudaStreamWaitEvent(ingress)");
++      enqueue_or_chunk(chunk_of(entry.leader, piece),
++                       slots,
++                       _slot_bytes,
++                       entry.sources.size(),
++                       piece.bytes,
++                       leader_stream);
++      check_cuda(cudaEventRecord(entry.merged[buffer].get(), leader_stream),
++                 "cudaEventRecord(merged)");
++    }
++  }
++
++  /// The pinned blocks of host slot @p slot for the chunk at window position @p position.
++  [[nodiscard]] std::size_t first_block(std::size_t position, std::size_t slot) const noexcept
++  {
++    return (position * _window_slots + slot) * _slot_blocks;
++  }
++
++  /// Submits one batch of copies between a leader's chunk and the blocks of a host slot.
++  void submit_host_copy(cudaStream_t stream,
++                        std::byte* device_bytes,
++                        std::size_t bytes,
++                        std::size_t block,
++                        bool to_host)
++  {
++    _copies.clear();
++    for (std::size_t offset = 0; offset < bytes; ++block) {
++      auto* const host_bytes = _window_blocks->at(block).data();
++      auto const count       = std::min(_block_bytes, bytes - offset);
++      if (to_host) {
++        _copies.add(host_bytes, device_bytes + offset, count);
++      } else {
++        _copies.add(device_bytes + offset, host_bytes, count);
++      }
++      offset += count;
++    }
++    check_cuda(_copies.enqueue(::cuda::stream_ref{stream}), "device_copy_batch::enqueue(array union)");
++  }
++
++  /// Cross, first half: every contributing leader copies its chunk to its host slot.
++  void submit_download(std::size_t sequence)
++  {
++    auto const& piece   = _chunks[sequence];
++    auto const position = sequence % _window;
++    for (auto& entry : _islands) {
++      if (!entry.input) { continue; }
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.device}};
++      auto const stream = entry.download->get().get();
++      if (!entry.sources.empty()) {
++        check_cuda(cudaStreamWaitEvent(stream, entry.merged[sequence % 2].get(), 0),
++                   "cudaStreamWaitEvent(merged)");
++      }
++      if (_inputs == 1 && sequence >= _window) {
++        // Passed through: the other leaders' uploads of the previous chunk here read this slot.
++        for (auto const& reader : _islands) {
++          if (!reader.uploads) { continue; }
++          check_cuda(cudaStreamWaitEvent(stream, reader.up_done[position].get(), 0),
++                     "cudaStreamWaitEvent(window reuse)");
++        }
++      }
++      submit_host_copy(stream,
++                       chunk_of(entry.leader, piece),
++                       piece.bytes,
++                       first_block(position, entry.input_index),
++                       true);
++      check_cuda(cudaEventRecord(entry.down_done[position].get(), stream),
++                 "cudaEventRecord(download)");
++    }
++  }
++
++  /// Cross, between the halves: waits for the inputs of one chunk and ORs them into its output slot.
++  void combine_on_host(std::size_t sequence)
++  {
++    auto const position = sequence % _window;
++    for (auto const& entry : _islands) {
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.device}};
++      if (entry.input) {
++        check_cuda(cudaEventSynchronize(entry.down_done[position].get()),
++                   "cudaEventSynchronize(download)");
++      }
++      if (entry.uploads && sequence >= _window) {
++        // The uploads of the previous chunk at this window position read the output slot.
++        check_cuda(cudaEventSynchronize(entry.up_done[position].get()),
++                   "cudaEventSynchronize(upload)");
++      }
++    }
++    nvtx_scoped_range or_range{"dynfilter::accum::host_or"};
++    or_job job{this, position, _chunks[sequence].bytes};
++    _runner.run(
++      _runner.executor,
++      _parts,
++      [](void* context, unsigned part) noexcept {
++        auto const& current = *static_cast<or_job const*>(context);
++        current.owner->combine_part(current.position, current.bytes, part);
++      },
++      &job);
++  }
++
++  /// ORs one part of a chunk: an equal share of its bytes, cut at 64-byte boundaries.
++  void combine_part(std::size_t position, std::size_t bytes, unsigned part) noexcept
++  {
++    constexpr std::size_t cut = 64;
++    auto const share          = [&](unsigned index) {
++      return index >= _parts ? bytes : bytes / _parts * index / cut * cut;
++    };
++    auto const inputs = std::span{_or_inputs}.subspan(part * _inputs, _inputs);
++    auto const out    = first_block(position, _inputs);
++    for (auto offset = share(part); offset < share(part + 1);) {
++      auto const block  = offset / _block_bytes;
++      auto const within = offset % _block_bytes;
++      auto const count  = std::min(_block_bytes - within, share(part + 1) - offset);
++      for (std::size_t input = 0; input < _inputs; ++input) {
++        inputs[input] =
++          _window_blocks->at(first_block(position, input) + block).subspan(within, count);
++      }
++      sirius::memory::host_or(inputs, _window_blocks->at(out + block).subspan(within, count));
++      offset += count;
++    }
++  }
++
++  /// Cross, second half: every receiving leader copies the union from the host into its chunk.
++  void submit_upload(std::size_t sequence)
++  {
++    auto const& piece   = _chunks[sequence];
++    auto const position = sequence % _window;
++    // The single input's slot when it is passed through, else the host OR's output slot.
++    auto const* const passed =
++      _inputs == 1 ? std::to_address(std::ranges::find_if(_islands, &island_state::input))
++                   : nullptr;
++    for (auto& entry : _islands) {
++      if (!entry.uploads) { continue; }
++      rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.device}};
++      auto const stream = entry.upload->get().get();
++      if (passed != nullptr) {
++        check_cuda(cudaStreamWaitEvent(stream, passed->down_done[position].get(), 0),
++                   "cudaStreamWaitEvent(download)");
++      }
++      submit_host_copy(stream,
++                       chunk_of(entry.leader, piece),
++                       piece.bytes,
++                       first_block(position, passed != nullptr ? 0 : _inputs),
++                       false);
++      check_cuda(cudaEventRecord(entry.up_done[position].get(), stream),
++                 "cudaEventRecord(upload)");
++    }
++  }
++
++  /// Fan-out: every other member copies its leader's chunk once that chunk is the union.
++  void submit_fan_out(std::size_t sequence)
++  {
++    auto const& piece = _chunks[sequence];
++    for (auto const& entry : _islands) {
++      // A leader that neither uploads nor merges was waited for once, before the first chunk.
++      auto const* const settled = entry.uploads           ? &entry.up_done[sequence % _window]
++                                  : !entry.sources.empty() ? &entry.merged[sequence % 2]
++                                                           : nullptr;
++      for (auto const member : entry.others) {
++        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_of(member)}};
++        if (settled != nullptr) {
++          check_cuda(cudaStreamWaitEvent(stream_of(member), settled->get(), 0),
++                     "cudaStreamWaitEvent(fan-out)");
++        }
++        check_cuda(cudaMemcpyPeerAsync(chunk_of(member, piece),
++                                       device_of(member),
++                                       chunk_of(entry.leader, piece),
++                                       entry.device,
++                                       piece.bytes,
++                                       stream_of(member)),
++                   "cudaMemcpyPeerAsync(fan-out)");
++      }
++    }
++  }
++
++  /// One host OR handed to the executor.
++  struct or_job {
++    union_run* owner;
++    std::size_t position;
++    std::size_t bytes;
++  };
++
++  /// Below this many bytes a part is not worth another thread.
++  static constexpr std::size_t minimum_part_bytes = std::size_t{128} << 10;
++
++  union_request const& _request;
++  union_or_runner _runner;
++  union_report _report;
++  std::vector<chunk> _chunks;      // Every chunk of every array, in submission order
++  std::size_t _slot_bytes = 0;     // The largest chunk: the size of one scratch or host slot
++  std::size_t _inputs     = 0;     // Contributing islands
++  bool _crosses_host      = false;
++  std::size_t _window       = 0;   // Chunks in flight per host input
++  std::size_t _window_slots = 0;   // Host slots per chunk in flight
++  std::size_t _block_bytes  = 0;   // Size of one pinned block
++  std::size_t _slot_blocks  = 0;   // Pinned blocks per host slot
++  unsigned _parts           = 1;   // Parts of one host OR
++  std::vector<std::span<std::byte const>> _or_inputs;  // Per part: its view of every input
++  sirius::cuda::device_copy_batch _copies;
++  std::vector<::cuda::stream_ref> _joined;
++  // Released after the islands, whose streams read and write it.
++  cucascade::memory::fixed_multiple_blocks_allocation _window_blocks;
++  std::vector<island_state> _islands;  // The root's island first
++};
++
++void validate(union_request const& request)
 +{
-+#if defined(__x86_64__)
-+  _mm_pause();
-+#else
-+  std::this_thread::yield();
-+#endif
++  auto const members = request.members.size();
++  bool valid         = members != 0 && members == request.island_ids.size() &&
++                       request.root < members && members <= std::numeric_limits<std::uint8_t>::max();
++  for (auto const& shape : request.shapes) {
++    valid = valid && shape.chunk_bytes != 0 && shape.chunk_bytes % sizeof(uint4) == 0 &&
++            shape.bytes % sizeof(uint4) == 0;
++  }
++  for (auto const& member : request.members) {
++    valid = valid && member.space != nullptr && member.arrays.size() == request.shapes.size();
++  }
++  if (!valid) { throw accumulation_invariant_error{"inconsistent array union request"}; }
 +}
 +
 +}  // namespace
 +
-+void host_or(std::span<std::span<std::byte const> const> inputs, std::span<std::byte> out) noexcept
++std::optional<union_report> unite(union_request const& request, union_or_runner runner)
 +{
-+#if defined(__x86_64__)
-+  static bool const avx512 = __builtin_cpu_supports("avx512f");
-+  if (avx512) { return or_avx512(inputs, out); }
-+#endif
-+  or_words(inputs, out);
-+}
-+
-+unsigned host_or_workers::thread_budget(unsigned hardware_threads) noexcept
-+{
-+  return std::clamp(hardware_threads / 4, 1U, 8U);
-+}
-+
-+std::shared_ptr<host_or_workers> host_or_workers::shared()
-+{
-+  static std::mutex mutex;
-+  static std::weak_ptr<host_or_workers> live;
-+  std::lock_guard lock{mutex};
-+  auto workers = live.lock();
-+  if (!workers) {
-+    workers = std::make_shared<host_or_workers>(thread_budget(std::thread::hardware_concurrency()));
-+    live    = workers;
-+  }
-+  return workers;
-+}
-+
-+host_or_workers::host_or_workers(unsigned threads) : _open_count{0}
-+{
-+  _helpers.reserve(std::max(threads, 1U) - 1);
++  validate(request);
++  std::unique_ptr<union_run> run;
 +  try {
-+    for (unsigned helper = 1; helper < threads; ++helper) {
-+      _helpers.emplace_back([this] { help(); });
-+    }
-+  } catch (...) {
-+    // A thread that cannot start leaves fewer helpers, not a failed engine.
++    run = std::make_unique<union_run>(request, runner);
++    if (!run->prepare()) { return std::nullopt; }
++  } catch (std::bad_alloc const&) {
++    // Nothing was submitted: a refused host allocation only refuses the call.
++    return std::nullopt;
 +  }
++  try {
++    join_on_failure(run->streams(), [&] {
++      run->submit();
++      run->wait();
++    });
++  } catch (unjoined_gpu_work const&) {
++    // Unfinished work may still touch the workspace: never free it or reuse its streams.
++    (void)run.release();
++    throw;
++  }
++  return run->take_report();
 +}
 +
-+host_or_workers::~host_or_workers()
-+{
-+  {
-+    std::lock_guard lock{_mutex};
-+    _stop = true;
-+  }
-+  _wake.notify_all();
-+  for (auto& helper : _helpers) {
-+    helper.join();
-+  }
-+}
-+
-+void host_or_workers::work(job& current) noexcept
-+{
-+  for (auto part = current.next.fetch_add(1, std::memory_order_relaxed); part < current.parts;
-+       part      = current.next.fetch_add(1, std::memory_order_relaxed)) {
-+    current.invoke(current.context, part);
-+  }
-+}
-+
-+void host_or_workers::run_job(unsigned parts, part_function invoke, void* context) noexcept
-+{
-+  job current{invoke, context, parts, 0};
-+  auto const helpers = std::min<std::size_t>(parts == 0 ? 0 : parts - 1, _helpers.size());
-+  if (helpers != 0) {
-+    current.wanted = static_cast<unsigned>(helpers);
-+    {
-+      std::lock_guard lock{_mutex};
-+      _open.push_back(&current);
-+      _open_count.store(static_cast<unsigned>(_open.size()), std::memory_order_release);
-+    }
-+    if (helpers == 1) {
-+      _wake.notify_one();
-+    } else {
-+      _wake.notify_all();
-+    }
-+  }
-+  work(current);
-+  if (helpers == 0) { return; }
-+  {
-+    // After this no helper can join; the ones that did are counted in `inside`.
-+    std::lock_guard lock{_mutex};
-+    std::erase(_open, &current);
-+    _open_count.store(static_cast<unsigned>(_open.size()), std::memory_order_release);
-+  }
-+  // Helpers finish their last part about when this thread finishes its own.
-+  for (unsigned spins = 0; current.inside.load(std::memory_order_acquire) != 0; ++spins) {
-+    if (spins < 4096) {
-+      pause();
-+    } else {
-+      std::this_thread::yield();
-+    }
-+  }
-+}
-+
-+void host_or_workers::help()
-+{
-+  using clock = std::chrono::steady_clock;
-+  std::unique_lock lock{_mutex};
-+  for (;;) {
-+    _wake.wait(lock, [this] { return _stop || !_open.empty(); });
-+    if (_stop) { return; }
-+    for (;;) {
-+      // Holding the mutex: join the oldest open job.
-+      auto* const current = _open.front();
-+      current->inside.fetch_add(1, std::memory_order_relaxed);
-+      if (--current->wanted == 0) {
-+        _open.erase(_open.begin());
-+        _open_count.store(static_cast<unsigned>(_open.size()), std::memory_order_release);
-+      }
-+      lock.unlock();
-+      work(*current);
-+      // The submitter may destroy the job as soon as this count drops: do not touch it afterwards.
-+      current->inside.fetch_sub(1, std::memory_order_release);
-+      auto const deadline = clock::now() + spin_window;
-+      while (_open_count.load(std::memory_order_acquire) == 0 && clock::now() < deadline) {
-+        pause();
-+      }
-+      lock.lock();
-+      if (_stop || _open.empty()) { break; }
-+    }
-+    if (_stop) { return; }
-+  }
-+}
-+
-+}  // namespace sirius::memory
-diff --git a/src/memory/host_or.hpp b/src/memory/host_or.hpp
++}  // namespace sirius::op::detail
+diff --git a/src/op/dynamic_filter/detail/union_transfer.hpp b/src/op/dynamic_filter/detail/union_transfer.hpp
 new file mode 100644
-index 00000000..4889cbef
+index 00000000..18f8c569
 --- /dev/null
-+++ b/src/memory/host_or.hpp
-@@ -0,0 +1,177 @@
++++ b/src/op/dynamic_filter/detail/union_transfer.hpp
+@@ -0,0 +1,158 @@
 +/*
 + * Copyright 2026, Sirius Contributors.
 + *
@@ -293,1049 +1714,144 @@ index 00000000..4889cbef
 + */
 +
 +/**
-+ * @file host_or.hpp
-+ * @brief Bitwise OR of host byte ranges, and the worker threads that split one OR over several
-+ * cores.
++ * @file union_transfer.hpp
++ * @brief Makes equally shaped byte arrays on several GPUs equal to their bitwise OR.
 + *
-+ * `sirius::op::detail::unite` combines the chunks that several GPUs staged in pinned host memory
-+ * with `host_or`. It splits each chunk into parts and hands them to a `host_or_executor`: in the
-+ * engine a `host_or_workers` shared by every publication, in tests an `inline_host_or_executor`.
++ * `accumulated_bloom_builder::finish` is the only caller: its arrays are the per-GPU Bloom partials.
++ * `unite` knows nothing about filters. Using the vocabulary of `union_plan.hpp`, it moves every
++ * array chunk by chunk through up to three stages:
++ *
++ * 1. Merge: inside an island, each contributing member's chunk is copied device to device into the
++ *    leader's scratch and ORed into the leader's chunk on the GPU.
++ * 2. Cross: between islands, every contributing leader copies its chunk into pinned host memory,
++ *    the host ORs those copies (`sirius::memory::host_or`), and every leader copies the result
++ *    back. With a single contributing island the host ORs nothing and the other leaders copy that
++ *    island's chunk.
++ * 3. Fan-out: inside an island, every other member copies the leader's chunk device to device.
++ *
++ * A stage with nothing to do is skipped: GPUs that all reach each other never touch the host, and
++ * GPUs that cannot reach each other at all use only the cross stage.
 + */
 +
 +#pragma once
 +
-+#include <atomic>
-+#include <chrono>
-+#include <concepts>
-+#include <condition_variable>
-+#include <cstddef>
-+#include <memory>
-+#include <mutex>
-+#include <span>
-+#include <thread>
-+#include <type_traits>
-+#include <vector>
++#include "memory/host_or.hpp"
 +
-+namespace sirius::memory {
++#include <rmm/resource_ref.hpp>
 +
-+/**
-+ * @brief Writes the bitwise OR of @p inputs to @p out.
-+ *
-+ * Uses AVX-512 with non-temporal stores when the CPU has it, so the output does not pass through
-+ * the cache on its way to the next device copy; otherwise ORs 8 bytes at a time. Never allocates.
-+ *
-+ * @pre @p inputs is not empty, every input holds at least `out.size()` bytes, and @p out overlaps
-+ * no input
-+ * @param inputs The ranges to combine; only the first `out.size()` bytes of each are read
-+ * @param out The range that receives the union
-+ */
-+void host_or(std::span<std::span<std::byte const> const> inputs, std::span<std::byte> out) noexcept;
-+
-+/**
-+ * @brief Something that runs the parts of one split job, possibly on several threads.
-+ *
-+ * `run(parts, body)` calls `body(i)` exactly once for each `i` in `[0, parts)` and returns after
-+ * every call returned. `max_parts()` is the largest split worth asking for.
-+ */
-+template <class Executor>
-+concept host_or_executor = requires(Executor& executor, void (*body)(unsigned) noexcept) {
-+  { executor.max_parts() } noexcept -> std::convertible_to<unsigned>;
-+  { executor.run(2U, body) } noexcept;
-+};
-+
-+/**
-+ * @brief Runs every part on the calling thread.
-+ */
-+class inline_host_or_executor {
-+ public:
-+  [[nodiscard]] unsigned max_parts() const noexcept { return 1; }
-+
-+  template <std::invocable<unsigned> Body>
-+  void run(unsigned parts, Body&& body) noexcept
-+  {
-+    for (unsigned part = 0; part < parts; ++part) {
-+      body(part);
-+    }
-+  }
-+};
-+
-+/**
-+ * @brief A fixed set of helper threads that run the parts of split jobs together with the threads
-+ * that submit them.
-+ *
-+ * The submitting thread always works on its own job and takes every part no helper has started, so
-+ * a job never waits for a helper: with all helpers busy on other jobs it simply runs on its
-+ * submitter. Jobs from different threads share the helpers part by part.
-+ *
-+ * A helper sleeps while there are no jobs. After finishing a part it keeps polling for the next job
-+ * for `spin_window` before it sleeps again, because the jobs of one publication follow each other
-+ * faster than a sleeping thread wakes up.
-+ */
-+class host_or_workers {
-+ public:
-+  /// How long a helper polls for another job after its last one
-+  static constexpr std::chrono::microseconds spin_window{500};
-+
-+  /**
-+   * @brief Threads one job may use, the submitter included, on a machine with
-+   * @p hardware_threads: a quarter of them, at least 1 and at most 8.
-+   */
-+  [[nodiscard]] static unsigned thread_budget(unsigned hardware_threads) noexcept;
-+
-+  /**
-+   * @brief The process-wide workers, sized by `thread_budget` of this machine.
-+   *
-+   * They live while any returned pointer does: `sirius_memory_reservation_manager` keeps one for
-+   * the engine's lifetime, so the threads are started once. A caller without a live manager gets
-+   * workers of its own that stop when it releases them.
-+   */
-+  [[nodiscard]] static std::shared_ptr<host_or_workers> shared();
-+
-+  /**
-+   * @brief Starts `threads - 1` helpers.
-+   *
-+   * @param threads Threads one job may use, the submitter included; at least 1
-+   */
-+  explicit host_or_workers(unsigned threads);
-+
-+  /// Stops and joins the helpers. No job may be running.
-+  ~host_or_workers();
-+
-+  host_or_workers(host_or_workers const&)            = delete;
-+  host_or_workers& operator=(host_or_workers const&) = delete;
-+
-+  [[nodiscard]] unsigned max_parts() const noexcept
-+  {
-+    return static_cast<unsigned>(_helpers.size()) + 1;
-+  }
-+
-+  /**
-+   * @brief Calls `body(i)` once for each `i` in `[0, parts)`, on this thread and on idle helpers,
-+   * and returns when all calls returned. Thread-safe.
-+   *
-+   * @param parts Number of parts; more than `max_parts()` is allowed and uses no extra thread
-+   * @param body Called concurrently with distinct arguments; must not throw
-+   */
-+  template <std::invocable<unsigned> Body>
-+  void run(unsigned parts, Body&& body) noexcept
-+  {
-+    run_job(
-+      parts,
-+      [](void* context, unsigned part) noexcept {
-+        (*static_cast<std::remove_reference_t<Body>*>(context))(part);
-+      },
-+      std::addressof(body));
-+  }
-+
-+ private:
-+  using part_function = void (*)(void* context, unsigned part) noexcept;
-+
-+  /// One submitted job; lives on its submitter's stack until no helper is inside it.
-+  struct job {
-+    part_function invoke;
-+    void* context;
-+    unsigned parts;
-+    unsigned wanted;                  ///< Helpers still to join; guarded by `_mutex`
-+    std::atomic<unsigned> next{0};    ///< The next part nobody has started
-+    std::atomic<unsigned> inside{0};  ///< Helpers that joined and have not left
-+  };
-+
-+  void run_job(unsigned parts, part_function invoke, void* context) noexcept;
-+  void help();
-+  static void work(job& current) noexcept;
-+
-+  std::mutex _mutex;
-+  std::condition_variable _wake;
-+  std::vector<job*> _open;            ///< Jobs that still want helpers; guarded by `_mutex`
-+  std::atomic<unsigned> _open_count;  ///< `_open.size()`, readable without the mutex
-+  bool _stop = false;                 ///< Guarded by `_mutex`
-+  std::vector<std::thread> _helpers;
-+};
-+
-+}  // namespace sirius::memory
-diff --git a/src/memory/peer_islands.cpp b/src/memory/peer_islands.cpp
-new file mode 100644
-index 00000000..af7b6f89
---- /dev/null
-+++ b/src/memory/peer_islands.cpp
-@@ -0,0 +1,71 @@
-+/*
-+ * Copyright 2026, Sirius Contributors.
-+ *
-+ * Licensed under the Apache License, Version 2.0 (the "License");
-+ * you may not use this file except in compliance with the License.
-+ * You may obtain a copy of the License at
-+ *
-+ *     http://www.apache.org/licenses/LICENSE-2.0
-+ *
-+ * Unless required by applicable law or agreed to in writing, software
-+ * distributed under the License is distributed on an "AS IS" BASIS,
-+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+ * See the License for the specific language governing permissions and
-+ * limitations under the License.
-+ */
-+
-+#include "memory/peer_islands.hpp"
-+
-+#include "memory/pool_peer_access.hpp"
-+
-+#include <cucascade/memory/memory_space.hpp>
-+
-+#include <algorithm>
-+#include <limits>
-+#include <memory>
-+#include <stdexcept>
-+
-+namespace sirius::memory {
-+
-+std::vector<std::uint8_t> islands_from_access(std::size_t count, std::span<bool const> access)
-+{
-+  if (count > std::numeric_limits<std::uint8_t>::max() || access.size() != count * count) {
-+    throw std::invalid_argument{"[islands_from_access] the access matrix does not match the count"};
-+  }
-+  auto const mutual = [&](std::size_t left, std::size_t right) {
-+    return access[left * count + right] && access[right * count + left];
-+  };
-+  std::vector<std::uint8_t> ids(count);
-+  std::uint8_t islands = 0;
-+  for (std::size_t device = 0; device < count; ++device) {
-+    std::uint8_t island = 0;
-+    for (; island < islands; ++island) {
-+      bool fits = true;
-+      for (std::size_t member = 0; member < device && fits; ++member) {
-+        fits = ids[member] != island || mutual(member, device);
-+      }
-+      if (fits) { break; }
-+    }
-+    ids[device] = island;
-+    islands     = std::max<std::uint8_t>(islands, island + 1);
-+  }
-+  return ids;
-+}
-+
-+std::vector<std::uint8_t> peer_islands(
-+  std::span<cucascade::memory::memory_space const* const> spaces)
-+{
-+  auto const count = spaces.size();
-+  // std::vector<bool> has no contiguous storage to view.
-+  auto const access = std::make_unique<bool[]>(count * count);
-+  for (std::size_t owner = 0; owner < count; ++owner) {
-+    for (std::size_t accessor = 0; accessor < count; ++accessor) {
-+      access[owner * count + accessor] =
-+        owner == accessor ||
-+        try_grant_pool_access(*spaces[owner], spaces[accessor]->get_device_id());
-+    }
-+  }
-+  return islands_from_access(count, std::span<bool const>{access.get(), count * count});
-+}
-+
-+}  // namespace sirius::memory
-diff --git a/src/memory/peer_islands.hpp b/src/memory/peer_islands.hpp
-new file mode 100644
-index 00000000..e034efee
---- /dev/null
-+++ b/src/memory/peer_islands.hpp
-@@ -0,0 +1,59 @@
-+/*
-+ * Copyright 2026, Sirius Contributors.
-+ *
-+ * Licensed under the Apache License, Version 2.0 (the "License");
-+ * you may not use this file except in compliance with the License.
-+ * You may obtain a copy of the License at
-+ *
-+ *     http://www.apache.org/licenses/LICENSE-2.0
-+ *
-+ * Unless required by applicable law or agreed to in writing, software
-+ * distributed under the License is distributed on an "AS IS" BASIS,
-+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+ * See the License for the specific language governing permissions and
-+ * limitations under the License.
-+ */
-+
-+#pragma once
++#include <cuda/stream>
 +
 +#include <cstddef>
 +#include <cstdint>
++#include <optional>
 +#include <span>
 +#include <vector>
 +
 +namespace cucascade::memory {
++class fixed_size_host_memory_resource;
 +class memory_space;
-+}
-+
-+namespace sirius::memory {
-+
-+/**
-+ * @brief Groups @p count devices into islands: sets in which every two members can copy directly
-+ * between each other's allocation pools.
-+ *
-+ * A device joins the first island all of whose members it has access with in both directions, else
-+ * it opens a new one; devices are visited in index order. Every island is therefore legal for peer
-+ * copies. When access is not transitive (A-B and B-C but not A-C) the grouping is legal but may use
-+ * more islands than necessary, which costs transfer speed only.
-+ *
-+ * @param count Number of devices
-+ * @param access Row-major `count x count` matrix; `access[owner * count + accessor]` is whether
-+ * `accessor` can read and write `owner`'s pool. The diagonal is ignored
-+ * @return One island id per device; ids are dense and numbered in order of first appearance
-+ */
-+[[nodiscard]] std::vector<std::uint8_t> islands_from_access(std::size_t count,
-+                                                            std::span<bool const> access);
-+
-+/**
-+ * @brief The islands of @p spaces, from `try_grant_pool_access` between every two of them.
-+ *
-+ * Nothing is cached: each call asks for every grant again.
-+ *
-+ * @throw Whatever `try_grant_pool_access` throws
-+ * @param spaces GPU spaces on distinct devices
-+ * @return One island id per space, as `islands_from_access` numbers them
-+ */
-+[[nodiscard]] std::vector<std::uint8_t> peer_islands(
-+  std::span<cucascade::memory::memory_space const* const> spaces);
-+
-+}  // namespace sirius::memory
-diff --git a/src/op/dynamic_filter/detail/union_plan.cpp b/src/op/dynamic_filter/detail/union_plan.cpp
-new file mode 100644
-index 00000000..8b5d81d5
---- /dev/null
-+++ b/src/op/dynamic_filter/detail/union_plan.cpp
-@@ -0,0 +1,109 @@
-+/*
-+ * Copyright 2026, Sirius Contributors.
-+ *
-+ * Licensed under the Apache License, Version 2.0 (the "License");
-+ * you may not use this file except in compliance with the License.
-+ * You may obtain a copy of the License at
-+ *
-+ *     http://www.apache.org/licenses/LICENSE-2.0
-+ *
-+ * Unless required by applicable law or agreed to in writing, software
-+ * distributed under the License is distributed on an "AS IS" BASIS,
-+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+ * See the License for the specific language governing permissions and
-+ * limitations under the License.
-+ */
-+
-+#include "op/dynamic_filter/detail/union_plan.hpp"
-+
-+#include <algorithm>
-+#include <cstddef>
-+#include <limits>
-+#include <stdexcept>
-+
-+namespace sirius::op::detail {
-+
-+union_plan union_plan::make(std::span<std::uint8_t const> island_ids,
-+                            std::span<bool const> contributed,
-+                            std::size_t root)
-+{
-+  auto const members = island_ids.size();
-+  if (members == 0 || members != contributed.size() || root >= members ||
-+      members > std::numeric_limits<std::uint8_t>::max()) {
-+    throw std::invalid_argument{"[union_plan::make] inconsistent members"};
-+  }
-+  union_plan plan;
-+  auto const add_island = [&](std::uint8_t id, std::size_t leader) {
-+    island entry{static_cast<std::uint8_t>(leader), contributed[leader], {}, {}};
-+    for (std::size_t member = 0; member < members; ++member) {
-+      if (island_ids[member] != id || member == leader) { continue; }
-+      entry.others.push_back(static_cast<std::uint8_t>(member));
-+      if (contributed[member]) { entry.sources.push_back(static_cast<std::uint8_t>(member)); }
-+    }
-+    plan.islands.push_back(std::move(entry));
-+  };
-+  add_island(island_ids[root], root);
-+  for (std::size_t first = 0; first < members; ++first) {
-+    auto const id = island_ids[first];
-+    // An island is added at its first member.
-+    if (id == island_ids[root] || std::ranges::find(island_ids.first(first), id) !=
-+                                    island_ids.begin() + static_cast<std::ptrdiff_t>(first)) {
-+      continue;
-+    }
-+    auto leader = first;
-+    for (auto member = first; member < members; ++member) {
-+      if (island_ids[member] == id && contributed[member]) {
-+        leader = member;
-+        break;
-+      }
-+    }
-+    add_island(id, leader);
-+  }
-+  return plan;
-+}
-+
-+union_plan union_plan::split(std::size_t index) const
-+{
-+  union_plan plan;
-+  plan.islands.reserve(islands.size() + islands[index].others.size());
-+  for (std::size_t position = 0; position < islands.size(); ++position) {
-+    auto const& entry = islands[position];
-+    if (position != index) {
-+      plan.islands.push_back(entry);
-+      continue;
-+    }
-+    plan.islands.push_back({entry.leader, entry.leader_contributes, {}, {}});
-+    for (auto const member : entry.others) {
-+      plan.islands.push_back(
-+        {member, std::ranges::find(entry.sources, member) != entry.sources.end(), {}, {}});
-+    }
-+  }
-+  return plan;
-+}
-+
-+std::size_t union_plan::inputs() const noexcept
-+{
-+  return static_cast<std::size_t>(
-+    std::ranges::count_if(islands, [](island const& entry) { return entry.contributes(); }));
-+}
-+
-+bool union_plan::crosses_host() const noexcept { return islands.size() >= 2 && inputs() >= 1; }
-+
-+bool union_plan::moves_nothing() const noexcept
-+{
-+  return inputs() == 0 || (islands.size() == 1 && islands.front().others.empty());
-+}
-+
-+bool union_plan::uploads(island const& entry) const noexcept
-+{
-+  return crosses_host() && (inputs() >= 2 || !entry.contributes());
-+}
-+
-+std::size_t union_plan::host_slots() const noexcept
-+{
-+  if (!crosses_host()) { return 0; }
-+  auto const count = inputs();
-+  return count >= 2 ? count + 1 : 1;
-+}
-+
-+}  // namespace sirius::op::detail
-diff --git a/src/op/dynamic_filter/detail/union_plan.hpp b/src/op/dynamic_filter/detail/union_plan.hpp
-new file mode 100644
-index 00000000..f3d2259c
---- /dev/null
-+++ b/src/op/dynamic_filter/detail/union_plan.hpp
-@@ -0,0 +1,117 @@
-+/*
-+ * Copyright 2026, Sirius Contributors.
-+ *
-+ * Licensed under the Apache License, Version 2.0 (the "License");
-+ * you may not use this file except in compliance with the License.
-+ * You may obtain a copy of the License at
-+ *
-+ *     http://www.apache.org/licenses/LICENSE-2.0
-+ *
-+ * Unless required by applicable law or agreed to in writing, software
-+ * distributed under the License is distributed on an "AS IS" BASIS,
-+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+ * See the License for the specific language governing permissions and
-+ * limitations under the License.
-+ */
-+
-+/**
-+ * @file union_plan.hpp
-+ * @brief Who does what when `unite` makes equally shaped arrays on several GPUs equal to their
-+ * bitwise OR.
-+ *
-+ * Vocabulary, shared with `union_transfer.hpp`:
-+ * - A member is one GPU's copy of the arrays, named by its index in the request.
-+ * - An island is a set of members that can copy directly between each other (see
-+ *   `sirius::memory::peer_islands`).
-+ * - Each island has one leader, the only member that exchanges data with the host.
-+ * - A member contributes if its arrays may hold set bits; the arrays of the others are all zero. An
-+ *   island contributes if any member does, and its leader is then an input of the host stage.
-+ *
-+ * A plan only assigns roles. It is plain host data without any GPU state, fixed before the first
-+ * transfer is submitted.
-+ */
-+
-+#pragma once
-+
-+#include <cstddef>
-+#include <cstdint>
-+#include <span>
-+#include <vector>
++}  // namespace cucascade::memory
 +
 +namespace sirius::op::detail {
 +
 +/**
-+ * @brief The roles of every member in one `unite` call.
++ * @brief One GPU's copy of the arrays.
 + */
-+struct union_plan {
-+  /**
-+   * @brief One island's roles.
-+   */
-+  struct island {
-+    std::uint8_t leader;                ///< The member that exchanges data with the host
-+    bool leader_contributes;            ///< Whether the leader's own arrays may hold set bits
-+    std::vector<std::uint8_t> sources;  ///< Contributing members other than the leader
-+    std::vector<std::uint8_t> others;   ///< Every member other than the leader, in member order
++struct union_member {
++  cucascade::memory::memory_space* space;  ///< The GPU's space; scratch and streams come from it
++  ::cuda::stream_ref stream;  ///< Orders every use and every free of this member's arrays
++  std::span<std::byte* const> arrays;  ///< One pointer per array; null for an array of no bytes
++  bool contributed;  ///< False promises that the arrays are all zero
++};
 +
-+    [[nodiscard]] bool contributes() const noexcept
-+    {
-+      return leader_contributes || !sources.empty();
-+    }
-+  };
++/**
++ * @brief The size of one array, identical on every member, and the size of its transfer chunks.
++ */
++struct union_shape {
++  std::size_t bytes;        ///< A multiple of 16
++  std::size_t chunk_bytes;  ///< A nonzero multiple of 16
++};
 +
-+  std::vector<island> islands;  ///< The root's island first, the rest by their first member
++/**
++ * @brief Everything one `unite` call works on. All spans are borrowed for the call.
++ */
++struct union_request {
++  std::span<union_member const> members;
++  /// One island id per member. Members with equal ids must have pool access to each other
++  /// (`sirius::memory::peer_islands`, or any finer grouping).
++  std::span<std::uint8_t const> island_ids;
++  std::span<union_shape const> shapes;          ///< One per array
++  std::size_t root;                             ///< The member on the calling thread's current GPU
++  ::cuda::stream_ref root_stream;               ///< A stream of the root GPU owned by the caller
++  rmm::device_async_resource_ref root_scratch;  ///< Allocates the root's merge scratch
++  /// Pinned fixed-size blocks for the cross stage; may be null when the islands never cross
++  cucascade::memory::fixed_size_host_memory_resource* host;
++};
 +
-+  /**
-+   * @brief Assigns the roles.
-+   *
-+   * The root leads its island. Any other island is led by its first contributing member, or by its
-+   * first member when none contributes, so that a contributing island never copies its leader's
-+   * data in from elsewhere.
-+   *
-+   * @throw std::invalid_argument if the spans differ in size, are empty, hold more than 255
-+   * members, or @p root is not a member
-+   * @param island_ids One island id per member; members with equal ids form an island
-+   * @param contributed Whether each member contributes
-+   * @param root The member whose island comes first and which leads it
-+   */
-+  [[nodiscard]] static union_plan make(std::span<std::uint8_t const> island_ids,
-+                                       std::span<bool const> contributed,
-+                                       std::size_t root);
++/**
++ * @brief What one `unite` call did and the workspace it held.
++ */
++struct union_report {
++  std::uint8_t islands       = 0;  ///< Islands after any split
++  std::uint8_t host_inputs   = 0;  ///< Islands that copied to the host; 0 without a cross stage
++  std::uint8_t window_chunks = 0;  ///< Chunks in flight per host input; 0 without a cross stage
++  bool peer_copies           = false;  ///< Whether any merge or fan-out stage ran
++  bool degraded              = false;  ///< An island was split or the window was halved
++  std::size_t host_window_bytes = 0;   ///< Pinned bytes held
++  std::vector<std::size_t> device_scratch_bytes;  ///< Per member: its tracked scratch charge
++};
 +
-+  /**
-+   * @brief This plan with island @p index replaced by one island per member, so that none of
-+   * them needs device scratch. The other islands are unchanged.
-+   *
-+   * @pre `index < islands.size()`
-+   */
-+  [[nodiscard]] union_plan split(std::size_t index) const;
++/**
++ * @brief A borrowed `host_or_executor` with its type erased, so that `unite` compiles once.
++ */
++struct union_or_runner {
++  using part_function = void (*)(void* context, unsigned part) noexcept;
 +
-+  /// Number of contributing islands: the inputs of the host stage
-+  [[nodiscard]] std::size_t inputs() const noexcept;
++  void* executor;      ///< The borrowed executor
++  unsigned max_parts;  ///< Its `max_parts()`
++  /// Calls the executor's `run` with a body that calls `part(context, index)`
++  void (*run)(void* executor, unsigned parts, part_function part, void* context) noexcept;
 +
-+  /// Whether leaders exchange data through the host: several islands and something to move
-+  [[nodiscard]] bool crosses_host() const noexcept;
-+
-+  /// Whether no data moves at all: nothing was contributed, or there is one member
-+  [[nodiscard]] bool moves_nothing() const noexcept;
-+
-+  /**
-+   * @brief Whether the leader of @p entry receives the union from the host: every leader when the
-+   * host combines several inputs, every leader but the single input otherwise.
-+   */
-+  [[nodiscard]] bool uploads(island const& entry) const noexcept;
-+
-+  /**
-+   * @brief Pinned chunk slots held per chunk in flight: one per input, plus one for the combined
-+   * chunk when there are several inputs. Zero without a host stage.
-+   */
-+  [[nodiscard]] std::size_t host_slots() const noexcept;
-+
-+  /// Device scratch chunk slots the leader of @p entry holds per chunk in flight
-+  [[nodiscard]] static std::size_t merge_slots(island const& entry) noexcept
++  /// Borrows @p executor, which must outlive every use of the result.
++  template <sirius::memory::host_or_executor Executor>
++  [[nodiscard]] static union_or_runner of(Executor& executor) noexcept
 +  {
-+    return entry.sources.size();
++    return {
++      &executor,
++      static_cast<unsigned>(executor.max_parts()),
++      [](void* erased, unsigned parts, part_function part, void* context) noexcept {
++        static_cast<Executor*>(erased)->run(
++          parts, [&](unsigned index) noexcept { part(context, index); });
++      }};
 +  }
 +};
++
++/**
++ * @brief Makes every member's arrays equal to the bitwise OR of all members' arrays and returns
++ * once every array is complete.
++ *
++ * Workspace is acquired before anything is submitted, and what is refused is replaced rather than
++ * failing the call. An island whose merge scratch is refused is split into single-member islands,
++ * which use the host instead. A pinned window refused at two chunks in flight is retried at one.
++ * Each replacement is logged and reported as `degraded`. When nothing was contributed, or there is
++ * one member, nothing is copied.
++ *
++ * On return, and on every exception but `unjoined_gpu_work`, nothing the call submitted is pending
++ * and its workspace is released.
++ *
++ * @pre The root's GPU is current; every member's stream already orders all earlier writes of its
++ * arrays; no other thread uses the arrays or streams
++ * @throw accumulation_cuda_error if a CUDA call fails; submitted work is joined first
++ * @throw unjoined_gpu_work if that join fails. The call has then abandoned its workspace without
++ * freeing it, and the caller must keep the arrays allocated
++ * @throw accumulation_invariant_error if the request is inconsistent, or the cross stage is needed
++ * and `request.host` has no fixed-size blocks
++ * @param request The arrays and where they live
++ * @param or_executor Splits each host OR over threads; see `union_or_runner::of`
++ * @return The report, or nullopt, with nothing submitted and nothing held, iff the smallest pinned
++ * window or a host allocation during preparation was refused
++ */
++[[nodiscard]] std::optional<union_report> unite(union_request const& request,
++                                                union_or_runner or_executor);
 +
 +}  // namespace sirius::op::detail
-diff --git a/test/cpp/memory/test_host_or.cpp b/test/cpp/memory/test_host_or.cpp
-new file mode 100644
-index 00000000..057731ce
---- /dev/null
-+++ b/test/cpp/memory/test_host_or.cpp
-@@ -0,0 +1,149 @@
-+/*
-+ * Copyright 2026, Sirius Contributors.
-+ *
-+ * Licensed under the Apache License, Version 2.0 (the "License");
-+ * you may not use this file except in compliance with the License.
-+ * You may obtain a copy of the License at
-+ *
-+ *     http://www.apache.org/licenses/LICENSE-2.0
-+ *
-+ * Unless required by applicable law or agreed to in writing, software
-+ * distributed under the License is distributed on an "AS IS" BASIS,
-+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+ * See the License for the specific language governing permissions and
-+ * limitations under the License.
-+ */
-+
-+#include "catch.hpp"
-+#include "memory/host_or.hpp"
-+
-+#include <algorithm>
-+#include <atomic>
-+#include <cstddef>
-+#include <cstdint>
-+#include <memory>
-+#include <random>
-+#include <span>
-+#include <thread>
-+#include <vector>
-+
-+namespace {
-+using sirius::memory::host_or;
-+using sirius::memory::host_or_workers;
-+using sirius::memory::inline_host_or_executor;
-+
-+static_assert(sirius::memory::host_or_executor<host_or_workers>);
-+static_assert(sirius::memory::host_or_executor<inline_host_or_executor>);
-+
-+std::vector<std::byte> random_bytes(std::size_t size, std::uint32_t seed)
-+{
-+  std::mt19937 engine{seed};
-+  std::vector<std::byte> bytes(size);
-+  for (auto& value : bytes) {
-+    value = static_cast<std::byte>(engine() & 0xFF);
-+  }
-+  return bytes;
-+}
-+}  // namespace
-+
-+TEST_CASE("host_or equals a byte-wise OR for every size, alignment and input count", "[host_or]")
-+{
-+  constexpr std::size_t guard = 96;
-+  auto const size =
-+    GENERATE(std::size_t{0}, 1, 7, 8, 63, 64, 65, 96, 127, 128, 1000, 4096, 4097, 262147);
-+  auto const input_count = GENERATE(std::size_t{1}, 2, 3, 5);
-+  auto const shift       = GENERATE(std::size_t{0}, 1, 31, 63);
-+
-+  std::vector<std::vector<std::byte>> sources;
-+  std::vector<std::span<std::byte const>> inputs;
-+  for (std::size_t index = 0; index < input_count; ++index) {
-+    // Inputs start at their own odd offsets and are longer than the output.
-+    sources.push_back(
-+      random_bytes(size + index + 3, static_cast<std::uint32_t>(17 * index + size)));
-+    inputs.emplace_back(sources.back().data() + index, size + 3);
-+  }
-+  std::vector<std::byte> expected(size);
-+  for (std::size_t index = 0; index < size; ++index) {
-+    for (auto const& input : inputs) {
-+      expected[index] |= input[index];
-+    }
-+  }
-+  // Bytes around the output must stay untouched.
-+  std::vector<std::byte> storage(guard + shift + size + guard, std::byte{0xA5});
-+  std::span<std::byte> const out{storage.data() + guard + shift, size};
-+  host_or(inputs, out);
-+  CHECK(std::ranges::equal(out, expected));
-+  CHECK(std::ranges::all_of(std::span{storage}.first(guard + shift),
-+                            [](std::byte value) { return value == std::byte{0xA5}; }));
-+  CHECK(std::ranges::all_of(std::span{storage}.last(guard),
-+                            [](std::byte value) { return value == std::byte{0xA5}; }));
-+}
-+
-+TEST_CASE("host_or_workers budgets a quarter of the hardware threads, between 1 and 8", "[host_or]")
-+{
-+  CHECK(host_or_workers::thread_budget(0) == 1);
-+  CHECK(host_or_workers::thread_budget(2) == 1);
-+  CHECK(host_or_workers::thread_budget(8) == 2);
-+  CHECK(host_or_workers::thread_budget(16) == 4);
-+  CHECK(host_or_workers::thread_budget(32) == 8);
-+  CHECK(host_or_workers::thread_budget(96) == 8);
-+}
-+
-+TEST_CASE("host_or_workers runs every part exactly once", "[host_or]")
-+{
-+  auto const threads = GENERATE(1U, 2U, 8U);
-+  host_or_workers workers{threads};
-+  CHECK(workers.max_parts() == threads);
-+  for (unsigned parts : {0U, 1U, 2U, 5U, 8U, 33U}) {
-+    std::vector<std::atomic<int>> calls(parts);
-+    for (int round = 0; round < 200; ++round) {
-+      workers.run(parts, [&](unsigned part) noexcept { calls[part].fetch_add(1); });
-+    }
-+    CHECK(std::ranges::all_of(calls, [](auto const& count) { return count.load() == 200; }));
-+  }
-+}
-+
-+TEST_CASE("host_or_workers shares its helpers between concurrent submitters", "[host_or]")
-+{
-+  constexpr unsigned submitters = 12;
-+  constexpr unsigned parts      = 6;
-+  constexpr int rounds          = 300;
-+  host_or_workers workers{4};
-+  std::vector<std::atomic<int>> calls(submitters * parts);
-+  {
-+    std::vector<std::jthread> threads;
-+    for (unsigned submitter = 0; submitter < submitters; ++submitter) {
-+      threads.emplace_back([&, submitter] {
-+        for (int round = 0; round < rounds; ++round) {
-+          workers.run(
-+            parts, [&](unsigned part) noexcept { calls[submitter * parts + part].fetch_add(1); });
-+        }
-+      });
-+    }
-+  }
-+  CHECK(std::ranges::all_of(calls, [](auto const& count) { return count.load() == rounds; }));
-+}
-+
-+TEST_CASE("host_or_workers::shared hands out one instance while it is held", "[host_or]")
-+{
-+  auto first        = host_or_workers::shared();
-+  auto const second = host_or_workers::shared();
-+  CHECK(first == second);
-+  CHECK(first->max_parts() == host_or_workers::thread_budget(std::thread::hardware_concurrency()));
-+  std::atomic<int> calls{0};
-+  first->run(first->max_parts(), [&](unsigned) noexcept { calls.fetch_add(1); });
-+  CHECK(calls.load() == static_cast<int>(first->max_parts()));
-+}
-+
-+TEST_CASE("inline_host_or_executor runs every part on the calling thread", "[host_or]")
-+{
-+  inline_host_or_executor executor;
-+  CHECK(executor.max_parts() == 1);
-+  std::vector<unsigned> order;
-+  auto const caller = std::this_thread::get_id();
-+  executor.run(3, [&](unsigned part) noexcept {
-+    CHECK(std::this_thread::get_id() == caller);
-+    order.push_back(part);
-+  });
-+  CHECK(order == std::vector<unsigned>{0, 1, 2});
-+}
-diff --git a/test/cpp/memory/test_peer_islands.cpp b/test/cpp/memory/test_peer_islands.cpp
-new file mode 100644
-index 00000000..4b3258a8
---- /dev/null
-+++ b/test/cpp/memory/test_peer_islands.cpp
-@@ -0,0 +1,102 @@
-+/*
-+ * Copyright 2026, Sirius Contributors.
-+ *
-+ * Licensed under the Apache License, Version 2.0 (the "License");
-+ * you may not use this file except in compliance with the License.
-+ * You may obtain a copy of the License at
-+ *
-+ *     http://www.apache.org/licenses/LICENSE-2.0
-+ *
-+ * Unless required by applicable law or agreed to in writing, software
-+ * distributed under the License is distributed on an "AS IS" BASIS,
-+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+ * See the License for the specific language governing permissions and
-+ * limitations under the License.
-+ */
-+
-+#include "catch.hpp"
-+#include "memory/peer_islands.hpp"
-+#include "memory/pool_peer_access.hpp"
-+#include "operator/operator_test_utils.hpp"
-+#include "utils/sirius_test_env.hpp"
-+
-+#include <cuda_runtime_api.h>
-+
-+#include <cucascade/memory/memory_space.hpp>
-+
-+#include <cstddef>
-+#include <cstdint>
-+#include <initializer_list>
-+#include <memory>
-+#include <stdexcept>
-+#include <utility>
-+#include <vector>
-+
-+namespace {
-+using sirius::memory::islands_from_access;
-+
-+/// The islands of `count` devices in which exactly the `linked` pairs have access both ways.
-+std::vector<std::uint8_t> islands_of(std::size_t count,
-+                                     std::initializer_list<std::pair<int, int>> linked)
-+{
-+  auto const access = std::make_unique<bool[]>(count * count);
-+  for (auto const [left, right] : linked) {
-+    access[left * count + right] = true;
-+    access[right * count + left] = true;
-+  }
-+  return islands_from_access(count, {access.get(), count * count});
-+}
-+}  // namespace
-+
-+TEST_CASE("islands_from_access groups devices with mutual access", "[peer_islands]")
-+{
-+  using ids = std::vector<std::uint8_t>;
-+  CHECK(islands_of(0, {}).empty());
-+  CHECK(islands_of(1, {}) == ids{0});
-+  CHECK(islands_of(4, {}) == ids{0, 1, 2, 3});
-+  CHECK(islands_of(4, {{0, 1}, {2, 3}}) == ids{0, 0, 1, 1});
-+  CHECK(islands_of(4, {{0, 2}, {1, 3}}) == ids{0, 1, 0, 1});
-+  CHECK(islands_of(3, {{0, 1}}) == ids{0, 0, 1});
-+  CHECK(islands_of(3, {{1, 2}}) == ids{0, 1, 1});
-+  CHECK(islands_of(4, {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}}) == ids{0, 0, 0, 0});
-+  // Not transitive: 0-1 and 1-2 without 0-2. Device 2 may not join {0, 1}.
-+  CHECK(islands_of(3, {{0, 1}, {1, 2}}) == ids{0, 0, 1});
-+  // A chain 0-1-2-3 is covered by its first and last link.
-+  CHECK(islands_of(4, {{0, 1}, {1, 2}, {2, 3}}) == ids{0, 0, 1, 1});
-+}
-+
-+TEST_CASE("islands_from_access requires access in both directions", "[peer_islands]")
-+{
-+  std::size_t const count = 2;
-+  bool access[4]          = {false, true, false, false};
-+  CHECK(islands_from_access(count, access) == std::vector<std::uint8_t>{0, 1});
-+  access[2] = true;
-+  CHECK(islands_from_access(count, access) == std::vector<std::uint8_t>{0, 0});
-+  CHECK_THROWS_AS(islands_from_access(3, access), std::invalid_argument);
-+}
-+
-+TEST_CASE("peer_islands agrees with the pool grants of the visible GPUs",
-+          "[peer_islands][multi_gpu]")
-+{
-+  int devices = 0;
-+  REQUIRE(cudaGetDeviceCount(&devices) == cudaSuccess);
-+  if (devices < 2) { return; }
-+  auto manager = sirius::test::operator_utils::initialize_memory_manager(devices);
-+  std::vector<cucascade::memory::memory_space const*> spaces;
-+  for (int device = 0; device < devices; ++device) {
-+    spaces.push_back(manager->get_memory_space(cucascade::memory::Tier::GPU, device));
-+  }
-+  auto const ids = sirius::memory::peer_islands(spaces);
-+  REQUIRE(ids.size() == spaces.size());
-+  CHECK(ids.front() == 0);
-+  for (std::size_t left = 0; left < spaces.size(); ++left) {
-+    for (std::size_t right = left + 1; right < spaces.size(); ++right) {
-+      auto const mutual =
-+        sirius::memory::try_grant_pool_access(*spaces[left], spaces[right]->get_device_id()) &&
-+        sirius::memory::try_grant_pool_access(*spaces[right], spaces[left]->get_device_id());
-+      // Members of one island always have mutual access.
-+      if (ids[left] == ids[right]) { CHECK(mutual); }
-+    }
-+  }
-+  CHECK(sirius::memory::peer_islands(spaces) == ids);
-+}
-diff --git a/test/cpp/operator/test_dynamic_filter_union_plan.cpp b/test/cpp/operator/test_dynamic_filter_union_plan.cpp
-new file mode 100644
-index 00000000..fc6cf11d
---- /dev/null
-+++ b/test/cpp/operator/test_dynamic_filter_union_plan.cpp
-@@ -0,0 +1,237 @@
-+/*
-+ * Copyright 2026, Sirius Contributors.
-+ *
-+ * Licensed under the Apache License, Version 2.0 (the "License");
-+ * you may not use this file except in compliance with the License.
-+ * You may obtain a copy of the License at
-+ *
-+ *     http://www.apache.org/licenses/LICENSE-2.0
-+ *
-+ * Unless required by applicable law or agreed to in writing, software
-+ * distributed under the License is distributed on an "AS IS" BASIS,
-+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+ * See the License for the specific language governing permissions and
-+ * limitations under the License.
-+ */
-+
-+#include "catch.hpp"
-+#include "op/dynamic_filter/detail/union_plan.hpp"
-+
-+#include <algorithm>
-+#include <array>
-+#include <cstddef>
-+#include <cstdint>
-+#include <stdexcept>
-+#include <vector>
-+
-+namespace {
-+using sirius::op::detail::union_plan;
-+
-+constexpr std::size_t max_members = 8;
-+
-+struct plan_case {
-+  std::array<std::uint8_t, max_members> ids;
-+  std::array<bool, max_members> contributed;
-+  std::size_t members;
-+  std::size_t root;
-+};
-+
-+/// Calls `visit` for every grouping of up to `max_members` members into islands, every set of
-+/// contributing members and every root.
-+template <class Visit>
-+void for_each_case(Visit&& visit)
-+{
-+  for (std::size_t members = 1; members <= max_members; ++members) {
-+    // Restricted growth strings enumerate each set partition once.
-+    std::array<std::uint8_t, max_members> ids{};
-+    for (;;) {
-+      for (unsigned mask = 0; mask < (1U << members); ++mask) {
-+        plan_case current{ids, {}, members, 0};
-+        for (std::size_t member = 0; member < members; ++member) {
-+          current.contributed[member] = (mask >> member & 1U) != 0;
-+        }
-+        for (current.root = 0; current.root < members; ++current.root) {
-+          visit(current);
-+        }
-+      }
-+      auto position = members;
-+      while (position-- > 1) {
-+        auto const limit = *std::max_element(ids.begin(), ids.begin() + position) + 1;
-+        if (ids[position] < limit) {
-+          ++ids[position];
-+          std::fill(ids.begin() + position + 1, ids.begin() + members, std::uint8_t{0});
-+          break;
-+        }
-+      }
-+      if (position == 0 || members == 1) { break; }
-+    }
-+  }
-+}
-+
-+/// The members of `entry`, leader first.
-+std::vector<std::uint8_t> members_of(union_plan::island const& entry)
-+{
-+  std::vector<std::uint8_t> members{entry.leader};
-+  members.insert(members.end(), entry.others.begin(), entry.others.end());
-+  return members;
-+}
-+
-+/// Counts the roles of `plan` that break a rule `union_plan::make` documents.
-+std::size_t violations(plan_case const& input, union_plan const& plan)
-+{
-+  std::size_t broken = 0;
-+  auto const expect  = [&](bool holds) { broken += holds ? 0 : 1; };
-+  std::array<int, max_members> seen{};
-+  std::size_t contributing_islands = 0;
-+  for (std::size_t position = 0; position < plan.islands.size(); ++position) {
-+    auto const& entry              = plan.islands[position];
-+    auto const id                  = input.ids[entry.leader];
-+    bool any                       = false;
-+    std::size_t first              = input.members;
-+    std::size_t first_contributing = input.members;
-+    for (std::size_t member = 0; member < input.members; ++member) {
-+      if (input.ids[member] != id) { continue; }
-+      first = std::min(first, member);
-+      if (input.contributed[member]) {
-+        first_contributing = std::min(first_contributing, member);
-+        any                = true;
-+      }
-+    }
-+    contributing_islands += any ? 1 : 0;
-+    expect(entry.contributes() == any);
-+    expect(entry.leader_contributes == input.contributed[entry.leader]);
-+    if (position == 0) {
-+      expect(entry.leader == input.root);
-+    } else {
-+      expect(id != input.ids[input.root]);
-+      expect(entry.leader == (any ? first_contributing : first));
-+    }
-+    expect(std::ranges::is_sorted(entry.others));
-+    expect(std::ranges::is_sorted(entry.sources));
-+    for (auto const member : members_of(entry)) {
-+      ++seen[member];
-+      expect(input.ids[member] == id);
-+    }
-+    for (auto const member : entry.others) {
-+      auto const is_source = std::ranges::find(entry.sources, member) != entry.sources.end();
-+      expect(member != entry.leader);
-+      expect(is_source == input.contributed[member]);
-+    }
-+    expect(union_plan::merge_slots(entry) == entry.sources.size());
-+  }
-+  for (std::size_t member = 0; member < max_members; ++member) {
-+    expect(seen[member] == (member < input.members ? 1 : 0));
-+  }
-+  auto const distinct = static_cast<std::size_t>(
-+                          *std::max_element(input.ids.begin(), input.ids.begin() + input.members)) +
-+                        1;
-+  expect(plan.islands.size() == distinct);
-+  expect(plan.inputs() == contributing_islands);
-+  expect(plan.crosses_host() == (distinct >= 2 && contributing_islands >= 1));
-+  expect(plan.moves_nothing() == (contributing_islands == 0 || input.members == 1));
-+  expect(plan.host_slots() == (!plan.crosses_host()        ? 0
-+                               : contributing_islands >= 2 ? contributing_islands + 1
-+                                                           : 1));
-+  for (auto const& entry : plan.islands) {
-+    expect(plan.uploads(entry) ==
-+           (plan.crosses_host() && (contributing_islands >= 2 || !entry.contributes())));
-+  }
-+  return broken;
-+}
-+}  // namespace
-+
-+TEST_CASE("union_plan assigns every member one role under the leader rule",
-+          "[dynamic_filter][union_plan]")
-+{
-+  std::size_t cases  = 0;
-+  std::size_t broken = 0;
-+  for_each_case([&](plan_case const& input) {
-+    ++cases;
-+    auto const plan = union_plan::make(
-+      {input.ids.data(), input.members}, {input.contributed.data(), input.members}, input.root);
-+    broken += violations(input, plan);
-+  });
-+  // Bell numbers 1, 2, 5, 15, 52, 203, 877, 4140, times contribution masks and roots.
-+  CHECK(cases == 1 * 2 * 1 + 2 * 4 * 2 + 5 * 8 * 3 + 15 * 16 * 4 + 52 * 32 * 5 + 203 * 64 * 6 +
-+                   877 * 128 * 7 + 4140 * 256 * 8);
-+  CHECK(broken == 0);
-+}
-+
-+TEST_CASE("union_plan::split turns one island into single-member islands and keeps the others",
-+          "[dynamic_filter][union_plan]")
-+{
-+  std::size_t broken = 0;
-+  auto const expect  = [&](bool holds) { broken += holds ? 0 : 1; };
-+  auto const same    = [](union_plan::island const& left, union_plan::island const& right) {
-+    return left.leader == right.leader && left.leader_contributes == right.leader_contributes &&
-+           left.sources == right.sources && left.others == right.others;
-+  };
-+  for_each_case([&](plan_case const& input) {
-+    // Splitting is exercised up to 6 members; larger cases add no new shape.
-+    if (input.members > 6) { return; }
-+    auto const plan = union_plan::make(
-+      {input.ids.data(), input.members}, {input.contributed.data(), input.members}, input.root);
-+    for (std::size_t index = 0; index < plan.islands.size(); ++index) {
-+      auto const pieces  = members_of(plan.islands[index]);
-+      auto const divided = plan.split(index);
-+      expect(divided.islands.size() == plan.islands.size() + pieces.size() - 1);
-+      if (divided.islands.size() != plan.islands.size() + pieces.size() - 1) { continue; }
-+      for (std::size_t position = 0; position < index; ++position) {
-+        expect(same(divided.islands[position], plan.islands[position]));
-+      }
-+      for (std::size_t piece = 0; piece < pieces.size(); ++piece) {
-+        auto const& single = divided.islands[index + piece];
-+        expect(single.leader == pieces[piece]);
-+        expect(single.leader_contributes == input.contributed[pieces[piece]]);
-+        expect(single.sources.empty() && single.others.empty());
-+      }
-+      for (std::size_t position = index + 1; position < plan.islands.size(); ++position) {
-+        expect(same(divided.islands[position + pieces.size() - 1], plan.islands[position]));
-+      }
-+      expect(divided.islands.front().leader == input.root);
-+    }
-+  });
-+  CHECK(broken == 0);
-+}
-+
-+TEST_CASE("union_plan::make rejects inconsistent members", "[dynamic_filter][union_plan]")
-+{
-+  std::array<std::uint8_t, 2> const ids{0, 1};
-+  std::array<bool, 2> const contributed{true, false};
-+  CHECK_THROWS_AS(union_plan::make(ids, contributed, 2), std::invalid_argument);
-+  CHECK_THROWS_AS(union_plan::make(ids, std::span{contributed}.first(1), 0), std::invalid_argument);
-+  CHECK_THROWS_AS(union_plan::make({}, {}, 0), std::invalid_argument);
-+}
-+
-+TEST_CASE("union_plan sizes the workspace of the measured machine shapes",
-+          "[dynamic_filter][union_plan]")
-+{
-+  std::array<bool, 4> const all{true, true, true, true};
-+  std::array<bool, 4> const root_only{true, false, false, false};
-+  std::array<std::uint8_t, 4> const pairs{0, 0, 1, 1};
-+  std::array<std::uint8_t, 4> const singles{0, 1, 2, 3};
-+  std::array<std::uint8_t, 4> const full{0, 0, 0, 0};
-+
-+  auto plan = union_plan::make(pairs, all, 0);
-+  CHECK(plan.inputs() == 2);
-+  CHECK(plan.host_slots() == 3);
-+  CHECK(union_plan::merge_slots(plan.islands[0]) == 1);
-+  CHECK(union_plan::merge_slots(plan.islands[1]) == 1);
-+
-+  plan = union_plan::make(pairs, root_only, 0);
-+  CHECK(plan.inputs() == 1);
-+  CHECK(plan.host_slots() == 1);
-+  CHECK(union_plan::merge_slots(plan.islands[0]) == 0);
-+  CHECK_FALSE(plan.uploads(plan.islands[0]));
-+  CHECK(plan.uploads(plan.islands[1]));
-+
-+  plan = union_plan::make(singles, all, 0);
-+  CHECK(plan.inputs() == 4);
-+  CHECK(plan.host_slots() == 5);
-+
-+  plan = union_plan::make(full, all, 2);
-+  CHECK_FALSE(plan.crosses_host());
-+  CHECK(plan.host_slots() == 0);
-+  CHECK(union_plan::merge_slots(plan.islands[0]) == 3);
-+  CHECK(plan.islands[0].leader == 2);
-+}
