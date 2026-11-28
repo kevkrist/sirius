@@ -9,10 +9,10 @@ def procs(arm, q):
     for tag in tags:
         for half in "AB":
             for d in sorted(glob.glob(f"{B}/{tag}_{arm}{half}/tpch_*_q{q}"))[-1:]:
-                t = [float(r["runtime_s"]) * 1000 for r in csv.DictReader(open(f"{d}/csv/runtimes.csv")) if int(r["iteration"]) >= 2]
+                t = [float(r["runtime_s"]) * 1000 for r in csv.DictReader(open(f"{d}/csv/runtimes.csv")) if int(r["iteration"]) >= 2 and r["query"] != "TOTAL"]
                 out.append((t, d))
     return out
-qs = sorted({int(re.search(r"_q(\d+)$", d).group(1)) for tag in tags for d in glob.glob(f"{B}/{tag}_tipA/tpch_*_q*")})
+qs = sorted({int(re.search(r"_q(\d+)$", d).group(1)) for tag in tags for d in glob.glob(f"{B}/{tag}_tipB/tpch_*_q*") if os.path.exists(d + "/csv/runtimes.csv")})
 print("| q | n/arm | tip | cpu-OR (compose) | gpu-OR (pipe) | cpu-tip | gpu-tip | cpu-gpu | process medians tip / cpu / gpu | spread tip / cpu / gpu |")
 print("|---|---|---|---|---|---|---|---|---|---|")
 tot = {a: 0.0 for a in arms}
