@@ -1,59 +1,68 @@
-# HEAD 498fe2fc70403a96fa593fae8086527062938eb2 branch prod/xfer
-diff --git a/src/cuda/union_transfer.cu b/src/cuda/union_transfer.cu
-index ea33f397..11e668d7 100644
---- a/src/cuda/union_transfer.cu
-+++ b/src/cuda/union_transfer.cu
-@@ -39,6 +39,7 @@
- #include <array>
- #include <chrono>
- #include <cstdint>
-+#include <cstdlib>
- #include <limits>
- #include <memory>
- #include <new>
-@@ -457,6 +458,7 @@ class union_run {
-           std::clamp<std::size_t>(std::min<std::size_t>(_runner.max_parts, 2 * _inputs),
-                                   1,
-                                   std::max<std::size_t>(1, _slot_bytes / minimum_part_bytes)));
-+        if (auto const* text = std::getenv("XFER_PARTS")) { _parts = static_cast<unsigned>(std::atoi(text)); }
-         _or_inputs.resize(_parts * _inputs);
-       }
-       return true;
-diff --git a/src/memory/host_or.cpp b/src/memory/host_or.cpp
-index 4ac4beea..7c629a9d 100644
---- a/src/memory/host_or.cpp
-+++ b/src/memory/host_or.cpp
-@@ -22,6 +22,7 @@
- #include <chrono>
- #include <cstdint>
- #include <cstring>
-+#include <cstdlib>
- #include <thread>
- 
- #if defined(__x86_64__)
-@@ -233,7 +234,8 @@ void host_or_workers::help()
-       work(*current);
-       // The submitter may destroy the job as soon as this count drops: do not touch it afterwards.
-       current->inside.fetch_sub(1, std::memory_order_release);
--      auto const deadline = clock::now() + spin_window;
-+      static auto const window = std::chrono::microseconds{std::getenv("XFER_SPIN_US") ? std::atoi(std::getenv("XFER_SPIN_US")) : 500};
-+      auto const deadline = clock::now() + window;
-       while (_open_count.load(std::memory_order_acquire) == 0 && clock::now() < deadline) {
-         pause();
-       }
+# HEAD 59729a897e776c72c18d1a47d66a7e0463e845b0 branch prod/xfer
 diff --git a/test/cpp/operator/test_dynamic_filter_union_transfer.cpp b/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
-index 0a4c3740..5a1475ff 100644
+index 0a4c3740..dece5099 100644
 --- a/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
 +++ b/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
-@@ -489,9 +489,9 @@ TEST_CASE("time of accumulated publication by array size, contribution and group
+@@ -479,19 +479,19 @@ TEST_CASE("concurrent publications share the host OR workers and stay exact",
+   REQUIRE(fixture.allocated_bytes() == baseline);
+ }
+ 
+-// Not a test: prints the time of `finish` for the array sizes and contributions of the transfer
+-// benchmarks. Run alone on an idle machine: sirius_unittest "[union_transfer_bench]".
+-TEST_CASE("time of accumulated publication by array size, contribution and grouping",
+-          "[.][union_transfer_bench][multi_gpu]")
++namespace {
++/// Prints the median time of `finish` over five publications for each size, contribution and
++/// grouping on the first `devices` GPUs.
++void print_finish_times(std::size_t devices, std::vector<int> const& megabyte_sizes)
+ {
+-  auto const devices = std::min<std::size_t>(4, static_cast<std::size_t>(acc::visible_gpus()));
+-  if (lacks_gpus(2)) { return; }
    acc::fixture fixture({.devices = devices, .gpu_bytes = std::size_t{8} << 30});
    unsigned const all = (1U << devices) - 1;
-   std::printf("| MiB | contributing | grouping | median ms | ms/GiB |\n|---|---|---|---|---|\n");
+-  std::printf("| MiB | contributing | grouping | median ms | ms/GiB |\n|---|---|---|---|---|\n");
 -  for (auto const megabytes : {4, 16, 57, 174, 281, 1434}) {
-+  for (auto const megabytes : std::getenv("XFER_SIZES") ? std::vector<int>{16, 281, 1434} : std::vector<int>{4, 16, 57, 174, 281, 1434}) {
++  std::vector<unsigned> masks{all, 0b0001U};
++  if (devices >= 3) { masks.insert(masks.begin() + 1, 0b0101U); }
++  std::printf("| GPUs | MiB | contributing | grouping | median ms | ms/GiB |\n|---|---|---|---|---|---|\n");
++  for (auto const megabytes : megabyte_sizes) {
      std::vector<std::size_t> const blocks{megabytes * acc::mib / op::bloom_bytes_per_block};
 -    for (auto const mask : {all, 0b0101U & all, 0b0001U}) {
-+    for (auto const mask : std::getenv("XFER_SIZES") ? std::vector<unsigned>{all} : std::vector<unsigned>{all, 0b0101U & all, 0b0001U}) {
++    for (auto const mask : masks) {
        for (bool const separate : {false, true}) {
          std::vector<double> times;
          for (int round = 0; round < 6; ++round) {
+@@ -518,11 +518,10 @@ TEST_CASE("time of accumulated publication by array size, contribution and group
+         }
+         std::ranges::sort(times);
+         auto const median = times[times.size() / 2];
+-        std::printf("| %d | %s | %s | %.2f | %.1f |\n",
++        std::printf("| %zu | %d | %s | %s | %.2f | %.1f |\n",
++                    devices,
+                     megabytes,
+-                    mask == all  ? "all"
+-                    : mask == 1U ? "root"
+-                                 : "GPUs 0+2",
++                    mask == all ? "all" : mask == 1U ? "root" : "GPUs 0+2",
+                     separate ? "separate" : "real",
+                     median,
+                     median * 1024 / megabytes);
+@@ -530,3 +529,18 @@ TEST_CASE("time of accumulated publication by array size, contribution and group
+     }
+   }
+ }
++}  // namespace
++
++// Not tests: they print the time of `finish` for the array sizes and contributions of the transfer
++// benchmarks. Run alone on an idle machine: sirius_unittest "[union_transfer_bench]".
++TEST_CASE("time of accumulated publication on four GPUs", "[.][union_transfer_bench][multi_gpu]")
++{
++  if (lacks_gpus(4)) { return; }
++  print_finish_times(4, {1, 4, 16, 57, 174, 281, 1434});
++}
++
++TEST_CASE("time of accumulated publication on two GPUs", "[.][union_transfer_bench][multi_gpu]")
++{
++  if (lacks_gpus(2)) { return; }
++  print_finish_times(2, {1, 281, 1434});
++}
