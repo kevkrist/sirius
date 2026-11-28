@@ -34,6 +34,7 @@
 #include <rmm/error.hpp>
 
 #include <absl/cleanup/cleanup.h>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
@@ -691,17 +692,16 @@ TEST_CASE("scheduler error drain joins collecting and publishing PARTITION tasks
   require_worker_reuse(test);
 }
 
-TEST_CASE("optional publication scratch OOM deposits without rescheduling the PARTITION task",
-          "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
+TEST_CASE(
+  "refused publication scratch deposits without rescheduling the PARTITION task and "
+  "publishes through the host",
+  "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
-  bool const refuse_host_scratch = GENERATE(false, true);
-  CAPTURE(refuse_host_scratch);
   harness test{2};
   if (!acc::has_pool_access(test.memory.spaces)) { return; }
   auto const first                = test.memory.make_batch(1, 0, 2000);
   auto const final                = test.memory.make_batch(0, 5000, 2000);
-  auto const baseline             = test.memory.allocated_bytes();
   auto record                     = std::make_shared<retry_record>();
   record->constrain_first_attempt = true;
   auto tasks                      = test.tasks({first, final}, record);
@@ -709,22 +709,12 @@ TEST_CASE("optional publication scratch OOM deposits without rescheduling the PA
   auto const geometry = acc::bloom_geometry(4000, 2, bloom_cap);
   auto const scratch_bytes =
     rmm::align_up(acc::merge_scratch_bytes(geometry), rmm::CUDA_ALLOCATION_ALIGNMENT);
-  auto const host_scratch_bytes =
-    rmm::align_up(geometry.chunk_bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
-  REQUIRE(host_scratch_bytes < scratch_bytes);
   std::atomic<std::size_t> scratch_requests{0};
-  std::atomic<std::size_t> host_scratch_requests{0};
   test.partition->before_execute = [&](op::operator_data const&, ::cuda::stream_ref stream) {
     test.observe_task_allocations(0, stream, [&](std::size_t requested) {
       if (requested == scratch_bytes && test.output.deposits.load() == 2) {
         ++scratch_requests;
         throw rmm::out_of_memory{"refused optional merge scratch"};
-      }
-      if (scratch_requests.load() != 0 && requested == host_scratch_bytes) {
-        ++host_scratch_requests;
-        if (refuse_host_scratch) {
-          throw rmm::out_of_memory{"refused optional HOST merge scratch"};
-        }
       }
     });
   };
@@ -734,36 +724,32 @@ TEST_CASE("optional publication scratch OOM deposits without rescheduling the PA
   test.wait_completed(2);
   sirius::test::retire_scheduler_query(
     test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), true, test.creator.get());
+  // The two GPUs then exchange through the host, which needs no device scratch at all.
   REQUIRE(scratch_requests.load() == 1);
-  REQUIRE(host_scratch_requests.load() == 1);
   REQUIRE(record->retries.load() == 0);
   REQUIRE(test.output.deposits.load() == 4);
   REQUIRE(test.memory.channel->snapshot().terminal());
   auto const counters = test.memory.stats.snapshot();
-  if (refuse_host_scratch) {
-    REQUIRE(test.memory.channel->snapshot().empty());
-    REQUIRE(counters.filters_pushed == 0);
-    REQUIRE(counters.accumulations_skipped_admission == 1);
-    REQUIRE(counters.accumulation_publications_finished == 0);
-    test.output.discard_batches();
-    REQUIRE(test.memory.allocated_bytes() == baseline);
-  } else {
-    REQUIRE(test.memory.channel->snapshot().entries().size() == 2);
-    REQUIRE(counters.filters_pushed == 2);
-    REQUIRE(counters.accumulations_skipped_admission == 0);
-    REQUIRE(counters.accumulation_publications_finished == 1);
-    REQUIRE(counters.accumulation_publications_host_staged == 1);
-    test.memory.require_members({first, final});
-  }
+  REQUIRE(test.memory.channel->snapshot().entries().size() == 2);
+  REQUIRE(counters.filters_pushed == 2);
+  REQUIRE(counters.accumulations_skipped_admission == 0);
+  REQUIRE(counters.accumulation_publications_finished == 1);
+  REQUIRE(counters.accumulation_publications_host_staged == 1);
+  REQUIRE(counters.accumulation_publications_degraded == 1);
+  test.memory.require_members({first, final});
   REQUIRE(test.memory.gpu(0).get_total_reserved_memory() == 0);
   REQUIRE(test.memory.gpu(1).get_total_reserved_memory() == 0);
   require_worker_reuse(test);
 }
 
-TEST_CASE("publication scratch allocation failure retires ordinary-pool partials",
-          "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
+TEST_CASE(
+  "refused publication scratch publishes through the host; a refused HOST window retires "
+  "ordinary-pool partials",
+  "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
 {
   if (!sirius::test::has_gpus(2)) { return; }
+  bool const host_exhausted = GENERATE(false, true);
+  CAPTURE(host_exhausted);
   acc::fixture memory{{.devices = 2}};
   if (!acc::has_pool_access(memory.spaces)) { return; }
   auto const input         = memory.make_batch(1, 0, 4000);
@@ -776,6 +762,11 @@ TEST_CASE("publication scratch allocation failure retires ordinary-pool partials
     requests.emplace_back(device, requested);
     throw rmm::out_of_memory{"refused optional merge scratch"};
   };
+  auto* host = memory.spaces[0]
+                 .get_host_staging_space()
+                 .get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  REQUIRE(host);
+  auto const host_before = host->get_total_allocated_bytes();
   {
     using builder_type = op::detail::accumulated_bloom_builder;
     auto builder       = builder_type::try_create(
@@ -790,12 +781,29 @@ TEST_CASE("publication scratch allocation failure retires ordinary-pool partials
         sirius::get_cudf_table_view(source), rmm::cuda_device_id{1}, memory.task_stream(1)));
       memory.task_stream(1).sync();
     }
+    auto const expected = acc::partial_union(*builder, 2, 2);
     rmm::cuda_set_device_raii guard{rmm::cuda_device_id{0}};
     observed_resource scratch{0, 8 * acc::mib, observer};
-    REQUIRE_FALSE(builder->finish(rmm::cuda_device_id{0}, memory.task_stream(0), scratch));
-    REQUIRE((requests == std::vector<std::pair<int, std::size_t>>{{0, scratch_bytes},
-                                                                  {0, geometry.chunk_bytes}}));
+    decltype(host->reserve_upto(0)) blocker;
+    cucascade::memory::fixed_multiple_blocks_allocation remaining;
+    if (host_exhausted) {
+      blocker = host->reserve_upto(host->get_available_memory());
+      REQUIRE(blocker);
+      remaining = host->allocate_multiple_blocks(host->get_available_memory());
+    }
+    auto const published = builder->finish(rmm::cuda_device_id{0}, memory.task_stream(0), scratch);
+    // The refused merge scratch is the only device request: the host route takes none.
+    REQUIRE((requests == std::vector<std::pair<int, std::size_t>>{{0, scratch_bytes}}));
+    if (host_exhausted) {
+      REQUIRE_FALSE(published);
+    } else {
+      REQUIRE(published);
+      REQUIRE(published->degraded);
+      REQUIRE(published->route == builder_type::publication_route::HOST);
+      acc::require_exact_union(published->filters, expected, 2);
+    }
   }
+  REQUIRE(host->get_total_allocated_bytes() == host_before);
   REQUIRE(memory.allocated_bytes() == baseline);
   REQUIRE(memory.gpu(0).get_total_reserved_memory() == 0);
   REQUIRE(memory.gpu(1).get_total_reserved_memory() == 0);

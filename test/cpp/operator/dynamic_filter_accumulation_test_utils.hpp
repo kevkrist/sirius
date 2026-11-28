@@ -17,6 +17,7 @@
 #pragma once
 
 #include "data/data_batch_utils.hpp"
+#include "memory/host_or.hpp"
 #include "memory/pool_peer_access.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/complete_build_inventory.hpp"
@@ -47,6 +48,7 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -79,20 +81,34 @@
 namespace sirius::op::detail {
 
 /**
- * @brief Exercises the private HOST path and workspace observations from tests
+ * @brief How a test wants `accumulated_bloom_builder::finish` to run; the defaults are
+ * production's.
+ */
+struct accumulated_bloom_finish_options {
+  /// One island id per fixture GPU, dividing the real islands; empty keeps them
+  std::span<std::uint8_t const> islands{};
+  bool inline_or       = false;    ///< Run the host ORs on the calling thread only
+  union_report* report = nullptr;  ///< Receives the workspace the transfer held
+};
+
+/**
+ * @brief Reaches `accumulated_bloom_builder::finish_impl` from tests.
  */
 struct accumulated_bloom_test_access {
-  using workspace_observation = accumulated_bloom_builder::workspace_observation;
-
   static auto finish(accumulated_bloom_builder& builder,
                      rmm::cuda_device_id root,
                      ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr,
-                     bool force_host,
-                     workspace_observation* observation = nullptr)
+                     accumulated_bloom_finish_options how = {})
   {
-    if (!force_host && observation == nullptr) { return builder.finish(root, stream, mr); }
-    return builder.finish_impl(root, stream, mr, force_host, observation);
+    if (how.inline_or) {
+      sirius::memory::inline_host_or_executor executor;
+      return builder.finish_impl(
+        root, stream, mr, how.islands, union_or_runner::of(executor), how.report);
+    }
+    auto const workers = sirius::memory::host_or_workers::shared();
+    return builder.finish_impl(
+      root, stream, mr, how.islands, union_or_runner::of(*workers), how.report);
   }
 };
 
@@ -278,6 +294,12 @@ void wait_until(Predicate done, std::chrono::milliseconds timeout = std::chrono:
 /**
  * @brief Number of visible GPUs.
  */
+/**
+ * @brief Island ids that put every GPU in an island of its own, as on a machine without peer
+ * access; pass the first `n` to `builder_access::options::islands`.
+ */
+inline constexpr std::array<std::uint8_t, 8> separate_gpus{0, 1, 2, 3, 4, 5, 6, 7};
+
 [[nodiscard]] inline int visible_gpus()
 {
   int count = 0;
