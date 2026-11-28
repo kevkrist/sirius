@@ -662,9 +662,9 @@ struct dynamic_filter_publication_session::state {
         skip_locked(attempt_counters::skipped_admission);
         return;
       }
+      using route = detail::accumulated_bloom_builder::publication_route;
       bool const host_staged =
-        constructed->transport ==
-        detail::accumulated_bloom_builder::publication_transport::HOST_STAGED;
+        constructed->route == route::HOST || constructed->route == route::PEER_AND_HOST;
       auto const& planned = construction->plan().keys;
       std::vector<key_filters> per_key(plan.admitted_keys().size());
       {
@@ -747,6 +747,7 @@ struct dynamic_filter_publication_session::state {
       outcome.bindings_skipped_incompatible_probe += counts.incompatible_probes;
       outcome.accumulation_publications_finished    = published ? 1 : 0;
       outcome.accumulation_publications_host_staged = published && host_staged ? 1 : 0;
+      outcome.accumulation_publications_degraded = published && constructed->bloom_degraded ? 1 : 0;
       if (latency) {
         outcome.accumulation_publication_latency_ns = static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(*latency).count());

@@ -303,6 +303,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_dynamic_filter_published_filters.cpp
     test/cpp/operator/test_dynamic_filter_shadowed_construction.cpp
     test/cpp/operator/test_dynamic_filter_union_plan.cpp
+    test/cpp/operator/test_dynamic_filter_union_transfer.cpp
     test/cpp/operator/test_physical_build_filter.cpp
     test/cpp/operator/test_dynamic_filter_accumulation.cpp
     test/cpp/operator/test_accumulated_bloom_key_types.cpp

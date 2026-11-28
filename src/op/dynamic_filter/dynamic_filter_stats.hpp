@@ -67,8 +67,10 @@ namespace sirius::op {
  * - `accumulation_storage_leaks`: an attempt whose storage was deliberately leaked because GPU work
  *   might still use it after a failed host join; it also counts in `accumulations_skipped_error`.
  * - `accumulation_publications_finished`: a fan-out that pushed at least one filter.
- * - `accumulation_publications_host_staged`: such a fan-out whose replicas were staged through HOST
- *   memory instead of copied between GPU pools.
+ * - `accumulation_publications_host_staged`: such a fan-out whose Bloom arrays crossed pinned HOST
+ *   memory between GPUs that cannot copy to each other directly.
+ * - `accumulation_publications_degraded`: such a fan-out whose Bloom transfer was refused workspace
+ *   and used the host in place of device-to-device copies, or fewer chunks in flight.
  * - `accumulation_publication_latency_ns`: one nanosecond from the Publishing Task's last
  *   Contribution to the first push, summed over every attempt that published a filter.
  * - `keys_skipped_bloom_size_gate`: a planned Bloom key whose membership was dropped because the
@@ -152,6 +154,7 @@ struct dynamic_filter_counters {
   Counter accumulation_storage_leaks{};
   Counter accumulation_publications_finished{};
   Counter accumulation_publications_host_staged{};
+  Counter accumulation_publications_degraded{};
   Counter accumulation_publication_latency_ns{};
   Counter keys_skipped_bloom_size_gate{};
   Counter keys_skipped_shadowed{};
@@ -208,6 +211,7 @@ inline constexpr std::array dynamic_filter_counter_fields{
   &dynamic_filter_counters<Counter>::accumulation_storage_leaks,
   &dynamic_filter_counters<Counter>::accumulation_publications_finished,
   &dynamic_filter_counters<Counter>::accumulation_publications_host_staged,
+  &dynamic_filter_counters<Counter>::accumulation_publications_degraded,
   &dynamic_filter_counters<Counter>::accumulation_publication_latency_ns,
   &dynamic_filter_counters<Counter>::keys_skipped_bloom_size_gate,
   &dynamic_filter_counters<Counter>::keys_skipped_shadowed,
