@@ -24,7 +24,7 @@ index e93f5abc..e577e1a0 100644
            sirius_dynamic_in_list_filter.cu
            sirius_dynamic_small_in_list_filter.cu
 diff --git a/src/cuda/sirius_dynamic_bloom_filter.cu b/src/cuda/sirius_dynamic_bloom_filter.cu
-index 0e13451f..65b5ed2e 100644
+index 0e13451f..a4d62998 100644
 --- a/src/cuda/sirius_dynamic_bloom_filter.cu
 +++ b/src/cuda/sirius_dynamic_bloom_filter.cu
 @@ -14,8 +14,8 @@
@@ -617,13 +617,13 @@ index 0e13451f..65b5ed2e 100644
 +  auto const started = std::chrono::steady_clock::now();
 +  try {
 +    united = unite({members,
-+                           islands,
-+                           shapes,
-+                           root_index,
-+                           stream,
-+                           scratch_mr,
-+                           root->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>()},
-+                          or_runner);
++                    islands,
++                    shapes,
++                    root_index,
++                    stream,
++                    scratch_mr,
++                    root->host_space->get_memory_resource_of<cucascade::memory::Tier::HOST>()},
++                   or_runner);
 +  } catch (unjoined_gpu_work const&) {
 +    // As in `enqueue_add`: never free storage that unfinished GPU work may still touch.
 +    _impl->leak_storage.store(true);
@@ -632,10 +632,10 @@ index 0e13451f..65b5ed2e 100644
 -  scratch.reset();
 -  staging.reset();
 +  if (!united) { return std::nullopt; }
-+  auto const route = united->host_inputs == 0
-+                       ? (united->peer_copies ? publication_route::PEER : publication_route::NONE)
-+                       : (united->peer_copies ? publication_route::PEER_AND_HOST
-+                                              : publication_route::HOST);
++  auto const route =
++    united->host_inputs == 0
++      ? (united->peer_copies ? publication_route::PEER : publication_route::NONE)
++      : (united->peer_copies ? publication_route::PEER_AND_HOST : publication_route::HOST);
    SIRIUS_LOG_DEBUG(
 -    "[accumulated_bloom_builder::finish] root GPU {} reduced and replicated {} key(s), {} bytes in "
 -    "all, "
@@ -709,7 +709,7 @@ index cf88ca25..ca8ce46f 100644
    std::optional<detail::exact_key_stager::gathered> staged;
    if (_impl->stager) {
 diff --git a/src/op/dynamic_filter/build_filter_construction.hpp b/src/op/dynamic_filter/build_filter_construction.hpp
-index f8f369ab..fc436d12 100644
+index f8f369ab..445b4ea8 100644
 --- a/src/op/dynamic_filter/build_filter_construction.hpp
 +++ b/src/op/dynamic_filter/build_filter_construction.hpp
 @@ -124,8 +124,9 @@ class build_filter_construction final {
@@ -719,7 +719,7 @@ index f8f369ab..fc436d12 100644
 -    std::optional<detail::accumulated_bloom_builder::publication_transport>
 -      transport;  ///< How the Bloom filters reached their replicas, if any key planned one
 +    std::optional<detail::accumulated_bloom_builder::publication_route>
-+      route;                     ///< How the Bloom filters reached their replicas, if any key planned one
++      route;  ///< How the Bloom filters reached their replicas, if any key planned one
 +    bool bloom_degraded = false;  ///< `accumulated_bloom_builder::publication::degraded`
    };
  
@@ -864,7 +864,7 @@ index f1eceb0d..e02aaa0a 100644
    struct impl;
    explicit accumulated_bloom_builder(std::unique_ptr<impl> state) noexcept;
 diff --git a/src/op/dynamic_filter/dynamic_filter_publisher.cpp b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
-index 70412286..a7eb9318 100644
+index 70412286..d8efb3f3 100644
 --- a/src/op/dynamic_filter/dynamic_filter_publisher.cpp
 +++ b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
 @@ -641,9 +641,9 @@ struct dynamic_filter_publication_session::state {
@@ -879,12 +879,11 @@ index 70412286..a7eb9318 100644
        auto const& planned = construction->plan().keys;
        std::vector<key_filters> per_key(plan.admitted_keys().size());
        {
-@@ -727,6 +727,8 @@ struct dynamic_filter_publication_session::state {
+@@ -727,6 +727,7 @@ struct dynamic_filter_publication_session::state {
        outcome.bindings_skipped_incompatible_probe += counts.incompatible_probes;
        outcome.accumulation_publications_finished    = published ? 1 : 0;
        outcome.accumulation_publications_host_staged = published && host_staged ? 1 : 0;
-+      outcome.accumulation_publications_degraded =
-+        published && constructed->bloom_degraded ? 1 : 0;
++      outcome.accumulation_publications_degraded = published && constructed->bloom_degraded ? 1 : 0;
        if (latency) {
          outcome.accumulation_publication_latency_ns = static_cast<std::uint64_t>(
            std::chrono::duration_cast<std::chrono::nanoseconds>(*latency).count());
@@ -922,7 +921,7 @@ index 1f9ae428..a8a21d05 100644
    &dynamic_filter_counters<Counter>::keys_skipped_bloom_size_gate,
    &dynamic_filter_counters<Counter>::keys_sized_on_total_rows,
 diff --git a/test/cpp/operator/dynamic_filter_accumulation_test_utils.hpp b/test/cpp/operator/dynamic_filter_accumulation_test_utils.hpp
-index 234590a5..4333d744 100644
+index 234590a5..41e3452b 100644
 --- a/test/cpp/operator/dynamic_filter_accumulation_test_utils.hpp
 +++ b/test/cpp/operator/dynamic_filter_accumulation_test_utils.hpp
 @@ -17,6 +17,7 @@
@@ -941,12 +940,13 @@ index 234590a5..4333d744 100644
  #include <atomic>
  #include <chrono>
  #include <condition_variable>
-@@ -81,20 +83,33 @@
+@@ -81,20 +83,34 @@
  namespace sirius::op::detail {
  
  /**
 - * @brief Exercises the private HOST path and workspace observations from tests
-+ * @brief How a test wants `accumulated_bloom_builder::finish` to run; the defaults are production's.
++ * @brief How a test wants `accumulated_bloom_builder::finish` to run; the defaults are
++ * production's.
   */
 -struct accumulated_bloom_test_access {
 -  using workspace_observation = accumulated_bloom_builder::workspace_observation;
@@ -982,7 +982,7 @@ index 234590a5..4333d744 100644
    }
  };
  
-@@ -280,6 +295,12 @@ void wait_until(Predicate done, std::chrono::milliseconds timeout = std::chrono:
+@@ -280,6 +296,12 @@ void wait_until(Predicate done, std::chrono::milliseconds timeout = std::chrono:
  /**
   * @brief Number of visible GPUs.
   */
@@ -996,7 +996,7 @@ index 234590a5..4333d744 100644
  {
    int count = 0;
 diff --git a/test/cpp/operator/test_dynamic_filter_accumulation.cpp b/test/cpp/operator/test_dynamic_filter_accumulation.cpp
-index b5659309..19fa2627 100644
+index b5659309..d140c130 100644
 --- a/test/cpp/operator/test_dynamic_filter_accumulation.cpp
 +++ b/test/cpp/operator/test_dynamic_filter_accumulation.cpp
 @@ -837,9 +837,7 @@ TEST_CASE(
@@ -1010,7 +1010,7 @@ index b5659309..19fa2627 100644
    {
      auto refusing_task =
        op::detail::scoped_replica_reservation::try_acquire(fixture.gpu(0), mib, stream);
-@@ -852,14 +850,12 @@ TEST_CASE(
+@@ -852,14 +850,14 @@ TEST_CASE(
      REQUIRE(allocator.get_allocated_bytes(stream) == live);
      REQUIRE(allocator.get_peak_allocated_bytes(stream) == peak);
      auto const counters = fixture.stats.snapshot();
@@ -1026,11 +1026,13 @@ index b5659309..19fa2627 100644
 +    REQUIRE(counters.accumulation_publications_finished == 1);
 +    REQUIRE(counters.accumulation_publications_host_staged == 1);
 +    REQUIRE(counters.accumulation_publications_degraded == 1);
++    // Probing allocates on the task stream, beyond what the refusing reservation admits.
++    refusing_task.reset();
 +    fixture.require_members({first, second});
    }
    // Once the task's reservation is gone, the untracked settle leaves only what the channel owns.
    fixture.session->finish_input();
-@@ -2075,87 +2071,7 @@ TEST_CASE("cached fusion finds device-local replicas when a second GPU applies",
+@@ -2075,87 +2073,7 @@ TEST_CASE("cached fusion finds device-local replicas when a second GPU applies",
    REQUIRE(counts == expected);
  }
  
@@ -1119,7 +1121,7 @@ index b5659309..19fa2627 100644
            "[dynamic_filter][construction][accumulation_workspace]")
  {
    acc::fixture fixture;
-@@ -2164,26 +2080,28 @@ TEST_CASE("local-only HOST publication allocates no transfer workspace",
+@@ -2164,26 +2082,28 @@ TEST_CASE("local-only HOST publication allocates no transfer workspace",
    auto batch          = fixture.make_batch(0, 0, 64);
    acc::add_to_builder(builder, fixture, batch);
    auto const expected = acc::partial_union(builder, 2, 1);
@@ -1156,7 +1158,7 @@ index b5659309..19fa2627 100644
    auto const geometry = acc::bloom_geometry(8000);
    auto builder        = acc::make_builder(fixture, geometry);
    auto batch          = fixture.make_batch(1, 0, 100);
-@@ -2192,22 +2110,26 @@ TEST_CASE("HOST scratch uses the unused task reservation and returns its excess"
+@@ -2192,22 +2112,27 @@ TEST_CASE("HOST scratch uses the unused task reservation and returns its excess"
    auto const before   = fixture.allocated_bytes();
    auto const stream   = fixture.publication_stream(0);
    auto& allocator     = fixture.allocator(0);
@@ -1173,27 +1175,28 @@ index b5659309..19fa2627 100644
 -                                               fixture.gpu(0).get_default_allocator(),
 -                                               true,
 -                                               &workspace);
-+    auto filters        = acc::builder_access::finish(
-+      builder,
-+      rmm::cuda_device_id{0},
-+      stream,
-+      fixture.gpu(0).get_default_allocator(),
-+      {.islands = separate ? std::span{acc::separate_gpus}.first(2)
-+                           : std::span<std::uint8_t const>{},
-+       .report  = &workspace});
++    auto filters =
++      acc::builder_access::finish(builder,
++                                  rmm::cuda_device_id{0},
++                                  stream,
++                                  fixture.gpu(0).get_default_allocator(),
++                                  {.islands = separate ? std::span{acc::separate_gpus}.first(2)
++                                                       : std::span<std::uint8_t const>{},
++                                   .report  = &workspace});
      REQUIRE(filters);
 -    REQUIRE(workspace.device_scratch_bytes ==
 -            op::detail::tracked_replica_allocation_bytes(geometry.chunk_bytes));
 -    REQUIRE(allocator.get_peak_allocated_bytes(stream) == tracked + workspace.device_scratch_bytes);
 +    // GPUs in one island merge through the root's scratch; separate GPUs take no device scratch.
 +    auto const scratch =
-+      separate ? 0 : op::detail::tracked_replica_allocation_bytes(acc::merge_scratch_bytes(geometry));
++      separate ? 0
++               : op::detail::tracked_replica_allocation_bytes(acc::merge_scratch_bytes(geometry));
 +    REQUIRE(workspace.device_scratch_bytes == std::vector<std::size_t>{scratch, 0});
 +    REQUIRE(allocator.get_peak_allocated_bytes(stream) == tracked + scratch);
      REQUIRE(allocator.get_allocated_bytes(stream) == tracked);
      REQUIRE(allocator.get_total_reserved_bytes() == reserved);
      REQUIRE(fixture.allocated_bytes()[0] == before[0] + mib);
-@@ -2215,7 +2137,8 @@ TEST_CASE("HOST scratch uses the unused task reservation and returns its excess"
+@@ -2215,7 +2140,8 @@ TEST_CASE("HOST scratch uses the unused task reservation and returns its excess"
                     .get_host_staging_space()
                     .get_memory_resource_of<cucascade::memory::Tier::HOST>();
      REQUIRE(geometry.chunk_bytes < host->get_block_size());
@@ -1204,7 +1207,7 @@ index b5659309..19fa2627 100644
    }
    REQUIRE(fixture.allocated_bytes() == before);
 diff --git a/test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp b/test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp
-index 17d26c5a..26c3bdf7 100644
+index 17d26c5a..b45f1549 100644
 --- a/test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp
 +++ b/test/cpp/operator/test_dynamic_filter_accumulation_fault.cpp
 @@ -21,10 +21,13 @@
@@ -1238,19 +1241,18 @@ index 17d26c5a..26c3bdf7 100644
  }  // namespace
  
  TEST_CASE("accumulated publication faults drain all registered streams and retain the CUDA cause",
-@@ -62,7 +72,10 @@ TEST_CASE("accumulated publication faults drain all registered streams and retai
+@@ -62,7 +72,9 @@ TEST_CASE("accumulated publication faults drain all registered streams and retai
                                failure_point{fault::enqueue_copy_batch, 1, true},
                                failure_point{fault::enqueue_copy_batch, 3, true},
                                failure_point{fault::enqueue_copy_batch, 12, true},
 -                              failure_point{fault::synchronize_stream_unjoined, 4, true});
 +                              failure_point{fault::enqueue_copy_batch, 23, true},
 +                              failure_point{fault::wait_event, 2, true},
-+                              failure_point{fault::synchronize_stream_unjoined, 4, true},
-+                              failure_point{fault::synchronize_stream_unjoined, 6, true});
++                              failure_point{fault::synchronize_stream_unjoined, 0, true});
    CAPTURE(point.operation, point.skip, point.staged);
    acc::fixture fixture({.devices = 2});
    if (!point.staged && !acc::has_pool_access(fixture.spaces)) { return; }
-@@ -86,7 +99,7 @@ TEST_CASE("accumulated publication faults drain all registered streams and retai
+@@ -86,7 +98,7 @@ TEST_CASE("accumulated publication faults drain all registered streams and retai
                                          rmm::cuda_device_id{0},
                                          fixture.publication_stream(0),
                                          fixture.gpu(0).get_default_allocator(),
@@ -1259,25 +1261,25 @@ index 17d26c5a..26c3bdf7 100644
        FAIL("the publication CUDA failure must escape");
      } catch (sirius::op::detail::accumulation_cuda_error const& error) {
        REQUIRE(error.code() == cudaErrorInvalidValue);
-@@ -111,7 +124,7 @@ TEST_CASE("accumulation preparation event failure preserves partials and retires
+@@ -111,7 +123,7 @@ TEST_CASE("accumulation preparation event failure preserves partials and retires
            "[dynamic_filter][accumulation_fault][multi_gpu][cuda_status_fault]")
  {
    if (!has_two_gpus()) { return; }
 -  auto const skip = GENERATE(std::size_t{0}, std::size_t{6});
-+  auto const skip = GENERATE(std::size_t{0}, std::size_t{5});
++  auto const skip = GENERATE(std::size_t{0}, std::size_t{7});
    acc::fixture fixture({.devices = 2});
    if (!acc::has_pool_access(fixture.spaces)) { return; }
    auto builder = acc::make_builder(fixture, acc::bloom_geometry(8000));
-@@ -120,7 +133,7 @@ TEST_CASE("accumulation preparation event failure preserves partials and retires
+@@ -120,7 +132,7 @@ TEST_CASE("accumulation preparation event failure preserves partials and retires
    auto const before   = fixture.allocated_bytes();
    auto const expected = acc::partial_union(builder, 2, 2);
    {
 -    // Six prior events place the late failure at the last target-completion event.
-+    // The transfer creates six events here; five prior ones place the late failure at the last.
++    // The transfer creates eight events here; seven prior ones place the late failure at the last.
      fault injection{fault::create_event, cudaErrorInvalidValue, skip};
      REQUIRE_THROWS_AS(builder.finish(rmm::cuda_device_id{0},
                                       fixture.publication_stream(0),
-@@ -164,25 +177,26 @@ TEST_CASE(
+@@ -164,25 +176,26 @@ TEST_CASE(
                                              rmm::cuda_device_id{0},
                                              fixture.publication_stream(0),
                                              fixture.gpu(0).get_default_allocator(),
@@ -1310,7 +1312,7 @@ index 17d26c5a..26c3bdf7 100644
    auto const geometry = acc::bloom_geometry(2'097'153);
    REQUIRE(geometry.chunks_per_key() == 3);
    auto builder = acc::make_builder(fixture, geometry);
-@@ -198,46 +212,56 @@ TEST_CASE("HOST publication submits every target upload before waiting for any",
+@@ -198,46 +211,56 @@ TEST_CASE("HOST publication submits every target upload before waiting for any",
    REQUIRE(host);
    auto const host_before = host->get_total_allocated_bytes();
    auto const baseline    = fixture.allocated_bytes();
@@ -1341,7 +1343,7 @@ index 17d26c5a..26c3bdf7 100644
 +      {.islands = std::span{acc::separate_gpus}.first(3), .report = &workspace});
      REQUIRE(injection.consumed());
      REQUIRE_FALSE(injection.invalid_join());
-     REQUIRE(injection.all_submitted_streams_joined());
+-    REQUIRE(injection.all_submitted_streams_joined());
 -    // The second upload was submitted while the first was held.
 -    REQUIRE(injection.submissions_during_delay() == 1);
 +    // While it was held: the other two leaders' uploads of that chunk and the three downloads of
@@ -1368,9 +1370,11 @@ index 17d26c5a..26c3bdf7 100644
  }
  
 -TEST_CASE("HOST exhaustion refuses preparation without changing any partial",
-+TEST_CASE("a HOST pool with room for one chunk in flight publishes; with less it refuses and "
-+          "changes no partial",
-           "[dynamic_filter][construction][accumulation_fault][multi_gpu][cuda_status_fault]")
+-          "[dynamic_filter][construction][accumulation_fault][multi_gpu][cuda_status_fault]")
++TEST_CASE(
++  "a HOST pool with room for one chunk in flight publishes; with less it refuses and "
++  "changes no partial",
++  "[dynamic_filter][construction][accumulation_fault][multi_gpu][cuda_status_fault]")
  {
    if (!has_two_gpus()) { return; }
 +  bool const one_chunk_fits = GENERATE(true, false);
@@ -1384,7 +1388,7 @@ index 17d26c5a..26c3bdf7 100644
    std::array<std::array<std::vector<std::byte>, 2>, 2> before;
    for (std::size_t key = 0; key < 2; ++key) {
      for (int device = 0; device < 2; ++device) {
-@@ -247,31 +271,42 @@ TEST_CASE("HOST exhaustion refuses preparation without changing any partial",
+@@ -247,31 +270,42 @@ TEST_CASE("HOST exhaustion refuses preparation without changing any partial",
    auto* host = fixture.spaces[0]
                   .get_host_staging_space()
                   .get_memory_resource_of<cucascade::memory::Tier::HOST>();
@@ -1442,7 +1446,7 @@ index 17d26c5a..26c3bdf7 100644
    for (std::size_t key = 0; key < 2; ++key) {
      for (int device = 0; device < 2; ++device) {
        auto const partial = builder.inspect_partial(key, rmm::cuda_device_id{device});
-@@ -281,3 +316,120 @@ TEST_CASE("HOST exhaustion refuses preparation without changing any partial",
+@@ -281,3 +315,118 @@ TEST_CASE("HOST exhaustion refuses preparation without changing any partial",
      }
    }
  }
@@ -1480,9 +1484,7 @@ index 17d26c5a..26c3bdf7 100644
 +                              island_failure{fault::enqueue_copy_batch, 9, "later chunk"},
 +                              island_failure{fault::synchronize_event, 0, "host OR, first chunk"},
 +                              island_failure{fault::synchronize_event, 5, "host OR, later chunk"},
-+                              island_failure{fault::synchronize_stream_unjoined, 0, "final wait"},
-+                              island_failure{fault::synchronize_stream_unjoined, 7, "final wait, "
-+                                                                                    "leased"});
++                              island_failure{fault::synchronize_stream_unjoined, 0, "final wait"});
 +  CAPTURE(devices, point.operation, point.skip, point.stage);
 +  acc::fixture fixture({.devices = static_cast<std::size_t>(std::min(devices, 4))});
 +  auto const count = fixture.spaces.size();
@@ -1493,8 +1495,8 @@ index 17d26c5a..26c3bdf7 100644
 +  auto builder = acc::make_builder(fixture, acc::bloom_geometry(2'097'153));
 +  std::vector<acc::batch_ptr> batches;
 +  for (std::size_t device = 0; device < count; ++device) {
-+    batches.push_back(fixture.make_batch(
-+      static_cast<int>(device), static_cast<std::int64_t>(1000 * device), 100));
++    batches.push_back(
++      fixture.make_batch(static_cast<int>(device), static_cast<std::int64_t>(1000 * device), 100));
 +    acc::add_to_builder(builder, fixture, batches.back());
 +  }
 +  auto const before = fixture.allocated_bytes();
@@ -1530,8 +1532,10 @@ index 17d26c5a..26c3bdf7 100644
 +{
 +  auto const devices = GENERATE(std::size_t{1}, std::size_t{2});
 +  if (static_cast<std::size_t>(acc::visible_gpus()) < devices) { return; }
++  // Any copy of the armed kind would consume the fault and fail the publication.
++  auto const copy        = GENERATE(fault::copy_peer, fault::enqueue_copy_batch);
 +  bool const contributes = devices == 1;
-+  CAPTURE(devices, contributes);
++  CAPTURE(devices, contributes, copy);
 +  acc::fixture fixture({.devices = devices});
 +  auto builder = acc::make_builder(fixture, acc::bloom_geometry(8000));
 +  acc::batch_ptr batch;
@@ -1544,15 +1548,13 @@ index 17d26c5a..26c3bdf7 100644
 +  sirius::op::detail::union_report workspace;
 +  std::optional<sirius::op::detail::accumulated_bloom_builder::publication> published;
 +  {
-+    // Armed far beyond any call: the harness only records what this thread submits.
-+    fault injection{fault::copy_peer, cudaErrorInvalidValue, 1'000'000};
++    fault injection{copy, cudaErrorInvalidValue};
 +    published = acc::builder_access::finish(builder,
 +                                            rmm::cuda_device_id{0},
 +                                            fixture.publication_stream(0),
 +                                            fixture.gpu(0).get_default_allocator(),
 +                                            {.report = &workspace});
 +    REQUIRE_FALSE(injection.consumed());
-+    REQUIRE(injection.observed_stream_count() == 0);
 +  }
 +  REQUIRE(published);
 +  using route = sirius::op::detail::accumulated_bloom_builder::publication_route;
@@ -1564,7 +1566,7 @@ index 17d26c5a..26c3bdf7 100644
 +  acc::require_exact_union(published->filters, expected, devices);
 +}
 diff --git a/test/cpp/pipeline/test_in_task_publication.cpp b/test/cpp/pipeline/test_in_task_publication.cpp
-index 205f15d3..927dbaa5 100644
+index 205f15d3..e05d8a19 100644
 --- a/test/cpp/pipeline/test_in_task_publication.cpp
 +++ b/test/cpp/pipeline/test_in_task_publication.cpp
 @@ -35,6 +35,7 @@
@@ -1575,14 +1577,16 @@ index 205f15d3..927dbaa5 100644
  #include <cucascade/memory/memory_reservation.hpp>
  #include <cucascade/memory/memory_reservation_manager.hpp>
  
-@@ -849,17 +850,15 @@ TEST_CASE("scheduler error drain joins collecting and publishing PARTITION tasks
+@@ -849,17 +850,16 @@ TEST_CASE("scheduler error drain joins collecting and publishing PARTITION tasks
    require_worker_reuse(test);
  }
  
 -TEST_CASE("optional publication scratch OOM deposits without rescheduling the PARTITION task",
-+TEST_CASE("refused publication scratch deposits without rescheduling the PARTITION task and "
-+          "publishes through the host",
-           "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
+-          "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
++TEST_CASE(
++  "refused publication scratch deposits without rescheduling the PARTITION task and "
++  "publishes through the host",
++  "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
  {
    if (!sirius::test::has_gpus(2)) { return; }
 -  bool const refuse_host_scratch = GENERATE(false, true);
@@ -1595,7 +1599,7 @@ index 205f15d3..927dbaa5 100644
    auto record                     = std::make_shared<retry_record>();
    record->constrain_first_attempt = true;
    auto tasks                      = test.tasks({first, final}, record);
-@@ -867,23 +866,13 @@ TEST_CASE("optional publication scratch OOM deposits without rescheduling the PA
+@@ -867,23 +867,13 @@ TEST_CASE("optional publication scratch OOM deposits without rescheduling the PA
    auto const geometry = acc::bloom_geometry(4000, 2, bloom_cap);
    auto const scratch_bytes =
      rmm::align_up(acc::merge_scratch_bytes(geometry), rmm::CUDA_ALLOCATION_ALIGNMENT);
@@ -1619,7 +1623,7 @@ index 205f15d3..927dbaa5 100644
      });
    };
    test.start();
-@@ -892,36 +881,31 @@ TEST_CASE("optional publication scratch OOM deposits without rescheduling the PA
+@@ -892,36 +882,32 @@ TEST_CASE("optional publication scratch OOM deposits without rescheduling the PA
    test.wait_completed(2);
    sirius::test::retire_scheduler_query(
      test.lifecycle, *test.scheduler, test.pipeline->get_query_id(), true, test.creator.get());
@@ -1658,9 +1662,11 @@ index 205f15d3..927dbaa5 100644
  }
  
 -TEST_CASE("publication scratch allocation failure retires ordinary-pool partials",
-+TEST_CASE("refused publication scratch publishes through the host; a refused HOST window retires "
-+          "ordinary-pool partials",
-           "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
+-          "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
++TEST_CASE(
++  "refused publication scratch publishes through the host; a refused HOST window retires "
++  "ordinary-pool partials",
++  "[pipeline][dynamic_filter][in_task_publication][mgpu][multi_gpu]")
  {
    if (!sirius::test::has_gpus(2)) { return; }
 +  bool const host_exhausted = GENERATE(false, true);
@@ -1668,7 +1674,7 @@ index 205f15d3..927dbaa5 100644
    acc::fixture memory{{.devices = 2}};
    if (!acc::has_pool_access(memory.spaces)) { return; }
    auto const input         = memory.make_batch(1, 0, 4000);
-@@ -934,6 +918,11 @@ TEST_CASE("publication scratch allocation failure retires ordinary-pool partials
+@@ -934,6 +920,11 @@ TEST_CASE("publication scratch allocation failure retires ordinary-pool partials
      requests.emplace_back(device, requested);
      throw rmm::out_of_memory{"refused optional merge scratch"};
    };
@@ -1680,7 +1686,7 @@ index 205f15d3..927dbaa5 100644
    {
      using builder_type = op::detail::accumulated_bloom_builder;
      auto builder =
-@@ -948,12 +937,29 @@ TEST_CASE("publication scratch allocation failure retires ordinary-pool partials
+@@ -948,12 +939,29 @@ TEST_CASE("publication scratch allocation failure retires ordinary-pool partials
          sirius::get_cudf_table_view(source), rmm::cuda_device_id{1}, memory.task_stream(1)));
        memory.task_stream(1).sync();
      }
@@ -1715,10 +1721,10 @@ index 205f15d3..927dbaa5 100644
    REQUIRE(memory.gpu(1).get_total_reserved_memory() == 0);
 diff --git a/src/cuda/union_transfer.cu b/src/cuda/union_transfer.cu
 new file mode 100644
-index 00000000..acc9354d
+index 00000000..0bf3d5a9
 --- /dev/null
 +++ b/src/cuda/union_transfer.cu
-@@ -0,0 +1,776 @@
+@@ -0,0 +1,810 @@
 +/*
 + * Copyright 2026, Sirius Contributors.
 + *
@@ -1869,13 +1875,13 @@ index 00000000..acc9354d
 + * events its sources record.
 + */
 +struct island_state {
-+  int device;                           // The leader's GPU
-+  std::uint8_t leader;                  // Index into the request's members
-+  std::vector<std::uint8_t> sources;    // Contributing members other than the leader
-+  std::vector<std::uint8_t> others;     // Every member other than the leader
-+  bool input   = false;                 // Copies its chunks to the host
-+  bool uploads = false;                 // Receives chunks from the host
-+  std::size_t input_index = 0;          // Its position among the inputs
++  int device;                         // The leader's GPU
++  std::uint8_t leader;                // Index into the request's members
++  std::vector<std::uint8_t> sources;  // Contributing members other than the leader
++  std::vector<std::uint8_t> others;   // Every member other than the leader
++  bool input              = false;    // Copies its chunks to the host
++  bool uploads            = false;    // Receives chunks from the host
++  std::size_t input_index = 0;        // Its position among the inputs
 +
 +  std::optional<stream_lease> ingress_lease;  // Absent for the root, which uses the caller's stream
 +  cudaStream_t ingress = nullptr;             // Carries the peer copies into scratch
@@ -1953,11 +1959,12 @@ index 00000000..acc9354d
 +    std::ranges::transform(_request.members, contributed.get(), &union_member::contributed);
 +    auto plan = union_plan::make(_request.island_ids, {contributed.get(), members}, _request.root);
 +    _joined.push_back(_request.root_stream);
-+    for (auto const& member : _request.members) {
-+      _joined.push_back(member.stream);
++    for (std::size_t member = 0; member < members; ++member) {
++      join(_request.members[member].stream, device_of(member));
 +    }
 +    if (plan.moves_nothing() || _chunks.empty()) {
 +      _report.islands = static_cast<std::uint8_t>(plan.islands.size());
++      create_completion_events();
 +      return true;
 +    }
 +    for (std::size_t index = 0; index < plan.islands.size(); ++index) {
@@ -1973,14 +1980,15 @@ index 00000000..acc9354d
 +    _inputs       = plan.inputs();
 +    _crosses_host = plan.crosses_host();
 +    for (std::size_t index = 0; index < _islands.size(); ++index) {
-+      auto& entry       = _islands[index];
-+      auto const& roles = plan.islands[index];
-+      entry.input       = _crosses_host && roles.contributes();
-+      entry.uploads     = plan.uploads(roles);
++      auto& entry         = _islands[index];
++      auto const& roles   = plan.islands[index];
++      entry.input         = _crosses_host && roles.contributes();
++      entry.uploads       = plan.uploads(roles);
 +      _report.peer_copies = _report.peer_copies || !entry.others.empty();
 +    }
 +    if (_crosses_host && !acquire_window(plan.host_slots())) { return false; }
 +    acquire_streams_and_events();
++    create_completion_events();
 +    _report.islands       = static_cast<std::uint8_t>(_islands.size());
 +    _report.host_inputs   = static_cast<std::uint8_t>(_crosses_host ? _inputs : 0);
 +    _report.window_chunks = static_cast<std::uint8_t>(_window);
@@ -2026,18 +2034,45 @@ index 00000000..acc9354d
 +    }
 +  }
 +
-+  /// Waits on the host for every stream of `streams()`.
++  /**
++   * @brief Makes the caller's stream wait for every other stream of `streams()` and waits for it on
++   * the host: the call's only blocking wait besides the host ORs.
++   */
 +  void wait() const
 +  {
-+    nvtx_scoped_range wait_range{"dynfilter::accum::late_wait"};
-+    for (auto const stream : _joined) {
-+      check_cuda(cudaStreamSynchronize(stream.get()), "cudaStreamSynchronize(array union)");
++    for (std::size_t index = 0; index < _completed.size(); ++index) {
++      {
++        rmm::cuda_set_device_raii guard{rmm::cuda_device_id{_joined_devices[index]}};
++        check_cuda(cudaEventRecord(_completed[index].get(), _joined[index + 1].get()),
++                   "cudaEventRecord(completed)");
++      }
++      check_cuda(cudaStreamWaitEvent(_request.root_stream.get(), _completed[index].get(), 0),
++                 "cudaStreamWaitEvent(completed)");
 +    }
++    nvtx_scoped_range wait_range{"dynfilter::accum::late_wait"};
++    check_cuda(cudaStreamSynchronize(_request.root_stream.get()),
++               "cudaStreamSynchronize(array union)");
 +  }
 +
 +  [[nodiscard]] union_report take_report() noexcept { return std::move(_report); }
 +
 + private:
++  /// Registers a stream the call submits work to.
++  void join(::cuda::stream_ref stream, int device)
++  {
++    _joined.push_back(stream);
++    _joined_devices.push_back(device);
++  }
++
++  /// One event per registered stream, for the final wait.
++  void create_completion_events()
++  {
++    _completed.reserve(_joined_devices.size());
++    for (auto const device : _joined_devices) {
++      _completed.emplace_back(device);
++    }
++  }
++
 +  [[nodiscard]] int device_of(std::size_t member) const
 +  {
 +    return _request.members[member].space->get_device_id();
@@ -2073,14 +2108,14 @@ index 00000000..acc9354d
 +    try {
 +      if (roles.leader == _request.root) {
 +        entry.ingress = _request.root_stream.get();
-+        entry.scratch = std::make_unique<rmm::device_buffer>(
-+          bytes, _request.root_stream, _request.root_scratch);
++        entry.scratch =
++          std::make_unique<rmm::device_buffer>(bytes, _request.root_stream, _request.root_scratch);
 +      } else {
 +        auto& space = *_request.members[roles.leader].space;
 +        entry.ingress_lease.emplace(sirius::memory::runtime_stream_pool::acquire(space));
-+        entry.ingress       = entry.ingress_lease->get().get();
-+        auto lease = scoped_replica_reservation::try_acquire(
-+          space, charge, ::cuda::stream_ref{entry.ingress});
++        entry.ingress = entry.ingress_lease->get().get();
++        auto lease =
++          scoped_replica_reservation::try_acquire(space, charge, ::cuda::stream_ref{entry.ingress});
 +        if (lease) {
 +          entry.scratch_lease.emplace(std::move(*lease));
 +          entry.scratch = std::make_unique<rmm::device_buffer>(
@@ -2101,7 +2136,7 @@ index 00000000..acc9354d
 +        roles.others.size() + 1);
 +      return false;
 +    }
-+    if (entry.ingress_lease) { _joined.push_back(::cuda::stream_ref{entry.ingress}); }
++    if (entry.ingress_lease) { join(::cuda::stream_ref{entry.ingress}, entry.device); }
 +    _report.device_scratch_bytes[roles.leader] = charge;
 +    _islands.push_back(std::move(entry));
 +    return true;
@@ -2117,7 +2152,8 @@ index 00000000..acc9354d
 +  {
 +    auto* const host = _request.host;
 +    if (host == nullptr || host->get_block_size() == 0) {
-+      throw accumulation_invariant_error{"an array union across islands requires fixed HOST blocks"};
++      throw accumulation_invariant_error{
++        "an array union across islands requires fixed HOST blocks"};
 +    }
 +    _block_bytes      = host->get_block_size();
 +    _slot_blocks      = ::cuda::ceil_div(_slot_bytes, _block_bytes);
@@ -2128,11 +2164,12 @@ index 00000000..acc9354d
 +      try {
 +        _window_blocks = host->allocate_multiple_blocks(bytes);
 +      } catch (std::bad_alloc const&) {
-+        SIRIUS_LOG_INFO("[unite] the pinned HOST pool refused a window of {} bytes ({} chunk(s) in "
-+                        "flight for {} input(s)).",
-+                        bytes,
-+                        _window,
-+                        _inputs);
++        SIRIUS_LOG_INFO(
++          "[unite] the pinned HOST pool refused a window of {} bytes ({} chunk(s) in "
++          "flight for {} input(s)).",
++          bytes,
++          _window,
++          _inputs);
 +        continue;
 +      }
 +      if (_window_blocks->size_bytes() < bytes) {
@@ -2173,11 +2210,11 @@ index 00000000..acc9354d
 +      if (entry.input) {
 +        entry.input_index = inputs++;
 +        entry.download.emplace(sirius::memory::runtime_stream_pool::acquire(space));
-+        _joined.push_back(entry.download->get());
++        join(entry.download->get(), entry.device);
 +      }
 +      if (entry.uploads) {
 +        entry.upload.emplace(sirius::memory::runtime_stream_pool::acquire(space));
-+        _joined.push_back(entry.upload->get());
++        join(entry.upload->get(), entry.device);
 +      }
 +      for (std::size_t slot = 0; slot < _window; ++slot) {
 +        if (entry.input) { entry.down_done.emplace_back(entry.device); }
@@ -2286,7 +2323,8 @@ index 00000000..acc9354d
 +      }
 +      offset += count;
 +    }
-+    check_cuda(_copies.enqueue(::cuda::stream_ref{stream}), "device_copy_batch::enqueue(array union)");
++    check_cuda(_copies.enqueue(::cuda::stream_ref{stream}),
++               "device_copy_batch::enqueue(array union)");
 +  }
 +
 +  /// Cross, first half: every contributing leader copies its chunk to its host slot.
@@ -2320,7 +2358,8 @@ index 00000000..acc9354d
 +    }
 +  }
 +
-+  /// Cross, between the halves: waits for the inputs of one chunk and ORs them into its output slot.
++  /// Cross, between the halves: waits for the inputs of one chunk and ORs them into its output
++  /// slot.
 +  void combine_on_host(std::size_t sequence)
 +  {
 +    auto const position = sequence % _window;
@@ -2392,8 +2431,7 @@ index 00000000..acc9354d
 +                       piece.bytes,
 +                       first_block(position, passed != nullptr ? 0 : _inputs),
 +                       false);
-+      check_cuda(cudaEventRecord(entry.up_done[position].get(), stream),
-+                 "cudaEventRecord(upload)");
++      check_cuda(cudaEventRecord(entry.up_done[position].get(), stream), "cudaEventRecord(upload)");
 +    }
 +  }
 +
@@ -2403,7 +2441,7 @@ index 00000000..acc9354d
 +    auto const& piece = _chunks[sequence];
 +    for (auto const& entry : _islands) {
 +      // A leader that neither uploads nor merges was waited for once, before the first chunk.
-+      auto const* const settled = entry.uploads           ? &entry.up_done[sequence % _window]
++      auto const* const settled = entry.uploads            ? &entry.up_done[sequence % _window]
 +                                  : !entry.sources.empty() ? &entry.merged[sequence % 2]
 +                                                           : nullptr;
 +      for (auto const member : entry.others) {
@@ -2436,18 +2474,20 @@ index 00000000..acc9354d
 +  union_request const& _request;
 +  union_or_runner _runner;
 +  union_report _report;
-+  std::vector<chunk> _chunks;      // Every chunk of every array, in submission order
-+  std::size_t _slot_bytes = 0;     // The largest chunk: the size of one scratch or host slot
-+  std::size_t _inputs     = 0;     // Contributing islands
-+  bool _crosses_host      = false;
-+  std::size_t _window       = 0;   // Chunks in flight per host input
-+  std::size_t _window_slots = 0;   // Host slots per chunk in flight
-+  std::size_t _block_bytes  = 0;   // Size of one pinned block
-+  std::size_t _slot_blocks  = 0;   // Pinned blocks per host slot
-+  unsigned _parts           = 1;   // Parts of one host OR
++  std::vector<chunk> _chunks;     // Every chunk of every array, in submission order
++  std::size_t _slot_bytes   = 0;  // The largest chunk: the size of one scratch or host slot
++  std::size_t _inputs       = 0;  // Contributing islands
++  bool _crosses_host        = false;
++  std::size_t _window       = 0;                       // Chunks in flight per host input
++  std::size_t _window_slots = 0;                       // Host slots per chunk in flight
++  std::size_t _block_bytes  = 0;                       // Size of one pinned block
++  std::size_t _slot_blocks  = 0;                       // Pinned blocks per host slot
++  unsigned _parts           = 1;                       // Parts of one host OR
 +  std::vector<std::span<std::byte const>> _or_inputs;  // Per part: its view of every input
 +  sirius::cuda::device_copy_batch _copies;
-+  std::vector<::cuda::stream_ref> _joined;
++  std::vector<::cuda::stream_ref> _joined;  // The caller's stream, then every other stream used
++  std::vector<int> _joined_devices;         // The GPU of each stream after the caller's
++  std::vector<device_event> _completed;     // Per stream after the caller's: its work is complete
 +  // Released after the islands, whose streams read and write it.
 +  cucascade::memory::fixed_multiple_blocks_allocation _window_blocks;
 +  std::vector<island_state> _islands;  // The root's island first
@@ -2456,8 +2496,8 @@ index 00000000..acc9354d
 +void validate(union_request const& request)
 +{
 +  auto const members = request.members.size();
-+  bool valid         = members != 0 && members == request.island_ids.size() &&
-+                       request.root < members && members <= std::numeric_limits<std::uint8_t>::max();
++  bool valid = members != 0 && members == request.island_ids.size() && request.root < members &&
++               members <= std::numeric_limits<std::uint8_t>::max();
 +  for (auto const& shape : request.shapes) {
 +    valid = valid && shape.chunk_bytes != 0 && shape.chunk_bytes % sizeof(uint4) == 0 &&
 +            shape.bytes % sizeof(uint4) == 0;
@@ -2497,10 +2537,10 @@ index 00000000..acc9354d
 +}  // namespace sirius::op::detail
 diff --git a/src/op/dynamic_filter/detail/union_transfer.hpp b/src/op/dynamic_filter/detail/union_transfer.hpp
 new file mode 100644
-index 00000000..18f8c569
+index 00000000..b7bf99bc
 --- /dev/null
 +++ b/src/op/dynamic_filter/detail/union_transfer.hpp
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,157 @@
 +/*
 + * Copyright 2026, Sirius Contributors.
 + *
@@ -2521,9 +2561,9 @@ index 00000000..18f8c569
 + * @file union_transfer.hpp
 + * @brief Makes equally shaped byte arrays on several GPUs equal to their bitwise OR.
 + *
-+ * `accumulated_bloom_builder::finish` is the only caller: its arrays are the per-GPU Bloom partials.
-+ * `unite` knows nothing about filters. Using the vocabulary of `union_plan.hpp`, it moves every
-+ * array chunk by chunk through up to three stages:
++ * `accumulated_bloom_builder::finish` is the only caller: its arrays are the per-GPU Bloom
++ * partials. `unite` knows nothing about filters. Using the vocabulary of `union_plan.hpp`, it moves
++ * every array chunk by chunk through up to three stages:
 + *
 + * 1. Merge: inside an island, each contributing member's chunk is copied device to device into the
 + *    leader's scratch and ORed into the leader's chunk on the GPU.
@@ -2563,9 +2603,9 @@ index 00000000..18f8c569
 + */
 +struct union_member {
 +  cucascade::memory::memory_space* space;  ///< The GPU's space; scratch and streams come from it
-+  ::cuda::stream_ref stream;  ///< Orders every use and every free of this member's arrays
++  ::cuda::stream_ref stream;           ///< Orders every use and every free of this member's arrays
 +  std::span<std::byte* const> arrays;  ///< One pointer per array; null for an array of no bytes
-+  bool contributed;  ///< False promises that the arrays are all zero
++  bool contributed;                    ///< False promises that the arrays are all zero
 +};
 +
 +/**
@@ -2596,12 +2636,12 @@ index 00000000..18f8c569
 + * @brief What one `unite` call did and the workspace it held.
 + */
 +struct union_report {
-+  std::uint8_t islands       = 0;  ///< Islands after any split
-+  std::uint8_t host_inputs   = 0;  ///< Islands that copied to the host; 0 without a cross stage
-+  std::uint8_t window_chunks = 0;  ///< Chunks in flight per host input; 0 without a cross stage
-+  bool peer_copies           = false;  ///< Whether any merge or fan-out stage ran
-+  bool degraded              = false;  ///< An island was split or the window was halved
-+  std::size_t host_window_bytes = 0;   ///< Pinned bytes held
++  std::uint8_t islands          = 0;  ///< Islands after any split
++  std::uint8_t host_inputs      = 0;  ///< Islands that copied to the host; 0 without a cross stage
++  std::uint8_t window_chunks    = 0;  ///< Chunks in flight per host input; 0 without a cross stage
++  bool peer_copies              = false;          ///< Whether any merge or fan-out stage ran
++  bool degraded                 = false;          ///< An island was split or the window was halved
++  std::size_t host_window_bytes = 0;              ///< Pinned bytes held
 +  std::vector<std::size_t> device_scratch_bytes;  ///< Per member: its tracked scratch charge
 +};
 +
@@ -2620,13 +2660,12 @@ index 00000000..18f8c569
 +  template <sirius::memory::host_or_executor Executor>
 +  [[nodiscard]] static union_or_runner of(Executor& executor) noexcept
 +  {
-+    return {
-+      &executor,
-+      static_cast<unsigned>(executor.max_parts()),
-+      [](void* erased, unsigned parts, part_function part, void* context) noexcept {
-+        static_cast<Executor*>(erased)->run(
-+          parts, [&](unsigned index) noexcept { part(context, index); });
-+      }};
++    return {&executor,
++            static_cast<unsigned>(executor.max_parts()),
++            [](void* erased, unsigned parts, part_function part, void* context) noexcept {
++              static_cast<Executor*>(erased)->run(
++                parts, [&](unsigned index) noexcept { part(context, index); });
++            }};
 +  }
 +};
 +
@@ -2661,10 +2700,10 @@ index 00000000..18f8c569
 +}  // namespace sirius::op::detail
 diff --git a/test/cpp/operator/test_dynamic_filter_union_transfer.cpp b/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
 new file mode 100644
-index 00000000..4c2d4734
+index 00000000..a6af3293
 --- /dev/null
 +++ b/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,478 @@
 +/*
 + * Copyright 2026, Sirius Contributors.
 + *
@@ -2707,8 +2746,8 @@ index 00000000..4c2d4734
 +#include <vector>
 +
 +namespace {
-+namespace acc = sirius::test::accumulation;
-+namespace op  = sirius::op;
++namespace acc      = sirius::test::accumulation;
++namespace op       = sirius::op;
 +using builder_type = op::detail::accumulated_bloom_builder;
 +using route        = builder_type::publication_route;
 +
@@ -2788,13 +2827,13 @@ index 00000000..4c2d4734
 +    chunks += ::cuda::ceil_div(bytes, chunk);
 +    slot = std::max(slot, chunk);
 +  }
-+  auto const plan     = op::detail::union_plan::make(islands, contributed, root);
++  auto const plan      = op::detail::union_plan::make(islands, contributed, root);
 +  auto const in_flight = std::min<std::size_t>(2, chunks);
 +  expected_workspace expected{std::vector<std::size_t>(islands.size(), 0), 0, route::NONE};
 +  if (plan.moves_nothing()) { return expected; }
 +  bool peer = false;
 +  for (auto const& island : plan.islands) {
-+    peer = peer || !island.others.empty();
++    peer                                         = peer || !island.others.empty();
 +    expected.device_scratch_bytes[island.leader] = op::detail::tracked_replica_allocation_bytes(
 +      in_flight * op::detail::union_plan::merge_slots(island) * slot);
 +  }
@@ -2812,8 +2851,8 @@ index 00000000..4c2d4734
 +  std::vector<acc::batch_ptr> batches;
 +  for (std::size_t device = 0; device < fixture.spaces.size(); ++device) {
 +    if ((mask >> device & 1U) == 0) { continue; }
-+    batches.push_back(fixture.make_batch(
-+      static_cast<int>(device), static_cast<std::int64_t>(1000 * device), 100));
++    batches.push_back(
++      fixture.make_batch(static_cast<int>(device), static_cast<std::int64_t>(1000 * device), 100));
 +    acc::add_to_builder(builder, fixture, batches.back());
 +  }
 +  return batches;
@@ -2849,12 +2888,12 @@ index 00000000..4c2d4734
 +  {
 +    auto const device = static_cast<int>(root);
 +    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
-+    published = acc::builder_access::finish(
-+      builder,
-+      rmm::cuda_device_id{device},
-+      fixture.publication_stream(device),
-+      fixture.gpu(device).get_default_allocator(),
-+      {.islands = islands, .inline_or = inline_or, .report = &report});
++    published =
++      acc::builder_access::finish(builder,
++                                  rmm::cuda_device_id{device},
++                                  fixture.publication_stream(device),
++                                  fixture.gpu(device).get_default_allocator(),
++                                  {.islands = islands, .inline_or = inline_or, .report = &report});
 +  }
 +  REQUIRE(published);
 +  REQUIRE_FALSE(published->degraded);
@@ -2874,13 +2913,15 @@ index 00000000..4c2d4734
 +}
 +}  // namespace
 +
-+TEST_CASE("every replica equals the union of the partials for every grouping, contribution and root",
-+          "[dynamic_filter][construction][union_transfer][accumulation_workspace][multi_gpu]")
++TEST_CASE(
++  "every replica equals the union of the partials for every grouping, contribution and root",
++  "[dynamic_filter][construction][union_transfer][accumulation_workspace][multi_gpu]")
 +{
 +  auto const devices = GENERATE(std::size_t{2}, std::size_t{3}, std::size_t{4});
 +  if (lacks_gpus(devices)) { return; }
 +  acc::fixture fixture({.devices = devices});
-+  // Three chunks per key, the last one short: both scratch buffers and both window slots are reused.
++  // Three chunks per key, the last one short: both scratch buffers and both window slots are
++  // reused.
 +  auto const geometry = acc::bloom_geometry(2'097'153);
 +  REQUIRE(geometry.chunks_per_key() == 3);
 +  for (std::size_t keys = 1; keys <= 2; ++keys) {
@@ -2919,9 +2960,10 @@ index 00000000..4c2d4734
 +  }
 +}
 +
-+TEST_CASE("refused root merge scratch publishes through the host and keeps the other islands' "
-+          "peer copies",
-+          "[dynamic_filter][construction][union_transfer][multi_gpu]")
++TEST_CASE(
++  "refused root merge scratch publishes through the host and keeps the other islands' "
++  "peer copies",
++  "[dynamic_filter][construction][union_transfer][multi_gpu]")
 +{
 +  auto const devices = GENERATE(std::size_t{2}, std::size_t{4});
 +  if (lacks_gpus(devices)) { return; }
@@ -2937,8 +2979,9 @@ index 00000000..4c2d4734
 +  auto const expected = acc::partial_union(builder, 2, devices);
 +  auto const baseline = fixture.allocated_bytes();
 +  // A task reservation that admits nothing beyond what is already allocated on the stream.
-+  auto const stream  = fixture.publication_stream(0);
-+  auto refusing_task = op::detail::scoped_replica_reservation::try_acquire(fixture.gpu(0), 256, stream);
++  auto const stream = fixture.publication_stream(0);
++  auto refusing_task =
++    op::detail::scoped_replica_reservation::try_acquire(fixture.gpu(0), 256, stream);
 +  REQUIRE(refusing_task);
 +  op::detail::union_report report;
 +  auto const published = acc::builder_access::finish(
@@ -2994,9 +3037,10 @@ index 00000000..4c2d4734
 +  REQUIRE(published->route == route::PEER_AND_HOST);
 +  REQUIRE(report.islands == 3);
 +  REQUIRE(report.host_inputs == 3);
-+  REQUIRE(report.device_scratch_bytes ==
-+          std::vector<std::size_t>{
-+            op::detail::tracked_replica_allocation_bytes(acc::merge_scratch_bytes(geometry)), 0, 0, 0});
++  REQUIRE(
++    report.device_scratch_bytes ==
++    std::vector<std::size_t>{
++      op::detail::tracked_replica_allocation_bytes(acc::merge_scratch_bytes(geometry)), 0, 0, 0});
 +  REQUIRE(fixture.allocated_bytes() == baseline);
 +  acc::require_exact_union(published->filters, expected, 4);
 +}
@@ -3048,13 +3092,14 @@ index 00000000..4c2d4734
 +
 +  std::vector<acc::batch_ptr> batches;
 +  for (std::size_t device = 0; device < devices; ++device) {
-+    batches.push_back(fixture.make_batch(
-+      static_cast<int>(device), static_cast<std::int64_t>(1000 * device), 100));
++    batches.push_back(
++      fixture.make_batch(static_cast<int>(device), static_cast<std::int64_t>(1000 * device), 100));
 +  }
 +  // Hold every task stream first, so each insert is still pending when publication starts.
 +  for (std::size_t device = 0; device < devices; ++device) {
 +    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{static_cast<int>(device)}};
-+    acc::enqueue_delay(fixture.task_stream(static_cast<int>(device)), std::chrono::milliseconds{60});
++    acc::enqueue_delay(fixture.task_stream(static_cast<int>(device)),
++                       std::chrono::milliseconds{60});
 +  }
 +  auto builder = acc::make_builder(fixture, geometry);
 +  std::vector<decltype(batches.front()->to_read_only())> sources;
@@ -3066,13 +3111,13 @@ index 00000000..4c2d4734
 +                                rmm::cuda_device_id{id},
 +                                fixture.task_stream(id)));
 +  }
-+  auto const published = acc::builder_access::finish(
-+    builder,
-+    rmm::cuda_device_id{0},
-+    fixture.publication_stream(0),
-+    fixture.gpu(0).get_default_allocator(),
-+    {.islands = separate ? std::span{acc::separate_gpus}.first(devices)
-+                         : std::span<std::uint8_t const>{}});
++  auto const published =
++    acc::builder_access::finish(builder,
++                                rmm::cuda_device_id{0},
++                                fixture.publication_stream(0),
++                                fixture.gpu(0).get_default_allocator(),
++                                {.islands = separate ? std::span{acc::separate_gpus}.first(devices)
++                                                     : std::span<std::uint8_t const>{}});
 +  for (std::size_t device = 0; device < devices; ++device) {
 +    fixture.task_stream(static_cast<int>(device)).sync();
 +  }
