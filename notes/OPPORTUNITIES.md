@@ -43,6 +43,10 @@
   "transfer on, eager off" -> being measured (HYBRID_FULL.md, arms X vs H+X).
 - (2026-11-28) S6 production design written: DESIGN_S6_PR.md (pull/level-triggered release; open questions inside). Not yet shown
   to the user in detail; no S6 production code yet.
+- (2026-11-28) User: LANDING ORDER = transfer PR (on main) -> #2569 -> #2570 -> S6.
+  Orchestrator note: hybrid-full measurement got a duplicate agent (SendMessage to a workflow agent resumed a second copy);
+  the copy was told to stop. Extra arms X / HX (transfer on, eager off) requested in runs/hybridfull/EXTRA_ARMS_REQUEST.md -
+  check HYBRID_FULL.md covers them, else run them afterwards. Do not SendMessage running workflow agents again.
 
 # OPPORTUNITIES: measured, verified opportunity list for the DF stack (#2569 -> #2570), TPC-H SF1000, 4 GPUs
 

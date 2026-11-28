@@ -1,46 +1,278 @@
 # HEAD 1bb25e9aa9fc66ac0b6f01155354772df50bef0e branch proto/hybrid-full
-diff --git a/experimental/doris/doris b/experimental/doris/doris
-index ad35a140..3933c9d6 160000
---- a/experimental/doris/doris
-+++ b/experimental/doris/doris
-@@ -1 +1 @@
--Subproject commit ad35a140c7fd0b842f18c23300bac581f7d04326
-+Subproject commit 3933c9d672f3dc172c4bf618e6d31ec09c141e31-dirty
-diff --git a/experimental/starrocks/brpc b/experimental/starrocks/brpc
-index 7daed0be..e20a3e0e 160000
---- a/experimental/starrocks/brpc
-+++ b/experimental/starrocks/brpc
-@@ -1 +1 @@
--Subproject commit 7daed0be6bf1f4d64b25554c72de7d9319a35dd7
-+Subproject commit e20a3e0e25685e22bb4ee21383b7ebd25701482c-dirty
-diff --git a/experimental/starrocks/starrocks b/experimental/starrocks/starrocks
-index 8a8e1864..34874b56 160000
---- a/experimental/starrocks/starrocks
-+++ b/experimental/starrocks/starrocks
-@@ -1 +1 @@
--Subproject commit 8a8e18642450fba09149c8a3f149abefa043c2b7
-+Subproject commit 34874b5632c9fb9f0c56ad9e3e14aee3fb6e560f-dirty
-diff --git a/sirius-duckdb/duckdb b/sirius-duckdb/duckdb
---- a/sirius-duckdb/duckdb
-+++ b/sirius-duckdb/duckdb
-@@ -1 +1 @@
--Subproject commit d54cbbe3df17e8e5ce68312f483b4155836112aa
-+Subproject commit d54cbbe3df17e8e5ce68312f483b4155836112aa-dirty
-diff --git a/sirius-duckdb/extension-ci-tools b/sirius-duckdb/extension-ci-tools
---- a/sirius-duckdb/extension-ci-tools
-+++ b/sirius-duckdb/extension-ci-tools
-@@ -1 +1 @@
--Subproject commit 55e9f697b4fb70f357cc1bd4d1893cbf217ee359
-+Subproject commit 55e9f697b4fb70f357cc1bd4d1893cbf217ee359-dirty
-diff --git a/sirius-duckdb/vcpkg b/sirius-duckdb/vcpkg
---- a/sirius-duckdb/vcpkg
-+++ b/sirius-duckdb/vcpkg
-@@ -1 +1 @@
--Subproject commit cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
-+Subproject commit cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3-dirty
-diff --git a/substrait b/substrait
---- a/substrait
-+++ b/substrait
-@@ -1 +1 @@
--Subproject commit 922489d3c8c77140b189ad3847554de141378b04
-+Subproject commit 922489d3c8c77140b189ad3847554de141378b04-dirty
+diff --git a/src/cuda/device_transfer.cpp b/src/cuda/device_transfer.cpp
+index fef5e376..56aff9e9 100644
+--- a/src/cuda/device_transfer.cpp
++++ b/src/cuda/device_transfer.cpp
+@@ -29,6 +29,7 @@
+ #include <cucascade/memory/memory_space.hpp>
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <exception>
+ #include <optional>
+ #include <stdexcept>
+@@ -80,8 +81,37 @@ cudaError_t drain(::cuda::stream_ref stream, rmm::cuda_device_id device) noexcep
+   return status;
+ }
+ 
++// PROTOTYPE (hybrid-full, arm EHX*): pipelined host hop for the one-shot replica fan-out.
++thread_local int proto_fast_hop_depth = 0;
++
++bool proto_fast_hop_enabled() noexcept
++{
++  static bool const on = [] {
++    char const* v = std::getenv("SIRIUS_PROTO_ONESHOT_FASTREP");
++    return v != nullptr && std::atoi(v) != 0;
++  }();
++  return on;
++}
++
++struct proto_event_set {
++  std::vector<cudaEvent_t> events;
++  ~proto_event_set()
++  {
++    for (auto e : events) { (void)cudaEventDestroy(e); }
++  }
++};
++
+ }  // namespace
+ 
++proto_pipelined_host_hop_scope::proto_pipelined_host_hop_scope() noexcept
++{
++  if (proto_fast_hop_enabled()) { ++proto_fast_hop_depth; }
++}
++proto_pipelined_host_hop_scope::~proto_pipelined_host_hop_scope()
++{
++  if (proto_fast_hop_enabled()) { --proto_fast_hop_depth; }
++}
++
+ device_transfer_route enqueue_device_copy(std::span<std::byte> destination,
+                                           rmm::cuda_device_id destination_device,
+                                           ::cuda::stream_ref destination_stream,
+@@ -167,6 +197,60 @@ device_transfer_route enqueue_device_copy(std::span<std::byte> destination,
+   bool destination_pending = false;
+   try {
+     wait_for_source(ready, source_stream);
++    if (proto_fast_hop_depth > 0) {
++      // PROTOTYPE: per ~8 MiB group, download on the source stream, upload on the destination stream
++      // behind the group's event; the upload of group k overlaps the download of group k+1. One wait
++      // per stream at the end (the copy is still complete on return, as the relay requires).
++      constexpr std::size_t group_bytes = std::size_t{8} << 20;
++      proto_event_set done;
++      source_pending      = true;
++      destination_pending = true;
++      for (std::size_t first = 0; first < sizes.size();) {
++        std::size_t last = first, bytes = 0;
++        while (last < sizes.size() && bytes < group_bytes) { bytes += sizes[last++]; }
++        {
++          rmm::cuda_set_device_raii guard{source_device};
++          for (std::size_t i = first; i < last; ++i) {
++            CUCASCADE_CUDA_TRY(cudaMemcpyAsync(d2h_destinations[i],
++                                               d2h_sources[i],
++                                               sizes[i],
++                                               cudaMemcpyDeviceToHost,
++                                               source_stream.get()));
++          }
++          cudaEvent_t event{};
++          CUCASCADE_CUDA_TRY(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
++          done.events.push_back(event);
++          CUCASCADE_CUDA_TRY(cudaEventRecord(event, source_stream.get()));
++        }
++        {
++          rmm::cuda_set_device_raii guard{destination_device};
++          CUCASCADE_CUDA_TRY(cudaStreamWaitEvent(destination_stream.get(), done.events.back(), 0));
++          for (std::size_t i = first; i < last; ++i) {
++            CUCASCADE_CUDA_TRY(cudaMemcpyAsync(h2d_destinations[i],
++                                               h2d_sources[i],
++                                               sizes[i],
++                                               cudaMemcpyHostToDevice,
++                                               destination_stream.get()));
++          }
++        }
++        first = last;
++      }
++      {
++        rmm::cuda_set_device_raii guard{source_device};
++        CUCASCADE_CUDA_TRY(cudaStreamSynchronize(source_stream.get()));
++        source_pending = false;
++      }
++      {
++        rmm::cuda_set_device_raii guard{destination_device};
++        CUCASCADE_CUDA_TRY(cudaStreamSynchronize(destination_stream.get()));
++        destination_pending = false;
++      }
++      SIRIUS_LOG_DEBUG("[enqueue_device_copy] PROTO pipelined host hop GPU {} -> GPU {}, {} bytes",
++                       source_device.value(),
++                       destination_device.value(),
++                       source.size());
++      return device_transfer_route::host_staging;
++    }
+     {
+       rmm::cuda_set_device_raii guard{source_device};
+       source_pending = true;
+diff --git a/src/memory/device_transfer.hpp b/src/memory/device_transfer.hpp
+index ca4fbf8a..6e1f7f3a 100644
+--- a/src/memory/device_transfer.hpp
++++ b/src/memory/device_transfer.hpp
+@@ -74,4 +74,13 @@ enum class device_transfer_policy { automatic, force_host_staging };
+   cucascade::memory::memory_space const* host_staging_space,
+   device_transfer_policy policy = device_transfer_policy::automatic);
+ 
++/// PROTOTYPE (hybrid-full, arm EHX*): while alive on this thread and SIRIUS_PROTO_ONESHOT_FASTREP=1,
++/// HOST-staged copies overlap download and upload per 8 MiB group.
++struct proto_pipelined_host_hop_scope {
++  proto_pipelined_host_hop_scope() noexcept;
++  ~proto_pipelined_host_hop_scope();
++  proto_pipelined_host_hop_scope(proto_pipelined_host_hop_scope const&)            = delete;
++  proto_pipelined_host_hop_scope& operator=(proto_pipelined_host_hop_scope const&) = delete;
++};
++
+ }  // namespace sirius::memory
+diff --git a/src/op/dynamic_filter/construction_plan.cpp b/src/op/dynamic_filter/construction_plan.cpp
+index 33e3e9eb..16d6a76d 100644
+--- a/src/op/dynamic_filter/construction_plan.cpp
++++ b/src/op/dynamic_filter/construction_plan.cpp
+@@ -279,6 +279,30 @@ bool is_shadowed(key_plan const& key,
+   return judge_shadow(key.candidate, bindings, decode_membership_cap).shadowed;
+ }
+ 
++bool proto_oneshot_shadowed(dynamic_filter_publish_plan::admitted_key const& key,
++                            membership_filter_kind kind,
++                            std::size_t valid_rows,
++                            std::span<binding_facts const> bindings,
++                            std::size_t decode_membership_cap)
++{
++  static_filter_facts candidate;
++  candidate.kind = kind;
++  if (kind == membership_filter_kind::none) { return false; }
++  if (kind != membership_filter_kind::bloom) { candidate.keys = valid_rows; }
++  candidate.estimated_keep  = key.estimated_keep(valid_rows);
++  candidate.estimate_proven = candidate.estimated_keep && key.domain_gate_eligible();
++  if (!judged(candidate)) { return false; }
++  auto const judgement = judge_shadow(candidate, bindings, decode_membership_cap);
++  log_shadow_judgement("oneshot",
++                       key.planner_condition_index,
++                       candidate,
++                       valid_rows,
++                       bindings.size(),
++                       judgement,
++                       judgement.shadowed ? "skip" : "build");
++  return judgement.shadowed;
++}
++
+ bool construction_shadowed(construction_plan const& planned,
+                            std::span<std::vector<binding_facts> const> bindings,
+                            std::size_t decode_membership_cap)
+diff --git a/src/op/dynamic_filter/construction_plan.hpp b/src/op/dynamic_filter/construction_plan.hpp
+index 055fcfa3..93b14c01 100644
+--- a/src/op/dynamic_filter/construction_plan.hpp
++++ b/src/op/dynamic_filter/construction_plan.hpp
+@@ -167,6 +167,14 @@ struct key_plan {
+                                std::span<binding_facts const> bindings,
+                                std::size_t decode_membership_cap) noexcept;
+ 
++/// PROTOTYPE (hybrid-full): the same shadow judgement for a key the one-shot path is about to build
++/// (kind and valid rows are known exactly there). Logs a `[dynamic_filter_shadow] at=oneshot` line.
++[[nodiscard]] bool proto_oneshot_shadowed(dynamic_filter_publish_plan::admitted_key const& key,
++                                          membership_filter_kind kind,
++                                          std::size_t valid_rows,
++                                          std::span<binding_facts const> bindings,
++                                          std::size_t decode_membership_cap);
++
+ /**
+  * @brief The plan for every admitted key with a binding
+  *
+diff --git a/src/op/dynamic_filter/dynamic_filter_publisher.cpp b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
+index c2e1d041..3c0fdea3 100644
+--- a/src/op/dynamic_filter/dynamic_filter_publisher.cpp
++++ b/src/op/dynamic_filter/dynamic_filter_publisher.cpp
+@@ -17,6 +17,7 @@
+ #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
+ 
+ #include "log/logging.hpp"
++#include "memory/device_transfer.hpp"
+ #include "memory/size_arithmetic.hpp"
+ #include "op/dynamic_filter/bloom_sizing.hpp"
+ #include "op/dynamic_filter/build_filter_construction.hpp"
+@@ -1491,6 +1492,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
+   bool merge_started = false;
+ 
+   try {
++    // PROTOTYPE (hybrid-full): what the Channels already hold, for the one-shot shadow judgement.
++    auto proto_bindings = binding_facts_of(plan);
++    read_published_filters(plan, proto_bindings);
+     for (std::size_t admitted_key_index = 0; admitted_key_index < admitted_keys.size();
+          ++admitted_key_index) {
+       if (probe_types[admitted_key_index].empty()) { continue; }
+@@ -1621,7 +1625,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
+       }
+ 
+       bool const in_list = fits_rep && !policy.bloom_only;
+-      auto const chosen  = choose_membership_filter(
++      auto chosen        = choose_membership_filter(
+         {.build_rows               = valid_rows,
+           .l2_cache_bytes           = l2_bytes,
+           .estimated_hash_set_bytes = set_bytes,
+@@ -1633,6 +1637,16 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
+           .supports_bloom =
+             fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
+ 
++      // PROTOTYPE (hybrid-full): the shadow rule at the one-shot site (the membership is dropped,
++      // the zone map stays, as in plan_construction).
++      bool const proto_shadowed =
++        proto_oneshot_shadowed(admitted_key,
++                               chosen,
++                               valid_rows,
++                               proto_bindings[admitted_key_index],
++                               plan.decode_membership_cap());
++      if (proto_shadowed) { chosen = membership_filter_kind::none; }
++
+       char const* choice = "none";
+       switch (chosen) {
+         case membership_filter_kind::small_in_list: {
+@@ -1667,7 +1681,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
+       }
+       if (filters.membership) { filters.membership_kind = chosen; }
+       // A filter no binding could receive is reported as absent, with the reason it is.
+-      if (!filters.membership ||
++      if (proto_shadowed) {
++        reported.reason = dynamic_filter_key_reason::SHADOWED;
++      } else if (!filters.membership ||
+           !membership_reaches_a_binding(plan, admitted_key_index, filters.membership_domain)) {
+         if (filters.membership) {
+           reported.reason = dynamic_filter_key_reason::UNREADABLE_PROBE;
+@@ -1680,8 +1696,10 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
+       }
+       if (filters.membership) {
+         ++outcome.membership_filters_built;
+-        if (auto const selectivity = estimated_selectivity_of(admitted_key, valid_rows)) {
+-          filters.membership->set_estimated_selectivity(*selectivity);
++        // PROTOTYPE (hybrid-full): shadow-era API; same Proven Estimate rule as the PARTITION path.
++        if (auto const selectivity = admitted_key.estimated_keep(valid_rows)) {
++          filters.membership->set_estimated_selectivity(
++            *selectivity, admitted_key.domain_gate_eligible() && plan.cross_rank_merge() == nullptr);
+         }
+       }
+       if (filters.zone_map) { ++outcome.zone_map_filters_built; }
+@@ -1711,6 +1729,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
+       stream.sync();
+ 
+       nvtx_scoped_range replicate_range{"dynfilter::replicate_devices"};
++      // PROTOTYPE (hybrid-full): EHX* pipelined host hop + replication time in the debug log.
++      sirius::memory::proto_pipelined_host_hop_scope proto_fast_hop;
++      auto const proto_replicate_start = std::chrono::steady_clock::now();
+       auto replicate = [&plan](std::shared_ptr<sirius_dynamic_filter> const& filter) {
+         if (!filter) { return; }
+         auto* replicable = dynamic_cast<sirius_device_replicable*>(filter.get());
+@@ -1727,6 +1748,11 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
+       for (auto const& filters : per_key) {
+         replicate(filters.membership);
+       }
++      SIRIUS_LOG_DEBUG("[proto_oneshot] replicated to {} spaces in {:.2f} ms",
++                       plan.replica_spaces().size(),
++                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
++                                                                 proto_replicate_start)
++                         .count());
+     }
+ 
+     // Permission to publish is granted by before_fanout(). This allows the caller to cancel
