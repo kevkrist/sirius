@@ -3,11 +3,12 @@
 (resampling hot iterations within each process), result identity vs T_a. Also author's m1 numbers side by side."""
 import csv, glob, hashlib, re, statistics as st, sys, os, random
 V = "/opt/dlami/nvme/dfperf/runs/vhybrid"; A = "/opt/dlami/nvme/dfperf/runs/hybrid"
-def load(base, tag):
+def load(base, tags):
     data, res = {}, {}
-    for d in glob.glob(f"{base}/{tag}_*_[ab]/tpch_*_q*"):
+    for tag in tags.split(","):
+      for d in glob.glob(f"{base}/{tag}_*_[ab]/tpch_*_q*"):
         m = re.search(rf"{tag}_([A-Z]+)_([ab])/tpch_.*_q(\d+)$", d)
-        arm, half, q = m.group(1), m.group(2), int(m.group(3))
+        arm, half, q = m.group(1), (m.group(2) if tag == tags.split(",")[0] else tag + m.group(2)), int(m.group(3))
         f = f"{d}/csv/runtimes.csv"
         if not os.path.exists(f): continue
         t = [float(r["runtime_s"]) * 1000 for r in csv.DictReader(open(f)) if int(r["iteration"]) >= 2 and r["query"] != "TOTAL"]
@@ -30,11 +31,11 @@ tag = sys.argv[1]
 D, R = load(V, tag); AD, _ = load(A, "m1")
 arms = [a for a in ["T", "H", "E", "EH", "X", "EHV"] if any(a in D[q] for q in D)]
 f = lambda x: "-" if x is None else f"{x:+.1f}"
-print("| q | n/arm | T ms | T a-b | " + " | ".join(f"{a}-T" for a in arms if a != "T") + " | results |"); print("|---|" * (len(arms) + 4))
+print("| q | n/arm | T ms | T proc spread | " + " | ".join(f"{a}-T" for a in arms if a != "T") + " | results |"); print("|---|" * (len(arms) + 4))
 S = {a: 0.0 for a in arms}; Sn = {a: 0 for a in arms}
 for q in sorted(D):
     t = med(D, q, "T"); v = D[q]["T"]
-    sp = abs(st.median(v["a"]) - st.median(v["b"])) if len(v) == 2 else float("nan")
+    pm = [st.median(x) for x in v.values()]; sp = max(pm) - min(pm)
     cells = []
     for a in arms:
         if a == "T": continue
@@ -48,7 +49,7 @@ for (a, b) in [("EH", "E"), ("X", "E"), ("X", "EH"), ("H", "T"), ("E", "T"), ("E
     print("| q | mine | half a | half b | 95% CI | author | mine+author |"); print("|---|---|---|---|---|---|---|")
     tm = ta = tc = 0.0; lo_s = hi_s = 0.0; n = 0
     for q in sorted(D):
-        if a not in D[q] or b not in D[q] or len(D[q][a]) < 2 or len(D[q][b]) < 2: continue
+        if a not in D[q] or b not in D[q] or len(D[q][a]) < 2 or len(D[q][b]) < 2 or set(D[q][a]) != set(D[q][b]): continue
         d = med(D, q, a) - med(D, q, b)
         ha = st.median(D[q][a]["a"]) - st.median(D[q][b]["a"]); hb = st.median(D[q][a]["b"]) - st.median(D[q][b]["b"])
         lo, hi = boot(D, q, a, b)
