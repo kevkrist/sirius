@@ -328,7 +328,8 @@ std::optional<build_filter_construction::constructed_filters> build_filter_const
   if (_impl->bloom) {
     blooms = _impl->bloom->finish(device, root.stream, root.scratch);
     if (!blooms) { return std::nullopt; }
-    result.transport = blooms->transport;
+    result.route          = blooms->route;
+    result.bloom_degraded = blooms->degraded;
   }
   std::optional<detail::exact_key_stager::gathered> staged;
   if (_impl->stager) {

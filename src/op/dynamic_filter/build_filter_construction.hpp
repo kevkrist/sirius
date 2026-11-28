@@ -124,8 +124,9 @@ class build_filter_construction final {
   struct constructed_filters {
     std::vector<constructed_key> keys;     ///< One per planned key, in plan order
     dynamic_filter_stats_snapshot counts;  ///< The `filters_skipped_construction_*` counters
-    std::optional<detail::accumulated_bloom_builder::publication_transport>
-      transport;  ///< How the Bloom filters reached their replicas, if any key planned one
+    std::optional<detail::accumulated_bloom_builder::publication_route>
+      route;  ///< How the Bloom filters reached their replicas, if any key planned one
+    bool bloom_degraded = false;  ///< `accumulated_bloom_builder::publication::degraded`
   };
 
   /**

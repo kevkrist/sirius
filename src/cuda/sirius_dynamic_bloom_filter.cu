@@ -820,7 +820,6 @@ std::size_t accumulated_bloom_builder::publication_scratch_bytes(std::span<key c
     chunk_slot       = std::max(chunk_slot, chunk);
     chunks += ::cuda::ceil_div(raw_bytes, chunk);
   }
-  // The direct transport's bound, which also covers the HOST-staged transport's single slot.
   auto const slots = std::min<std::size_t>(2, chunks) * (replicas - 1);
   return chunk_slot > maximum / slots ? maximum
                                       : tracked_replica_allocation_bytes(slots * chunk_slot);

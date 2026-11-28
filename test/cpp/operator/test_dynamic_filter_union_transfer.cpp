@@ -93,27 +93,14 @@ std::string describe(std::span<std::uint8_t const> islands)
   return text;
 }
 
-/// The geometry of `keys` arrays of exactly `blocks` Bloom blocks each; mirrors
-/// `accumulated_bloom_geometry::try_create`, which sizes from rows.
-op::detail::accumulated_bloom_geometry geometry_of(std::size_t blocks, std::size_t keys)
-{
-  using geometry       = op::detail::accumulated_bloom_geometry;
-  auto const raw_bytes = blocks * op::bloom_bytes_per_block;
-  auto const aligned   = rmm::align_up(raw_bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
-  auto const chunk     = std::clamp(
-    raw_bytes / 8, geometry::k_min_transfer_chunk_bytes, geometry::k_max_transfer_chunk_bytes);
-  return {blocks,
-          raw_bytes,
-          aligned * keys,
-          std::min(rmm::align_up(chunk, rmm::CUDA_ALLOCATION_ALIGNMENT), aligned)};
-}
-
-/// A builder over `blocks.size()` arrays of `blocks[0]` Bloom blocks each, with the keys of the
-/// fixture's batches.
+/// A builder over arrays of `blocks[i]` Bloom blocks, with the keys of the fixture's batches.
 builder_type make_builder(acc::fixture const& fixture, std::span<std::size_t const> blocks)
 {
-  REQUIRE(std::ranges::all_of(blocks, [&](auto count) { return count == blocks[0]; }));
-  return acc::make_builder(fixture, geometry_of(blocks[0], blocks.size()), blocks.size());
+  std::vector<builder_type::key> keys{{0, cudf::data_type{cudf::type_id::INT32}, blocks[0]}};
+  if (blocks.size() == 2) { keys.push_back({1, cudf::data_type{cudf::type_id::INT64}, blocks[1]}); }
+  auto result = builder_type::try_create(std::move(keys), fixture.spaces);
+  REQUIRE(result);
+  return std::move(*result);
 }
 
 /// What `unite` must report for a publication, from the plan's roles and the array shapes.
@@ -129,9 +116,14 @@ expected_workspace expect_workspace(std::span<std::uint8_t const> islands,
                                     std::span<std::size_t const> blocks,
                                     std::size_t host_block)
 {
-  auto const geometry  = geometry_of(blocks[0], blocks.size());
-  auto const chunks    = blocks.size() * geometry.chunks_per_key();
-  auto const slot      = geometry.chunk_bytes;
+  std::size_t chunks = 0;
+  std::size_t slot   = 0;
+  for (auto const count : blocks) {
+    auto const bytes = count * op::bloom_bytes_per_block;
+    auto const chunk = op::detail::accumulated_bloom_chunk_bytes(bytes);
+    chunks += ::cuda::ceil_div(bytes, chunk);
+    slot = std::max(slot, chunk);
+  }
   auto const plan      = op::detail::union_plan::make(islands, contributed, root);
   auto const in_flight = std::min<std::size_t>(2, chunks);
   expected_workspace expected{std::vector<std::size_t>(islands.size(), 0), 0, route::NONE};
@@ -243,7 +235,7 @@ TEST_CASE(
   }
 }
 
-TEST_CASE("the union is exact for arrays from one chunk to many",
+TEST_CASE("the union is exact for arrays from one chunk to many, of different sizes per key",
           "[dynamic_filter][multi_partition][union_transfer][multi_gpu]")
 {
   auto const devices = std::min<std::size_t>(4, static_cast<std::size_t>(acc::visible_gpus()));
@@ -252,7 +244,7 @@ TEST_CASE("the union is exact for arrays from one chunk to many",
   // Bloom blocks of 32 bytes: 96 B; one short chunk; 2 MiB + 32 B (two chunks, the second 32 B);
   // 8 MiB + 32 B (five chunks); 70 MiB + 96 B (nine 8 MiB chunks with a short tail).
   std::vector<std::vector<std::size_t>> const shapes{
-    {3}, {1000, 1000}, {65537, 65537}, {262145}, {2'293'763, 2'293'763}};
+    {3}, {3, 1000}, {65537, 3}, {262145, 65537}, {2'293'763, 1000}};
   unsigned const all = (1U << devices) - 1;
   for (auto const& blocks : shapes) {
     for (auto const root : {std::size_t{0}, devices - 1}) {
