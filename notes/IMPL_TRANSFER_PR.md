@@ -113,3 +113,15 @@ retires partials).
   prod/stack-2569-on-xfer head, graft the 11 #2570 commits on it (tree + F1 patch; union test from $R/tmp/union_test_c.cpp once tags are [construction]), F2 at 2570 head
   (stats bullets, check vs prod/xfer-on-shadow), build, tests.
 - Measurement 1 queued: runs/xfer_main m1_* (ABBA main vs xfer, q21 3 7 8 10 9 6 2 4) and id1_* (22 q, debug log, 2 iters). Table: bin/table.py main xfer m1.
+
+## Checkpoint log 3 (finishing session, 2026-11-28 afternoon; NVMe was wiped and restored, old worktrees / $R/tmp scripts lost)
+- origin/main = f1595eb3 (a94d5c4b + 1 scan commit, no overlap). All five branches rebased onto it, patches byte-identical (index / hunk offsets only):
+  prod/xfer-main 8c99539f; prod/ctl-stack-2569-on-main 7abf43af; prod/ctl-stack-2570-on-main 61d61249; prod/stack-2569-on-xfer 91dbc27f;
+  prod/stack-2570-on-xfer 67aeb069. Heads before this rebase: prod/old-a94d/* (9038a957, 83d4a8af, 03f77567, cea78cba, 1e81bbd3).
+  Repo-local git identity set to the PR author (author + committer).
+- Worktrees: $R/wt-main (origin/main, arm A), wt-xfer (B), wt-ctl (C = ctl-stack-2570), wt-stack (D = stack-2570-on-xfer). pixi 0.85.0 re-downloaded
+  to $R/pixi-new. Scripts: $R/tmp/wt_build.sh <wt>, wt_test.sh <wt> <binary> <catch args>, wt_submods.sh <wt> (only the submodules the build needs,
+  cloned from wt-xfer's local stores; a full recursive update clones starrocks / doris per worktree and takes > 20 min).
+- Rebase replay (conflict list): $R/notes/xfer_rebase/replay_rebase.sh + replay.log.
+- Run dir $R/runs/xfer_fin (bin/abba_q.sh, one_query.sh, table.py as in runs/xfer_main). DF queries: 2 3 4 5 7 8 9 10 11 12 16 17 18 19 20 21 22; non-DF 1 6 13 14 15.
+- NEXT: builds A-D, unit gates on B and D (+ 2569 head), pre-commit on B, measurement (a) B vs A, (b) D vs C, 22-query identity, tables below.
