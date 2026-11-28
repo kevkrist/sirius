@@ -1,0 +1,162 @@
+# HEAD 3de0c74641c03e1e58d22be4a1910f0a0cf97c4c branch prod/xfer
+diff --git a/src/cuda/sirius_dynamic_bloom_filter.cu b/src/cuda/sirius_dynamic_bloom_filter.cu
+index a4d62998..6095402f 100644
+--- a/src/cuda/sirius_dynamic_bloom_filter.cu
++++ b/src/cuda/sirius_dynamic_bloom_filter.cu
+@@ -966,8 +966,8 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
+       : (united->peer_copies ? publication_route::PEER_AND_HOST : publication_route::HOST);
+   SIRIUS_LOG_DEBUG(
+     "[accumulated_bloom_builder::finish] root GPU {} united {} key(s), {} bytes per GPU, on {} "
+-    "GPU(s) in {:.3f} ms: {} island(s), {} through the host, {} chunk(s) in flight, {} pinned "
+-    "bytes, {} device scratch bytes{}.",
++    "GPU(s) in {:.3f} ms: {} island(s), {} through the host ({:.3f} ms in host ORs, {:.3f} ms "
++    "waiting for their inputs), {} chunk(s) in flight, {} pinned bytes, {} device scratch bytes{}.",
+     root->device_id,
+     _impl->keys.size(),
+     all_bytes,
+@@ -975,6 +975,8 @@ std::optional<accumulated_bloom_builder::publication> accumulated_bloom_builder:
+     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
+     united->islands,
+     united->host_inputs,
++    united->host_or_ms,
++    united->host_wait_ms,
+     united->window_chunks,
+     united->host_window_bytes,
+     std::reduce(united->device_scratch_bytes.begin(), united->device_scratch_bytes.end()),
+diff --git a/src/cuda/union_transfer.cu b/src/cuda/union_transfer.cu
+index 0bf3d5a9..ea33f397 100644
+--- a/src/cuda/union_transfer.cu
++++ b/src/cuda/union_transfer.cu
+@@ -37,6 +37,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cstdint>
+ #include <limits>
+ #include <memory>
+@@ -635,7 +636,10 @@ class union_run {
+   /// slot.
+   void combine_on_host(std::size_t sequence)
+   {
++    using clock         = std::chrono::steady_clock;
++    using milliseconds  = std::chrono::duration<double, std::milli>;
+     auto const position = sequence % _window;
++    auto const arrived  = clock::now();
+     for (auto const& entry : _islands) {
+       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{entry.device}};
+       if (entry.input) {
+@@ -648,16 +652,21 @@ class union_run {
+                    "cudaEventSynchronize(upload)");
+       }
+     }
+-    nvtx_scoped_range or_range{"dynfilter::accum::host_or"};
+-    or_job job{this, position, _chunks[sequence].bytes};
+-    _runner.run(
+-      _runner.executor,
+-      _parts,
+-      [](void* context, unsigned part) noexcept {
+-        auto const& current = *static_cast<or_job const*>(context);
+-        current.owner->combine_part(current.position, current.bytes, part);
+-      },
+-      &job);
++    auto const started = clock::now();
++    {
++      nvtx_scoped_range or_range{"dynfilter::accum::host_or"};
++      or_job job{this, position, _chunks[sequence].bytes};
++      _runner.run(
++        _runner.executor,
++        _parts,
++        [](void* context, unsigned part) noexcept {
++          auto const& current = *static_cast<or_job const*>(context);
++          current.owner->combine_part(current.position, current.bytes, part);
++        },
++        &job);
++    }
++    _report.host_wait_ms += milliseconds{started - arrived}.count();
++    _report.host_or_ms += milliseconds{clock::now() - started}.count();
+   }
+ 
+   /// ORs one part of a chunk: an equal share of its bytes, cut at 64-byte boundaries.
+diff --git a/src/op/dynamic_filter/detail/union_transfer.hpp b/src/op/dynamic_filter/detail/union_transfer.hpp
+index b7bf99bc..3191ccae 100644
+--- a/src/op/dynamic_filter/detail/union_transfer.hpp
++++ b/src/op/dynamic_filter/detail/union_transfer.hpp
+@@ -99,6 +99,8 @@ struct union_report {
+   bool peer_copies              = false;          ///< Whether any merge or fan-out stage ran
+   bool degraded                 = false;          ///< An island was split or the window was halved
+   std::size_t host_window_bytes = 0;              ///< Pinned bytes held
++  double host_or_ms             = 0;  ///< Time the calling thread spent in host ORs
++  double host_wait_ms           = 0;  ///< Time it waited for the transfers the host ORs read
+   std::vector<std::size_t> device_scratch_bytes;  ///< Per member: its tracked scratch charge
+ };
+ 
+diff --git a/test/cpp/operator/test_dynamic_filter_union_transfer.cpp b/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
+index a6af3293..8f6abbb5 100644
+--- a/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
++++ b/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
+@@ -30,8 +30,10 @@
+ #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
+ #include <memory>
+ #include <optional>
+ #include <span>
+@@ -476,3 +478,53 @@ TEST_CASE("concurrent publications share the host OR workers and stay exact",
+   REQUIRE(host->get_total_allocated_bytes() == host_before);
+   REQUIRE(fixture.allocated_bytes() == baseline);
+ }
++
++// Not a test: prints the time of `finish` for the array sizes and contributions of the transfer
++// benchmarks. Run alone on an idle machine: sirius_unittest "[union_transfer_bench]".
++TEST_CASE("time of accumulated publication by array size, contribution and grouping",
++          "[.][union_transfer_bench][multi_gpu]")
++{
++  auto const devices = std::min<std::size_t>(4, static_cast<std::size_t>(acc::visible_gpus()));
++  if (lacks_gpus(2)) { return; }
++  acc::fixture fixture({.devices = devices, .gpu_bytes = std::size_t{8} << 30});
++  unsigned const all = (1U << devices) - 1;
++  std::printf("| MiB | contributing | grouping | median ms | ms/GiB |\n|---|---|---|---|---|\n");
++  for (auto const megabytes : {4, 16, 57, 174, 281, 1434}) {
++    std::vector<std::size_t> const blocks{megabytes * acc::mib / op::bloom_bytes_per_block};
++    for (auto const mask : {all, 0b0101U & all, 0b0001U}) {
++      for (bool const separate : {false, true}) {
++        std::vector<double> times;
++        for (int round = 0; round < 6; ++round) {
++          auto builder       = make_builder(fixture, blocks);
++          auto const batches = contribute(builder, fixture, mask);
++          for (std::size_t device = 0; device < devices; ++device) {
++            // Publication is timed without the pending zero fill of the arrays.
++            REQUIRE(builder.inspect_partial(0, rmm::cuda_device_id{static_cast<int>(device)}));
++          }
++          auto const started   = std::chrono::steady_clock::now();
++          auto const published = acc::builder_access::finish(
++            builder,
++            rmm::cuda_device_id{0},
++            fixture.publication_stream(0),
++            fixture.gpu(0).get_default_allocator(),
++            {.islands = separate ? std::span{acc::separate_gpus}.first(devices)
++                                 : std::span<std::uint8_t const>{}});
++          auto const elapsed = std::chrono::steady_clock::now() - started;
++          REQUIRE(published);
++          // The first round warms up streams, kernels and pinned pages.
++          if (round != 0) {
++            times.push_back(std::chrono::duration<double, std::milli>(elapsed).count());
++          }
++        }
++        std::ranges::sort(times);
++        auto const median = times[times.size() / 2];
++        std::printf("| %d | %s | %s | %.2f | %.1f |\n",
++                    megabytes,
++                    mask == all ? "all" : mask == 1U ? "root" : "GPUs 0+2",
++                    separate ? "separate" : "real",
++                    median,
++                    median * 1024 / megabytes);
++      }
++    }
++  }
++}

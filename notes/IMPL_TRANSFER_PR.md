@@ -16,3 +16,7 @@ Build: `$R/tmp/xfer_build.sh` (flock + pixi run make, log `$R/logs/build_prod_xf
   test_in_task_publication.cpp 852-960, test_pool_peer_access.cpp, multi_partition integration), new test file
   test_dynamic_filter_union_transfer.cpp (identity over topologies, degradation, concurrency, inserts in flight), docs, gates.
 - helper scripts: $R/tmp/xfer_build.sh, xfer_test.sh <bin> <catch args>, xfer_pc.sh (pre-commit), xfer_commit.sh "<msg>".
+- commits 4-5 done: 5c34bfd8 (unite module), 3de0c746 (finish switched, both tip transports deleted, tests updated/added).
+  Unit gates green at 3de0c746: sirius_unittest "[dynamic_filter]~[cuda_status_fault]~[.],[device_transfer],[publisher],[construction_plan],
+  [physical_partition],[build_filter],[in_task_publication],[pool_peer_access],[peer_islands],[host_or]" = 741 cases pass;
+  sirius_cuda_fault_test "[cuda_status_fault]~[.]" = 22 cases pass. Pre-commit clean. NEXT: engine gates (22 q identity, ABBA), docs, notes.
