@@ -1,0 +1,185 @@
+# HEAD 89ebb7d5995411c9b6d46e29d95b517db741bd59 branch 
+diff --git a/src/cuda/sirius_dynamic_bloom_filter.cu b/src/cuda/sirius_dynamic_bloom_filter.cu
+index 284bf247..e4a2c6cb 100644
+--- a/src/cuda/sirius_dynamic_bloom_filter.cu
++++ b/src/cuda/sirius_dynamic_bloom_filter.cu
+@@ -820,7 +820,6 @@ std::size_t accumulated_bloom_builder::publication_scratch_bytes(std::span<key c
+     chunk_slot       = std::max(chunk_slot, chunk);
+     chunks += ::cuda::ceil_div(raw_bytes, chunk);
+   }
+-  // The direct transport's bound, which also covers the HOST-staged transport's single slot.
+   auto const slots = std::min<std::size_t>(2, chunks) * (replicas - 1);
+   return chunk_slot > maximum / slots ? maximum
+                                       : tracked_replica_allocation_bytes(slots * chunk_slot);
+diff --git a/src/op/dynamic_filter/build_filter_construction.cpp b/src/op/dynamic_filter/build_filter_construction.cpp
+index cf88ca25..ca8ce46f 100644
+--- a/src/op/dynamic_filter/build_filter_construction.cpp
++++ b/src/op/dynamic_filter/build_filter_construction.cpp
+@@ -328,7 +328,8 @@ std::optional<build_filter_construction::constructed_filters> build_filter_const
+   if (_impl->bloom) {
+     blooms = _impl->bloom->finish(device, root.stream, root.scratch);
+     if (!blooms) { return std::nullopt; }
+-    result.transport = blooms->transport;
++    result.route          = blooms->route;
++    result.bloom_degraded = blooms->degraded;
+   }
+   std::optional<detail::exact_key_stager::gathered> staged;
+   if (_impl->stager) {
+diff --git a/src/op/dynamic_filter/build_filter_construction.hpp b/src/op/dynamic_filter/build_filter_construction.hpp
+index ef190efb..29034e73 100644
+--- a/src/op/dynamic_filter/build_filter_construction.hpp
++++ b/src/op/dynamic_filter/build_filter_construction.hpp
+@@ -124,8 +124,9 @@ class build_filter_construction final {
+   struct constructed_filters {
+     std::vector<constructed_key> keys;     ///< One per planned key, in plan order
+     dynamic_filter_stats_snapshot counts;  ///< The `filters_skipped_construction_*` counters
+-    std::optional<detail::accumulated_bloom_builder::publication_transport>
+-      transport;  ///< How the Bloom filters reached their replicas, if any key planned one
++    std::optional<detail::accumulated_bloom_builder::publication_route>
++      route;  ///< How the Bloom filters reached their replicas, if any key planned one
++    bool bloom_degraded = false;  ///< `accumulated_bloom_builder::publication::degraded`
+   };
+ 
+   /**
+diff --git a/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp b/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp
+index 79a633cc..ca66cabd 100644
+--- a/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp
++++ b/src/op/dynamic_filter/detail/accumulated_bloom_builder.hpp
+@@ -214,6 +214,7 @@ class accumulated_bloom_builder final {
+    *
+    * @throw accumulation_invariant_error if a key has no blocks, an unsupported type, or sizes that
+    * overflow
++   * @throw cucascade::cuda_error if a pool access query fails
+    * @return The builder, or nullopt iff a lease was refused, after releasing everything built so
+    * far
+    */
+@@ -222,7 +223,8 @@ class accumulated_bloom_builder final {
+ 
+   /**
+    * @brief An upper bound on the task scratch `finish` takes for `keys` (with their blocks set)
+-   * replicated on `replicas` GPUs: the direct merge's chunk slots for every non-root source.
++   * replicated on `replicas` GPUs: the merge's chunk slots when every other GPU is a source in the
++   * root's group.
+    */
+   [[nodiscard]] static std::size_t publication_scratch_bytes(std::span<key const> keys,
+                                                              std::size_t replicas) noexcept;
+diff --git a/src/op/dynamic_filter/dynamic_filter_stats.hpp b/src/op/dynamic_filter/dynamic_filter_stats.hpp
+index 07133f6d..b99a30ed 100644
+--- a/src/op/dynamic_filter/dynamic_filter_stats.hpp
++++ b/src/op/dynamic_filter/dynamic_filter_stats.hpp
+@@ -56,22 +56,23 @@ namespace sirius::op {
+  * `accumulations_declined_port_directive` (a late-materialization directive),
+  * `accumulations_declined_unreadable_arrival` (an arrival the ledger cannot accept, including any
+  * non-GPU arrival), and `accumulations_declined_compressed_arrival` (a compressed arrival).
+- * `keys_skipped_shadowed` counts Shadowed Keys: keys planned without a membership filter because
+- * no Consumer would select it over the filters already on its Channels.
+- * `keys_sized_on_total_rows` counts keys whose null count was unknown, so their Bloom filter was
+- * sized on every row and no exact IN-list was considered. `filters_skipped_construction_invariant`
+- * counts filters dropped because staging found more valid rows than the inventory recorded;
++ * `keys_skipped_shadowed` counts Shadowed Keys: keys planned without a membership filter because no
++ * Consumer would select it over the filters already on its Channels. `keys_sized_on_total_rows`
++ * counts keys whose null count was unknown, so their Bloom filter was sized on every row and no
++ * exact IN-list was considered. `filters_skipped_construction_invariant` counts filters dropped
++ * because staging found more valid rows than the inventory recorded;
+  * `filters_skipped_construction_admission` counts filters dropped because the root GPU refused the
+- * memory to build them.
+- * `accumulations_skipped_admission` counts allocation or admission refusals before any filter is
+- * published, including initialization leases, publication workspace, and a
++ * memory to build them. `accumulations_skipped_admission` counts allocation or admission refusals
++ * before any filter is published, including initialization leases, publication workspace, and a
+  * contribution or publication GPU without an admitted partial. `accumulations_skipped_error` counts
+  * unexpected or fatal failures before they propagate, and `accumulations_skipped_transient` counts
+  * retryable kernel-launch errors. `accumulations_incomplete` counts inputs that closed before every
+  * batch contributed, `accumulations_abandoned` publications owed by a task that never ran them
+  * before input closed in an uncancelled session, and `accumulation_publications_finished` fan-outs
+- * that pushed at least one filter; `accumulation_publications_host_staged` counts those whose
+- * replicas were staged through HOST memory instead of copied between GPU pools.
++ * that pushed at least one filter; `accumulation_publications_host_staged` counts those whose Bloom
++ * arrays crossed pinned HOST memory between GPUs that cannot copy to each other directly, and
++ * `accumulation_publications_degraded` those whose Bloom transfer was refused workspace and used
++ * the host in place of device-to-device copies, or fewer chunks in flight.
+  * `accumulation_storage_leaks` counts partial storage deliberately leaked because GPU work might
+  * still use it after a failed host join. `accumulation_publication_latency_ns` sums the time from
+  * final contribution to first push for every attempt that published a filter.
+diff --git a/test/cpp/operator/test_dynamic_filter_union_transfer.cpp b/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
+index 92b577b8..674c19da 100644
+--- a/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
++++ b/test/cpp/operator/test_dynamic_filter_union_transfer.cpp
+@@ -16,7 +16,6 @@
+ 
+ #include "dynamic_filter_accumulation_test_utils.hpp"
+ #include "memory/peer_islands.hpp"
+-#include "op/dynamic_filter/bloom_sizing.hpp"
+ #include "op/dynamic_filter/detail/accumulated_bloom_builder.hpp"
+ #include "op/dynamic_filter/detail/union_plan.hpp"
+ #include "op/dynamic_filter/detail/union_transfer.hpp"
+@@ -93,27 +92,14 @@ std::string describe(std::span<std::uint8_t const> islands)
+   return text;
+ }
+ 
+-/// The geometry of `keys` arrays of exactly `blocks` Bloom blocks each; mirrors
+-/// `accumulated_bloom_geometry::try_create`, which sizes from rows.
+-op::detail::accumulated_bloom_geometry geometry_of(std::size_t blocks, std::size_t keys)
+-{
+-  using geometry       = op::detail::accumulated_bloom_geometry;
+-  auto const raw_bytes = blocks * op::bloom_bytes_per_block;
+-  auto const aligned   = rmm::align_up(raw_bytes, rmm::CUDA_ALLOCATION_ALIGNMENT);
+-  auto const chunk     = std::clamp(
+-    raw_bytes / 8, geometry::k_min_transfer_chunk_bytes, geometry::k_max_transfer_chunk_bytes);
+-  return {blocks,
+-          raw_bytes,
+-          aligned * keys,
+-          std::min(rmm::align_up(chunk, rmm::CUDA_ALLOCATION_ALIGNMENT), aligned)};
+-}
+-
+-/// A builder over `blocks.size()` arrays of `blocks[0]` Bloom blocks each, with the keys of the
+-/// fixture's batches.
++/// A builder over arrays of `blocks[i]` Bloom blocks, with the keys of the fixture's batches.
+ builder_type make_builder(acc::fixture const& fixture, std::span<std::size_t const> blocks)
+ {
+-  REQUIRE(std::ranges::all_of(blocks, [&](auto count) { return count == blocks[0]; }));
+-  return acc::make_builder(fixture, geometry_of(blocks[0], blocks.size()), blocks.size());
++  std::vector<builder_type::key> keys{{0, cudf::data_type{cudf::type_id::INT32}, blocks[0]}};
++  if (blocks.size() == 2) { keys.push_back({1, cudf::data_type{cudf::type_id::INT64}, blocks[1]}); }
++  auto result = builder_type::try_create(std::move(keys), fixture.spaces);
++  REQUIRE(result);
++  return std::move(*result);
+ }
+ 
+ /// What `unite` must report for a publication, from the plan's roles and the array shapes.
+@@ -129,9 +115,14 @@ expected_workspace expect_workspace(std::span<std::uint8_t const> islands,
+                                     std::span<std::size_t const> blocks,
+                                     std::size_t host_block)
+ {
+-  auto const geometry  = geometry_of(blocks[0], blocks.size());
+-  auto const chunks    = blocks.size() * geometry.chunks_per_key();
+-  auto const slot      = geometry.chunk_bytes;
++  std::size_t chunks = 0;
++  std::size_t slot   = 0;
++  for (auto const count : blocks) {
++    auto const bytes = count * op::bloom_bytes_per_block;
++    auto const chunk = op::detail::accumulated_bloom_chunk_bytes(bytes);
++    chunks += ::cuda::ceil_div(bytes, chunk);
++    slot = std::max(slot, chunk);
++  }
+   auto const plan      = op::detail::union_plan::make(islands, contributed, root);
+   auto const in_flight = std::min<std::size_t>(2, chunks);
+   expected_workspace expected{std::vector<std::size_t>(islands.size(), 0), 0, route::NONE};
+@@ -243,7 +234,7 @@ TEST_CASE(
+   }
+ }
+ 
+-TEST_CASE("the union is exact for arrays from one chunk to many",
++TEST_CASE("the union is exact for arrays from one chunk to many, of different sizes per key",
+           "[dynamic_filter][multi_partition][union_transfer][multi_gpu]")
+ {
+   auto const devices = std::min<std::size_t>(4, static_cast<std::size_t>(acc::visible_gpus()));
+@@ -252,7 +243,7 @@ TEST_CASE("the union is exact for arrays from one chunk to many",
+   // Bloom blocks of 32 bytes: 96 B; one short chunk; 2 MiB + 32 B (two chunks, the second 32 B);
+   // 8 MiB + 32 B (five chunks); 70 MiB + 96 B (nine 8 MiB chunks with a short tail).
+   std::vector<std::vector<std::size_t>> const shapes{
+-    {3}, {1000, 1000}, {65537, 65537}, {262145}, {2'293'763, 2'293'763}};
++    {3}, {3, 1000}, {65537, 3}, {262145, 65537}, {2'293'763, 1000}};
+   unsigned const all = (1U << devices) - 1;
+   for (auto const& blocks : shapes) {
+     for (auto const root : {std::size_t{0}, devices - 1}) {

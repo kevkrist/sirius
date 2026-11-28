@@ -99,3 +99,17 @@ retires partials).
 - NEXT: fix compile errors, unit tests ([dynamic_filter],[peer_islands],[host_or],[union_plan],[in_task_publication],[pool_peer_access]; sirius_cuda_fault_test),
   pre-commit, squash WIP into switch commit; rebase prod/ctl-stack-* onto prod/xfer-main -> prod/stack-2569-on-xfer / prod/stack-2570-on-xfer (worktree wt-stack-xfer);
   builds: wt-main (A), wt-prod-xfer-main (B), wt-stack (C = prod/ctl-stack-2570-on-main), wt-stack-xfer (D); measure B vs A and D vs C.
+- prod/xfer-main FINAL CANDIDATE = 9038a957 (6 commits on origin/main a94d5c4b). Built (full pixi run make rc=0, tree a57dbf51 + doc-only delta), unit gates green:
+  sirius_unittest "[dynamic_filter]~[cuda_status_fault]~[.],[device_transfer],[publisher],[physical_partition],[build_filter],[in_task_publication],[pool_peer_access],[peer_islands],[host_or],[union_plan]"
+  = 649 cases pass (4 GPUs); sirius_cuda_fault_test "[cuda_status_fault]~[.]" = 25 cases pass; pre-commit clean.
+  Main-only additions: src/cuda/accumulation_cuda.cuh (check_cuda / cuda_event / make_event_on shared by the Bloom .cu and union_transfer.cu; on the stack
+  accumulation_partial.cuh now includes it instead of defining them).
+- Stack on transfer: prod/stack-2570-on-xfer = 1a9df698 (25 commits grafted on 9038a957; $R/tmp/graft.py, res.py, cont.sh). Textual conflicts: cmake lists (union);
+  e4b71389 bloom .cu (take transfer finish, per-key shapes); 7a4ac11e bloom .cu include + create() (lease_partials then islands), accumulation_partial.cuh;
+  82fdfe91 accumulation_partial.cuh; 49445de2 publisher (route / bloom_degraded); 2fe817f7 test tags [multi_partition]->[construction] incl. union test;
+  966cc597 + 0ceaf75e docs (stack text + transfer paragraphs); 9ef40276 builder hpp try_create doc.
+- IN PROGRESS: wt-stack-xfer detached at 89ebb7d5 (2569 head on transfer) + UNCOMMITTED semantic fixes F1 (build_filter_construction route/bloom_degraded, stats prose,
+  builder hpp docs, orphan comment, union test = prod/xfer ed3a54b8 version with [multi_partition] tags); building (log build_wt-stack-xfer.log). Then: commit F1 as
+  prod/stack-2569-on-xfer head, graft the 11 #2570 commits on it (tree + F1 patch; union test from $R/tmp/union_test_c.cpp once tags are [construction]), F2 at 2570 head
+  (stats bullets, check vs prod/xfer-on-shadow), build, tests.
+- Measurement 1 queued: runs/xfer_main m1_* (ABBA main vs xfer, q21 3 7 8 10 9 6 2 4) and id1_* (22 q, debug log, 2 iters). Table: bin/table.py main xfer m1.
