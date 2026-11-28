@@ -32,6 +32,11 @@
   Old heads kept on fork: dfperf/backup/pr2569-a2d6bd5a, dfperf/backup/pr2570-ae939824. "tip" in older notes = ae939824 (pre-shadow).
   Later PR-bound branches (prod/xfer, S6) must be rebased onto 317e0cfc before they are proposed.
 - (2026-11-28) Transfer design Q3/Q5/Q7/Q9: proceed with the architect's recommendations.
+- (2026-11-28) Hybrid one-shot question, VERIFIED picture (VERIFY_PROTO_HYBRID_ONESHOT.md corrects PROTO_HYBRID_ONESHOT.md):
+  one-shot for whole-arriving builds vs PARTITION-only: -160 ms today (no S6); TIE with S6 when the eager release fires right
+  after one-shot publication (author's +84 ms "forfeit" was a prototype artifact); ~100 ms WORSE with S6 + transfer PR
+  (cross-experiment estimate, not measured in one binary). Cost of keeping it: ~670 src + ~450 test lines + a second transfer path.
+  Recommendation stands (PARTITION-only) but it rests on the transfer PR landing. User decision pending.
 
 # OPPORTUNITIES: measured, verified opportunity list for the DF stack (#2569 -> #2570), TPC-H SF1000, 4 GPUs
 
