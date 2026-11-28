@@ -214,6 +214,7 @@ class accumulated_bloom_builder final {
    *
    * @throw accumulation_invariant_error if a key has no blocks, an unsupported type, or sizes that
    * overflow
+   * @throw cucascade::cuda_error if a pool access query fails
    * @return The builder, or nullopt iff a lease was refused, after releasing everything built so
    * far
    */
@@ -222,7 +223,8 @@ class accumulated_bloom_builder final {
 
   /**
    * @brief An upper bound on the task scratch `finish` takes for `keys` (with their blocks set)
-   * replicated on `replicas` GPUs: the direct merge's chunk slots for every non-root source.
+   * replicated on `replicas` GPUs: the merge's chunk slots when every other GPU is a source in the
+   * root's group.
    */
   [[nodiscard]] static std::size_t publication_scratch_bytes(std::span<key const> keys,
                                                              std::size_t replicas) noexcept;

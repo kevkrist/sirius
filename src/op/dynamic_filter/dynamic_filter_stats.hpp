@@ -56,22 +56,23 @@ namespace sirius::op {
  * `accumulations_declined_port_directive` (a late-materialization directive),
  * `accumulations_declined_unreadable_arrival` (an arrival the ledger cannot accept, including any
  * non-GPU arrival), and `accumulations_declined_compressed_arrival` (a compressed arrival).
- * `keys_skipped_shadowed` counts Shadowed Keys: keys planned without a membership filter because
- * no Consumer would select it over the filters already on its Channels.
- * `keys_sized_on_total_rows` counts keys whose null count was unknown, so their Bloom filter was
- * sized on every row and no exact IN-list was considered. `filters_skipped_construction_invariant`
- * counts filters dropped because staging found more valid rows than the inventory recorded;
+ * `keys_skipped_shadowed` counts Shadowed Keys: keys planned without a membership filter because no
+ * Consumer would select it over the filters already on its Channels. `keys_sized_on_total_rows`
+ * counts keys whose null count was unknown, so their Bloom filter was sized on every row and no
+ * exact IN-list was considered. `filters_skipped_construction_invariant` counts filters dropped
+ * because staging found more valid rows than the inventory recorded;
  * `filters_skipped_construction_admission` counts filters dropped because the root GPU refused the
- * memory to build them.
- * `accumulations_skipped_admission` counts allocation or admission refusals before any filter is
- * published, including initialization leases, publication workspace, and a
+ * memory to build them. `accumulations_skipped_admission` counts allocation or admission refusals
+ * before any filter is published, including initialization leases, publication workspace, and a
  * contribution or publication GPU without an admitted partial. `accumulations_skipped_error` counts
  * unexpected or fatal failures before they propagate, and `accumulations_skipped_transient` counts
  * retryable kernel-launch errors. `accumulations_incomplete` counts inputs that closed before every
  * batch contributed, `accumulations_abandoned` publications owed by a task that never ran them
  * before input closed in an uncancelled session, and `accumulation_publications_finished` fan-outs
- * that pushed at least one filter; `accumulation_publications_host_staged` counts those whose
- * replicas were staged through HOST memory instead of copied between GPU pools.
+ * that pushed at least one filter; `accumulation_publications_host_staged` counts those whose Bloom
+ * arrays crossed pinned HOST memory between GPUs that cannot copy to each other directly, and
+ * `accumulation_publications_degraded` those whose Bloom transfer was refused workspace and used
+ * the host in place of device-to-device copies, or fewer chunks in flight.
  * `accumulation_storage_leaks` counts partial storage deliberately leaked because GPU work might
  * still use it after a failed host join. `accumulation_publication_latency_ns` sums the time from
  * final contribution to first push for every attempt that published a filter.
